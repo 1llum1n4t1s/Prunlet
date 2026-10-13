@@ -46,7 +46,10 @@ $isolatedCodex = Join-Path $OutputDirectory 'isolated-codex'
 $settingsBackup = Join-Path $OutputDirectory 'settings-backup'
 
 # 起こり得る失敗を列挙してから実システムの検証を組み立てる。
-$failureConditions = @('初回許可範囲欠落', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '公開HEADに必要ソース欠落', 'ZIP traversal/重複/リンク', 'ビルド失敗', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '許可範囲内の作業場所と復元先の検証')
+$failureConditions = @('初回許可範囲欠落', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '公開HEADに必要ソース欠落', 'ZIP traversal/重複/リンク', 'ビルド失敗', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '許可範囲内の作業場所と復元先の検証', '指示登録オプションの組合せ不備', '指示marker重複・不完全・利用者編集', 'guide既存未所有・利用者編集', '指示登録途中での書込み失敗')
+Test-Case 'Agent instructions require explicit Codex registration' {
+    Expect-Failure { & $installer -InstallDirectory $install -AllowedRoot $allowed -RegisterAgentInstructions } 'requires explicit -RegisterCodex'
+}
 Test-Case 'First install requires explicit allowed roots' {
     Expect-Failure { & $installer -InstallDirectory $install } 'First installation requires'
     Assert-True (!(Test-Path -LiteralPath $install)) 'Initial failure created install files.'
@@ -175,6 +178,7 @@ try {
         Assert-True (!$toml.Contains($repoRoot) -and !$hooks.Contains($repoRoot) -and !$toml.Contains($fixtureRoot) -and !$hooks.Contains($fixtureRoot)) 'Registration references checkout source.'
         Assert-True ($toml.Contains('bin\\prunlet.exe')) 'Registration does not use installed bin.'
         Assert-True (!(Test-Path -LiteralPath (Join-Path $OutputDirectory 'first-work'))) 'Successful work was not cleaned.'
+        Assert-True (!(Test-Path -LiteralPath (Join-Path $isolatedCodex 'AGENTS.md')) -and !(Test-Path -LiteralPath (Join-Path $isolatedCodex 'PRUNLET.md'))) 'Without the flag agent instructions were written.'
     }
     Test-Case 'Next install resolves new HEAD and preserves config and recovery' {
         $configHash = (Get-FileHash -LiteralPath (Join-Path $install 'config.json')).Hash
@@ -245,6 +249,160 @@ try {
         Assert-True ($LASTEXITCODE -eq 0) 'Core rejected actual installed configuration.'
         Assert-True (!(Test-Path -LiteralPath $probeWork)) 'Work inside allowed root was not cleaned.'
     }
+    $instructionInstall = Join-Path $OutputDirectory 'instruction-install'
+    $fixtureInstalls.Add($instructionInstall)
+    $instructionCodex = Join-Path $OutputDirectory 'instruction-codex'
+    $instructionBackup = Join-Path $OutputDirectory 'instruction-backup'
+    New-Item -ItemType Directory -Path $instructionCodex | Out-Null
+    $instructionAgents = Join-Path $instructionCodex 'AGENTS.md'
+    $instructionGuide = Join-Path $instructionCodex 'PRUNLET.md'
+    $originalAgentText = "# Existing contract`r`nKeep this body.`r`n`r`n## Lessons`r`nExisting lessons.`r`n"
+    [IO.File]::WriteAllText($instructionAgents, $originalAgentText, [Text.UTF8Encoding]::new($true))
+    $originalAgentHash = (Get-FileHash -LiteralPath $instructionAgents).Hash
+    $trustPath = Join-Path $instructionCodex 'unrelated-trust-fixture.json'
+    [IO.File]::WriteAllText($trustPath, '{"trusted":false,"keep":true}', [Text.UTF8Encoding]::new($false))
+    $trustHash = (Get-FileHash -LiteralPath $trustPath).Hash
+    Test-Case 'Instruction opt-in preserves BOM/body and prepends before Lessons' {
+        & $installer -InstallDirectory $instructionInstall -AllowedRoot $allowed -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-first-work') | Out-Null
+        $agentText = [IO.File]::ReadAllText($instructionAgents)
+        Assert-True ($agentText.StartsWith('<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->', [StringComparison]::Ordinal)) 'Owned block is not at the document beginning.'
+        Assert-True ($agentText.IndexOf('BEGIN PRUNLET AGENT-INSTRUCTIONS') -lt $agentText.IndexOf('## Lessons')) 'Owned block is not before Lessons.'
+        Assert-True ($agentText.Contains('Prunlet MCPの`delete_files`を最初から使う。')) 'Instruction does not select the MCP first.'
+        $withoutBlock = [regex]::Replace($agentText, '<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->\r\n.*?\r\n<!-- END PRUNLET AGENT-INSTRUCTIONS -->\r\n', '')
+        Assert-True ($withoutBlock -ceq $originalAgentText) 'Existing AGENTS body or newlines changed.'
+        $bytes = [IO.File]::ReadAllBytes($instructionAgents)
+        Assert-True ($bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf) 'UTF8 BOM was removed.'
+        Assert-True ((Get-FileHash -LiteralPath $instructionGuide).Hash -eq (Get-FileHash -LiteralPath (Join-Path $instructionInstall 'bin\PRUNLET.md')).Hash) 'Registered guide differs from installed guide.'
+        Assert-True ((Get-FileHash -LiteralPath $trustPath).Hash -eq $trustHash) 'Unrelated host trust data changed.'
+    }
+    Test-Case 'Instruction registration is idempotent' {
+        $agentHash = (Get-FileHash -LiteralPath $instructionAgents).Hash
+        $guideHash = (Get-FileHash -LiteralPath $instructionGuide).Hash
+        & $installer -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-idempotent-work') | Out-Null
+        Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $instructionAgents).Hash -and $guideHash -eq (Get-FileHash -LiteralPath $instructionGuide).Hash) 'Idempotent instruction registration rewrote contents.'
+    }
+    $updatedZip = Join-Path $OutputDirectory 'updated-guide-fixture.zip'
+    $fixtureGuide = Join-Path $source 'integration\PRUNLET.md'
+    [byte[]]$originalGuideBytes = [IO.File]::ReadAllBytes($fixtureGuide)
+    try {
+        [IO.File]::AppendAllText($fixtureGuide, "`nFixture guide update.`n", [Text.UTF8Encoding]::new($false))
+        [IO.Compression.ZipFile]::CreateFromDirectory($fixtureRoot, $updatedZip)
+    } finally { [IO.File]::WriteAllBytes($fixtureGuide, $originalGuideBytes) }
+    $global:PrunletLatestFixture.zip = $updatedZip
+    $global:PrunletLatestFixture.sha = 'd' * 40
+    Test-Case 'Owned guide updates from its previous installed hash' {
+        $agentHash = (Get-FileHash -LiteralPath $instructionAgents).Hash
+        & $installer -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-update-work') | Out-Null
+        Assert-True ([IO.File]::ReadAllText($instructionGuide).Contains('Fixture guide update.')) 'Owned guide did not update.'
+        Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $instructionAgents).Hash) 'Guide update changed existing AGENTS.'
+    }
+    Test-Case 'Update without instruction flag preserves existing edited guide' {
+        [byte[]]$original = [IO.File]::ReadAllBytes($instructionGuide)
+        try {
+            [IO.File]::AppendAllText($instructionGuide, 'User edit preserved without opt-in.', [Text.UTF8Encoding]::new($false))
+            $agentHash = (Get-FileHash -LiteralPath $instructionAgents).Hash
+            $guideHash = (Get-FileHash -LiteralPath $instructionGuide).Hash
+            & $installer -InstallDirectory $instructionInstall -RegisterCodex -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-no-flag-work') | Out-Null
+            Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $instructionAgents).Hash -and $guideHash -eq (Get-FileHash -LiteralPath $instructionGuide).Hash) 'Update without the flag touched agent instructions.'
+        } finally { [IO.File]::WriteAllBytes($instructionGuide, $original) }
+    }
+    Test-Case 'Edited instructions and guide reject install and uninstall before writes' {
+        $paths = @($instructionAgents, $instructionGuide, (Join-Path $instructionCodex 'config.toml'), (Join-Path $instructionCodex 'hooks.json'))
+        foreach ($kind in @('block', 'guide')) {
+            $target = if ($kind -eq 'block') { $instructionAgents } else { $instructionGuide }
+            [byte[]]$original = [IO.File]::ReadAllBytes($target)
+            try {
+                if ($kind -eq 'block') { [IO.File]::WriteAllText($target, ([IO.File]::ReadAllText($target).Replace('最初から使う。', '利用者が編集した内容。')), [Text.UTF8Encoding]::new($true)) }
+                else { [IO.File]::AppendAllText($target, 'User guide edit.', [Text.UTF8Encoding]::new($false)) }
+                $hashes = @{}; foreach ($path in $paths) { $hashes[$path] = (Get-FileHash -LiteralPath $path).Hash }
+                Expect-Failure { & $installer -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory "edited-$kind-work") } 'was edited'
+                Expect-Failure { & (Join-Path $instructionInstall 'bin\uninstall-codex.ps1') -CodexHome $instructionCodex -BackupDirectory $instructionBackup } 'was edited'
+                foreach ($path in $paths) { Assert-True ($hashes[$path] -eq (Get-FileHash -LiteralPath $path).Hash) 'Edited profile changed despite rejection.' }
+            } finally { [IO.File]::WriteAllBytes($target, $original) }
+        }
+    }
+    Test-Case 'Instruction write failure rolls back MCP hooks and four profile files' {
+        $lockedInstall = Join-Path $OutputDirectory 'instruction-locked-install'
+        $fixtureInstalls.Add($lockedInstall)
+        $lockedCodex = Join-Path $OutputDirectory 'instruction-locked-codex'
+        New-Item -ItemType Directory -Path $lockedCodex | Out-Null
+        $lockedAgents = Join-Path $lockedCodex 'AGENTS.md'
+        [IO.File]::WriteAllText($lockedAgents, "Keep original contract.`n", [Text.UTF8Encoding]::new($false))
+        $agentHash = (Get-FileHash -LiteralPath $lockedAgents).Hash
+        $lock = [IO.File]::Open($lockedAgents, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            Expect-Failure { & $installer -InstallDirectory $lockedInstall -AllowedRoot $allowed -RegisterCodex -RegisterAgentInstructions -CodexHome $lockedCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-locked-work') } 'WriteAllBytes'
+            Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $lockedAgents).Hash) 'Locked original AGENTS changed.'
+            foreach ($name in @('PRUNLET.md','hooks.json','config.toml')) { Assert-True (!(Test-Path -LiteralPath (Join-Path $lockedCodex $name))) "Failed registration left $name." }
+            Assert-True (!(Test-Path -LiteralPath $lockedInstall)) 'Instruction failure left initial products/config/recovery.'
+        } finally { $lock.Dispose() }
+    }
+    Test-Case 'Malformed markers and unowned guides are preserved' {
+        $helper = Join-Path $instructionInstall 'bin\install-agent-instructions.ps1'
+        foreach ($kind in @('duplicate','incomplete','unowned-guide')) {
+            $invalidCodex = Join-Path $OutputDirectory "instruction-invalid-$kind"
+            New-Item -ItemType Directory -Path $invalidCodex | Out-Null
+            $badAgents = Join-Path $invalidCodex 'AGENTS.md'
+            $badGuide = Join-Path $invalidCodex 'PRUNLET.md'
+            if ($kind -eq 'unowned-guide') { [IO.File]::WriteAllText($badGuide, 'User-owned guide.') }
+            else { [IO.File]::WriteAllText($badAgents, $(if ($kind -eq 'duplicate') { '<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS --><!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->' } else { '<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS' })) }
+            $before = @{}; Get-ChildItem -LiteralPath $invalidCodex -File | ForEach-Object { $before[$_.FullName] = (Get-FileHash -LiteralPath $_.FullName).Hash }
+            Expect-Failure { & $helper -SourceGuidePath (Join-Path $instructionInstall 'bin\PRUNLET.md') -CodexHome $invalidCodex -BackupDirectory $instructionBackup } 'Duplicate or incomplete|no owned agent'
+            foreach ($path in $before.Keys) { Assert-True ($before[$path] -eq (Get-FileHash -LiteralPath $path).Hash) 'Invalid instruction files were changed.' }
+        }
+    }
+    Test-Case 'Instruction uninstall restores original AGENTS bytes and removes owned guide' {
+        & (Join-Path $instructionInstall 'bin\uninstall-codex.ps1') -CodexHome $instructionCodex -BackupDirectory $instructionBackup | Out-Null
+        Assert-True ((Get-FileHash -LiteralPath $instructionAgents).Hash -eq $originalAgentHash) 'Uninstall did not restore exact original AGENTS bytes.'
+        Assert-True (!(Test-Path -LiteralPath $instructionGuide)) 'Uninstall retained owned guide.'
+        Assert-True (![IO.File]::ReadAllText((Join-Path $instructionCodex 'config.toml')).Contains('[mcp_servers.prunlet]')) 'Uninstall retained owned MCP entry.'
+        Assert-True ((Get-FileHash -LiteralPath $trustPath).Hash -eq $trustHash) 'Uninstall changed unrelated host trust data.'
+        # ガイドもmarkerもないときは従来の解除を冪等に実行する。
+        & (Join-Path $instructionInstall 'bin\uninstall-codex.ps1') -CodexHome $instructionCodex -BackupDirectory $instructionBackup | Out-Null
+        Assert-True ((Get-FileHash -LiteralPath $instructionAgents).Hash -eq $originalAgentHash) 'Legacy uninstall changed unrelated AGENTS.'
+    }
+    Test-Case 'Instruction roundtrip preserves BOM encodings and no-Lessons EOF bytes' {
+        foreach ($kind in @('utf8','utf16','utf32')) {
+            $encodingCodex = Join-Path $OutputDirectory "instruction-encoding-$kind"
+            New-Item -ItemType Directory -Path $encodingCodex | Out-Null
+            $agentPath = Join-Path $encodingCodex 'AGENTS.md'
+            $encoding = switch ($kind) {
+                'utf8' { [Text.UTF8Encoding]::new($false) }
+                'utf16' { [Text.UnicodeEncoding]::new($false, $true) }
+                'utf32' { [Text.UTF32Encoding]::new($true, $true) }
+            }
+            [IO.File]::WriteAllText($agentPath, "利用者の本文`n末尾に改行なし", $encoding)
+            $originalHash = (Get-FileHash -LiteralPath $agentPath).Hash
+            $helperParameters = @{ SourceGuidePath = (Join-Path $instructionInstall 'bin\PRUNLET.md'); CodexHome = $encodingCodex; BackupDirectory = $instructionBackup }
+            & (Join-Path $instructionInstall 'bin\install-agent-instructions.ps1') @helperParameters | Out-Null
+            & (Join-Path $instructionInstall 'bin\install-agent-instructions.ps1') @helperParameters -Uninstall | Out-Null
+            Assert-True ($originalHash -eq (Get-FileHash -LiteralPath $agentPath).Hash) 'Instruction roundtrip changed original encoding or EOF.'
+        }
+    }
+    Test-Case 'Prepended instructions stay outside EOF fences and fake Lessons code examples' {
+        foreach ($kind in @('fence-eof', 'fake-lessons')) {
+            $fencedCodex = Join-Path $OutputDirectory "instruction-fenced-$kind"
+            New-Item -ItemType Directory -Path $fencedCodex | Out-Null
+            $agentPath = Join-Path $fencedCodex 'AGENTS.md'
+            $text = if ($kind -eq 'fence-eof') { "# Existing contract`n`n" + '```powershell' + "`nWrite-Output 'example'`n" + '```' }
+                else { "# Existing contract`r`n`r`n" + '```markdown' + "`r`n## Lessons`r`nExample section in a code fence.`r`n" + '```' + "`r`nExisting body outside the example." }
+            [IO.File]::WriteAllText($agentPath, $text, [Text.UTF8Encoding]::new($true))
+            $originalHash = (Get-FileHash -LiteralPath $agentPath).Hash
+            $helperParameters = @{ SourceGuidePath = (Join-Path $instructionInstall 'bin\PRUNLET.md'); CodexHome = $fencedCodex; BackupDirectory = $instructionBackup }
+            & (Join-Path $instructionInstall 'bin\install-agent-instructions.ps1') @helperParameters | Out-Null
+            $registered = [IO.File]::ReadAllText($agentPath)
+            Assert-True ($registered.StartsWith('<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->', [StringComparison]::Ordinal)) 'Owned block was inserted inside existing Markdown.'
+            $html = (ConvertFrom-Markdown -InputObject $registered).Html
+            $codeBlocks = [regex]::Matches($html, '(?s)<pre><code.*?</code></pre>')
+            foreach ($codeBlock in $codeBlocks) { Assert-True (!$codeBlock.Value.Contains('Windowsのファイル削除では')) 'Agent instruction is inside a Markdown code block.' }
+            $outsideCode = [regex]::Replace($html, '(?s)<pre><code.*?</code></pre>', '')
+            Assert-True ($outsideCode.Contains('Windowsのファイル削除では')) 'Agent instruction is not rendered outside code examples.'
+            Assert-True ($registered.EndsWith($text, [StringComparison]::Ordinal)) 'Registering instructions changed existing body or EOF bytes.'
+            & (Join-Path $instructionInstall 'bin\install-agent-instructions.ps1') @helperParameters -Uninstall | Out-Null
+            Assert-True ($originalHash -eq (Get-FileHash -LiteralPath $agentPath).Hash) 'Fenced document registration/removal did not restore original bytes.'
+        }
+    }
+    $global:PrunletLatestFixture.zip = $zipPath
 } finally {
     Remove-Item Function:\Invoke-RestMethod, Function:\Invoke-WebRequest, Function:\Copy-Item
     Remove-Variable PrunletLatestFixture -Scope Global

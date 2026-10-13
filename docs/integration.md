@@ -4,7 +4,27 @@ PrunletはWindows向けCLIとstdio MCPを一つのexeで提供します。Codex�
 
 ## 準備
 
-通常は[READMEのlatestインストール手順](../README.md#インストールと更新)を使います。GitHubの既定ブランチ最新HEADからソースを取得し、exeと4つの連携スクリプトを`%USERPROFILE%\.local\Prunlet\bin`へ配置します。`-RegisterCodex`で下記の共通登録も実行できます。ローカルクローン内のファイルを実行元に登録しません。
+通常は[READMEのlatestインストール手順](../README.md#インストールと更新)を使います。GitHubの既定ブランチ最新HEADからソースを取得し、exe・連携スクリプト・共通指示を`%USERPROFILE%\.local\Prunlet\bin`へ配置します。`-RegisterCodex`で下記の共通登録も実行できます。ローカルクローン内のファイルを実行元に登録しません。
+
+## エージェント共通指示
+
+`-RegisterCodex -RegisterAgentInstructions`を明示すると、Codex homeの`PRUNLET.md`を配置し、共通`AGENTS.md`の先頭へ管理マーカー付きの参照を追加します。各リポジトリへの記載は不要です。対象ファイルの削除では最初からPrunlet MCPの`delete_files`を使うよう指示し、シェルで削除してから再試行する往復を避けます。
+
+この登録は共通AGENTS本文を変更するため明示オプションにしています。既存本文を保持し、重複・不完全な管理マーカーや利用者が編集した指示を検出した場合は自動更新を拒否します。更新時に登録が途中で失敗した場合は、MCP・hookに加えてAGENTSと専用指示も復旧対象になります。
+
+共通指示を登録した導入は更新時も同じオプションを渡します。オプションを省略した更新では共通指示は不変更です。その間に配置済みguideだけが更新された場合、古い共通指示を編集済みの指示と区別できないため、自動更新・解除は停止することがあります。
+
+配置済みアプリに初めて共通指示を登録する場合は、次のhelperも利用できます。
+
+```powershell
+$bin = Join-Path $env:USERPROFILE '.local\Prunlet\bin'
+$instructionBackup = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\instructions-' + [guid]::NewGuid().ToString('N'))
+& (Join-Path $bin 'install-agent-instructions.ps1') -SourceGuidePath (Join-Path $bin 'PRUNLET.md') -BackupDirectory $instructionBackup
+```
+
+RTKの共通指示と同様、エージェントのツール選択を案内する方式です。フックによる入力の機械的な置換や、将来の全呼び出しの強制とは区別してください。
+
+## 手動の設定準備
 
 以下は配置済みアプリを手動で設定・登録する場合の手順です。登録スクリプトと`configuration-common.ps1`は同じディレクトリに置きます。PowerShell 7の`pwsh`が必要です。
 
@@ -42,7 +62,7 @@ $rollback = Join-Path $env:LOCALAPPDATA 'Codex\TaskArtifacts\Prunlet\integration
 
 設定ファイルの上書き前に、`-BackupDirectory`へ元ファイルと復元記録を保存します。この保存先はCodexHome、ユーザーの`.codex`、リポジトリの外に置いてください。Prunletの削除バックアップとは別の用途です。変更対象の`features`と`mcp_servers`にquoted key、表名の内部空白、dotted root keyがある場合や、複数行文字列を含むTOMLは、既存値を保持するため自動更新を拒否します。その場合は手動登録が必要です。プロジェクトのtrust tableなど、変更対象以外のquoted tableは保持します。設定ファイルの更新中にI/Oエラーが起きた場合は、表示された保存先の復元記録を確認してください。
 
-登録後はCodexで`/hooks`を開き、Prunlet hookの定義を確認して信頼してください。登録スクリプトはhookのtrust記録やAGENTS.mdを変更しません。Codexを再起動してMCPとhookの読込みを確認します。
+フックの登録後はCodexで`/hooks`を開き、Prunlet hookの定義を確認して信頼してください。`install-codex.ps1`はhookのtrust記録やAGENTS.mdを変更しません。共通AGENTSを変更するのは上記の明示オプションです。Codexを再起動してMCP・共通指示・hookの読込みを確認します。
 
 MCP登録の実行内容は次のとおりです。
 
@@ -86,6 +106,6 @@ hookはPowerShell AST上の直接コマンド名を調べます。文字列に`R
 & (Join-Path $bin 'uninstall-codex.ps1') -BackupDirectory $rollback
 ```
 
-隔離先へ登録した場合は同じ`-CodexHome`を渡します。Prunlet handlerと専用マーカー内のMCP設定、Prunletが追加したhook機能設定を解除し、他のhook・MCP・設定を保持します。同じ操作を繰り返しても登録は増えません。解除はexe、Prunlet設定、削除バックアップを残します。
+隔離先へ登録した場合は同じ`-CodexHome`を渡します。Prunlet handlerと専用マーカー内のMCP設定、Prunletが追加したhook機能設定を解除し、他のhook・MCP・設定を保持します。共通指示を登録済みの場合は、所有するAGENTS参照と専用guideも検証して解除します。利用者の編集があれば書込み前に停止します。同じ操作を繰り返しても登録は増えません。解除はexe、Prunlet設定、削除バックアップを残します。
 
 専用マーカー内を編集した場合や、MCPマーカーの末尾から次のtableまでに利用者の値を追加した場合は、所属tableを保持するため書込み前に自動解除を停止します。内容を確認してから手動でPrunlet部分だけを解除してください。復元が必要なら、保存された記録の`target`、`backup`、`existed`を確認し、現在の変更を保全して元ファイルを戻します。記録は連携の検証と復元の必要がなくなった時点で清掃できます。

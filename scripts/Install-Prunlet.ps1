@@ -8,6 +8,7 @@ param(
     [string]$WorkDirectory,
     [ValidateSet('win-x64', 'win-arm64')][string]$Runtime = 'win-x64',
     [switch]$RegisterCodex,
+    [switch]$RegisterAgentInstructions,
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [string]$SettingsBackupDirectory
 )
@@ -87,7 +88,7 @@ function Expand-CheckedArchive([string]$Archive, [string]$Destination) {
         $rootName = @($roots)[0]
         $root = Join-Path $Destination $rootName
         if (!(Test-Path -LiteralPath $root -PathType Container)) { throw 'Source archive root is not a directory.' }
-        foreach ($required in @('src\Prunlet\Prunlet.csproj', 'scripts\Publish-Prunlet.ps1', 'integration\configuration-common.ps1', 'integration\codex-pretooluse.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1')) {
+        foreach ($required in @('src\Prunlet\Prunlet.csproj', 'scripts\Publish-Prunlet.ps1', 'integration\configuration-common.ps1', 'integration\codex-pretooluse.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1', 'integration\install-agent-instructions.ps1', 'integration\PRUNLET.md')) {
             if (!(Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Latest source is not installable; required file missing: $required. Publish the source to the repository default branch first." }
         }
         return $root
@@ -95,6 +96,7 @@ function Expand-CheckedArchive([string]$Archive, [string]$Destination) {
 }
 
 if (!$IsWindows) { throw 'Prunlet installation requires Windows and PowerShell 7.' }
+if ($RegisterAgentInstructions -and !$RegisterCodex) { throw 'RegisterAgentInstructions requires explicit -RegisterCodex.' }
 if ($Repository -cnotmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$') { throw 'Repository must be a GitHub owner/repository name.' }
 $nativeArchitecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 if ($nativeArchitecture -eq 'Arm64' -and !$PSBoundParameters.ContainsKey('Runtime')) { throw 'On Windows ARM64 explicitly choose -Runtime win-arm64 (or win-x64 for emulation).' }
@@ -133,7 +135,9 @@ if ($RegisterCodex -and $SettingsBackupDirectory) { $SettingsBackupDirectory = A
 if (!(Get-Command dotnet -ErrorAction SilentlyContinue)) { throw '.NET 10 SDK is required. Install the SDK and run this installer again.' }
 $sdks = @(& dotnet --list-sdks)
 if ($LASTEXITCODE -ne 0 -or !($sdks | Where-Object { $_ -match '^10\.' })) { throw '.NET 10 SDK is required; an installed runtime alone cannot build latest source.' }
-$products = @('bin\prunlet.exe', 'bin\configuration-common.ps1', 'bin\codex-pretooluse.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'source-info.json')
+$products = @('bin\prunlet.exe', 'bin\configuration-common.ps1', 'bin\codex-pretooluse.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
+$previousGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
+$previousGuideSha256 = if (Test-Path -LiteralPath $previousGuidePath -PathType Leaf) { (Get-FileHash -LiteralPath $previousGuidePath -Algorithm SHA256).Hash } else { $null }
 foreach ($relative in $products) {
     $target = Assert-PlainPath (Join-Path $InstallDirectory $relative) 'Installed product path'
     if (Test-Path -LiteralPath $target -PathType Container) { throw "Installed product path is a directory: $target" }
@@ -166,6 +170,10 @@ try {
     Invoke-WebRequest -Uri $downloadUrl -Headers @{ 'User-Agent' = 'Prunlet-Latest-Installer' } -OutFile $archive -TimeoutSec 120 | Out-Null
     $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
     $sourceRoot = Expand-CheckedArchive $archive (Join-Path $WorkDirectory 'source')
+    if ($RegisterAgentInstructions) {
+        $instructionParameters = @{ SourceGuidePath = (Join-Path $sourceRoot 'integration\PRUNLET.md'); CodexHome = $CodexHome; BackupDirectory = $(if ($SettingsBackupDirectory) { $SettingsBackupDirectory } else { $updateBackup }); PreviousGuideSha256 = $previousGuideSha256 }
+        & (Join-Path $sourceRoot 'integration\install-agent-instructions.ps1') @instructionParameters -ValidateOnly | Out-Null
+    }
     $buildRoot = Join-Path $WorkDirectory 'build'
     & (Join-Path $sourceRoot 'scripts\Publish-Prunlet.ps1') -OutputDirectory $buildRoot -Runtime $Runtime | Out-Null
     $exe = Join-Path $buildRoot 'publish\prunlet.exe'
@@ -218,7 +226,9 @@ try {
     }
     if ($RegisterCodex) {
         # 連携側の2ファイル書込みを一つの操作として戻せるよう、呼出し前のバイト列を保全する。
-        foreach ($fileName in @('hooks.json', 'config.toml')) {
+        $profileFiles = @('hooks.json', 'config.toml')
+        if ($RegisterAgentInstructions) { $profileFiles += @('AGENTS.md', 'PRUNLET.md') }
+        foreach ($fileName in $profileFiles) {
             $target = Assert-PlainPath (Join-Path $CodexHome $fileName) 'Codex configuration path'
             if (Test-Path -LiteralPath $target -PathType Container) { throw "Codex configuration path is a directory: $target" }
             $existed = Test-Path -LiteralPath $target -PathType Leaf
@@ -239,8 +249,12 @@ try {
         # 既存連携スクリプトの任意キー処理には呼出し元のStrictModeを伝播させない。
         $registrationStarted = $true
         & { Set-StrictMode -Off; & (Join-Path $InstallDirectory 'bin\install-codex.ps1') @registration }
+        if ($RegisterAgentInstructions) {
+            $instructionParameters.SourceGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
+            & (Join-Path $InstallDirectory 'bin\install-agent-instructions.ps1') @instructionParameters | Out-Null
+        }
     }
-    [ordered]@{ status = 'installed'; installDirectory = $InstallDirectory; configPath = $configPath; repository = $Repository; defaultBranch = $branch; commitSha = $sha; sourceInfoPath = (Join-Path $InstallDirectory 'source-info.json'); updateBackupDirectory = $(if ($saved.Count -or $profileSnapshot.Count) { $updateBackup } else { $null }); codexRegistered = [bool]$RegisterCodex } | ConvertTo-Json
+    [ordered]@{ status = 'installed'; installDirectory = $InstallDirectory; configPath = $configPath; repository = $Repository; defaultBranch = $branch; commitSha = $sha; sourceInfoPath = (Join-Path $InstallDirectory 'source-info.json'); updateBackupDirectory = $(if ($saved.Count -or $profileSnapshot.Count) { $updateBackup } else { $null }); codexRegistered = [bool]$RegisterCodex; agentInstructionsRegistered = [bool]$RegisterAgentInstructions } | ConvertTo-Json
 } catch {
     $originalError = $_
     $rollbackErrors = [Collections.Generic.List[string]]::new()

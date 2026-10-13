@@ -19,12 +19,16 @@ $installerDirectory = Join-Path ([IO.Path]::GetTempPath()) ('Codex\Prunlet\boots
 New-Item -ItemType Directory -Path $installerDirectory | Out-Null
 $installer = Join-Path $installerDirectory 'Install-Prunlet.ps1'
 Invoke-WebRequest 'https://raw.githubusercontent.com/1llum1n4t1s/Prunlet/main/scripts/Install-Prunlet.ps1' -OutFile $installer
-pwsh -NoProfile -File $installer -AllowedRoot 'C:\work\project' -RegisterCodex
+pwsh -NoProfile -File $installer -AllowedRoot 'C:\work\project' -RegisterCodex -RegisterAgentInstructions
 ```
 
 インストーラーはGitHub APIから既定ブランチと最新コミットを取得し、そのコミットのアーカイブを取得してビルドします。導入処理中は取得したSHAでソースを揃えますが、次回の導入・更新は再び最新HEADを解決します。取得失敗やリモートの実装不足では停止し、ローカルクローンへ切り替えません。
 
-既定の配置先は`%USERPROFILE%\.local\Prunlet`です。`bin\prunlet.exe`と4つの連携スクリプトを配置し、`source-info.json`に取得元・ブランチ・コミットを記録します。`-RegisterCodex`を指定すると共通MCPとフックも登録します。起動時にダウンロードやビルドは行いません。
+既定の配置先は`%USERPROFILE%\.local\Prunlet`です。`bin\prunlet.exe`と連携スクリプト・共通指示を配置し、`source-info.json`に取得元・ブランチ・コミットを記録します。`-RegisterCodex`を指定すると共通MCPとフックも登録します。起動時にダウンロードやビルドは行いません。
+
+上の`-RegisterAgentInstructions`は、Codex homeの`PRUNLET.md`と、共通`AGENTS.md`の専用参照を登録する明示オプションです。各リポジトリへ追記せず、最初からPrunlet MCPで削除するようCodexへ指示します。共通指示を変更したくない場合はこのオプションを外してください。コマンドの機械的な強制とは別の仕組みです。
+
+共通指示を登録した導入の更新でも、同じ`-RegisterAgentInstructions`を指定してください。指定しない更新では共通指示に書き込みません。古い共通指示と新しい配置済みguideが異なる場合は、利用者の編集との区別を付けられないため自動更新・解除を拒否します。
 
 更新時は最新版のインストーラーを再取得して実行します。既存の`config.json`と復元データを保持します。初回は`-AllowedRoot`で削除を許可する既存ディレクトリを指定し、複数指定するときはPowerShellの配列を渡してください。配置先は`-InstallDirectory`で変更できます。利用者のクローンパスをCodex設定へ登録することはありません。
 

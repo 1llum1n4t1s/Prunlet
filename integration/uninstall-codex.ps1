@@ -10,6 +10,13 @@ $tomlPath = Join-Path $CodexHome 'config.toml'
 $toml = if (Test-Path -LiteralPath $tomlPath) { [IO.File]::ReadAllText($tomlPath) } else { '' }
 Assert-SimpleIntegrationToml $toml
 $updatedToml = Remove-OwnedBlock (Remove-OwnedBlock $toml 'MCP') 'HOOK-FEATURE'
+# 利用者が編集した指示やガイドは、MCP・フックを変更する前に検査して保持する。
+$agentHelper = Join-Path $PSScriptRoot 'install-agent-instructions.ps1'
+$agentParameters = @{ CodexHome = $CodexHome; BackupDirectory = $BackupDirectory; SourceGuidePath = (Join-Path $PSScriptRoot 'PRUNLET.md'); Uninstall = $true }
+if (Test-Path -LiteralPath $agentHelper -PathType Leaf) {
+    $agentState = & $agentHelper @agentParameters -ValidateOnly
+    if ($agentState.instructionsPresent) { & $agentHelper @agentParameters | Out-Null }
+}
 if (Test-Path -LiteralPath $hooksPath) {
     $hooks = Read-Hooks $hooksPath
     $groups = @(); $changed = $false
