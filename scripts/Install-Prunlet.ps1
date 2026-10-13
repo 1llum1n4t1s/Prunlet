@@ -6,6 +6,7 @@ param(
     [string[]]$AllowedRoot,
     [string]$BackupDirectory,
     [string]$WorkDirectory,
+    [string]$UpdateBackupRoot = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Codex\TaskArtifacts\Prunlet'),
     [ValidateSet('win-x64', 'win-arm64')][string]$Runtime = 'win-x64',
     [switch]$RegisterCodex,
     [switch]$RegisterAgentInstructions,
@@ -88,7 +89,7 @@ function Expand-CheckedArchive([string]$Archive, [string]$Destination) {
         $rootName = @($roots)[0]
         $root = Join-Path $Destination $rootName
         if (!(Test-Path -LiteralPath $root -PathType Container)) { throw 'Source archive root is not a directory.' }
-        foreach ($required in @('src\Prunlet\Prunlet.csproj', 'scripts\Publish-Prunlet.ps1', 'integration\configuration-common.ps1', 'integration\codex-pretooluse.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1', 'integration\install-agent-instructions.ps1', 'integration\PRUNLET.md')) {
+        foreach ($required in @('src\Prunlet\Prunlet.csproj', 'scripts\Publish-Prunlet.ps1', 'integration\configuration-common.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1', 'integration\install-agent-instructions.ps1', 'integration\PRUNLET.md')) {
             if (!(Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Latest source is not installable; required file missing: $required. Publish the source to the repository default branch first." }
         }
         return $root
@@ -129,16 +130,19 @@ foreach ($rootValue in $effectiveRoots) {
     if ((Test-InTree $root $effectiveBackup) -or (Test-InTree $effectiveBackup $root)) { throw 'AllowedRoot and recovery backup must be separate trees.' }
 }
 if ((Test-InTree $effectiveBackup $WorkDirectory) -or (Test-InTree $WorkDirectory $effectiveBackup)) { throw 'WorkDirectory and recovery backup must be separate trees.' }
-$updateBackup = Assert-ExternalPath (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "Codex\TaskArtifacts\Prunlet\$runId") 'UpdateBackupDirectory'
+$UpdateBackupRoot = Assert-ExternalPath $UpdateBackupRoot 'UpdateBackupRoot'
+$updateBackup = Assert-ExternalPath (Join-Path $UpdateBackupRoot $runId) 'UpdateBackupDirectory'
 if ((Test-InTree $updateBackup $InstallDirectory) -or (Test-InTree $InstallDirectory $updateBackup) -or (Test-InTree $updateBackup $WorkDirectory) -or (Test-InTree $WorkDirectory $updateBackup)) { throw 'Update backup must be separate from install and work directories.' }
+if ((Test-InTree $updateBackup $effectiveBackup) -or (Test-InTree $effectiveBackup $updateBackup)) { throw 'Update backup must be separate from recovery data.' }
 if ($RegisterCodex -and $SettingsBackupDirectory) { $SettingsBackupDirectory = Assert-ExternalPath $SettingsBackupDirectory 'SettingsBackupDirectory' }
 if (!(Get-Command dotnet -ErrorAction SilentlyContinue)) { throw '.NET 10 SDK is required. Install the SDK and run this installer again.' }
 $sdks = @(& dotnet --list-sdks)
 if ($LASTEXITCODE -ne 0 -or !($sdks | Where-Object { $_ -match '^10\.' })) { throw '.NET 10 SDK is required; an installed runtime alone cannot build latest source.' }
-$products = @('bin\prunlet.exe', 'bin\configuration-common.ps1', 'bin\codex-pretooluse.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
+$products = @('bin\prunlet.exe', 'bin\configuration-common.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
+$retiredProducts = @('bin\codex-pretooluse.ps1')
 $previousGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
 $previousGuideSha256 = if (Test-Path -LiteralPath $previousGuidePath -PathType Leaf) { (Get-FileHash -LiteralPath $previousGuidePath -Algorithm SHA256).Hash } else { $null }
-foreach ($relative in $products) {
+foreach ($relative in @($products + $retiredProducts)) {
     $target = Assert-PlainPath (Join-Path $InstallDirectory $relative) 'Installed product path'
     if (Test-Path -LiteralPath $target -PathType Container) { throw "Installed product path is a directory: $target" }
     if ((Test-InTree $effectiveBackup $target) -or (Test-InTree $target $effectiveBackup)) { throw 'Product files and recovery backup must be separate.' }
@@ -154,6 +158,7 @@ $createdDirectories = [Collections.Generic.List[object]]::new()
 $createdConfig = $null
 $profileSnapshot = [Collections.Generic.List[object]]::new()
 $registrationStarted = $false
+$retiredOperations = [Collections.Generic.List[string]]::new()
 try {
     try { $mutexAcquired = $installationMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $mutexAcquired = $true }
     if (!$mutexAcquired) { throw 'Another Prunlet installation is already running for this directory.' }
@@ -171,7 +176,7 @@ try {
     $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
     $sourceRoot = Expand-CheckedArchive $archive (Join-Path $WorkDirectory 'source')
     if ($RegisterAgentInstructions) {
-        $instructionParameters = @{ SourceGuidePath = (Join-Path $sourceRoot 'integration\PRUNLET.md'); CodexHome = $CodexHome; BackupDirectory = $(if ($SettingsBackupDirectory) { $SettingsBackupDirectory } else { $updateBackup }); PreviousGuideSha256 = $previousGuideSha256 }
+        $instructionParameters = @{ SourceGuidePath = (Join-Path $sourceRoot 'integration\PRUNLET.md'); CodexHome = $CodexHome; BackupDirectory = $(if ($SettingsBackupDirectory) { $SettingsBackupDirectory } else { $updateBackup }); PreviousGuideSha256 = $previousGuideSha256; ExecutablePath = (Join-Path $InstallDirectory 'bin\prunlet.exe'); ConfigPath = $configPath }
         & (Join-Path $sourceRoot 'integration\install-agent-instructions.ps1') @instructionParameters -ValidateOnly | Out-Null
     }
     $buildRoot = Join-Path $WorkDirectory 'build'
@@ -195,7 +200,7 @@ try {
     $provenance = [ordered]@{ repository = $Repository; defaultBranch = $branch; commitSha = $sha; downloadUrl = $downloadUrl; archiveSha256 = $archiveHash; executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; installedUtc = [DateTimeOffset]::UtcNow.ToString('o'); runtime = $Runtime }
     $provenance | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $WorkDirectory 'source-info.json') -Encoding utf8NoBOM
     # 更新対象だけ保全し、config/recoveryは既存のまま保持する。
-    foreach ($relative in $products) {
+    foreach ($relative in @($products + $retiredProducts)) {
         $target = Join-Path $InstallDirectory $relative
         [void](Assert-PlainPath $target 'Installed product path')
         if (Test-Path -LiteralPath $target -PathType Leaf) {
@@ -244,17 +249,35 @@ try {
         }
         New-Item -ItemType Directory -Path $updateBackup -Force | Out-Null
         [ordered]@{ purpose = 'Restore Codex profile files if registration fails.'; installDirectory = $InstallDirectory; files = @($profileSnapshot.ToArray()); restore = 'For an originally existing file copy its backup to target; for an originally absent file remove the newly created target after reviewing it.'; retention = 'Keep until installation and Codex registration are verified; delete this installation backup when no recovery is required.' } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $updateBackup 'profile-backup-info.json') -Encoding utf8NoBOM
-        $registration = @{ ExecutablePath = (Join-Path $InstallDirectory 'bin\prunlet.exe'); ConfigPath = $configPath; HookPath = (Join-Path $InstallDirectory 'bin\codex-pretooluse.ps1'); CodexHome = $CodexHome }
+        $registration = @{ ExecutablePath = (Join-Path $InstallDirectory 'bin\prunlet.exe'); ConfigPath = $configPath; CodexHome = $CodexHome }
         if ($SettingsBackupDirectory) { $registration.BackupDirectory = $SettingsBackupDirectory }
         # 既存連携スクリプトの任意キー処理には呼出し元のStrictModeを伝播させない。
         $registrationStarted = $true
-        & { Set-StrictMode -Off; & (Join-Path $InstallDirectory 'bin\install-codex.ps1') @registration }
+        & { Set-StrictMode -Off; & (Join-Path $InstallDirectory 'bin\install-codex.ps1') @registration } | Out-Null
         if ($RegisterAgentInstructions) {
             $instructionParameters.SourceGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
             & (Join-Path $InstallDirectory 'bin\install-agent-instructions.ps1') @instructionParameters | Out-Null
         }
     }
-    [ordered]@{ status = 'installed'; installDirectory = $InstallDirectory; configPath = $configPath; repository = $Repository; defaultBranch = $branch; commitSha = $sha; sourceInfoPath = (Join-Path $InstallDirectory 'source-info.json'); updateBackupDirectory = $(if ($saved.Count -or $profileSnapshot.Count) { $updateBackup } else { $null }); codexRegistered = [bool]$RegisterCodex; agentInstructionsRegistered = [bool]$RegisterAgentInstructions } | ConvertTo-Json
+    # 廃止したバックエンドもCoreの検証済みバックアップ付き削除で退役する。
+    foreach ($relative in $retiredProducts) {
+        $target = Assert-PlainPath (Join-Path $InstallDirectory $relative) 'Retired product path'
+        if (!(Test-Path -LiteralPath $target -PathType Leaf)) { continue }
+        $retirementConfig = Join-Path $updateBackup 'retirement-config.json'
+        $retirementBackup = Join-Path $updateBackup 'retired-recovery'
+        New-Item -ItemType Directory -Path $retirementBackup -Force | Out-Null
+        $installedExe = Join-Path $InstallDirectory 'bin\prunlet.exe'
+        $retirementInitJson = & $installedExe --config $retirementConfig init --allowed-root (Join-Path $InstallDirectory 'bin') --backup-directory $retirementBackup
+        if ($LASTEXITCODE -ne 0) { throw "Prunlet rejected the retired product configuration: $retirementInitJson" }
+        [void]$changed.Add($relative)
+        $retirementJson = & $installedExe --config $retirementConfig delete -- $target
+        if ($LASTEXITCODE -ne 0) { throw 'Prunlet could not retire the obsolete hook backend; recovery data was preserved.' }
+        $retirement = $retirementJson | ConvertFrom-Json
+        if (!$retirement.operationId -or @($retirement.items).Count -ne 1 -or @($retirement.items | Where-Object status -ne 'deleted').Count -or (Test-Path -LiteralPath $target)) { throw 'Retired product deletion was not confirmed.' }
+        $retiredOperations.Add([string]$retirement.operationId)
+        $retirementJson | Set-Content -LiteralPath (Join-Path $updateBackup 'retired-products.json') -Encoding utf8NoBOM
+    }
+    [ordered]@{ status = 'installed'; installDirectory = $InstallDirectory; configPath = $configPath; repository = $Repository; defaultBranch = $branch; commitSha = $sha; sourceInfoPath = (Join-Path $InstallDirectory 'source-info.json'); updateBackupDirectory = $(if ($saved.Count -or $profileSnapshot.Count) { $updateBackup } else { $null }); retiredOperationIds = @($retiredOperations.ToArray()); codexRegistered = [bool]$RegisterCodex; agentInstructionsRegistered = [bool]$RegisterAgentInstructions; requiresHookTrust = [bool]$RegisterCodex } | ConvertTo-Json
 } catch {
     $originalError = $_
     $rollbackErrors = [Collections.Generic.List[string]]::new()

@@ -25,6 +25,7 @@ foreach ($path in @($OutputDirectory, $ReportPath)) {
     if (Test-Path -LiteralPath $full) { throw 'Verification destinations must be new.' }
 }
 New-Item -ItemType Directory -Path $OutputDirectory, (Split-Path -Parent $ReportPath) -Force | Out-Null
+$fixtureUpdateBackupRoot = Join-Path $OutputDirectory 'update-backups'
 $results = [Collections.Generic.List[object]]::new()
 function Assert-True([bool]$Value, [string]$Message) { if (!$Value) { throw $Message } }
 function Test-Case([string]$Name, [scriptblock]$Action) {
@@ -48,27 +49,32 @@ $settingsBackup = Join-Path $OutputDirectory 'settings-backup'
 # 起こり得る失敗を列挙してから実システムの検証を組み立てる。
 $failureConditions = @('初回許可範囲欠落', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '公開HEADに必要ソース欠落', 'ZIP traversal/重複/リンク', 'ビルド失敗', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '許可範囲内の作業場所と復元先の検証', '指示登録オプションの組合せ不備', '指示marker重複・不完全・利用者編集', 'guide既存未所有・利用者編集', '指示登録途中での書込み失敗')
 Test-Case 'Agent instructions require explicit Codex registration' {
-    Expect-Failure { & $installer -InstallDirectory $install -AllowedRoot $allowed -RegisterAgentInstructions } 'requires explicit -RegisterCodex'
+    Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -RegisterAgentInstructions } 'requires explicit -RegisterCodex'
 }
 Test-Case 'First install requires explicit allowed roots' {
-    Expect-Failure { & $installer -InstallDirectory $install } 'First installation requires'
+    Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install } 'First installation requires'
     Assert-True (!(Test-Path -LiteralPath $install)) 'Initial failure created install files.'
 }
 Test-Case 'Invalid repository stops before download' {
-    Expect-Failure { & $installer -Repository '../Prunlet' -InstallDirectory $install -AllowedRoot $allowed } 'Repository must'
+    Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -Repository '../Prunlet' -InstallDirectory $install -AllowedRoot $allowed } 'Repository must'
 }
 Test-Case 'Repository output and linked install paths are refused' {
-    Expect-Failure { & $installer -InstallDirectory (Join-Path $repoRoot 'should-not-exist') -AllowedRoot $allowed } 'outside repositories'
+    Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory (Join-Path $repoRoot 'should-not-exist') -AllowedRoot $allowed } 'outside repositories'
     $linked = Join-Path $OutputDirectory 'linked-install'
     New-Item -ItemType Junction -Path $linked -Target $allowed | Out-Null
-    try { Expect-Failure { & $installer -InstallDirectory $linked -AllowedRoot $allowed } 'cannot traverse links' }
+    try { Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $linked -AllowedRoot $allowed } 'cannot traverse links' }
     finally { Remove-Item -LiteralPath $linked }
+}
+Test-Case 'Update backup root cannot be inside a repository or installation' {
+    Expect-Failure { & $installer -UpdateBackupRoot $repoRoot -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'backup-repo-work') } 'outside repositories'
+    Expect-Failure { & $installer -UpdateBackupRoot (Join-Path $install 'updates') -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'backup-install-work') } 'separate from install'
+    Assert-True (!(Test-Path -LiteralPath $install)) 'Invalid update backup root created installation files.'
 }
 if ($CheckPublicHead) {
     Test-Case 'Public default branch is queried without clone fallback' {
         $publicInstall = Join-Path $OutputDirectory 'public-install'
         try {
-            & $installer -InstallDirectory $publicInstall -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'public-work') | Out-Null
+            & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $publicInstall -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'public-work') | Out-Null
             $publicInfo = Get-Content -LiteralPath (Join-Path $publicInstall 'source-info.json') -Raw | ConvertFrom-Json
             Assert-True ($publicInfo.commitSha -match '^[0-9a-f]{40}$') 'Public installation has no provenance.'
         } catch {
@@ -108,7 +114,7 @@ function Invoke-WebRequest {
 function Copy-Item {
     [CmdletBinding()]
     param([string[]]$LiteralPath, [string]$Destination, [switch]$Force, [switch]$Recurse)
-    if ($global:PrunletLatestFixture.failCopy -and $Destination -eq (Join-Path $install 'bin\codex-pretooluse.ps1')) {
+    if ($global:PrunletLatestFixture.failCopy -and $Destination -eq (Join-Path $install 'bin\install-codex.ps1')) {
         $global:PrunletLatestFixture.failCopy = $false
         throw 'Fixture product write failure.'
     }
@@ -124,11 +130,11 @@ function Assert-Snapshot($Before) {
     Assert-True ($Before.Count -eq $after.Count) 'Installed file count changed on failure.'
     foreach ($key in $Before.Keys) { Assert-True ($Before[$key] -eq $after[$key]) "Installed file changed: $key" }
 }
-$beforeBackups = @(Get-ChildItem -LiteralPath (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Codex\TaskArtifacts\Prunlet') -Directory -Filter 'install-*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+$beforeBackups = @(Get-ChildItem -LiteralPath $fixtureUpdateBackupRoot -Directory -Filter 'install-*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
 try {
     Test-Case 'Download failure preserves initial boundary' {
         $global:PrunletLatestFixture.failDownload = $true
-        try { Expect-Failure { & $installer -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'network-work') } 'Fixture network failure' }
+        try { Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'network-work') } 'Fixture network failure' }
         finally { $global:PrunletLatestFixture.failDownload = $false }
         Assert-True (!(Test-Path -LiteralPath $install)) 'Download failure created install files.'
     }
@@ -137,7 +143,7 @@ try {
         $z = [IO.Compression.ZipFile]::Open($badZip, [IO.Compression.ZipArchiveMode]::Create)
         try { [void]$z.CreateEntry('root/../escaped.txt') } finally { $z.Dispose() }
         $global:PrunletLatestFixture.zip = $badZip
-        try { Expect-Failure { & $installer -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'unsafe-work') } 'Unsafe archive path' }
+        try { Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'unsafe-work') } 'Unsafe archive path' }
         finally { $global:PrunletLatestFixture.zip = $zipPath }
         Assert-True (!(Test-Path -LiteralPath $install)) 'Unsafe ZIP created install files.'
     }
@@ -151,7 +157,7 @@ try {
                 else { $entry.ExternalAttributes = [int](-1577058304) }
             } finally { $z.Dispose() }
             $global:PrunletLatestFixture.zip = $badZip
-            try { Expect-Failure { & $installer -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory "$kind-work") } 'Duplicate archive path|Archive links or special files' }
+            try { Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory "$kind-work") } 'Duplicate archive path|Archive links or special files' }
             finally { $global:PrunletLatestFixture.zip = $zipPath }
         }
         Assert-True (!(Test-Path -LiteralPath $install)) 'Invalid ZIP created install files.'
@@ -164,12 +170,12 @@ try {
             Set-Content -LiteralPath $publishScript -Value "param([string]`$OutputDirectory, [string]`$Runtime)`nthrow 'Fixture publish failure.'" -Encoding utf8NoBOM
             [IO.Compression.ZipFile]::CreateFromDirectory($fixtureRoot, $brokenZip)
             $global:PrunletLatestFixture.zip = $brokenZip
-            Expect-Failure { & $installer -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'broken-work') } 'Fixture publish failure'
+            Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'broken-work') } 'Fixture publish failure'
         } finally { [IO.File]::WriteAllText($publishScript, $originalPublish); $global:PrunletLatestFixture.zip = $zipPath }
         Assert-True (!(Test-Path -LiteralPath $install)) 'Build failure created install files.'
     }
     Test-Case 'Latest fixture builds and installs with isolated Codex registration' {
-        & $installer -InstallDirectory $install -AllowedRoot $allowed -RegisterCodex -CodexHome $isolatedCodex -SettingsBackupDirectory $settingsBackup -WorkDirectory (Join-Path $OutputDirectory 'first-work') | Out-Null
+        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -RegisterCodex -CodexHome $isolatedCodex -SettingsBackupDirectory $settingsBackup -WorkDirectory (Join-Path $OutputDirectory 'first-work') | Out-Null
         $info = Get-Content -LiteralPath (Join-Path $install 'source-info.json') -Raw | ConvertFrom-Json
         Assert-True ($info.commitSha -eq ('a' * 40)) 'Initial provenance mismatch.'
         Assert-True ($info.executableSha256 -eq (Get-FileHash -LiteralPath (Join-Path $install 'bin\prunlet.exe')).Hash) 'Executable provenance hash mismatch.'
@@ -186,7 +192,7 @@ try {
         Set-Content -LiteralPath $recoveryMarker -Value 'Keep user recovery data.' -Encoding utf8NoBOM
         $markerHash = (Get-FileHash -LiteralPath $recoveryMarker).Hash
         $global:PrunletLatestFixture.sha = 'b' * 40
-        & $installer -InstallDirectory $install -RegisterCodex -CodexHome $isolatedCodex -SettingsBackupDirectory $settingsBackup -WorkDirectory (Join-Path $OutputDirectory 'second-work') | Out-Null
+        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -RegisterCodex -CodexHome $isolatedCodex -SettingsBackupDirectory $settingsBackup -WorkDirectory (Join-Path $OutputDirectory 'second-work') | Out-Null
         $info = Get-Content -LiteralPath (Join-Path $install 'source-info.json') -Raw | ConvertFrom-Json
         Assert-True ($info.commitSha -eq ('b' * 40)) 'Update reused old HEAD.'
         Assert-True ($configHash -eq (Get-FileHash -LiteralPath (Join-Path $install 'config.json')).Hash) 'Update rewrote config.'
@@ -196,7 +202,7 @@ try {
         $before = Snapshot-Install
         $global:PrunletLatestFixture.sha = 'c' * 40
         $global:PrunletLatestFixture.failCopy = $true
-        Expect-Failure { & $installer -InstallDirectory $install -WorkDirectory (Join-Path $OutputDirectory 'rollback-work') } 'Fixture product write failure'
+        Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -WorkDirectory (Join-Path $OutputDirectory 'rollback-work') } 'Fixture product write failure'
         Assert-Snapshot $before
     }
     Test-Case 'Codex refusal preserves installed products and configuration' {
@@ -206,7 +212,7 @@ try {
         $toml = Join-Path $blockedCodex 'config.toml'
         Set-Content -LiteralPath $toml -Value "[features]`nhooks = false`n" -Encoding utf8NoBOM
         $tomlHash = (Get-FileHash -LiteralPath $toml).Hash
-        Expect-Failure { & $installer -InstallDirectory $install -RegisterCodex -CodexHome $blockedCodex -SettingsBackupDirectory $settingsBackup -WorkDirectory (Join-Path $OutputDirectory 'refused-work') } 'features.hooks is false'
+        Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -RegisterCodex -CodexHome $blockedCodex -SettingsBackupDirectory $settingsBackup -WorkDirectory (Join-Path $OutputDirectory 'refused-work') } 'features.hooks is false'
         Assert-Snapshot $before
         Assert-True ($tomlHash -eq (Get-FileHash -LiteralPath $toml).Hash) 'User hooks policy was changed.'
     }
@@ -229,7 +235,7 @@ try {
             # 読取りは許可し、後半のTOML書込みだけを実OSの共有ロックで失敗させる。
             $lock = [IO.File]::Open($tomlPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
             try {
-                Expect-Failure { & $installer -InstallDirectory $partialInstall -AllowedRoot $allowed -RegisterCodex -CodexHome $partialCodex -SettingsBackupDirectory $partialSettingsBackup -WorkDirectory (Join-Path $OutputDirectory "partial-work-$hookState") } 'WriteAllText'
+                Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $partialInstall -AllowedRoot $allowed -RegisterCodex -CodexHome $partialCodex -SettingsBackupDirectory $partialSettingsBackup -WorkDirectory (Join-Path $OutputDirectory "partial-work-$hookState") } 'WriteAllText'
                 Assert-True ($tomlHash -eq (Get-FileHash -LiteralPath $tomlPath).Hash) 'Locked TOML was changed.'
                 if ($hookState -eq 'existing') { Assert-True ($hookHash -eq (Get-FileHash -LiteralPath $hooksPath).Hash) 'Existing hooks preimage was not restored.' }
                 else { Assert-True (!(Test-Path -LiteralPath $hooksPath)) 'Partial registration left newly created hooks.json.' }
@@ -241,7 +247,7 @@ try {
         $probeInstall = Join-Path $OutputDirectory 'probe-install'
         $fixtureInstalls.Add($probeInstall)
         $probeWork = Join-Path $allowed 'probe-work'
-        & $installer -InstallDirectory $probeInstall -AllowedRoot $allowed -WorkDirectory $probeWork | Out-Null
+        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $probeInstall -AllowedRoot $allowed -WorkDirectory $probeWork | Out-Null
         $config = Join-Path $probeInstall 'config.json'
         $probeConfig = Get-Content -LiteralPath $config -Raw | ConvertFrom-Json
         Assert-True ($probeConfig.backupDirectory -eq (Join-Path $probeInstall 'recovery')) 'Initial config does not use final recovery directory.'
@@ -263,22 +269,117 @@ try {
     [IO.File]::WriteAllText($trustPath, '{"trusted":false,"keep":true}', [Text.UTF8Encoding]::new($false))
     $trustHash = (Get-FileHash -LiteralPath $trustPath).Hash
     Test-Case 'Instruction opt-in preserves BOM/body and prepends before Lessons' {
-        & $installer -InstallDirectory $instructionInstall -AllowedRoot $allowed -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-first-work') | Out-Null
+        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $instructionInstall -AllowedRoot $allowed -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-first-work') | Out-Null
         $agentText = [IO.File]::ReadAllText($instructionAgents)
         Assert-True ($agentText.StartsWith('<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->', [StringComparison]::Ordinal)) 'Owned block is not at the document beginning.'
         Assert-True ($agentText.IndexOf('BEGIN PRUNLET AGENT-INSTRUCTIONS') -lt $agentText.IndexOf('## Lessons')) 'Owned block is not before Lessons.'
-        Assert-True ($agentText.Contains('Prunlet MCPの`delete_files`を最初から使う。')) 'Instruction does not select the MCP first.'
-        $withoutBlock = [regex]::Replace($agentText, '<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->\r\n.*?\r\n<!-- END PRUNLET AGENT-INSTRUCTIONS -->\r\n', '')
+        Assert-True ($agentText.Contains('Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。')) 'Instruction does not select the CLI first.'
+        $bindingMatch = [regex]::Match($agentText, '(?m)^Prunlet CLI: (\{[^\r\n]*\})\r?$')
+        Assert-True $bindingMatch.Success 'Installed CLI binding is absent.'
+        $binding = $bindingMatch.Groups[1].Value | ConvertFrom-Json
+        Assert-True ($binding.executablePath -ceq (Join-Path $instructionInstall 'bin\prunlet.exe') -and $binding.configPath -ceq (Join-Path $instructionInstall 'config.json')) 'CLI binding does not refer to the installed product.'
+        Assert-True ([IO.File]::ReadAllText($instructionGuide).Contains('--paths-file')) 'Guide omits literal paths-file input.'
+        $withoutBlock = [regex]::Replace($agentText, '<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->\r\n[\s\S]*?\r\n<!-- END PRUNLET AGENT-INSTRUCTIONS -->\r\n', '')
         Assert-True ($withoutBlock -ceq $originalAgentText) 'Existing AGENTS body or newlines changed.'
         $bytes = [IO.File]::ReadAllBytes($instructionAgents)
         Assert-True ($bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf) 'UTF8 BOM was removed.'
         Assert-True ((Get-FileHash -LiteralPath $instructionGuide).Hash -eq (Get-FileHash -LiteralPath (Join-Path $instructionInstall 'bin\PRUNLET.md')).Hash) 'Registered guide differs from installed guide.'
         Assert-True ((Get-FileHash -LiteralPath $trustPath).Hash -eq $trustHash) 'Unrelated host trust data changed.'
     }
+
+    Test-Case 'Custom CLI binding uninstalls with the registered paths and preserves existing content' {
+        $customCodex = Join-Path $OutputDirectory 'custom-binding-codex'
+        $customProduct = Join-Path $OutputDirectory 'custom-binding-product'
+        New-Item -ItemType Directory -Path $customCodex, $customProduct | Out-Null
+        $customExe = Join-Path $customProduct 'custom-prunlet.exe'
+        $customConfig = Join-Path $customProduct 'custom-config.json'
+        Copy-Item -LiteralPath (Join-Path $instructionInstall 'bin\prunlet.exe') -Destination $customExe
+        Copy-Item -LiteralPath (Join-Path $instructionInstall 'config.json') -Destination $customConfig
+        $customAgents = Join-Path $customCodex 'AGENTS.md'
+        [IO.File]::WriteAllText($customAgents, $originalAgentText, [Text.UTF8Encoding]::new($true))
+        $original = (Get-FileHash -LiteralPath $customAgents).Hash
+        $customHooks = Join-Path $customCodex 'hooks.json'
+        [IO.File]::WriteAllText($customHooks, '{"userValue":"keep","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo keep-custom-hook"}]}]}}')
+        $customParameters = @{ ExecutablePath = $customExe; ConfigPath = $customConfig; CodexHome = $customCodex; BackupDirectory = $instructionBackup }
+        & (Join-Path $instructionInstall 'bin\install-codex.ps1') @customParameters | Out-Null
+        & (Join-Path $instructionInstall 'bin\install-agent-instructions.ps1') @customParameters | Out-Null
+        $text = [IO.File]::ReadAllText($customAgents)
+        $binding = [regex]::Match($text, '(?m)^Prunlet CLI: (\{[^\r\n]*\})\r?$').Groups[1].Value | ConvertFrom-Json
+        Assert-True ($binding.executablePath -ceq $customExe -and $binding.configPath -ceq $customConfig) 'Custom CLI paths were not registered.'
+        & (Join-Path $instructionInstall 'bin\uninstall-codex.ps1') @customParameters | Out-Null
+        Assert-True ((Get-FileHash -LiteralPath $customAgents).Hash -eq $original) 'Custom uninstall changed the existing AGENTS bytes.'
+        Assert-True (!(Test-Path -LiteralPath (Join-Path $customCodex 'PRUNLET.md'))) 'Custom uninstall retained the owned guide.'
+        $remaining = [IO.File]::ReadAllText($customHooks) | ConvertFrom-Json
+        Assert-True ($remaining.userValue -ceq 'keep' -and $remaining.hooks.PreToolUse.Count -eq 1 -and $remaining.hooks.PreToolUse[0].hooks[0].command -ceq 'echo keep-custom-hook') 'Custom uninstall changed the unrelated hook.'
+        Assert-True (Test-Path -LiteralPath $customExe -PathType Leaf) 'Uninstall removed the custom executable.'
+        Assert-True (Test-Path -LiteralPath $customConfig -PathType Leaf) 'Uninstall removed the custom config.'
+    }
+    Test-Case 'Owned MCP-first instructions upgrade to CLI binding without changing the body' {
+        $legacyInstall = Join-Path $OutputDirectory 'legacy-instruction-install'
+        $fixtureInstalls.Add($legacyInstall)
+        $legacyCodex = Join-Path $OutputDirectory 'legacy-instruction-codex'
+        New-Item -ItemType Directory -Path $legacyCodex | Out-Null
+        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $legacyInstall -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'legacy-instruction-base-work') | Out-Null
+        $obsoleteBackend = Join-Path $legacyInstall 'bin\codex-pretooluse.ps1'
+        [IO.File]::WriteAllText($obsoleteBackend, '# Previous installed PowerShell backend fixture', [Text.UTF8Encoding]::new($false))
+        $obsoleteHash = (Get-FileHash -LiteralPath $obsoleteBackend -Algorithm SHA256).Hash
+        $legacyGuide = "<!-- Prunlet managed agent instructions -->`n# Previous guide`nUse Prunlet MCP first.`n"
+        $legacyBytes = [Text.UTF8Encoding]::new($false).GetBytes($legacyGuide)
+        [IO.File]::WriteAllBytes((Join-Path $legacyInstall 'bin\PRUNLET.md'), $legacyBytes)
+        [IO.File]::WriteAllBytes((Join-Path $legacyCodex 'PRUNLET.md'), $legacyBytes)
+        $legacyBlock = "<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->`r`n" + 'Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet MCPの`delete_files`を最初から使う。' + "`r`n<!-- END PRUNLET AGENT-INSTRUCTIONS -->`r`n"
+        $legacyAgents = Join-Path $legacyCodex 'AGENTS.md'
+        [IO.File]::WriteAllText($legacyAgents, $legacyBlock + $originalAgentText, [Text.UTF8Encoding]::new($true))
+        $legacyResult = & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $legacyInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $legacyCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'legacy-instruction-upgrade-work') | ConvertFrom-Json
+        Assert-True (@($legacyResult).Count -eq 1 -and $legacyResult.requiresHookTrust) 'Installer must emit one result including the hook trust requirement.'
+        Assert-True (!(Test-Path -LiteralPath $obsoleteBackend)) 'Upgrade retained the obsolete backend.'
+        $retiredManifests = @(Get-ChildItem -LiteralPath (Join-Path $legacyResult.updateBackupDirectory 'retired-recovery') -Filter 'manifest.json' -File -Recurse)
+        Assert-True ($retiredManifests.Count -eq 1) 'Retirement has no unique recovery operation.'
+        $retired = [IO.File]::ReadAllText($retiredManifests[0].FullName) | ConvertFrom-Json
+        Assert-True ($retired.items[0].path -ieq $obsoleteBackend -and $retired.items[0].sha256 -ieq $obsoleteHash) 'Retirement manifest does not match the old backend.'
+        $retiredCopy = Join-Path $retiredManifests[0].DirectoryName '0000.bak'
+        Assert-True ((Get-FileHash -LiteralPath $retiredCopy -Algorithm SHA256).Hash -eq $obsoleteHash) 'Obsolete backend recovery copy is not verified.'
+        $updated = [IO.File]::ReadAllText($legacyAgents)
+        Assert-True ($updated.Contains('Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。')) 'Legacy instructions did not migrate.'
+        Assert-True (!$updated.Contains('Prunlet MCPの`delete_files`を最初から使う。')) 'Legacy normal route survived migration.'
+        $remaining = [regex]::Replace($updated, '^<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->\r\n[\s\S]*?\r\n<!-- END PRUNLET AGENT-INSTRUCTIONS -->\r\n', '')
+        Assert-True ($remaining -ceq $originalAgentText) 'Legacy migration changed the existing body.'
+        Assert-True ((Get-FileHash -LiteralPath (Join-Path $legacyCodex 'PRUNLET.md')).Hash -eq (Get-FileHash -LiteralPath (Join-Path $legacyInstall 'bin\PRUNLET.md')).Hash) 'Legacy guide did not migrate from the previous installed hash.'
+        $before = (Get-FileHash -LiteralPath $legacyAgents).Hash
+        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $legacyInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $legacyCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'legacy-instruction-repeat-work') | Out-Null
+        Assert-True ((Get-FileHash -LiteralPath $legacyAgents).Hash -eq $before) 'Migrated instructions were not idempotent.'
+    }
+    Test-Case 'Native hook replaces exact legacy command and preserves unrelated handlers' {
+        $migrationCodex = Join-Path $OutputDirectory 'native-hook-migration-codex'
+        New-Item -ItemType Directory -Path $migrationCodex | Out-Null
+        $migrationHooks = Join-Path $migrationCodex 'hooks.json'
+        $exePath = Join-Path $instructionInstall 'bin\prunlet.exe'
+        $cfgPath = Join-Path $instructionInstall 'config.json'
+        $oldHelper = Join-Path $instructionInstall 'bin\codex-pretooluse.ps1'
+        $legacyCommand = 'call "' + $exePath + '" --config "' + $cfgPath + '" hook --hook-script "' + $oldHelper + '"'
+        $nativeCommand = 'call "' + $exePath + '" --config "' + $cfgPath + '" hook'
+        $unrelated = @{ matcher = 'Bash'; hooks = @(@{ type = 'command'; command = 'echo keep-user-hook' }) }
+        $document = @{ userValue = 'keep'; hooks = @{ PreToolUse = @(@{ matcher = '^(Bash|exec_command|functions\.exec_command)$'; hooks = @(@{ type = 'command'; timeout = 10; statusMessage = 'Prunlet: protected literal deletion'; command = $legacyCommand }) }, $unrelated) } }
+        [IO.File]::WriteAllText($migrationHooks, ($document | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+        $registration = @{ ExecutablePath = $exePath; ConfigPath = $cfgPath; CodexHome = $migrationCodex; BackupDirectory = $instructionBackup }
+        & (Join-Path $instructionInstall 'bin\install-codex.ps1') @registration | Out-Null
+        $migrated = [IO.File]::ReadAllText($migrationHooks) | ConvertFrom-Json
+        Assert-True ($migrated.hooks.PreToolUse[0].hooks[0].command -ceq $nativeCommand) 'Legacy backend command did not migrate.'
+        Assert-True ($migrated.userValue -ceq 'keep' -and $migrated.hooks.PreToolUse[1].hooks[0].command -ceq 'echo keep-user-hook') 'Migration altered an unrelated handler.'
+        $before = (Get-FileHash -LiteralPath $migrationHooks).Hash
+        & (Join-Path $instructionInstall 'bin\install-codex.ps1') @registration | Out-Null
+        Assert-True ((Get-FileHash -LiteralPath $migrationHooks).Hash -eq $before) 'Native hook registration was not idempotent.'
+        # 管理handlerに利用者が追加した変更を自動移行で上書きしない。
+        $migrated.hooks.PreToolUse[0].hooks[0].timeout = 11
+        [IO.File]::WriteAllText($migrationHooks, ($migrated | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+        $edited = (Get-FileHash -LiteralPath $migrationHooks).Hash
+        Expect-Failure { & (Join-Path $instructionInstall 'bin\install-codex.ps1') @registration } 'was edited'
+        Assert-True ((Get-FileHash -LiteralPath $migrationHooks).Hash -eq $edited) 'Edited handler was changed.'
+    }
     Test-Case 'Instruction registration is idempotent' {
         $agentHash = (Get-FileHash -LiteralPath $instructionAgents).Hash
         $guideHash = (Get-FileHash -LiteralPath $instructionGuide).Hash
-        & $installer -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-idempotent-work') | Out-Null
+        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-idempotent-work') | Out-Null
         Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $instructionAgents).Hash -and $guideHash -eq (Get-FileHash -LiteralPath $instructionGuide).Hash) 'Idempotent instruction registration rewrote contents.'
     }
     $updatedZip = Join-Path $OutputDirectory 'updated-guide-fixture.zip'
@@ -292,7 +393,7 @@ try {
     $global:PrunletLatestFixture.sha = 'd' * 40
     Test-Case 'Owned guide updates from its previous installed hash' {
         $agentHash = (Get-FileHash -LiteralPath $instructionAgents).Hash
-        & $installer -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-update-work') | Out-Null
+        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-update-work') | Out-Null
         Assert-True ([IO.File]::ReadAllText($instructionGuide).Contains('Fixture guide update.')) 'Owned guide did not update.'
         Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $instructionAgents).Hash) 'Guide update changed existing AGENTS.'
     }
@@ -302,7 +403,7 @@ try {
             [IO.File]::AppendAllText($instructionGuide, 'User edit preserved without opt-in.', [Text.UTF8Encoding]::new($false))
             $agentHash = (Get-FileHash -LiteralPath $instructionAgents).Hash
             $guideHash = (Get-FileHash -LiteralPath $instructionGuide).Hash
-            & $installer -InstallDirectory $instructionInstall -RegisterCodex -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-no-flag-work') | Out-Null
+            & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $instructionInstall -RegisterCodex -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-no-flag-work') | Out-Null
             Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $instructionAgents).Hash -and $guideHash -eq (Get-FileHash -LiteralPath $instructionGuide).Hash) 'Update without the flag touched agent instructions.'
         } finally { [IO.File]::WriteAllBytes($instructionGuide, $original) }
     }
@@ -312,10 +413,15 @@ try {
             $target = if ($kind -eq 'block') { $instructionAgents } else { $instructionGuide }
             [byte[]]$original = [IO.File]::ReadAllBytes($target)
             try {
-                if ($kind -eq 'block') { [IO.File]::WriteAllText($target, ([IO.File]::ReadAllText($target).Replace('最初から使う。', '利用者が編集した内容。')), [Text.UTF8Encoding]::new($true)) }
+                if ($kind -eq 'block') {
+                    $beforeEdit = [IO.File]::ReadAllText($target)
+                    $afterEdit = $beforeEdit.Replace('Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。', '利用者が編集した内容。')
+                    Assert-True ($afterEdit -cne $beforeEdit) 'Edited-block fixture did not alter the managed instruction.'
+                    [IO.File]::WriteAllText($target, $afterEdit, [Text.UTF8Encoding]::new($true))
+                }
                 else { [IO.File]::AppendAllText($target, 'User guide edit.', [Text.UTF8Encoding]::new($false)) }
                 $hashes = @{}; foreach ($path in $paths) { $hashes[$path] = (Get-FileHash -LiteralPath $path).Hash }
-                Expect-Failure { & $installer -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory "edited-$kind-work") } 'was edited'
+                Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory "edited-$kind-work") } 'was edited'
                 Expect-Failure { & (Join-Path $instructionInstall 'bin\uninstall-codex.ps1') -CodexHome $instructionCodex -BackupDirectory $instructionBackup } 'was edited'
                 foreach ($path in $paths) { Assert-True ($hashes[$path] -eq (Get-FileHash -LiteralPath $path).Hash) 'Edited profile changed despite rejection.' }
             } finally { [IO.File]::WriteAllBytes($target, $original) }
@@ -331,7 +437,7 @@ try {
         $agentHash = (Get-FileHash -LiteralPath $lockedAgents).Hash
         $lock = [IO.File]::Open($lockedAgents, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
         try {
-            Expect-Failure { & $installer -InstallDirectory $lockedInstall -AllowedRoot $allowed -RegisterCodex -RegisterAgentInstructions -CodexHome $lockedCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-locked-work') } 'WriteAllBytes'
+            Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $lockedInstall -AllowedRoot $allowed -RegisterCodex -RegisterAgentInstructions -CodexHome $lockedCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-locked-work') } 'WriteAllBytes'
             Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $lockedAgents).Hash) 'Locked original AGENTS changed.'
             foreach ($name in @('PRUNLET.md','hooks.json','config.toml')) { Assert-True (!(Test-Path -LiteralPath (Join-Path $lockedCodex $name))) "Failed registration left $name." }
             Assert-True (!(Test-Path -LiteralPath $lockedInstall)) 'Instruction failure left initial products/config/recovery.'
@@ -407,7 +513,7 @@ try {
     Remove-Item Function:\Invoke-RestMethod, Function:\Invoke-WebRequest, Function:\Copy-Item
     Remove-Variable PrunletLatestFixture -Scope Global
     # 検証インストールの更新バックアップだけを検証済み絶対パスから清掃する。
-    $backupParent = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Codex\TaskArtifacts\Prunlet'
+    $backupParent = $fixtureUpdateBackupRoot
     Get-ChildItem -LiteralPath $backupParent -Directory -Filter 'install-*' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notin $beforeBackups } | ForEach-Object {
         $manifest = Join-Path $_.FullName 'backup-info.json'
         if (!(Test-Path -LiteralPath $manifest)) { $manifest = Join-Path $_.FullName 'profile-backup-info.json' }

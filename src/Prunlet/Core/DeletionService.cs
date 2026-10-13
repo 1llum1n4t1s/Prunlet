@@ -3,7 +3,7 @@ using System.Text.Json;
 
 namespace Prunlet.Core;
 
-public sealed class DeletionService
+public sealed partial class DeletionService
 {
     private readonly PrunletConfig config;
 
@@ -105,13 +105,14 @@ public sealed class DeletionService
         using var directories = PathPolicy.PinDirectories(directory);
         using var operationLock = NativeFiles.OpenLock(Path.Combine(directory, "operation.lock"));
         NativeFiles.Verify(operationLock, Path.Combine(directory, "operation.lock"));
+        if (Directory.EnumerateFileSystemEntries(directory).Any(path => Path.GetFileName(path).Equals("purge-intent.json", StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException("Recovery copies have been scheduled for purge; restoration is unavailable for this operation.");
         var manifestPath = Path.Combine(directory, "manifest.json");
         using var manifestHandle = NativeFiles.OpenBackup(manifestPath);
         NativeFiles.Verify(manifestHandle, manifestPath);
         using var manifestStream = new FileStream(manifestHandle, FileAccess.Read);
         if (manifestStream.Length > 8 * 1024 * 1024) throw new InvalidDataException("Manifest is too large.");
-        var manifest = JsonSerializer.Deserialize<OperationManifest>(manifestStream, PrunletConfig.JsonOptions)
-            ?? throw new InvalidDataException("Manifest is empty.");
+        var manifest = ReadValidatedJson<OperationManifest>(manifestStream);
         ValidateManifest(manifest, operationId);
         var result = new RestoreResult { OperationId = operationId };
         for (var i = 0; i < manifest.Items.Count; i++)
@@ -196,7 +197,7 @@ public sealed class DeletionService
 
     private void ValidateManifest(OperationManifest manifest, string operationId)
     {
-        if (manifest.Schema != 1 || manifest.OperationId != operationId || manifest.Items is null
+        if (manifest.Schema != 1 || manifest.OperationId != operationId || manifest.CreatedUtc == default || manifest.Items is null
             || manifest.Items.Count is 0 or > 256)
             throw new InvalidDataException("Manifest schema, ID, or item count is invalid.");
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

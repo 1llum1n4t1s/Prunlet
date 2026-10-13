@@ -1,4 +1,6 @@
 param(
+    [string]$ExecutablePath = (Join-Path $PSScriptRoot 'prunlet.exe'),
+    [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config.json'),
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [string]$BackupDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\integration-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')))
 )
@@ -12,7 +14,7 @@ Assert-SimpleIntegrationToml $toml
 $updatedToml = Remove-OwnedBlock (Remove-OwnedBlock $toml 'MCP') 'HOOK-FEATURE'
 # 利用者が編集した指示やガイドは、MCP・フックを変更する前に検査して保持する。
 $agentHelper = Join-Path $PSScriptRoot 'install-agent-instructions.ps1'
-$agentParameters = @{ CodexHome = $CodexHome; BackupDirectory = $BackupDirectory; SourceGuidePath = (Join-Path $PSScriptRoot 'PRUNLET.md'); Uninstall = $true }
+$agentParameters = @{ CodexHome = $CodexHome; BackupDirectory = $BackupDirectory; SourceGuidePath = (Join-Path $PSScriptRoot 'PRUNLET.md'); ExecutablePath = $ExecutablePath; ConfigPath = $ConfigPath; Uninstall = $true }
 if (Test-Path -LiteralPath $agentHelper -PathType Leaf) {
     $agentState = & $agentHelper @agentParameters -ValidateOnly
     if ($agentState.instructionsPresent) { & $agentHelper @agentParameters | Out-Null }

@@ -15,17 +15,18 @@ internal static class NativeFiles
     internal static SafeFileHandle OpenDirectory(string path) => Open(path, 0x80, 3, 3, OpenReparse | BackupSemantics);
     internal static SafeFileHandle OpenSource(string path) => Open(path, Read | Delete, 1, 3, OpenReparse);
     internal static SafeFileHandle OpenBackup(string path) => Open(path, Read, 1, 3, OpenReparse);
+    internal static SafeFileHandle OpenPurgeTarget(string path) => Open(path, Read | Delete, 1, 3, OpenReparse);
     internal static SafeFileHandle CreateDestination(string path) => Open(path, Read | Write | Delete, 1, 1, OpenReparse);
     internal static SafeFileHandle OpenLock(string path) => Open(path, Read | Write, 0, 3, OpenReparse);
 
     internal static void CreateDirectory(string path)
     {
-        if (!CreateDirectoryW(path, IntPtr.Zero)) ThrowLastError("Cannot exclusively create operation directory");
+        if (!CreateDirectoryW(Win32Path(path), IntPtr.Zero)) ThrowLastError("Cannot exclusively create operation directory");
     }
 
     internal static void RejectNamedStreams(string path)
     {
-        var search = FindFirstStreamW(path, 0, out var data, 0);
+        var search = FindFirstStreamW(Win32Path(path), 0, out var data, 0);
         if (search == new IntPtr(-1))
         {
             if (Marshal.GetLastWin32Error() == 38) return;
@@ -44,7 +45,7 @@ internal static class NativeFiles
 
     private static SafeFileHandle Open(string path, uint access, uint share, uint disposition, uint flags)
     {
-        var handle = CreateFileW(path, access, share, IntPtr.Zero, disposition, flags, IntPtr.Zero);
+        var handle = CreateFileW(Win32Path(path), access, share, IntPtr.Zero, disposition, flags, IntPtr.Zero);
         if (!handle.IsInvalid) return handle;
         var error = Marshal.GetLastWin32Error();
         handle.Dispose();
@@ -52,6 +53,9 @@ internal static class NativeFiles
         if (error == 3) throw new DirectoryNotFoundException("A parent directory does not exist.");
         throw new IOException($"Cannot open {path}: {new Win32Exception(error).Message}", new Win32Exception(error));
     }
+
+    // 入力の許可条件を保ち、Win32 呼び出しの直前だけ長いパス形式へ変換する。
+    private static string Win32Path(string path) => @"\\?\" + PathPolicy.Absolute(path);
 
     internal static void Verify(SafeFileHandle handle, string expected, bool directory = false)
     {
@@ -77,11 +81,39 @@ internal static class NativeFiles
             throw new IOException("Resolved handle path differs from the validated path (aliases are not supported).");
     }
 
+    internal static void VerifySingleLink(SafeFileHandle handle)
+    {
+        if (!GetFileInformationByHandle(handle, out var info)) ThrowLastError("Cannot inspect recovery file handle");
+        if (info.Links != 1)
+            throw new IOException("Recovery files with multiple hard links cannot be purged.");
+    }
+
     internal static void DeleteHandle(SafeFileHandle handle)
     {
         var disposition = new FileDisposition { DeleteFile = true };
         if (!SetFileInformationByHandle(handle, 4, ref disposition, (uint)Marshal.SizeOf<FileDisposition>()))
             ThrowLastError("Cannot mark file for deletion");
+    }
+
+    internal static void RenameHandle(SafeFileHandle handle, string destination)
+    {
+        var name = Encoding.Unicode.GetBytes(Win32Path(destination));
+        // FILE_RENAME_INFO の HANDLE は自然境界へ整列する。FileNameLength は UTF-16 のバイト数。
+        var rootOffset = IntPtr.Size == 8 ? 8 : 4;
+        var lengthOffset = rootOffset + IntPtr.Size;
+        var nameOffset = lengthOffset + sizeof(uint);
+        var size = checked(nameOffset + name.Length + sizeof(char));
+        var buffer = Marshal.AllocHGlobal(size);
+        try
+        {
+            // ReplaceIfExists=false、RootDirectory=NULL。既存の公開済み記録は置換しない。
+            Marshal.Copy(new byte[size], 0, buffer, size);
+            Marshal.WriteInt32(buffer, lengthOffset, name.Length);
+            Marshal.Copy(name, 0, IntPtr.Add(buffer, nameOffset), name.Length);
+            if (!SetFileInformationByHandle(handle, 3, buffer, (uint)size))
+                ThrowLastError("Cannot atomically publish file without replacing an existing destination");
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
     }
 
     private static void ThrowLastError(string message) => throw new IOException($"{message}: {new Win32Exception(Marshal.GetLastWin32Error()).Message}");
@@ -131,4 +163,7 @@ internal static class NativeFiles
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, ref FileDisposition info, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, IntPtr info, uint size);
 }

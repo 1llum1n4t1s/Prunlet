@@ -5,6 +5,8 @@ param(
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [string]$BackupDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\agent-instructions-' + [Guid]::NewGuid().ToString('N'))),
     [string]$PreviousGuideSha256,
+    [string]$ExecutablePath = (Join-Path $PSScriptRoot 'prunlet.exe'),
+    [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config.json'),
     [switch]$Uninstall,
     [switch]$ValidateOnly
 )
@@ -47,7 +49,14 @@ $guidePath = Assert-AgentFilePath (Join-Path $CodexHome 'PRUNLET.md')
 $document = Read-AgentDocument $agentPath
 $begin = '<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->'
 $end = '<!-- END PRUNLET AGENT-INSTRUCTIONS -->'
-$instruction = 'Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet MCPの`delete_files`を最初から使う。'
+$instruction = 'Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。'
+$legacyInstruction = 'Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet MCPの`delete_files`を最初から使う。'
+$ExecutablePath = Resolve-Absolute $ExecutablePath 'ExecutablePath'
+$ConfigPath = Resolve-Absolute $ConfigPath 'ConfigPath'
+# CMDの再展開を生むpathは、自動登録するbindingとして受け付けない。
+$null = Quote-CommandArgument $ExecutablePath
+$null = Quote-CommandArgument $ConfigPath
+$bindingLine = 'Prunlet CLI: ' + ([ordered]@{ executablePath = $ExecutablePath; configPath = $ConfigPath } | ConvertTo-Json -Compress)
 $guideHeader = '<!-- Prunlet managed agent instructions -->'
 $begins = [regex]::Matches($document.text, 'BEGIN PRUNLET AGENT-INSTRUCTIONS')
 $ends = [regex]::Matches($document.text, 'END PRUNLET AGENT-INSTRUCTIONS')
@@ -56,8 +65,13 @@ $guideExists = Test-Path -LiteralPath $guidePath -PathType Leaf
 $blockMatch = $null
 if ($owned) {
     if ($begins.Count -ne 1 -or $ends.Count -ne 1) { throw 'Duplicate or incomplete Prunlet agent instruction markers; existing instructions were preserved.' }
-    $pattern = [regex]::Escape($begin) + '(?<newline>\r\n|\n|\r)' + [regex]::Escape($instruction) + '\k<newline>' + [regex]::Escape($end) + '\k<newline>'
+    $pattern = [regex]::Escape($begin) + '(?<newline>\r\n|\n|\r)' + [regex]::Escape($instruction) + '\k<newline>' + [regex]::Escape($bindingLine) + '\k<newline>' + [regex]::Escape($end) + '\k<newline>'
     $blockMatch = [regex]::Match($document.text, $pattern)
+    if (!$blockMatch.Success) {
+        # 出荷済みMCP-firstの正確な管理blockだけを移行対象にする。
+        $legacyPattern = [regex]::Escape($begin) + '(?<newline>\r\n|\n|\r)' + [regex]::Escape($legacyInstruction) + '\k<newline>' + [regex]::Escape($end) + '\k<newline>'
+        $blockMatch = [regex]::Match($document.text, $legacyPattern)
+    }
     if (!$blockMatch.Success) { throw 'The Prunlet agent instruction block was edited or is incomplete; it was preserved.' }
     if (!$guideExists) { throw 'Owned agent instructions have no PRUNLET.md guide; review before changing registration.' }
 } elseif ($guideExists) { throw 'An existing PRUNLET.md has no owned agent instruction block; it was preserved.' }
@@ -77,11 +91,15 @@ if ($guideExists) {
     if (![IO.File]::ReadAllText($guidePath).StartsWith($guideHeader, [StringComparison]::Ordinal)) { throw 'Existing PRUNLET.md has no Prunlet ownership header.' }
 }
 if ($Uninstall) { $updatedText = $document.text.Remove($blockMatch.Index, $blockMatch.Length) }
-elseif ($owned) { $updatedText = $document.text }
+elseif ($owned) {
+    $newline = $blockMatch.Groups['newline'].Value
+    $block = $begin + $newline + $instruction + $newline + $bindingLine + $newline + $end + $newline
+    $updatedText = $document.text.Remove($blockMatch.Index, $blockMatch.Length).Insert($blockMatch.Index, $block)
+}
 else {
     $newlineMatch = [regex]::Match($document.text, '\r\n|\n|\r')
     $newline = if ($newlineMatch.Success) { $newlineMatch.Value } else { [Environment]::NewLine }
-    $block = $begin + $newline + $instruction + $newline + $end + $newline
+    $block = $begin + $newline + $instruction + $newline + $bindingLine + $newline + $end + $newline
     # 文書先頭なら既存のコード例や末尾の未閉鎖フェンスへ指示が入り込まない。
     # BOMは別に保持し、既存本文のバイト列と末尾の改行は変更しない。
     $updatedText = $block + $document.text

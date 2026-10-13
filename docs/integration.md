@@ -1,6 +1,6 @@
 # Codexとの連携
 
-PrunletはWindows向けCLIとstdio MCPを一つのexeで提供します。Codexの`PreToolUse` hookはexeの高速判定入口を呼び、削除候補だけPowerShell AST helperで解析します。対応するPowerShell削除を通常のshell tool上のPrunlet CLI呼出しに置き換え、hook自身は削除処理を実行しません。
+PrunletはWindows向けCLIとstdio MCPを一つのexeで提供します。Codexの`PreToolUse` hookはネイティブexeだけで入力を検査し、認識した直接削除を拒否してCLI手順を案内します。入力の自動置換や削除は実行しません。PowerShellは導入・登録・ビルド・E2Eの管理スクリプトで使います。
 
 ## 準備
 
@@ -8,9 +8,9 @@ PrunletはWindows向けCLIとstdio MCPを一つのexeで提供します。Codex�
 
 ## エージェント共通指示
 
-`-RegisterCodex -RegisterAgentInstructions`を明示すると、Codex homeの`PRUNLET.md`を配置し、共通`AGENTS.md`の先頭へ管理マーカー付きの参照を追加します。各リポジトリへの記載は不要です。対象ファイルの削除では最初からPrunlet MCPの`delete_files`を使うよう指示し、シェルで削除してから再試行する往復を避けます。
+`-RegisterCodex -RegisterAgentInstructions`を明示すると、Codex homeの`PRUNLET.md`を配置し、共通`AGENTS.md`の先頭へ管理マーカー付きの参照と、配置済みexe・設定の絶対パスを追加します。各リポジトリへの記載は不要です。削除では最初から`cmd.exe`・`login: false`のPrunlet CLIを使います。空白・Unicode・多数・長い対象パスは`--paths-file`で渡します。exe・設定のパス自体をCMDで安全に表現できない場合は、実行前に同じCoreのMCPを選びます。拒否された削除を別shellやPrunletへ付け替えて再試行しません。
 
-この登録は共通AGENTS本文を変更するため明示オプションにしています。既存本文を保持し、重複・不完全な管理マーカーや利用者が編集した指示を検出した場合は自動更新を拒否します。更新時に登録が途中で失敗した場合は、MCP・hookに加えてAGENTSと専用指示も復旧対象になります。
+この登録は共通AGENTSの専用ブロックを変更するため明示オプションにしています。旧MCP優先ブロックは既知の正確な内容とguideのハッシュを照合して移行します。既存本文を保持し、重複・不完全な管理マーカーや利用者が編集した指示を検出した場合は自動更新を拒否します。更新時に登録が途中で失敗した場合は、MCP・hookに加えてAGENTSと専用指示も復旧対象になります。
 
 共通指示を登録した導入は更新時も同じオプションを渡します。オプションを省略した更新では共通指示は不変更です。その間に配置済みguideだけが更新された場合、古い共通指示を編集済みの指示と区別できないため、自動更新・解除は停止することがあります。
 
@@ -19,10 +19,10 @@ PrunletはWindows向けCLIとstdio MCPを一つのexeで提供します。Codex�
 ```powershell
 $bin = Join-Path $env:USERPROFILE '.local\Prunlet\bin'
 $instructionBackup = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\instructions-' + [guid]::NewGuid().ToString('N'))
-& (Join-Path $bin 'install-agent-instructions.ps1') -SourceGuidePath (Join-Path $bin 'PRUNLET.md') -BackupDirectory $instructionBackup
+& (Join-Path $bin 'install-agent-instructions.ps1') -SourceGuidePath (Join-Path $bin 'PRUNLET.md') -ExecutablePath (Join-Path $bin 'prunlet.exe') -ConfigPath (Join-Path $env:USERPROFILE '.local\Prunlet\config.json') -BackupDirectory $instructionBackup
 ```
 
-RTKの共通指示と同様、エージェントのツール選択を案内する方式です。フックによる入力の機械的な置換や、将来の全呼び出しの強制とは区別してください。
+RTKの共通指示と同様、エージェントのツール選択を案内する方式です。フックによる直接削除の拒否や、将来の全呼び出しの強制とは区別してください。
 
 ## 手動の設定準備
 
@@ -54,7 +54,6 @@ $rollback = Join-Path $env:LOCALAPPDATA 'Codex\TaskArtifacts\Prunlet\integration
 & (Join-Path $bin 'install-codex.ps1') `
   -ExecutablePath (Join-Path $bin 'prunlet.exe') `
   -ConfigPath (Join-Path $env:USERPROFILE '.local\Prunlet\config.json') `
-  -HookPath (Join-Path $bin 'codex-pretooluse.ps1') `
   -BackupDirectory $rollback
 ```
 
@@ -70,42 +69,30 @@ MCP登録の実行内容は次のとおりです。
 & $exe --config $config mcp
 ```
 
-## hookの変換範囲
+## hookの検査範囲
 
-対応するtool名は`Bash`、`exec_command`、`functions.exec_command`です。入力は`tool_input.command`または`tool_input.cmd`を読み、その他の引数を保持します。対象外toolや削除候補のないshell入力にはexe単体で`{}`を返し、PowerShell起動を省きます。削除候補は既存のAST helperで解析します。
+対応するtool名は`Bash`、`exec_command`、`functions.exec_command`です。入力は`tool_input.command`または`tool_input.cmd`を読みます。対象外toolや削除候補のないshell入力にはexe単体で`{}`を返します。認識した直接削除は理由とPrunlet CLI手順を付けて拒否し、入力の自動置換を行いません。
 
-登録されるWindows hookコマンドは`call "<exe>" --config "<config>" hook --hook-script "<script>"`です。CodexのWindows command hook runnerで使うcmdの内部`call`により、空白を含むexeパスを扱います。登録パスにcmd再展開文字`%`、`!`、`^`、`&`などが含まれる場合は自動登録を拒否します。
+登録するWindows hookコマンドは`call "<exe>" --config "<config>" hook`です。CodexのWindows command hook runnerのCMDで空白を含むexeパスを扱います。登録パスにCMD再展開文字が含まれる場合は自動登録を拒否します。旧`--hook-script <script>`は互換引数として受理するだけで、PowerShell backendを起動しません。更新で配置済み旧backendを退役させる際は、製品バックアップを保全してCoreによるバックアップ付き削除を使います。
 
 | 入力 | 結果 |
 | --- | --- |
-| 単独の`Remove-Item -LiteralPath 'C:\work\a.txt'` | Prunlet CLIへ置換 |
-| `Microsoft.PowerShell.Management\Remove-Item`、`ri`、`rm`、`del`、`erase` | 同じ限定構文であれば置換 |
-| `-LiteralPath 'C:\work\a.txt','C:\work\b.txt'` | 定数文字列の配列として置換 |
-| `-Force`、`-ErrorAction Stop` | 対応。CLI自身の方針で処理 |
-| `-WhatIf` | `delete --dry-run`へ置換 |
-| 相対パス、変数、式、`*`や`?`、`-Path`、`-Recurse` | 実行前に拒否 |
-| 複数文、パイプ、リダイレクト、呼出し演算子による削除 | 実行前に拒否 |
-| 代表的なcmd/pwsh/PowerShell wrapper内で読み取れる直接削除 | 実行前に拒否 |
-| 不正なhook JSON、識別済み削除の解析失敗、exe/config不在 | 理由を付けて拒否 |
+| 認識した`Remove-Item`・削除alias・CMDの`del` / `erase` | 拒否してCLI手順を案内 |
+| 読み取れるwrapper内の直接削除・削除を含む複数文 | 拒否。別shellへの付け替えはしない |
+| 削除候補のない入力、Prunlet CLI自身 | 通過 |
+| 未知のshell | 自動置換しない。検出可能な直接削除は拒否 |
+| 不正なhook JSON、入力検査の失敗 | 理由を付けて拒否 |
 
-角括弧を含むファイル名は`-LiteralPath`で文字どおり扱います。例では次のように置換されます。
+フックはstdoutにJSONだけを返し、診断はstderrへ出します。Codexの既存の承認・安全設定・他hookの判定を変更しません。
 
-```powershell
-Remove-Item -LiteralPath 'C:\work\a[1].txt' -WhatIf
-# 通常のshell toolへ返すコマンド
-& 'C:\Users\IMT\.local\Prunlet\bin\prunlet.exe' --config 'C:\Users\IMT\.local\Prunlet\config.json' delete --dry-run -- 'C:\work\a[1].txt'
-```
-
-hookはPowerShell AST上の直接コマンド名を調べます。文字列に`Remove-Item`という単語があるだけでは削除とみなしません。Prunlet CLI自身も再変換しません。出力はstdoutにJSONだけ、診断はstderrです。`allow`と`updatedInput`による置換はCodexの正式なhook契約を使い、既存の承認・安全設定・他hookの判定を変更しません。[Codex公式hook仕様](https://learn.chatgpt.com/docs/hooks)
-
-このhookは任意コードの全削除を検出する境界ではありません。動的なコマンド名、独自alias、.NETのファイルAPI、他言語のコード、外部スクリプト、エンコード済みコマンド、対話型shellへ後から送る入力などは検出対象外です。PowerShell以外のshellで同じ名前が別の意味を持つ場合も自動変換できません。Prunletの許可ルート・パス検査はCLIとMCPの入口で別途適用されます。
+このhookは任意コードの全削除を検出する境界ではありません。動的なコマンド名、独自alias、.NETのファイルAPI、他言語のコード、外部スクリプト、エンコード済みコマンド、対話型shellへ後から送る入力などは検出対象外です。Prunletの許可ルート・パス検査はCLIとMCPの入口で別途適用されます。通常の削除例とJSON一覧の制限は[README](../README.md#削除・復元)を参照してください。
 
 ## 解除と復元
 
 ```powershell
-& (Join-Path $bin 'uninstall-codex.ps1') -BackupDirectory $rollback
+& (Join-Path $bin 'uninstall-codex.ps1') -ExecutablePath $exe -ConfigPath $config -BackupDirectory $rollback
 ```
 
-隔離先へ登録した場合は同じ`-CodexHome`を渡します。Prunlet handlerと専用マーカー内のMCP設定、Prunletが追加したhook機能設定を解除し、他のhook・MCP・設定を保持します。共通指示を登録済みの場合は、所有するAGENTS参照と専用guideも検証して解除します。利用者の編集があれば書込み前に停止します。同じ操作を繰り返しても登録は増えません。解除はexe、Prunlet設定、削除バックアップを残します。
+隔離先へ登録した場合は同じ`-CodexHome`を渡します。exeや設定を標準配置以外へ置いた場合も、登録時と同じ`-ExecutablePath`・`-ConfigPath`を渡します。Prunlet handlerと専用マーカー内のMCP設定、Prunletが追加したhook機能設定を解除し、他のhook・MCP・設定を保持します。共通指示を登録済みの場合は、所有するAGENTS参照と専用guideも検証して解除します。利用者の編集があれば書込み前に停止します。同じ操作を繰り返しても登録は増えません。解除はexe、Prunlet設定、削除バックアップを残します。
 
 専用マーカー内を編集した場合や、MCPマーカーの末尾から次のtableまでに利用者の値を追加した場合は、所属tableを保持するため書込み前に自動解除を停止します。内容を確認してから手動でPrunlet部分だけを解除してください。復元が必要なら、保存された記録の`target`、`backup`、`existed`を確認し、現在の変更を保全して元ファイルを戻します。記録は連携の検証と復元の必要がなくなった時点で清掃できます。

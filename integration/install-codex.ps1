@@ -1,32 +1,49 @@
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$ConfigPath,
-    [Parameter(Mandatory)][string]$HookPath,
+    [string]$HookPath,
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [string]$BackupDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\integration-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')))
 )
 . (Join-Path $PSScriptRoot 'configuration-common.ps1')
 $CodexHome = Resolve-Absolute $CodexHome 'CodexHome'
 $BackupDirectory = Assert-ExternalBackup $BackupDirectory $CodexHome
-foreach ($pair in @(@($ExecutablePath, 'ExecutablePath'), @($ConfigPath, 'ConfigPath'), @($HookPath, 'HookPath'))) {
+foreach ($pair in @(@($ExecutablePath, 'ExecutablePath'), @($ConfigPath, 'ConfigPath'))) {
     $resolved = Resolve-Absolute $pair[0] $pair[1]
     if (!(Test-Path -LiteralPath $resolved -PathType Leaf)) { throw ($pair[1] + ' does not exist.') }
 }
 $ExecutablePath = Resolve-Absolute $ExecutablePath 'ExecutablePath'
 $ConfigPath = Resolve-Absolute $ConfigPath 'ConfigPath'
-$HookPath = Resolve-Absolute $HookPath 'HookPath'
+if ($HookPath) { $HookPath = Resolve-Absolute $HookPath 'legacy HookPath' }
 $prunletConfig = [IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json -AsHashtable
 if ($prunletConfig.schema -ne 1 -or !$prunletConfig.allowedRoots.Count -or !$prunletConfig.backupDirectory) { throw 'Initialize a valid Prunlet config before registering integration.' }
 $hooksPath = Join-Path $CodexHome 'hooks.json'
 $tomlPath = Join-Path $CodexHome 'config.toml'
 $hooks = Read-Hooks $hooksPath
-$command = 'call ' + (Quote-CommandArgument $ExecutablePath) + ' --config ' + (Quote-CommandArgument $ConfigPath) + ' hook --hook-script ' + (Quote-CommandArgument $HookPath)
+$command = 'call ' + (Quote-CommandArgument $ExecutablePath) + ' --config ' + (Quote-CommandArgument $ConfigPath) + ' hook'
+$legacyPaths = @((Join-Path ([IO.Path]::GetDirectoryName($ExecutablePath)) 'codex-pretooluse.ps1'))
+if ($HookPath) { $legacyPaths += $HookPath }
+$knownCommands = @($command)
+foreach ($legacyPath in $legacyPaths) {
+    $knownCommands += 'call ' + (Quote-CommandArgument $ExecutablePath) + ' --config ' + (Quote-CommandArgument $ConfigPath) + ' hook --hook-script ' + (Quote-CommandArgument $legacyPath)
+    $knownCommands += 'pwsh -NoProfile -NonInteractive -File ' + (Quote-CommandArgument $legacyPath) + ' -ExecutablePath ' + (Quote-CommandArgument $ExecutablePath) + ' -ConfigPath ' + (Quote-CommandArgument $ConfigPath)
+}
 $handler = @{ type = 'command'; command = $command; timeout = 10; statusMessage = $script:PrunletHookMarker }
 $groups = @($hooks.hooks.PreToolUse | Where-Object { $null -ne $_ })
 $owned = @($groups | ForEach-Object { $_.hooks } | Where-Object { $_.statusMessage -eq $script:PrunletHookMarker })
 if ($owned.Count -gt 1) { throw 'Multiple Prunlet hook handlers found; review before installation.' }
-if ($owned.Count -eq 1 -and ($owned[0].command -cne $command -or $owned[0].type -ne 'command')) { throw 'Existing Prunlet hook differs; uninstall it before changing registration.' }
-if (!$owned.Count) { $groups += @{ matcher = '^(Bash|exec_command|functions\.exec_command)$'; hooks = @($handler) }; $hooks.hooks.PreToolUse = $groups }
+$matcher = '^(Bash|exec_command|functions\.exec_command)$'
+$hookChanged = !$owned.Count
+if ($owned.Count -eq 1) {
+    $ownerGroup = @($groups | Where-Object { @($_.hooks | Where-Object { $_.statusMessage -eq $script:PrunletHookMarker }).Count })
+    if ($ownerGroup.Count -ne 1 -or $ownerGroup[0].matcher -cne $matcher -or $owned[0].type -cne 'command' -or $owned[0].timeout -ne 10 -or $owned[0].Keys.Count -ne 4 -or $knownCommands -cnotcontains $owned[0].command) { throw 'Existing Prunlet hook was edited; its registration was preserved.' }
+    $hookChanged = $owned[0].command -cne $command
+    # 出荷済みの正確な管理commandだけをnative exeの入口へ移す。
+    $owned[0].command = $command
+} else {
+    $groups += @{ matcher = $matcher; hooks = @($handler) }
+    $hooks.hooks.PreToolUse = $groups
+}
 $toml = if (Test-Path -LiteralPath $tomlPath) { [IO.File]::ReadAllText($tomlPath) } else { '' }
 Assert-SimpleIntegrationToml $toml
 $newline = if ($toml.Contains("`r`n")) { "`r`n" } else { "`n" }
@@ -56,6 +73,6 @@ if ($featureTable.Success) {
     $toml += $newline + '# BEGIN PRUNLET HOOK-FEATURE' + $newline + '[features]' + $newline + 'hooks = true' + $newline + '# END PRUNLET HOOK-FEATURE' + $newline
 }
 # 両設定の内容を先に構成し、衝突があれば書込み前に停止する。
-if (!$owned.Count) { Write-PreservedFile $hooksPath ($hooks | ConvertTo-Json -Depth 100) $BackupDirectory }
+if ($hookChanged) { Write-PreservedFile $hooksPath ($hooks | ConvertTo-Json -Depth 100) $BackupDirectory }
 Write-PreservedFile $tomlPath $toml $BackupDirectory
 @{ status = 'installed'; codexHome = $CodexHome; backupRoot = $BackupDirectory; requiresHookTrust = $true; message = 'Review and trust the Prunlet hook through Codex /hooks. Trust settings were not changed.' } | ConvertTo-Json -Compress
