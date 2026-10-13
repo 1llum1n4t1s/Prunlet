@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <AssemblyName>prunlet</AssemblyName>
+    <Version>1.0.0</Version>
     <Authors>Kagayoi</Authors>
   </PropertyGroup>
 </Project>
