@@ -73,7 +73,7 @@ MCP登録の実行内容は次のとおりです。
 ```powershell
 Remove-Item -LiteralPath 'C:\work\a[1].txt' -WhatIf
 # 通常のshell toolへ返すコマンド
-& 'C:\Users\IMT\AppData\Local\Prunlet\bin\prunlet.exe' --config 'C:\Users\IMT\AppData\Local\Prunlet\config.json' delete --dry-run -- 'C:\work\a[1].txt'
+& 'C:\Users\IMT\.local\Prunlet\bin\prunlet.exe' --config 'C:\Users\IMT\.local\Prunlet\config.json' delete --dry-run -- 'C:\work\a[1].txt'
 ```
 
 hookはPowerShell AST上の直接コマンド名を調べます。文字列に`Remove-Item`という単語があるだけでは削除とみなしません。Prunlet CLI自身も再変換しません。出力はstdoutにJSONだけ、診断はstderrです。`allow`と`updatedInput`による置換はCodexの正式なhook契約を使い、既存の承認・安全設定・他hookの判定を変更しません。[Codex公式hook仕様](https://learn.chatgpt.com/docs/hooks)

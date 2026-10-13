@@ -4,7 +4,8 @@ CLI・MCP・Codexフックを実際の別プロセスで起動して検証しま
 
 ```powershell
 $runRoot = Join-Path ([IO.Path]::GetTempPath()) ('Codex\Prunlet\verification-' + [guid]::NewGuid().ToString('N'))
-$report = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Prunlet\verification-' + [guid]::NewGuid().ToString('N') + '.json')
+$report = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\verification-' + [guid]::NewGuid().ToString('N') + '.json')
+New-Item -ItemType Directory -Path (Split-Path -Parent $report) -Force | Out-Null
 pwsh -NoProfile -File .\scripts\Verify-Prunlet.ps1 -ExecutablePath 'C:\path\to\prunlet.exe' -OutputDirectory $runRoot -ReportPath $report
 ```
 
