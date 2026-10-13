@@ -15,7 +15,7 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 
 出力は`$buildRoot\publish\prunlet.exe`。既定は`win-x64`、ARM64向けは`-Runtime win-arm64`を指定する。
 
-実装変更後は[検証手順](docs/verification.md)のコマンドで`scripts/Verify-Prunlet.ps1`に今回のexeを渡し、CLI・stdio MCP・フックのE2Eを実行する。インストーラー変更時は`scripts/Verify-LatestInstall.ps1`も実行し、検証用アーカイブの結果と実GitHubの結果を区別する。終了コード、`passed` / `failed`、外部JSONレポートを読んで判定する。Codex自身のフック読込・承認はスクリプトの検証範囲外なので、連携変更時は同文書の実ホスト確認も行う。
+実装変更後は[検証手順](docs/verification.md)のコマンドで`scripts/Verify-Prunlet.ps1`に今回のexeを渡し、CLI・stdio MCP・フックのE2Eを実行する。インストーラーや共通指示の登録・解除を変更した場合は`scripts/Verify-LatestInstall.ps1`も実行し、検証用アーカイブの結果と実GitHubの結果を区別する。終了コード、`passed` / `failed`、外部JSONレポートを読んで判定する。Codex自身のフック読込・承認と共通指示の読込・MCP選択はスクリプトの検証範囲外なので、連携変更時は同文書の実ホスト確認も行う。
 
 リポジトリおよびCodex homeへ`bin`・`obj`・一時物・検証出力・バックアップを作らない。検証用出力とレポートには新しい外部絶対パスを渡し、レポートの親を事前に作る。検証後の保持と清掃は[検証手順](docs/verification.md)に従う。
 

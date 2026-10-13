@@ -81,7 +81,7 @@ $config = Join-Path $env:USERPROFILE '.local\Prunlet\config.json'
 | --- | --- | --- |
 | `delete_files` | `paths`、任意の`dryRun` | バックアップ付き削除 |
 | `restore_files` | `operationId` | 上書きしない復元 |
-| `list_operations` | なし | 復元できる操作IDの一覧 |
+| `list_operations` | なし | 保存された操作IDの一覧（復元可否は復元時に検証） |
 
 サーバーは削除ツールの用途を`instructions`で通知します。各リポジトリへの記載は不要ですが、ツールを最初から選ぶかどうかは利用するエージェントの判断に依存します。
 

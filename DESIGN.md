@@ -14,6 +14,7 @@ PrunletはWindowsの通常ファイルを、検証済みの復元用コピーを
 | `Protocol/McpServer.cs` | 改行区切りJSON-RPC、初期化、3つのツールと引数検査。許可範囲を入力から拡張しない |
 | `Protocol/HookRouter.cs` / `integration/codex-pretooluse.ps1` | exeで候補を選別し、必要時だけPowerShell ASTで置換可否を判定。入力の置換・拒否のみを行う |
 | `integration/install-codex.ps1` / `uninstall-codex.ps1` / `configuration-common.ps1` | 他設定を保持したMCP・フック登録と解除、更新前バックアップ、所有マーカーと競合の検査 |
+| `integration/install-agent-instructions.ps1` / `integration/PRUNLET.md` | Codex共通AGENTSから専用指示を読む経路の登録・解除。管理マーカーとguideのハッシュを照合し、利用者の編集を保護 |
 | `scripts/` | 外部出力のビルド、GitHub最新HEADからの導入、実プロセスを使うE2E検証 |
 
 `Core/`と`Protocol/`のパスは`src/Prunlet/`配下。ターゲットは`net10.0-windows`で、publishスクリプトはランタイムを含む単一exeを作る。実行時のダウンロードやビルドはない。
@@ -45,6 +46,6 @@ manifestの`backup_ready`は復元用コピーの準備状態であり、削除�
 
 登録・解除は所有部分だけを変更する。既存の同名登録、明示的なhook無効化、変更対象のTOMLを安全に扱えない構文は自動更新を拒否する。設定保持を優先するため、手動登録が必要な場合がある。
 
-`-RegisterAgentInstructions`は共通AGENTSから専用の`PRUNLET.md`を読む経路を明示登録する。エージェントが最初からMCPを選ぶための指示であり、ツール入力を書き換えるhookとは別である。参照を文書先頭へ追加し、既存のコード例へ入り込むことを避ける。登録・解除は管理マーカーで所有範囲を限定し、既存本文と利用者が編集した指示を保護する。登録途中の失敗ではMCP・hookと同様に指示ファイルも復旧対象にする。
+`-RegisterAgentInstructions`は`-RegisterCodex`と併用し、共通AGENTSから専用の`PRUNLET.md`を読む経路を明示登録する。エージェントが最初からMCPを選ぶための指示であり、ツール入力を書き換えるhookとは別である。参照を文書先頭へ追加し、既存のコード例へ入り込むことを避ける。登録・解除は管理マーカーと参照ブロックの一致、guideのハッシュで所有範囲を限定し、既存本文と利用者が編集した指示を保護する。更新時は更新前の配置済みguideのハッシュも受け入れ、旧版からの更新と利用者の編集を区別する。オプションを省略すると共通指示は変更しないため、配置済みguideとの不一致が残り、後の自動更新・解除を拒否する場合がある。登録途中の失敗ではMCP・hookと同様に指示ファイルも復旧対象にする。
 
 検証は実exe・stdio・hook・登録スクリプトを別プロセスで動かし、外部JSONレポートへ結果を残す。latest導入のE2Eは検証用アーカイブと実GitHubの確認を区別する。Codex自身のhook読込・置換・承認は別途実ホストで確認する。[検証手順](docs/verification.md)を参照する。
