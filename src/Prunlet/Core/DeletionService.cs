@@ -1,0 +1,279 @@
+using System.Security.Cryptography;
+using System.Text.Json;
+
+namespace Prunlet.Core;
+
+public sealed class DeletionService
+{
+    private readonly PrunletConfig config;
+
+    public DeletionService(PrunletConfig config)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        config.Validate();
+        this.config = new PrunletConfig
+        {
+            Schema = config.Schema,
+            AllowedRoots = config.AllowedRoots.Select(PathPolicy.Absolute).ToArray(),
+            BackupDirectory = PathPolicy.Absolute(config.BackupDirectory)
+        };
+    }
+
+    public DeleteResult Delete(string[] paths, bool dryRun = false)
+    {
+        config.Validate();
+        ArgumentNullException.ThrowIfNull(paths);
+        if (paths.Length == 0 || paths.Length > 256) throw new ArgumentException("Specify between 1 and 256 files.");
+        var normalized = paths.Select(ValidateTarget).ToArray();
+        if (normalized.Distinct(StringComparer.OrdinalIgnoreCase).Count() != normalized.Length)
+            throw new ArgumentException("Duplicate paths are not allowed.");
+        foreach (var path in normalized) PathPolicy.Inspect(path);
+        var result = new DeleteResult { DryRun = dryRun };
+        if (dryRun)
+        {
+            foreach (var path in normalized) result.Items.Add(CheckOnly(path));
+            return result;
+        }
+
+        using var backupRoot = PathPolicy.PinDirectories(config.BackupDirectory);
+        var operationId = Guid.NewGuid().ToString("N");
+        var directory = Path.Combine(config.BackupDirectory, operationId);
+        NativeFiles.CreateDirectory(directory);
+        using var operationDirectories = PathPolicy.PinDirectories(directory);
+        using var operationLock = NativeFiles.CreateDestination(Path.Combine(directory, "operation.lock"));
+        NativeFiles.Verify(operationLock, Path.Combine(directory, "operation.lock"));
+        result.OperationId = operationId;
+        var manifest = new OperationManifest { OperationId = operationId };
+        var prepared = new List<PreparedFile>();
+        try
+        {
+            for (var i = 0; i < normalized.Length; i++)
+            {
+                var entry = new ManifestEntry { Path = normalized[i] };
+                var item = new FileOperationResult { Path = normalized[i], Status = "failed" };
+                manifest.Items.Add(entry);
+                result.Items.Add(item);
+                try
+                {
+                    var ready = Prepare(normalized[i], BackupPath(directory, i), entry, item);
+                    prepared.Add(ready);
+                    entry.State = "backup_ready";
+                    item.Status = "backup_ready";
+                }
+                catch (FileNotFoundException) { entry.State = item.Status = "already_absent"; }
+                catch (DirectoryNotFoundException) { entry.State = item.Status = "already_absent"; }
+                catch (Exception ex) when (IsOperational(ex)) { entry.State = "failed"; item.Error = ex.Message; }
+            }
+            try { WriteNewJson(Path.Combine(directory, "manifest.json"), manifest); }
+            catch (Exception ex) when (IsOperational(ex))
+            {
+                foreach (var ready in prepared)
+                {
+                    ready.Item.Status = "failed";
+                    ready.Item.Error = $"No deletion was attempted because manifest persistence failed: {ex.Message}";
+                }
+                return result;
+            }
+            foreach (var ready in prepared)
+            {
+                try
+                {
+                    NativeFiles.Verify(ready.Source.SafeFileHandle, ready.Entry.Path);
+                    NativeFiles.DeleteHandle(ready.Source.SafeFileHandle);
+                    // DELETE_PENDING は最後のハンドルを閉じた時点で反映される。
+                    ready.Source.Dispose();
+                    ready.Item.Status = "deleted";
+                }
+                catch (Exception ex) when (IsOperational(ex))
+                {
+                    ready.Item.Status = "failed";
+                    ready.Item.Error = ex.Message;
+                }
+            }
+            TryWriteResult(Path.Combine(directory, "delete-result.json"), result, result.Warnings);
+            return result;
+        }
+        finally { foreach (var ready in prepared) ready.Dispose(); }
+    }
+
+    public RestoreResult Restore(string operationId)
+    {
+        config.Validate();
+        if (!Guid.TryParseExact(operationId, "N", out var id) || id.ToString("N") != operationId)
+            throw new ArgumentException("Operation ID must be a lowercase 32-character GUID.");
+        var directory = Path.Combine(config.BackupDirectory, operationId);
+        using var directories = PathPolicy.PinDirectories(directory);
+        using var operationLock = NativeFiles.OpenLock(Path.Combine(directory, "operation.lock"));
+        NativeFiles.Verify(operationLock, Path.Combine(directory, "operation.lock"));
+        var manifestPath = Path.Combine(directory, "manifest.json");
+        using var manifestHandle = NativeFiles.OpenBackup(manifestPath);
+        NativeFiles.Verify(manifestHandle, manifestPath);
+        using var manifestStream = new FileStream(manifestHandle, FileAccess.Read);
+        if (manifestStream.Length > 8 * 1024 * 1024) throw new InvalidDataException("Manifest is too large.");
+        var manifest = JsonSerializer.Deserialize<OperationManifest>(manifestStream, PrunletConfig.JsonOptions)
+            ?? throw new InvalidDataException("Manifest is empty.");
+        ValidateManifest(manifest, operationId);
+        var result = new RestoreResult { OperationId = operationId };
+        for (var i = 0; i < manifest.Items.Count; i++)
+        {
+            var entry = manifest.Items[i];
+            var item = new FileOperationResult { Path = entry.Path, Status = "not_backed_up" };
+            result.Items.Add(item);
+            if (entry.State != "backup_ready") continue;
+            item.BackupPath = BackupPath(directory, i);
+            item.Sha256 = entry.Sha256;
+            item.Size = entry.Size;
+            try { RestoreOne(entry, item); }
+            catch (Exception ex) when (IsOperational(ex)) { item.Status = "failed"; item.Error = ex.Message; }
+        }
+        TryWriteResult(Path.Combine(directory, $"restore-result-{Guid.NewGuid():N}.json"), result, result.Warnings);
+        return result;
+    }
+
+    private string ValidateTarget(string path)
+    {
+        var normalized = PathPolicy.Absolute(path);
+        if (!config.AllowedRoots.Any(root => PathPolicy.Within(normalized, root)))
+            throw new ArgumentException($"Path is outside configured allowed roots: {normalized}");
+        return normalized;
+    }
+
+    private static FileOperationResult CheckOnly(string path)
+    {
+        var item = new FileOperationResult { Path = path };
+        try
+        {
+            using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(path)!);
+            using var handle = NativeFiles.OpenBackup(path);
+            NativeFiles.Verify(handle, path);
+            NativeFiles.RejectNamedStreams(path);
+            using var stream = new FileStream(handle, FileAccess.Read);
+            item.Size = stream.Length;
+            item.Status = "would_delete";
+        }
+        catch (FileNotFoundException) { item.Status = "already_absent"; }
+        catch (DirectoryNotFoundException) { item.Status = "already_absent"; }
+        catch (Exception ex) when (IsOperational(ex)) { item.Status = "failed"; item.Error = ex.Message; }
+        return item;
+    }
+
+    private static PreparedFile Prepare(string path, string backupPath, ManifestEntry entry, FileOperationResult item)
+    {
+        var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(path)!);
+        FileStream? source = null, backup = null;
+        try
+        {
+            var sourceHandle = NativeFiles.OpenSource(path);
+            try { NativeFiles.Verify(sourceHandle, path); source = new FileStream(sourceHandle, FileAccess.Read); }
+            catch { sourceHandle.Dispose(); throw; }
+            NativeFiles.RejectNamedStreams(path);
+            var backupHandle = NativeFiles.CreateDestination(backupPath);
+            try { NativeFiles.Verify(backupHandle, backupPath); backup = new FileStream(backupHandle, FileAccess.ReadWrite); }
+            catch { backupHandle.Dispose(); throw; }
+            entry.Size = source.Length;
+            entry.LastWriteUtc = File.GetLastWriteTimeUtc(path);
+            using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = new byte[128 * 1024];
+            int count;
+            while ((count = source.Read(buffer)) != 0)
+            {
+                backup.Write(buffer, 0, count);
+                digest.AppendData(buffer, 0, count);
+            }
+            backup.Flush(true);
+            entry.Sha256 = Convert.ToHexString(digest.GetHashAndReset()).ToLowerInvariant();
+            backup.Position = 0;
+            var backupHash = Convert.ToHexString(SHA256.HashData(backup)).ToLowerInvariant();
+            if (entry.Sha256 != backupHash || backup.Length != entry.Size)
+                throw new IOException("Backup size/hash verification failed. Source was not deleted.");
+            item.BackupPath = backupPath;
+            item.Sha256 = entry.Sha256;
+            item.Size = entry.Size;
+            return new PreparedFile(parents, source, backup, entry, item);
+        }
+        catch { backup?.Dispose(); source?.Dispose(); parents.Dispose(); throw; }
+    }
+
+    private void ValidateManifest(OperationManifest manifest, string operationId)
+    {
+        if (manifest.Schema != 1 || manifest.OperationId != operationId || manifest.Items is null
+            || manifest.Items.Count is 0 or > 256)
+            throw new InvalidDataException("Manifest schema, ID, or item count is invalid.");
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in manifest.Items)
+        {
+            if (entry is null) throw new InvalidDataException("Manifest contains a null entry.");
+            var normalized = ValidateTarget(entry.Path);
+            if (normalized != entry.Path || !seen.Add(normalized)) throw new InvalidDataException("Manifest path is not canonical or duplicated.");
+            if (entry.State is not ("backup_ready" or "already_absent" or "failed")) throw new InvalidDataException("Invalid manifest state.");
+            if (entry.State == "backup_ready" && (entry.Size is null or < 0 || entry.Sha256 is null
+                || entry.Sha256.Length != 64 || !entry.Sha256.All(char.IsAsciiHexDigit)))
+                throw new InvalidDataException("Manifest hash or size is invalid.");
+        }
+    }
+
+    private static void RestoreOne(ManifestEntry entry, FileOperationResult item)
+    {
+        using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(entry.Path)!);
+        using var backupHandle = NativeFiles.OpenBackup(item.BackupPath!);
+        NativeFiles.Verify(backupHandle, item.BackupPath!);
+        using var backup = new FileStream(backupHandle, FileAccess.Read);
+        var digest = Convert.ToHexString(SHA256.HashData(backup)).ToLowerInvariant();
+        if (backup.Length != entry.Size || !digest.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Backup hash or size differs from the manifest.");
+        backup.Position = 0;
+        if (Path.Exists(entry.Path)) { item.Status = "conflict"; item.Error = "Original path already exists; nothing was overwritten."; return; }
+        Microsoft.Win32.SafeHandles.SafeFileHandle destinationHandle;
+        try { destinationHandle = NativeFiles.CreateDestination(entry.Path); }
+        catch (IOException) when (Path.Exists(entry.Path)) { item.Status = "conflict"; item.Error = "Original path was concurrently created; nothing was overwritten."; return; }
+        using (destinationHandle)
+        using (var destination = new FileStream(destinationHandle, FileAccess.ReadWrite))
+        {
+            try
+            {
+                NativeFiles.Verify(destinationHandle, entry.Path);
+                backup.CopyTo(destination);
+                destination.Flush(true);
+                destination.Position = 0;
+                if (!Convert.ToHexString(SHA256.HashData(destination)).Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("Restored file hash verification failed.");
+                if (entry.LastWriteUtc.HasValue) File.SetLastWriteTimeUtc(entry.Path, entry.LastWriteUtc.Value);
+                item.Status = "restored";
+            }
+            catch (Exception original) when (IsOperational(original))
+            {
+                try { NativeFiles.DeleteHandle(destinationHandle); }
+                catch (Exception cleanup) when (IsOperational(cleanup))
+                { throw new IOException($"{original.Message} Partial restored file could not be removed: {cleanup.Message}", original); }
+                throw;
+            }
+        }
+    }
+
+    private static string BackupPath(string directory, int index) => Path.Combine(directory, $"{index:D4}.bak");
+
+    private static void WriteNewJson<T>(string path, T value)
+    {
+        using var handle = NativeFiles.CreateDestination(path);
+        NativeFiles.Verify(handle, path);
+        using var stream = new FileStream(handle, FileAccess.ReadWrite);
+        JsonSerializer.Serialize(stream, value, PrunletConfig.JsonOptions);
+        stream.Flush(true);
+    }
+
+    private static void TryWriteResult<T>(string path, T value, List<string> warnings)
+    {
+        try { WriteNewJson(path, value); }
+        catch (Exception ex) when (IsOperational(ex)) { warnings.Add($"Outcome record could not be persisted: {ex.Message}. Backups remain available."); }
+    }
+
+    private static bool IsOperational(Exception ex) => ex is IOException or UnauthorizedAccessException or ArgumentException or System.Security.SecurityException;
+
+    private sealed class PreparedFile(DirectoryLease parents, FileStream source, FileStream backup, ManifestEntry entry, FileOperationResult item) : IDisposable
+    {
+        internal FileStream Source { get; } = source;
+        internal ManifestEntry Entry { get; } = entry;
+        internal FileOperationResult Item { get; } = item;
+        public void Dispose() { backup.Dispose(); Source.Dispose(); parents.Dispose(); }
+    }
+}

@@ -1,0 +1,184 @@
+using System.Text.Json;
+using Prunlet.Core;
+
+namespace Prunlet.Protocol;
+
+internal sealed class McpServer(DeletionService service, Func<object> listOperations)
+{
+    private bool initialized;
+    private bool ready;
+    private static readonly string[] SupportedVersions = ["2025-11-25", "2025-06-18", "2024-11-05"];
+
+    public async Task RunAsync(TextReader input, TextWriter output)
+    {
+        while (await input.ReadLineAsync() is { } line)
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            JsonElement? id = null;
+            object response;
+            try
+            {
+                if (line.Length > 1_048_576) throw new RpcException(-32600, "Request exceeds 1 MiB.");
+                using var document = JsonDocument.Parse(line);
+                var request = document.RootElement;
+                if (request.ValueKind != JsonValueKind.Object) throw new RpcException(-32600, "Expected a JSON-RPC object.");
+                if (request.TryGetProperty("id", out var requestId))
+                {
+                    if (requestId.ValueKind is not JsonValueKind.String and not JsonValueKind.Number)
+                        throw new RpcException(-32600, "Request id must be a string or number.");
+                    id = requestId.Clone();
+                }
+                if (!request.TryGetProperty("jsonrpc", out var rpc) || rpc.GetString() != "2.0" ||
+                    !request.TryGetProperty("method", out var methodElement) || methodElement.ValueKind != JsonValueKind.String)
+                    throw new RpcException(-32600, "Invalid JSON-RPC request.");
+                var method = methodElement.GetString()!;
+                if (id is null)
+                {
+                    // tools/callをnotificationとして受けても副作用を起こさない。
+                    if (method == "notifications/initialized" && initialized) ready = true;
+                    continue;
+                }
+                var parameters = request.TryGetProperty("params", out var p) ? p : default;
+                var result = Dispatch(method, parameters);
+                response = new { jsonrpc = "2.0", id, result };
+            }
+            catch (JsonException)
+            {
+                response = Error(id, -32700, "Invalid JSON.");
+            }
+            catch (RpcException ex)
+            {
+                response = Error(id, ex.Code, ex.Message);
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
+            {
+                response = Error(id, -32603, ex.Message);
+            }
+            await output.WriteLineAsync(JsonSerializer.Serialize(response, Program.JsonOptions));
+            await output.FlushAsync();
+        }
+    }
+
+    private object Dispatch(string method, JsonElement parameters)
+    {
+        if (method == "ping") return new { };
+        if (method == "initialize")
+        {
+            if (initialized) throw new RpcException(-32600, "Already initialized.");
+            var requestedVersion = StringProperty(parameters, "protocolVersion");
+            initialized = true;
+            return new
+            {
+                protocolVersion = SupportedVersions.Contains(requestedVersion) ? requestedVersion : SupportedVersions[0],
+                capabilities = new { tools = new { listChanged = false } },
+                serverInfo = new { name = "prunlet", title = "Prunlet", version = "development" },
+                instructions = "Use delete_files for authorized Windows file deletion within configured roots. Prunlet verifies recovery copies before deleting files. Use restore_files with the returned operationId to recover files. Use dryRun to inspect targets. Directories, recursion, wildcards and links are unsupported. Existing host approvals and policies still apply."
+            };
+        }
+        if (!ready) throw new RpcException(-32600, "Initialize and send notifications/initialized first.");
+        return method switch
+        {
+            "tools/list" => new { tools = Tools() },
+            "tools/call" => CallTool(parameters),
+            _ => throw new RpcException(-32601, $"Unknown method: {method}")
+        };
+    }
+
+    private object CallTool(JsonElement parameters)
+    {
+        var name = StringProperty(parameters, "name");
+        var args = parameters.TryGetProperty("arguments", out var a) ? a : JsonSerializer.SerializeToElement(new { });
+        if (args.ValueKind != JsonValueKind.Object) throw new RpcException(-32602, "Arguments must be an object.");
+        if (name is not "delete_files" and not "restore_files" and not "list_operations")
+            throw new RpcException(-32602, $"Unknown tool: {name}");
+        object result;
+        try
+        {
+            switch (name)
+            {
+                case "delete_files":
+                    RejectExtraProperties(args, "paths", "dryRun");
+                    if (!args.TryGetProperty("paths", out var paths) || paths.ValueKind != JsonValueKind.Array || paths.GetArrayLength() == 0 || paths.GetArrayLength() > 256)
+                        throw new RpcException(-32602, "Paths must contain 1 to 256 strings.");
+                    if (paths.EnumerateArray().Any(path => path.ValueKind != JsonValueKind.String))
+                        throw new RpcException(-32602, "Each path must be a string.");
+                    if (args.TryGetProperty("dryRun", out var dryRun) && dryRun.ValueKind is not JsonValueKind.True and not JsonValueKind.False)
+                        throw new RpcException(-32602, "DryRun must be boolean.");
+                    result = service.Delete(paths.EnumerateArray().Select(path => path.GetString()!).ToArray(), dryRun.ValueKind == JsonValueKind.True);
+                    break;
+                case "restore_files":
+                    RejectExtraProperties(args, "operationId");
+                    result = service.Restore(StringProperty(args, "operationId"));
+                    break;
+                default:
+                    RejectExtraProperties(args);
+                    result = listOperations();
+                    break;
+            }
+        }
+        catch (RpcException) { throw; }
+        catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
+        {
+            return new { content = new[] { new { type = "text", text = ex.Message } }, isError = true };
+        }
+        return new
+        {
+            content = new[] { new { type = "text", text = JsonSerializer.Serialize(result, Program.JsonOptions) } },
+            structuredContent = result,
+            isError = Program.HasErrors(result)
+        };
+    }
+
+    private static object[] Tools() =>
+    [
+        new
+        {
+            name = "delete_files", title = "Delete files with recovery copies",
+            description = "Delete authorized absolute Windows file paths within configured roots after making verified recovery copies. Does not expand wildcards or delete directories/links.",
+            inputSchema = new
+            {
+                type = "object", properties = new
+                {
+                    paths = new { type = "array", items = new { type = "string" }, minItems = 1, maxItems = 256 },
+                    dryRun = new { type = "boolean", description = "Inspect without changing files." }
+                },
+                required = new[] { "paths" }, additionalProperties = false
+            },
+            annotations = new { readOnlyHint = false, destructiveHint = true, idempotentHint = false, openWorldHint = false }
+        },
+        new
+        {
+            name = "restore_files", title = "Restore a deletion operation",
+            description = "Restore verified recovery copies by operationId; never overwrite existing destination files.",
+            inputSchema = new
+            {
+                type = "object", properties = new { operationId = new { type = "string" } },
+                required = new[] { "operationId" }, additionalProperties = false
+            },
+            annotations = new { readOnlyHint = false, destructiveHint = false, idempotentHint = false, openWorldHint = false }
+        },
+        new
+        {
+            name = "list_operations", title = "List recovery operations",
+            description = "List operation ids available in the configured recovery directory.",
+            inputSchema = new { type = "object", properties = new { }, additionalProperties = false },
+            annotations = new { readOnlyHint = true, destructiveHint = false, idempotentHint = true, openWorldHint = false }
+        }
+    ];
+
+    private static string StringProperty(JsonElement value, string name)
+    {
+        if (value.ValueKind != JsonValueKind.Object || !value.TryGetProperty(name, out var item) || item.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(item.GetString()))
+            throw new RpcException(-32602, $"Missing or invalid string: {name}");
+        return item.GetString()!;
+    }
+
+    private static void RejectExtraProperties(JsonElement args, params string[] allowed)
+    {
+        if (args.EnumerateObject().Any(p => !allowed.Contains(p.Name, StringComparer.Ordinal)))
+            throw new RpcException(-32602, "Unknown argument property.");
+    }
+
+    private static object Error(JsonElement? id, int code, string message) => new { jsonrpc = "2.0", id, error = new { code, message } };
+    private sealed class RpcException(int code, string message) : Exception(message) { public int Code { get; } = code; }
+}
