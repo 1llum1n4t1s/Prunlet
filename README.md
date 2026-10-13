@@ -1,6 +1,6 @@
 # Prunlet
 
-Windowsのファイル削除をCLI・MCP・Codexフックから利用するツールです。指定した範囲のファイルを検証済みバックアップへ保存してから削除し、操作IDを使って復元できます。提供元はKagayoiです。
+Windowsのファイル削除をCLI・MCPから利用するツールです。指定した範囲のファイルを検証済みバックアップへ保存してから削除し、操作IDを使って復元できます。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
 
 初版はファイルのみを扱います。フォルダー・再帰削除・ワイルドカード・リンク・ネットワークパスは扱いません。通常の削除であり、ディスク上のデータを復元不能にする消去機能はありません。
 
@@ -26,6 +26,8 @@ pwsh -NoProfile -File $installer -AllowedRoot 'C:\work\project' -RegisterCodex -
 
 既定の配置先は`%USERPROFILE%\.local\Prunlet`です。`bin\prunlet.exe`と登録用スクリプト・共通指示を配置し、`source-info.json`に取得元・ブランチ・コミットを記録します。`-RegisterCodex`を指定すると共通MCPとネイティブexeのフックも登録します。起動時にダウンロードやビルドは行いません。
 
+`-RegisterCodex`を指定した導入・更新後は、Codexで`/hooks`を開いてPrunletフックの定義を確認し、信頼してください。インストーラーは信頼設定を変更せず、結果の`requiresHookTrust`でこの操作が必要なことを通知します。Codexを再起動し、MCP・共通指示・フックの読込みを確認してください。登録と解除の詳細は[連携手順](docs/integration.md#登録)を参照してください。
+
 上の`-RegisterAgentInstructions`は、Codex homeの`PRUNLET.md`と、共通`AGENTS.md`の専用参照・配置済みexeと設定の絶対パスを登録する明示オプションです。各リポジトリへ追記せず、最初からCMD上のPrunlet CLIで削除するようCodexへ指示します。exe・設定のパス自体をCMDで安全に表現できない場合は、実行前に同じCoreを使うMCPを選びます。共通指示を変更したくない場合はこのオプションを外してください。
 
 共通指示を登録した導入の更新でも、同じ`-RegisterAgentInstructions`を指定してください。指定しない更新では共通指示に書き込みません。古い共通指示と新しい配置済みguideが異なる場合は、利用者の編集との区別を付けられないため自動更新・解除を拒否します。
@@ -50,7 +52,7 @@ $exe = Join-Path $env:USERPROFILE '.local\Prunlet\bin\prunlet.exe'
 & $exe --config $config init --allowed-root 'C:\work\project' --backup-directory $backup
 ```
 
-インストーラーを利用した場合は初期化済みです。手動の`init`も既存設定を上書きしません。許可範囲を追加するときは`--allowed-root`を繰り返します。MCPの引数から範囲を拡張することはできません。
+インストーラーを利用した場合は初期化済みです。手動の`init`も既存設定を上書きしません。初期化時に複数の許可範囲を指定するときは`--allowed-root`を繰り返します。MCPの引数から範囲を拡張することはできません。
 
 ```json
 {

@@ -10,7 +10,7 @@ PrunletはWindowsの通常ファイルを、検証済みの復元用コピーを
 | `Core/PrunletConfig.cs` | schema 1の設定と操作記録の型、許可ルートとバックアップ先の検証 |
 | `Core/PathPolicy.cs` | ローカル絶対パスの正規化、範囲判定、リンク検査、祖先ディレクトリのハンドル保持 |
 | `Core/NativeFiles.cs` | Win32による排他的作成、共有制限付きオープン、ハンドル実体・case-sensitive属性・ADS検査、ハンドルを使った削除 |
-| `Core/DeletionService.cs` | CLIとMCP共通の削除・復元処理、CLIの明示purge、SHA-256検証、永続記録 |
+| `Core/DeletionService.cs` / `Core/DeletionService.Purge.cs` | CLIとMCP共通の削除・復元処理、CLIの明示purge、SHA-256検証、永続記録 |
 | `Protocol/McpServer.cs` | 改行区切りJSON-RPC、初期化、3つのツールと引数検査。許可範囲を入力から拡張しない |
 | `Protocol/HookRouter.cs` | exeだけで入力を検査し、直接削除を拒否してCLI手順を案内。削除・自動置換は行わない |
 | `integration/install-codex.ps1` / `uninstall-codex.ps1` / `configuration-common.ps1` | 他設定を保持したMCP・フック登録と解除、更新前バックアップ、所有マーカーと競合の検査 |
@@ -39,7 +39,7 @@ intent保存後の操作は復元を拒否する。有効なintentを持つ中�
 
 purgeのintentと結果は、操作ディレクトリ外のバックアップルートに`purge-pending-<operationId>-<random>.json`を排他的に作成し、今回作成したファイルの削除権限付きハンドルを保持して書く。シリアライズ・厳格な検証・`Flush(true)`の後、`FileRenameInfo`（情報クラス3）で既存ファイルを上書きせず最終名へ原子的に公開し、公開先の実体を検証して再度`Flush(true)`を行う。
 
-書込み例外では保持したハンドルで非公開draftを清掃する。プロセスの強制終了ではバックアップルートにdraftが残る場合があるが、操作ディレクトリの構成要素に含まれず、有効なintentからの再開を妨げない。未知のdraftは自動清掃しない。実プロセス強制終了とflush障害の注入による確認は未検証であり、原子的な公開と永続化の確認を区別する。
+書込み例外では保持したハンドルで非公開draftを清掃する。プロセスの強制終了ではバックアップルートにdraftが残る場合があるが、操作ディレクトリの構成要素に含まれず、有効なintentからの再開を妨げない。未知のdraftは自動清掃しない。
 
 ## 不変条件と設計判断
 
@@ -56,6 +56,8 @@ purgeのintentと結果は、操作ディレクトリ外のバックアップル
 インストーラーはGitHubの既定ブランチ最新HEADを解決し、そのSHAのアーカイブを検査・ビルドして配置する。ローカルクローンへのフォールバックはしない。`source-info.json`に取得元・ブランチ・SHAとアーカイブ・exeのハッシュを記録する。更新対象の製品ファイルを検証済みバックアップへ保全し、既存設定と復元データを保持する。失敗時は変更済み製品と登録設定の復旧を試み、復旧失敗時は保存先を報告する。
 
 登録・解除は所有部分だけを変更する。既存の同名登録、明示的なhook無効化、変更対象のTOMLを安全に扱えない構文は自動更新を拒否する。設定保持を優先するため、手動登録が必要な場合がある。
+
+hookの起動はシステムの`cmd.exe /d /c call`を明示し、Codexが引き継ぐ既定shellに依存せずネイティブexeへ到達させる。CMD・PowerShellの展開文字を含む登録パスは書込み前に拒否する。既知の旧起動経路は所有handlerの内容が一致する場合だけ移行し、利用者の編集や他handlerを保持する。登録はhookの信頼を付与せず、`requiresHookTrust`で利用者の確認が必要なことを通知する。具体的な登録コマンドと信頼操作は[連携手順](docs/integration.md#登録)を参照する。
 
 `-RegisterAgentInstructions`は`-RegisterCodex`と併用し、共通AGENTSから専用の`PRUNLET.md`を読む経路と配置済みexe・設定の絶対パスを明示登録する。初回からCMDのCLIを選ぶ指示であり、exe・設定をCMDで安全に表現できない場合は事前に同じCoreのMCPを選ぶ。登録・解除は管理マーカー・参照ブロック・guideのハッシュで所有範囲を限定し、既存本文と利用者の編集を保護する。旧MCP優先ブロックの移行は既知の正確な内容・ハッシュに一致する場合だけ行う。オプションを省略すると共通指示は変更しない。登録途中の失敗ではMCP・hookと同様に指示ファイルも復旧対象にする。
 
