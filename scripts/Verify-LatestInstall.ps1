@@ -349,32 +349,124 @@ try {
         & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $legacyInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $legacyCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'legacy-instruction-repeat-work') | Out-Null
         Assert-True ((Get-FileHash -LiteralPath $legacyAgents).Hash -eq $before) 'Migrated instructions were not idempotent.'
     }
-    Test-Case 'Native hook replaces exact legacy command and preserves unrelated handlers' {
-        $migrationCodex = Join-Path $OutputDirectory 'native-hook-migration-codex'
-        New-Item -ItemType Directory -Path $migrationCodex | Out-Null
-        $migrationHooks = Join-Path $migrationCodex 'hooks.json'
+    Test-Case 'Explicit CMD hook migrates three owned routes and preserves unrelated handlers' {
         $exePath = Join-Path $instructionInstall 'bin\prunlet.exe'
         $cfgPath = Join-Path $instructionInstall 'config.json'
         $oldHelper = Join-Path $instructionInstall 'bin\codex-pretooluse.ps1'
-        $legacyCommand = 'call "' + $exePath + '" --config "' + $cfgPath + '" hook --hook-script "' + $oldHelper + '"'
         $nativeCommand = 'call "' + $exePath + '" --config "' + $cfgPath + '" hook'
-        $unrelated = @{ matcher = 'Bash'; hooks = @(@{ type = 'command'; command = 'echo keep-user-hook' }) }
-        $document = @{ userValue = 'keep'; hooks = @{ PreToolUse = @(@{ matcher = '^(Bash|exec_command|functions\.exec_command)$'; hooks = @(@{ type = 'command'; timeout = 10; statusMessage = 'Prunlet: protected literal deletion'; command = $legacyCommand }) }, $unrelated) } }
-        [IO.File]::WriteAllText($migrationHooks, ($document | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
-        $registration = @{ ExecutablePath = $exePath; ConfigPath = $cfgPath; CodexHome = $migrationCodex; BackupDirectory = $instructionBackup }
-        & (Join-Path $instructionInstall 'bin\install-codex.ps1') @registration | Out-Null
-        $migrated = [IO.File]::ReadAllText($migrationHooks) | ConvertFrom-Json
-        Assert-True ($migrated.hooks.PreToolUse[0].hooks[0].command -ceq $nativeCommand) 'Legacy backend command did not migrate.'
-        Assert-True ($migrated.userValue -ceq 'keep' -and $migrated.hooks.PreToolUse[1].hooks[0].command -ceq 'echo keep-user-hook') 'Migration altered an unrelated handler.'
-        $before = (Get-FileHash -LiteralPath $migrationHooks).Hash
-        & (Join-Path $instructionInstall 'bin\install-codex.ps1') @registration | Out-Null
-        Assert-True ((Get-FileHash -LiteralPath $migrationHooks).Hash -eq $before) 'Native hook registration was not idempotent.'
-        # 管理handlerに利用者が追加した変更を自動移行で上書きしない。
-        $migrated.hooks.PreToolUse[0].hooks[0].timeout = 11
-        [IO.File]::WriteAllText($migrationHooks, ($migrated | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
-        $edited = (Get-FileHash -LiteralPath $migrationHooks).Hash
-        Expect-Failure { & (Join-Path $instructionInstall 'bin\install-codex.ps1') @registration } 'was edited'
-        Assert-True ((Get-FileHash -LiteralPath $migrationHooks).Hash -eq $edited) 'Edited handler was changed.'
+        $cmdPath = Join-Path ([Environment]::GetFolderPath('System')) 'cmd.exe'
+        $expectedCommand = $cmdPath + ' /d /c ' + $nativeCommand
+        $legacyCommands = @($nativeCommand, ($nativeCommand + ' --hook-script "' + $oldHelper + '"'), ('pwsh -NoProfile -NonInteractive -File "' + $oldHelper + '" -ExecutablePath "' + $exePath + '" -ConfigPath "' + $cfgPath + '"'))
+        $route = 0
+        foreach ($legacyCommand in $legacyCommands) {
+            $migrationCodex = Join-Path $OutputDirectory ('native-hook-migration-codex-' + $route++)
+            New-Item -ItemType Directory -Path $migrationCodex | Out-Null
+            $migrationHooks = Join-Path $migrationCodex 'hooks.json'
+            $unrelated = @{ matcher = 'Bash'; hooks = @(@{ type = 'command'; command = 'echo keep-user-hook' }) }
+            $document = @{ userValue = 'keep'; hooks = @{ PreToolUse = @(@{ matcher = '^(Bash|exec_command|functions\.exec_command)$'; hooks = @(@{ type = 'command'; timeout = 10; statusMessage = 'Prunlet: protected literal deletion'; command = $legacyCommand }) }, $unrelated) } }
+            [IO.File]::WriteAllText($migrationHooks, ($document | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+            $registration = @{ ExecutablePath = $exePath; ConfigPath = $cfgPath; CodexHome = $migrationCodex; BackupDirectory = $instructionBackup }
+            & (Join-Path $instructionInstall 'bin\install-codex.ps1') @registration | Out-Null
+            $migrated = [IO.File]::ReadAllText($migrationHooks) | ConvertFrom-Json
+            Assert-True ($migrated.hooks.PreToolUse[0].hooks[0].command -ceq $expectedCommand) 'Owned route did not migrate to explicit CMD entry.'
+            Assert-True ($migrated.userValue -ceq 'keep' -and $migrated.hooks.PreToolUse[1].hooks[0].command -ceq 'echo keep-user-hook') 'Migration altered an unrelated handler.'
+            $before = (Get-FileHash -LiteralPath $migrationHooks).Hash
+            & (Join-Path $instructionInstall 'bin\install-codex.ps1') @registration | Out-Null
+            Assert-True ((Get-FileHash -LiteralPath $migrationHooks).Hash -eq $before) 'Explicit CMD registration was not idempotent.'
+            $unchanged = [IO.File]::ReadAllText($migrationHooks)
+            foreach ($kind in @('timeout', 'type', 'matcher')) {
+                $migrated = $unchanged | ConvertFrom-Json
+                switch ($kind) {
+                    'timeout' { $migrated.hooks.PreToolUse[0].hooks[0].timeout = 11 }
+                    'type' { $migrated.hooks.PreToolUse[0].hooks[0].type = 'user-edited' }
+                    'matcher' { $migrated.hooks.PreToolUse[0].matcher = 'user-edited' }
+                }
+                [IO.File]::WriteAllText($migrationHooks, ($migrated | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+                $edited = (Get-FileHash -LiteralPath $migrationHooks).Hash
+                Expect-Failure { & (Join-Path $instructionInstall 'bin\install-codex.ps1') @registration } 'was edited'
+                Assert-True ((Get-FileHash -LiteralPath $migrationHooks).Hash -eq $edited) 'Edited handler was changed.'
+            }
+        }
+    }
+    Test-Case 'Hook registration rejects PowerShell expansion paths before changing Codex files' {
+        $specialRoot = Join-Path $OutputDirectory 'hook-expansion-paths'
+        New-Item -ItemType Directory -Path $specialRoot | Out-Null
+        foreach ($configName in @('config$dollar.json', 'config`tick.json')) {
+            $specialConfig = Join-Path $specialRoot $configName
+            Copy-Item -LiteralPath (Join-Path $instructionInstall 'config.json') -Destination $specialConfig
+            $specialHome = Join-Path $specialRoot ($configName + '-home')
+            New-Item -ItemType Directory -Path $specialHome | Out-Null
+            [IO.File]::WriteAllText((Join-Path $specialHome 'config.toml'), "# User-owned configuration`r`n[features]`r`nhooks = true`r`n", [Text.UTF8Encoding]::new($true))
+            [IO.File]::WriteAllText((Join-Path $specialHome 'hooks.json'), '{"userValue":"preserve","hooks":{"PreToolUse":[]}}', [Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText((Join-Path $specialHome 'AGENTS.md'), $originalAgentText, [Text.UTF8Encoding]::new($true))
+            $before = @{}
+            Get-ChildItem -LiteralPath $specialHome -File | ForEach-Object { $before[$_.FullName] = (Get-FileHash -LiteralPath $_.FullName).Hash }
+            Expect-Failure { & (Join-Path $instructionInstall 'bin\install-codex.ps1') -ExecutablePath (Join-Path $instructionInstall 'bin\prunlet.exe') -ConfigPath $specialConfig -CodexHome $specialHome -BackupDirectory $instructionBackup } 'expansion characters'
+            Assert-True (@(Get-ChildItem -LiteralPath $specialHome -File).Count -eq $before.Count) 'Rejected hook registration added Codex files.'
+            foreach ($file in $before.Keys) { Assert-True ((Get-FileHash -LiteralPath $file).Hash -eq $before[$file]) 'Rejected expansion path changed Codex bytes.' }
+        }
+    }
+    Test-Case 'Registered hook starts from inherited PowerShell and CMD and denies raw deletion' {
+        $hooks = [IO.File]::ReadAllText((Join-Path $instructionCodex 'hooks.json')) | ConvertFrom-Json
+        $registeredCommand = @($hooks.hooks.PreToolUse | ForEach-Object { $_.hooks } | Where-Object { $_.statusMessage -eq 'Prunlet: protected literal deletion' })[0].command
+        # 空白配置も手書きcommandではなく、本物の登録builderを通す。
+        $spaceProduct = Join-Path $OutputDirectory 'runtime space'
+        $spaceCodex = Join-Path $OutputDirectory 'space-hook-codex'
+        New-Item -ItemType Directory -Path $spaceProduct, $spaceCodex | Out-Null
+        $spaceExe = Join-Path $spaceProduct 'prunlet.exe'
+        $spaceConfig = Join-Path $spaceProduct 'config space.json'
+        Copy-Item -LiteralPath (Join-Path $instructionInstall 'bin\prunlet.exe') -Destination $spaceExe
+        Copy-Item -LiteralPath (Join-Path $instructionInstall 'config.json') -Destination $spaceConfig
+        & (Join-Path $instructionInstall 'bin\install-codex.ps1') -ExecutablePath $spaceExe -ConfigPath $spaceConfig -CodexHome $spaceCodex -BackupDirectory $instructionBackup | Out-Null
+        $spaceHooks = [IO.File]::ReadAllText((Join-Path $spaceCodex 'hooks.json')) | ConvertFrom-Json
+        $spaceCommand = @($spaceHooks.hooks.PreToolUse | ForEach-Object { $_.hooks } | Where-Object { $_.statusMessage -eq 'Prunlet: protected literal deletion' })[0].command
+        $spaceExpected = (Join-Path ([Environment]::GetFolderPath('System')) 'cmd.exe') + ' /d /c call "' + $spaceExe + '" --config "' + $spaceConfig + '" hook'
+        Assert-True ($spaceCommand -ceq $spaceExpected) 'Space-path registration did not quote the installed exe and config exactly.'
+        $launchVariants = @(@{ name = 'standard'; command = $registeredCommand }, @{ name = 'spaces'; command = $spaceCommand })
+        $sentinel = Join-Path $allowed 'registered-hook-sentinel.txt'
+        [IO.File]::WriteAllText($sentinel, 'Hook must not execute deletion.', [Text.UTF8Encoding]::new($false))
+        $sentinelHash = (Get-FileHash -LiteralPath $sentinel).Hash
+        $cmdPath = Join-Path ([Environment]::GetFolderPath('System')) 'cmd.exe'
+        $powerShellPath = (Get-Process -Id $PID).Path
+        foreach ($variant in $launchVariants) {
+            $registeredCommand = $variant.command
+            foreach ($shell in @('PowerShell', 'CMD')) {
+                foreach ($command in @(('del "' + $sentinel + '"'), 'echo harmless')) {
+                    $event = @{ hook_event_name = 'PreToolUse'; tool_name = 'Bash'; tool_input = @{ command = $command } } | ConvertTo-Json -Depth 8 -Compress
+                    $start = [Diagnostics.ProcessStartInfo]::new()
+                    $start.FileName = if ($shell -eq 'CMD') { $cmdPath } else { $powerShellPath }
+                    if ($shell -eq 'CMD') { $start.Arguments = '/d /c "' + $registeredCommand + '"' }
+                    else {
+                        foreach ($argument in @('-NoProfile', '-NonInteractive', '-Command', $registeredCommand)) { $start.ArgumentList.Add($argument) }
+                    }
+                    $start.UseShellExecute = $false
+                    $start.CreateNoWindow = $true
+                    $start.RedirectStandardInput = $true
+                    $start.RedirectStandardOutput = $true
+                    $start.RedirectStandardError = $true
+                    $start.StandardInputEncoding = [Text.UTF8Encoding]::new($false)
+                    $start.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+                    $start.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+                    $runner = [Diagnostics.Process]::new()
+                    $runner.StartInfo = $start
+                    try {
+                        Assert-True ($runner.Start()) 'Registered hook shell did not start.'
+                        $outputTask = $runner.StandardOutput.ReadToEndAsync()
+                        $errorTask = $runner.StandardError.ReadToEndAsync()
+                        $runner.StandardInput.Write($event)
+                        $runner.StandardInput.Close()
+                        Assert-True ($runner.WaitForExit(10000)) 'Registered hook shell timed out.'
+                        $output = $outputTask.GetAwaiter().GetResult()
+                        $errorText = $errorTask.GetAwaiter().GetResult()
+                        Assert-True ($runner.ExitCode -eq 0) ('Registered hook failed under ' + $variant.name + '/' + $shell + ': ' + $errorText)
+                        $parsed = $output | ConvertFrom-Json -Depth 20
+                        if ($command.StartsWith('del ')) { Assert-True ($parsed.hookSpecificOutput.permissionDecision -eq 'deny' -and !$parsed.hookSpecificOutput.updatedInput) ('Raw deletion was not denied under ' + $shell) }
+                        else { Assert-True (!$parsed.hookSpecificOutput) ('Ordinary command was blocked under ' + $shell) }
+                        Assert-True ((Get-FileHash -LiteralPath $sentinel).Hash -eq $sentinelHash) 'Hook caused a deletion or changed its sentinel.'
+                    } finally { $runner.Dispose() }
+                }
+            }
+        }
     }
     Test-Case 'Instruction registration is idempotent' {
         $agentHash = (Get-FileHash -LiteralPath $instructionAgents).Hash

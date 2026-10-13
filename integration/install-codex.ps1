@@ -20,10 +20,15 @@ if ($prunletConfig.schema -ne 1 -or !$prunletConfig.allowedRoots.Count -or !$pru
 $hooksPath = Join-Path $CodexHome 'hooks.json'
 $tomlPath = Join-Path $CodexHome 'config.toml'
 $hooks = Read-Hooks $hooksPath
-$command = 'call ' + (Quote-CommandArgument $ExecutablePath) + ' --config ' + (Quote-CommandArgument $ConfigPath) + ' hook'
+$nativeCommand = 'call ' + (Quote-CommandArgument $ExecutablePath) + ' --config ' + (Quote-CommandArgument $ConfigPath) + ' hook'
+# hookは環境既定shellを継承するため、CALLを実行するCMDを明示する。
+$cmdPath = Resolve-Absolute (Join-Path ([Environment]::GetFolderPath('System')) 'cmd.exe') 'System CMD'
+$null = Quote-CommandArgument $cmdPath
+if ($cmdPath -match '\s') { throw 'System CMD path requires quoting; explicit hook shell startup needs review.' }
+$command = $cmdPath + ' /d /c ' + $nativeCommand
 $legacyPaths = @((Join-Path ([IO.Path]::GetDirectoryName($ExecutablePath)) 'codex-pretooluse.ps1'))
 if ($HookPath) { $legacyPaths += $HookPath }
-$knownCommands = @($command)
+$knownCommands = @($command, $nativeCommand)
 foreach ($legacyPath in $legacyPaths) {
     $knownCommands += 'call ' + (Quote-CommandArgument $ExecutablePath) + ' --config ' + (Quote-CommandArgument $ConfigPath) + ' hook --hook-script ' + (Quote-CommandArgument $legacyPath)
     $knownCommands += 'pwsh -NoProfile -NonInteractive -File ' + (Quote-CommandArgument $legacyPath) + ' -ExecutablePath ' + (Quote-CommandArgument $ExecutablePath) + ' -ConfigPath ' + (Quote-CommandArgument $ConfigPath)

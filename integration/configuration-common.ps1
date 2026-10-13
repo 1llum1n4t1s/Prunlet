@@ -43,7 +43,7 @@ function Read-Hooks([string]$Path) {
     return $document
 }
 function Quote-CommandArgument([string]$Value) {
-    if ($Value -match '["%!^&|<>\r\n]') { throw 'Hook command paths must not contain quotes, newlines or cmd expansion characters.' }
+    if ($Value -match '["%!^&|<>$`\r\n]') { throw 'Hook command paths must not contain quotes, newlines or cmd/PowerShell expansion characters.' }
     return '"' + $Value + '"'
 }
 function Toml-String([string]$Value) { return ($Value | ConvertTo-Json -Compress) }

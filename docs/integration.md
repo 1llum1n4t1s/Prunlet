@@ -73,7 +73,7 @@ MCP登録の実行内容は次のとおりです。
 
 対応するtool名は`Bash`、`exec_command`、`functions.exec_command`です。入力は`tool_input.command`または`tool_input.cmd`を読みます。対象外toolや削除候補のないshell入力にはexe単体で`{}`を返します。認識した直接削除は理由とPrunlet CLI手順を付けて拒否し、入力の自動置換を行いません。
 
-登録するWindows hookコマンドは`call "<exe>" --config "<config>" hook`です。CodexのWindows command hook runnerのCMDで空白を含むexeパスを扱います。登録パスにCMD再展開文字が含まれる場合は自動登録を拒否します。旧`--hook-script <script>`は互換引数として受理するだけで、PowerShell backendを起動しません。更新で配置済み旧backendを退役させる際は、製品バックアップを保全してCoreによるバックアップ付き削除を使います。
+登録するWindows hookコマンドは`<Systemのcmd.exe絶対パス> /d /c call "<exe>" --config "<config>" hook`です。Codexは環境の既定シェルをフックへ引き継ぐため、CMDを明示して`call`をCMD内で実行します。登録パスにCMD再展開文字やPowerShellの展開文字（ドル記号・バッククォート）が含まれる場合は、書込み前に自動登録を拒否します。旧`--hook-script <script>`は互換引数として受理するだけで、PowerShell backendを起動しません。更新で配置済み旧backendを退役させる際は、製品バックアップを保全してCoreによるバックアップ付き削除を使います。
 
 | 入力 | 結果 |
 | --- | --- |
