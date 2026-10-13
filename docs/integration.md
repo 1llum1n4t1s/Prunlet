@@ -28,20 +28,19 @@ RTKの共通指示と同様、エージェントのツール選択を案内す�
 
 以下は配置済みアプリを手動で設定・登録する場合の手順です。登録スクリプトと`configuration-common.ps1`は同じディレクトリに置きます。PowerShell 7の`pwsh`が必要です。
 
-設定は明示的な許可ルートと削除バックアップ先から初期化します。両ディレクトリは事前に作成してください。既存の設定ファイルは上書きしません。
+設定は復元データの保存先から初期化します。そのディレクトリは事前に作成してください。削除対象フォルダーの事前登録は不要で、既存の設定ファイルは上書きしません。
 
 ```powershell
 $exe = Join-Path $env:USERPROFILE '.local\Prunlet\bin\prunlet.exe'
 $config = Join-Path $env:USERPROFILE '.local\Prunlet\config.json'
-& $exe --config $config init --allowed-root 'C:\work\project' --backup-directory 'D:\PrunletBackup'
+& $exe --config $config init --backup-directory 'D:\PrunletBackup'
 ```
 
-設定の形式は次のとおりです。許可ルートは必要な範囲だけを指定します。
+設定の形式は次のとおりです。ローカルドライブ内の通常ファイルを扱い、復元データ保存先内は通常削除から保護します。旧`allowedRoots`・`--allowed-root`・`-AllowedRoot`は互換用に受理しますが、対象フォルダーを制限しません。
 
 ```json
 {
   "schema": 1,
-  "allowedRoots": ["C:\\work\\project"],
   "backupDirectory": "D:\\PrunletBackup"
 }
 ```
@@ -85,7 +84,7 @@ MCP登録の実行内容は次のとおりです。
 
 フックはstdoutにJSONだけを返し、診断はstderrへ出します。Codexの既存の承認・安全設定・他hookの判定を変更しません。
 
-このhookは任意コードの全削除を検出する境界ではありません。動的なコマンド名、独自alias、.NETのファイルAPI、他言語のコード、外部スクリプト、エンコード済みコマンド、対話型shellへ後から送る入力などは検出対象外です。Prunletの許可ルート・パス検査はCLIとMCPの入口で別途適用されます。通常の削除例とJSON一覧の制限は[README](../README.md#削除・復元)を参照してください。
+このhookは任意コードの全削除を検出する境界ではありません。動的なコマンド名、独自alias、.NETのファイルAPI、他言語のコード、外部スクリプト、エンコード済みコマンド、対話型shellへ後から送る入力などは検出対象外です。Prunletのローカル絶対パス検査・復元データ保存先の保護はCLIとMCPの入口で別途適用されます。通常の削除例とJSON一覧の制限は[README](../README.md#削除・復元)を参照してください。
 
 ## 解除と復元
 

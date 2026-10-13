@@ -47,13 +47,9 @@ $isolatedCodex = Join-Path $OutputDirectory 'isolated-codex'
 $settingsBackup = Join-Path $OutputDirectory 'settings-backup'
 
 # 起こり得る失敗を列挙してから実システムの検証を組み立てる。
-$failureConditions = @('初回許可範囲欠落', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '公開HEADに必要ソース欠落', 'ZIP traversal/重複/リンク', 'ビルド失敗', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '許可範囲内の作業場所と復元先の検証', '指示登録オプションの組合せ不備', '指示marker重複・不完全・利用者編集', 'guide既存未所有・利用者編集', '指示登録途中での書込み失敗')
+$failureConditions = @('フォルダー未登録の初回導入が拒否される', '旧rootsが削除範囲へ再適用される', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '公開HEADに必要ソース欠落', 'ZIP traversal/重複/リンク', 'ビルド失敗', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '旧roots内外の作業場所と復元先の検証', '指示登録オプションの組合せ不備', '指示marker重複・不完全・利用者編集', 'guide既存未所有・利用者編集', '指示登録途中での書込み失敗')
 Test-Case 'Agent instructions require explicit Codex registration' {
     Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -RegisterAgentInstructions } 'requires explicit -RegisterCodex'
-}
-Test-Case 'First install requires explicit allowed roots' {
-    Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install } 'First installation requires'
-    Assert-True (!(Test-Path -LiteralPath $install)) 'Initial failure created install files.'
 }
 Test-Case 'Invalid repository stops before download' {
     Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -Repository '../Prunlet' -InstallDirectory $install -AllowedRoot $allowed } 'Repository must'
@@ -174,8 +170,8 @@ try {
         } finally { [IO.File]::WriteAllText($publishScript, $originalPublish); $global:PrunletLatestFixture.zip = $zipPath }
         Assert-True (!(Test-Path -LiteralPath $install)) 'Build failure created install files.'
     }
-    Test-Case 'Latest fixture builds and installs with isolated Codex registration' {
-        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -RegisterCodex -CodexHome $isolatedCodex -SettingsBackupDirectory $settingsBackup -WorkDirectory (Join-Path $OutputDirectory 'first-work') | Out-Null
+    Test-Case 'Latest fixture installs without target registration and protects recovery storage' {
+        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -RegisterCodex -CodexHome $isolatedCodex -SettingsBackupDirectory $settingsBackup -WorkDirectory (Join-Path $OutputDirectory 'first-work') | Out-Null
         $info = Get-Content -LiteralPath (Join-Path $install 'source-info.json') -Raw | ConvertFrom-Json
         Assert-True ($info.commitSha -eq ('a' * 40)) 'Initial provenance mismatch.'
         Assert-True ($info.executableSha256 -eq (Get-FileHash -LiteralPath (Join-Path $install 'bin\prunlet.exe')).Hash) 'Executable provenance hash mismatch.'
@@ -185,9 +181,25 @@ try {
         Assert-True ($toml.Contains('bin\\prunlet.exe')) 'Registration does not use installed bin.'
         Assert-True (!(Test-Path -LiteralPath (Join-Path $OutputDirectory 'first-work'))) 'Successful work was not cleaned.'
         Assert-True (!(Test-Path -LiteralPath (Join-Path $isolatedCodex 'AGENTS.md')) -and !(Test-Path -LiteralPath (Join-Path $isolatedCodex 'PRUNLET.md'))) 'Without the flag agent instructions were written.'
+        $installedExe = Join-Path $install 'bin\prunlet.exe'
+        $installedConfig = Join-Path $install 'config.json'
+        $target = Join-Path $OutputDirectory 'unregistered-install-target.txt'
+        [IO.File]::WriteAllText($target, 'unregistered install target')
+        $deleted = (& $installedExe --config $installedConfig delete -- $target | ConvertFrom-Json)
+        Assert-True ($LASTEXITCODE -eq 0 -and ![IO.File]::Exists($target)) 'Installed CLI requires target registration.'
+        $restored = (& $installedExe --config $installedConfig restore $deleted.operationId | ConvertFrom-Json)
+        Assert-True ($LASTEXITCODE -eq 0 -and [IO.File]::ReadAllText($target) -eq 'unregistered install target') 'Installed unrestricted restore differs.'
+        $protected = Join-Path $install 'recovery\protected-install-target.txt'
+        [IO.File]::WriteAllText($protected, 'keep recovery storage')
+        $null = & $installedExe --config $installedConfig delete -- $protected
+        Assert-True ($LASTEXITCODE -ne 0 -and [IO.File]::ReadAllText($protected) -eq 'keep recovery storage') 'Installed CLI deletes from its own recovery storage.'
     }
-    Test-Case 'Next install resolves new HEAD and preserves config and recovery' {
-        $configHash = (Get-FileHash -LiteralPath (Join-Path $install 'config.json')).Hash
+    Test-Case 'Next install resolves new HEAD and preserves legacy config and recovery' {
+        $legacyConfigPath = Join-Path $install 'config.json'
+        $legacyConfig = Get-Content -LiteralPath $legacyConfigPath -Raw | ConvertFrom-Json
+        $legacyConfig.allowedRoots = @((Join-Path $OutputDirectory 'nonexistent-legacy-root'))
+        [IO.File]::WriteAllText($legacyConfigPath, ($legacyConfig | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+        $configHash = (Get-FileHash -LiteralPath $legacyConfigPath).Hash
         $recoveryMarker = Join-Path $install 'recovery\user-marker.txt'
         Set-Content -LiteralPath $recoveryMarker -Value 'Keep user recovery data.' -Encoding utf8NoBOM
         $markerHash = (Get-FileHash -LiteralPath $recoveryMarker).Hash

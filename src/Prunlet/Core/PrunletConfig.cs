@@ -6,6 +6,7 @@ namespace Prunlet.Core;
 public sealed class PrunletConfig
 {
     public int Schema { get; set; } = 1;
+    // 旧設定との互換性のため保持する。対象パスの制限には使用しない。
     public string[] AllowedRoots { get; set; } = [];
     public string BackupDirectory { get; set; } = string.Empty;
 
@@ -21,16 +22,8 @@ public sealed class PrunletConfig
     {
         if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Prunlet supports Windows only.");
         if (Schema != 1) throw new InvalidDataException("Unsupported configuration schema.");
-        if (AllowedRoots is null || AllowedRoots.Length == 0) throw new InvalidDataException("At least one allowed root is required.");
         var backup = PathPolicy.Absolute(BackupDirectory);
         PathPolicy.ExistingDirectory(backup);
-        foreach (var value in AllowedRoots)
-        {
-            var root = PathPolicy.Absolute(value);
-            PathPolicy.ExistingDirectory(root);
-            if (PathPolicy.Within(backup, root) || PathPolicy.Within(root, backup))
-                throw new InvalidDataException("Backup directory and allowed roots must be separate directory trees.");
-        }
     }
 
     internal static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)

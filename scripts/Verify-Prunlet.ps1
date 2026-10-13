@@ -128,10 +128,33 @@ function Assert-PurgeRejected([object]$Fixture) {
 }
 
 Test-Case 'init' {
-    $result = Invoke-Prunlet @('init', '--allowed-root', $script:Scope, '--backup-directory', $script:Recovery)
+    $result = Invoke-Prunlet @('init', '--backup-directory', $script:Recovery)
     Assert-True ($result.ExitCode -eq 0 -and [IO.File]::Exists($script:Config)) 'Init failed.'
 }
 Test-Case 'init never overwrites config' { Assert-Rejected @('init', '--allowed-root', $script:Scope, '--backup-directory', $script:Recovery) $script:Config }
+Test-Case 'schema 1 omitted null stale and overlapping legacy roots do not restrict targets' {
+    $original = [IO.File]::ReadAllBytes($script:Config)
+    try {
+        $variants = @(
+            @{ schema = 1; backupDirectory = $script:Recovery },
+            @{ schema = 1; allowedRoots = $null; backupDirectory = $script:Recovery },
+            @{ schema = 1; allowedRoots = @((Join-Path $outputRoot 'missing-legacy-root')); backupDirectory = $script:Recovery },
+            @{ schema = 1; allowedRoots = @($outputRoot); backupDirectory = $script:Recovery }
+        )
+        $index = 0
+        foreach ($variant in $variants) {
+            [IO.File]::WriteAllText($script:Config, ($variant | ConvertTo-Json -Depth 10))
+            $bytes = [IO.File]::ReadAllBytes($script:Config)
+            $file = Join-Path $outputRoot ('legacy-unrestricted-' + $index++ + '.txt')
+            [IO.File]::WriteAllText($file, 'legacy config content')
+            $deleted = Invoke-Prunlet @('delete', '--', $file)
+            Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($file)) 'Legacy roots still restrict local deletion.'
+            $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+            Assert-True ($restored.ExitCode -eq 0 -and [IO.File]::ReadAllText($file) -eq 'legacy config content') 'Legacy roots still restrict restore.'
+            Assert-True ([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:Config)) -ceq [Convert]::ToBase64String($bytes)) 'Reading a legacy config rewrote it.'
+        }
+    } finally { [IO.File]::WriteAllBytes($script:Config, $original) }
+}
 Test-Case 'CLI Unicode/spaces delete and restore preserve bytes and timestamp' {
     $file = New-File '日本語 with spaces.txt' '復元するbytes 🐈'
     $hash = (Get-FileHash -LiteralPath $file).Hash
@@ -170,7 +193,7 @@ Test-Case 'paths-file rejects malformed encoding structure paths counts and ambi
         @{ Name = 'relative'; Json = (ConvertTo-Json -InputObject @($file, 'relative.txt') -Compress) },
         @{ Name = 'namespace'; Json = (ConvertTo-Json -InputObject @($file, ('\\?\' + $file)) -Compress) },
         @{ Name = 'duplicate'; Json = (ConvertTo-Json -InputObject @($file, $file) -Compress) },
-        @{ Name = 'outside'; Json = (ConvertTo-Json -InputObject @($file, $outside) -Compress) },
+        @{ Name = 'recovery'; Json = (ConvertTo-Json -InputObject @($file, (Join-Path $script:Recovery 'protected-input.txt')) -Compress) },
         @{ Name = 'over-count'; Json = (ConvertTo-Json -InputObject @(1..257 | ForEach-Object { $file }) -Compress) }
     )
     foreach ($fixture in $fixtures) {
@@ -252,11 +275,21 @@ Test-Case 'multi-file deletion' {
     $result = Invoke-Prunlet @('delete', '--', $one, $two)
     Assert-True ($result.ExitCode -eq 0 -and ![IO.File]::Exists($one) -and ![IO.File]::Exists($two) -and $result.Json.items.Count -eq 2) 'Batch failed.'
 }
-Test-Case 'scope violation preflight keeps every source' {
+Test-Case 'files outside former root delete and restore without registration' {
     $file = New-File 'preflight.txt'
     $outside = Join-Path $outputRoot 'outside.txt'; [IO.File]::WriteAllText($outside, 'outside')
-    Assert-Rejected @('delete', '--', $file, $outside) $file
-    Assert-True ([IO.File]::ReadAllText($outside) -eq 'outside') 'Outside source changed.'
+    $hash = File-Digest $file
+    $result = Invoke-Prunlet @('delete', '--', $file, $outside)
+    Assert-True ($result.ExitCode -eq 0 -and ![IO.File]::Exists($file) -and ![IO.File]::Exists($outside)) 'Local targets still depend on registered roots.'
+    $restored = Invoke-Prunlet @('restore', $result.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0 -and (File-Digest $file) -ceq $hash -and [IO.File]::ReadAllText($outside) -eq 'outside') 'Unrestricted restore differs.'
+}
+Test-Case 'recovery directory targets reject the whole preflight batch' {
+    $file = New-File 'recovery-preflight-source.txt'
+    $protected = Join-Path $script:Recovery 'protected-source.txt'
+    [IO.File]::WriteAllText($protected, 'keep recovery data')
+    Assert-Rejected @('delete', '--', $file, $protected) $file
+    Assert-True ([IO.File]::ReadAllText($protected) -eq 'keep recovery data') 'Recovery directory source changed.'
 }
 Test-Case 'relative path rejected' { Assert-Rejected @('delete', '--', 'relative.txt') '' }
 Test-Case 'wildcard rejected' { Assert-Rejected @('delete', '--', (Join-Path $script:Scope '*.txt')) '' }
@@ -320,15 +353,15 @@ Test-Case 'read-only source failure preserves original' {
     try { Assert-Rejected @('delete', '--', $file) $file }
     finally { [IO.File]::SetAttributes($file, [IO.FileAttributes]::Normal) }
 }
-Test-Case 'manifest scope tamper rejected before restore' {
+Test-Case 'manifest recovery-directory target rejected before restore' {
     $file = New-File 'manifest-tamper.txt'; $result = Invoke-Prunlet @('delete', '--', $file)
     $manifestPath = Join-Path (Join-Path $script:Recovery $result.Json.operationId) 'manifest.json'
     $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -Depth 20
-    $outside = Join-Path $outputRoot 'never-restore-outside.txt'
+    $outside = Join-Path $script:Recovery 'never-restore-inside-recovery.txt'
     $manifest.items[0].path = $outside
     [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 20))
     Assert-Rejected @('restore', $result.Json.operationId) ''
-    Assert-True (![IO.File]::Exists($outside)) 'Manifest tamper wrote outside scope.'
+    Assert-True (![IO.File]::Exists($outside)) 'Manifest tamper wrote into recovery storage.'
 }
 Test-Case 'operations lists recorded ids' {
     $result = Invoke-Prunlet @('operations'); Assert-True ($result.ExitCode -eq 0 -and $result.Json.operations.Count -ge 1) 'No operations listed.'
@@ -406,7 +439,7 @@ Test-Case 'purge rejects manifest path tamper before changing backups' {
     $fixture = New-PurgeFixture 'purge-manifest-tamper'
     $manifestPath = Join-Path $fixture.Root 'manifest.json'
     $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -Depth 20
-    $manifest.items[0].path = Join-Path $outputRoot 'outside-purge-manifest.txt'
+    $manifest.items[0].path = Join-Path $script:Recovery 'inside-purge-manifest.txt'
     [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 20))
     Assert-PurgeRejected $fixture
 }
@@ -520,7 +553,9 @@ Test-Case 'MCP real stdio lifecycle/delete/restore/validation' {
         $bad = Rpc @{jsonrpc='2.0';id=6;method='tools/call';params=@{name='delete_files';arguments=@{paths=@($file);dryRun='false'}}}
         Assert-True ($bad.error.code -eq -32602 -and [IO.File]::Exists($file)) 'Invalid arguments were not rejected.'
         $outside = Rpc @{jsonrpc='2.0';id=7;method='tools/call';params=@{name='delete_files';arguments=@{paths=@((Join-Path $outputRoot 'outside.txt'))}}}
-        Assert-True ($outside.result.isError) 'MCP scope violation did not report isError.'
+        Assert-True (!$outside.result.isError -and ![IO.File]::Exists((Join-Path $outputRoot 'outside.txt'))) 'MCP still rejects local targets outside former roots.'
+        $outsideRestored = Rpc @{jsonrpc='2.0';id=9;method='tools/call';params=@{name='restore_files';arguments=@{operationId=$outside.result.structuredContent.operationId}}}
+        Assert-True (!$outsideRestored.result.isError -and [IO.File]::ReadAllText((Join-Path $outputRoot 'outside.txt')) -eq 'outside') 'MCP unrestricted restore differs.'
         $list = Rpc @{jsonrpc='2.0';id=8;method='tools/call';params=@{name='list_operations';arguments=@{}}}
         Assert-True (!$list.result.isError) 'MCP operations failed.'
         $process.StandardInput.Close()

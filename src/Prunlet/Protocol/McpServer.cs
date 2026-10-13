@@ -71,8 +71,8 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
             {
                 protocolVersion = SupportedVersions.Contains(requestedVersion) ? requestedVersion : SupportedVersions[0],
                 capabilities = new { tools = new { listChanged = false } },
-                serverInfo = new { name = "prunlet", title = "Prunlet", version = "development" },
-                instructions = "Use delete_files for authorized Windows file deletion within configured roots. Prunlet verifies recovery copies before deleting files. Use restore_files with the returned operationId to recover files. Use dryRun to inspect targets. Directories, recursion, wildcards and links are unsupported. Existing host approvals and policies still apply."
+                serverInfo = new { name = "prunlet", title = "Prunlet", version = "1.0.0" },
+                instructions = "Use delete_files for authorized absolute Windows file deletion without a configured target directory allowlist. Files inside the configured recovery directory are protected. Prunlet verifies recovery copies before deleting files. Use restore_files with the returned operationId to recover files. Use dryRun to inspect targets. Directories, recursion, wildcards and links are unsupported. Existing host approvals and policies still apply."
             };
         }
         if (!ready) throw new RpcException(-32600, "Initialize and send notifications/initialized first.");
@@ -134,7 +134,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
         new
         {
             name = "delete_files", title = "Delete files with recovery copies",
-            description = "Delete authorized absolute Windows file paths within configured roots after making verified recovery copies. Does not expand wildcards or delete directories/links.",
+            description = "Delete authorized absolute Windows file paths without a configured target directory allowlist after making verified recovery copies. Files inside the configured recovery directory are protected. Does not expand wildcards or delete directories/links.",
             inputSchema = new
             {
                 type = "object", properties = new

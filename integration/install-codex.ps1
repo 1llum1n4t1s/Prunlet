@@ -16,7 +16,7 @@ $ExecutablePath = Resolve-Absolute $ExecutablePath 'ExecutablePath'
 $ConfigPath = Resolve-Absolute $ConfigPath 'ConfigPath'
 if ($HookPath) { $HookPath = Resolve-Absolute $HookPath 'legacy HookPath' }
 $prunletConfig = [IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json -AsHashtable
-if ($prunletConfig.schema -ne 1 -or !$prunletConfig.allowedRoots.Count -or !$prunletConfig.backupDirectory) { throw 'Initialize a valid Prunlet config before registering integration.' }
+if ($prunletConfig.schema -ne 1 -or !$prunletConfig.backupDirectory) { throw 'Initialize a valid Prunlet config before registering integration.' }
 $hooksPath = Join-Path $CodexHome 'hooks.json'
 $tomlPath = Join-Path $CodexHome 'config.toml'
 $hooks = Read-Hooks $hooksPath

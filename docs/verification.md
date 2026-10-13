@@ -11,7 +11,7 @@ pwsh -NoProfile -File .\scripts\Verify-Prunlet.ps1 -ExecutablePath 'C:\path\to\p
 
 `OutputDirectory`と`ReportPath`は新しい外部パスを指定します。レポートの親ディレクトリは事前に用意してください。検証用フォルダーには、この実行が作る使い捨てのファイル・設定・バックアップだけを置きます。標準出力の`passed`と`failed`、終了コード、JSONレポートを確認します。
 
-検証範囲は、削除と復元の内容・時刻一致、欠損、dry-run、scope外・リンク・ADS・ロックの拒否、復元先の競合、復元データ改竄、MCPの実通信と不正引数、ネイティブフックの直接削除拒否・通常入力の通過、登録の冪等性と解除時の既存設定保持です。各ケースの所要時間と実行exeのSHA-256を記録します。
+検証範囲は、削除と復元の内容・時刻一致、欠損、dry-run、旧ルート外・ルート未指定設定での成功、復元データ保存先・リンク・ADS・ロックの拒否、復元先の競合、復元データ改竄、MCPの実通信と不正引数、ネイティブフックの直接削除拒否・通常入力の通過、登録の冪等性と解除時の既存設定保持です。各ケースの所要時間と実行exeのSHA-256を記録します。
 
 CLIのJSON一覧では1〜256件・最大1 MiB・不正JSON・不正パス・重複を確認し、空白・Unicode・多数・長い対象をCMDから渡します。長い既存ファイルと本当の欠損を区別し、長いディレクトリ、ADS・リンク・aliasの拒否、通常パスとの互換性を確認します。既存の拒否対象を再試行せず、新規fixtureだけを使います。purgeは既定dry-run・明示apply・コピーの内容検証・metadata保持・復元拒否・不正記録と複数リンク拒否・有効なintentからの再開を検証します。
 
@@ -34,7 +34,7 @@ New-Item -ItemType Directory -Path (Split-Path -Parent $latestReport) -Force | O
 pwsh -NoProfile -File .\scripts\Verify-LatestInstall.ps1 -OutputDirectory $latestRun -ReportPath $latestReport -CheckPublicHead
 ```
 
-GitHub応答を検証用アーカイブへ差し替え、実際のインストーラー・.NETビルド・配置・Codex登録を通すE2Eです。最新HEADの再解決、同一SHAからの導入、クローンに依存しない登録、既存設定と復元データの保持、ZIPの不正経路・重複・リンク、取得とビルドの失敗、製品更新の失敗時の復元を検証します。Codex設定がロックされて登録が途中で失敗した場合の復旧と、作業場所が許可ルート配下にある場合の導入も確認します。実ユーザーの配置先・Codex設定は使いません。
+GitHub応答を検証用アーカイブへ差し替え、実際のインストーラー・.NETビルド・配置・Codex登録を通すE2Eです。最新HEADの再解決、同一SHAからの導入、クローンに依存しない登録、既存設定と復元データの保持、ZIPの不正経路・重複・リンク、取得とビルドの失敗、製品更新の失敗時の復元を検証します。Codex設定がロックされて登録が途中で失敗した場合の復旧と、旧`allowedRoots`内外にある作業場所での導入も確認します。実ユーザーの配置先・Codex設定は使いません。
 
 `-CheckPublicHead`では実際のGitHubも参照します。リモートに必要な実装がまだない場合は、配置先を変更せず停止することを確認します。検証用アーカイブでの成功を、実GitHubからの導入成功として扱いません。公開後は実GitHubから導入し、`source-info.json`のリポジトリ・ブランチ・コミット、配置済みexeと登録先を照合してください。
 

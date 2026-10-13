@@ -1,12 +1,12 @@
 # Prunlet
 
-Windowsのファイル削除をCLI・MCPから利用するツールです。指定した範囲のファイルを検証済みバックアップへ保存してから削除し、操作IDを使って復元できます。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
+Windowsのファイル削除をCLI・MCPから利用するツールです。指定したファイルを検証済みバックアップへ保存してから削除し、操作IDを使って復元できます。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
 
 初版はファイルのみを扱います。フォルダー・再帰削除・ワイルドカード・リンク・ネットワークパスは扱いません。通常の削除であり、ディスク上のデータを復元不能にする消去機能はありません。
 
 代替データストリーム（ADS）を持つファイルも、本体だけのバックアップで情報を失わないため削除を拒否します。ブラウザから取得したファイルの`Zone.Identifier`も該当します。読み取り専用ファイルの属性を勝手に解除することはありません。
 
-大文字小文字を区別するディレクトリを含むパスは扱いません。ディレクトリのcase-sensitive属性を取得できないOS・ファイルシステムでも、範囲の誤判定を防ぐため処理を停止します。
+大文字小文字を区別するディレクトリを含むパスは扱いません。ディレクトリのcase-sensitive属性を取得できないOS・ファイルシステムでも、パス実体の誤照合を防ぐため処理を停止します。
 
 ## インストールと更新
 
@@ -19,7 +19,7 @@ $installerDirectory = Join-Path ([IO.Path]::GetTempPath()) ('Codex\Prunlet\boots
 New-Item -ItemType Directory -Path $installerDirectory | Out-Null
 $installer = Join-Path $installerDirectory 'Install-Prunlet.ps1'
 Invoke-WebRequest 'https://raw.githubusercontent.com/1llum1n4t1s/Prunlet/main/scripts/Install-Prunlet.ps1' -OutFile $installer
-pwsh -NoProfile -File $installer -AllowedRoot 'C:\work\project' -RegisterCodex -RegisterAgentInstructions
+pwsh -NoProfile -File $installer -RegisterCodex -RegisterAgentInstructions
 ```
 
 インストーラーはGitHub APIから既定ブランチと最新コミットを取得し、そのコミットのアーカイブを取得してビルドします。導入処理中は取得したSHAでソースを揃えますが、次回の導入・更新は再び最新HEADを解決します。取得失敗やリモートの実装不足では停止し、ローカルクローンへ切り替えません。
@@ -32,7 +32,7 @@ pwsh -NoProfile -File $installer -AllowedRoot 'C:\work\project' -RegisterCodex -
 
 共通指示を登録した導入の更新でも、同じ`-RegisterAgentInstructions`を指定してください。指定しない更新では共通指示に書き込みません。古い共通指示と新しい配置済みguideが異なる場合は、利用者の編集との区別を付けられないため自動更新・解除を拒否します。
 
-更新時は最新版のインストーラーを再取得して実行します。既存の`config.json`と復元データを保持します。初回は`-AllowedRoot`で削除を許可する既存ディレクトリを指定し、複数指定するときはPowerShellの配列を渡してください。配置先は`-InstallDirectory`で変更できます。利用者のクローンパスをCodex設定へ登録することはありません。
+更新時は最新版のインストーラーを再取得して実行します。既存の`config.json`と復元データを保持します。削除対象フォルダーの事前登録は不要です。旧`-AllowedRoot`は互換引数として受理しますが、削除範囲を制限しません。配置先は`-InstallDirectory`で変更できます。利用者のクローンパスをCodex設定へ登録することはありません。
 
 取得したbootstrapファイルは一時物です。導入結果を確認して、そのbootstrap専用ディレクトリだけを清掃してください。アプリの配置先と復元用データは清掃対象に含めません。
 
@@ -42,22 +42,21 @@ MSIX環境でAppDataが別の実体へ転送される場合は、`-UpdateBackupR
 
 ## 初期設定
 
-許可する削除範囲と、復元データの保存先を明示します。両方のディレクトリは事前に作成してください。バックアップ保存先は許可範囲と互いに包含しない場所に置きます。
+復元データの保存先を指定し、そのディレクトリを事前に作成します。削除対象はローカルドライブ内の通常ファイルで、対象フォルダーの許可リストはありません。復元データの保存先内は通常削除から保護し、コピーの整理にはCLIの明示`purge`を使います。
 
 ```powershell
 $config = Join-Path $env:USERPROFILE '.local\Prunlet\config.json'
 $backup = Join-Path $env:USERPROFILE '.local\Prunlet\recovery'
 New-Item -ItemType Directory -Path (Split-Path $config), $backup -Force | Out-Null
 $exe = Join-Path $env:USERPROFILE '.local\Prunlet\bin\prunlet.exe'
-& $exe --config $config init --allowed-root 'C:\work\project' --backup-directory $backup
+& $exe --config $config init --backup-directory $backup
 ```
 
-インストーラーを利用した場合は初期化済みです。手動の`init`も既存設定を上書きしません。初期化時に複数の許可範囲を指定するときは`--allowed-root`を繰り返します。MCPの引数から範囲を拡張することはできません。
+インストーラーを利用した場合は初期化済みです。手動の`init`も既存設定を上書きしません。旧`--allowed-root`と設定の`allowedRoots`はschema 1との互換用に受理しますが、削除範囲の判定には使いません。`allowedRoots`を省略・空配列・nullにした設定や、記録された旧ルートが存在しなくなった設定も使用できます。
 
 ```json
 {
   "schema": 1,
-  "allowedRoots": ["C:\\work\\project"],
   "backupDirectory": "C:\\Users\\you\\.local\\Prunlet\\recovery"
 }
 ```

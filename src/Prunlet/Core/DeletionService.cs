@@ -14,7 +14,7 @@ public sealed partial class DeletionService
         this.config = new PrunletConfig
         {
             Schema = config.Schema,
-            AllowedRoots = config.AllowedRoots.Select(PathPolicy.Absolute).ToArray(),
+            AllowedRoots = config.AllowedRoots?.ToArray() ?? [],
             BackupDirectory = PathPolicy.Absolute(config.BackupDirectory)
         };
     }
@@ -134,8 +134,8 @@ public sealed partial class DeletionService
     private string ValidateTarget(string path)
     {
         var normalized = PathPolicy.Absolute(path);
-        if (!config.AllowedRoots.Any(root => PathPolicy.Within(normalized, root)))
-            throw new ArgumentException($"Path is outside configured allowed roots: {normalized}");
+        if (PathPolicy.Within(normalized, config.BackupDirectory))
+            throw new ArgumentException($"Target path is inside the recovery directory: {normalized}");
         return normalized;
     }
 

@@ -3,6 +3,7 @@
 param(
     [string]$Repository = '1llum1n4t1s/Prunlet',
     [string]$InstallDirectory = (Join-Path $env:USERPROFILE '.local\Prunlet'),
+    # 出荷済み呼出しの互換引数。対象フォルダーの制限には使わない。
     [string[]]$AllowedRoot,
     [string]$BackupDirectory,
     [string]$WorkDirectory,
@@ -115,20 +116,13 @@ if (Test-Path -LiteralPath $WorkDirectory) { throw 'WorkDirectory must be a new 
 if (Test-Path -LiteralPath $InstallDirectory -PathType Leaf) { throw 'InstallDirectory is a file.' }
 $configPath = Join-Path $InstallDirectory 'config.json'
 $existingConfig = Test-Path -LiteralPath $configPath -PathType Leaf
-if (!$existingConfig -and !$AllowedRoot) { throw 'First installation requires explicit -AllowedRoot directories.' }
 if (!$BackupDirectory) { $BackupDirectory = Join-Path $InstallDirectory 'recovery' }
 $BackupDirectory = Assert-ExternalPath $BackupDirectory 'BackupDirectory'
 if ($existingConfig) {
     [void](Assert-PlainPath $configPath 'ConfigPath')
     $existing = [IO.File]::ReadAllText($configPath) | ConvertFrom-Json
     $effectiveBackup = Assert-ExternalPath $existing.backupDirectory 'Configured backupDirectory'
-    $effectiveRoots = @($existing.allowedRoots)
-} else { $effectiveBackup = $BackupDirectory; $effectiveRoots = @($AllowedRoot) }
-foreach ($rootValue in $effectiveRoots) {
-    $root = Assert-PlainPath $rootValue 'AllowedRoot'
-    if (!(Test-Path -LiteralPath $root -PathType Container)) { throw "AllowedRoot does not exist: $root" }
-    if ((Test-InTree $root $effectiveBackup) -or (Test-InTree $effectiveBackup $root)) { throw 'AllowedRoot and recovery backup must be separate trees.' }
-}
+} else { $effectiveBackup = $BackupDirectory }
 if ((Test-InTree $effectiveBackup $WorkDirectory) -or (Test-InTree $WorkDirectory $effectiveBackup)) { throw 'WorkDirectory and recovery backup must be separate trees.' }
 $UpdateBackupRoot = Assert-ExternalPath $UpdateBackupRoot 'UpdateBackupRoot'
 $updateBackup = Assert-ExternalPath (Join-Path $UpdateBackupRoot $runId) 'UpdateBackupDirectory'
@@ -186,11 +180,10 @@ try {
     # 初期設定も外部作業場所で検証する。既存設定は一切書き換えない。
     $newConfig = Join-Path $WorkDirectory 'config.json'
     if (!$existingConfig) {
-        # 仮の復元先では包含関係が変わるため、最終的な復元先でCoreに検査させる。
+        # 最終的な復元先の安全性をCoreに検査させる。
         # 今回作ったディレクトリだけを追跡し、失敗時に空のものを戻す。
         New-TrackedDirectory $effectiveBackup
         $probeArgs = @('--config', $newConfig, 'init', '--backup-directory', $effectiveBackup)
-        foreach ($root in $effectiveRoots) { $probeArgs += @('--allowed-root', $root) }
         & $exe @probeArgs | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'Prunlet rejected the initial configuration.' }
     } else {
@@ -267,7 +260,7 @@ try {
         $retirementBackup = Join-Path $updateBackup 'retired-recovery'
         New-Item -ItemType Directory -Path $retirementBackup -Force | Out-Null
         $installedExe = Join-Path $InstallDirectory 'bin\prunlet.exe'
-        $retirementInitJson = & $installedExe --config $retirementConfig init --allowed-root (Join-Path $InstallDirectory 'bin') --backup-directory $retirementBackup
+        $retirementInitJson = & $installedExe --config $retirementConfig init --backup-directory $retirementBackup
         if ($LASTEXITCODE -ne 0) { throw "Prunlet rejected the retired product configuration: $retirementInitJson" }
         [void]$changed.Add($relative)
         $retirementJson = & $installedExe --config $retirementConfig delete -- $target

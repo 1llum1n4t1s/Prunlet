@@ -21,7 +21,7 @@ internal static class Program
             {
                 Console.WriteLine("""
                     Prunlet — Windows file deletion with verified recovery copies.
-                    prunlet --config <absolute-json-path> init --allowed-root <directory> [...] --backup-directory <directory>
+                    prunlet --config <absolute-json-path> init --backup-directory <directory>
                     prunlet --config <absolute-json-path> delete [--dry-run] -- <absolute-file-path> [...]
                     prunlet --config <absolute-json-path> delete [--dry-run] --paths-file <absolute-json-file>
                     prunlet --config <absolute-json-path> restore <operation-id>
@@ -29,6 +29,8 @@ internal static class Program
                     prunlet --config <absolute-json-path> operations
                     prunlet --config <absolute-json-path> mcp
                     prunlet --config <absolute-json-path> hook [--hook-script <legacy-path>]
+                    Legacy --allowed-root <directory> options are accepted but do not restrict target directories.
+                    Files inside the configured recovery directory are protected.
                     Directories, recursive deletion, wildcard expansion and links are unsupported.
                     """);
                 return 0;
@@ -134,7 +136,7 @@ internal static class Program
                 default: throw new ArgumentException($"Unknown or repeated init option: {args[i]}");
             }
         }
-        if (roots.Count == 0 || backupDirectory is null) throw new ArgumentException("Specify allowed roots and a backup directory.");
+        if (backupDirectory is null) throw new ArgumentException("Specify a backup directory.");
         var config = new PrunletConfig { Schema = 1, AllowedRoots = roots.ToArray(), BackupDirectory = backupDirectory };
         config.Validate();
         var parent = Path.GetDirectoryName(configPath)!;
