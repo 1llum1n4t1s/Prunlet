@@ -12,6 +12,8 @@ Windowsのファイル削除をCLI・MCP・Codexフックから利用するツ�
 
 Windows、.NET 10 SDK、PowerShell 7が必要です。インストール元は[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の既定ブランチの最新HEADです。開発用クローンは使用しません。
 
+Windows ARM64では、下の実行コマンドに`-Runtime win-arm64`を追加してください。既定は`win-x64`で、ARM64での未指定は停止します。x64エミュレーションを選ぶ場合も`-Runtime win-x64`の明示指定が必要です。
+
 ```powershell
 $installerDirectory = Join-Path ([IO.Path]::GetTempPath()) ('Codex\Prunlet\bootstrap-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $installerDirectory | Out-Null
@@ -27,6 +29,8 @@ pwsh -NoProfile -File $installer -AllowedRoot 'C:\work\project' -RegisterCodex
 更新時は最新版のインストーラーを再取得して実行します。既存の`config.json`と復元データを保持します。初回は`-AllowedRoot`で削除を許可する既存ディレクトリを指定し、複数指定するときはPowerShellの配列を渡してください。配置先は`-InstallDirectory`で変更できます。利用者のクローンパスをCodex設定へ登録することはありません。
 
 取得したbootstrapファイルは一時物です。導入結果を確認して、そのbootstrap専用ディレクトリだけを清掃してください。アプリの配置先と復元用データは清掃対象に含めません。
+
+更新前の製品や登録前のCodex設定のバックアップがある場合、導入結果の`updateBackupDirectory`に保存先が表示されます。既定は`%LOCALAPPDATA%\Codex\TaskArtifacts\Prunlet\install-<ID>`です。動作とCodex登録を確認し、復旧が不要になってから、その導入分のバックアップだけを清掃してください。連携スクリプトの設定バックアップは[連携手順](docs/integration.md)を参照してください。
 
 ## 初期設定
 
@@ -81,19 +85,10 @@ $config = Join-Path $env:USERPROFILE '.local\Prunlet\config.json'
 
 共通MCP登録、削除コマンドの入力置換、解除手順は[連携手順](docs/integration.md)を参照してください。フックは認識できる単独の削除コマンドだけを専用CLIへ置換し、フック自身は削除を実行しません。Codex側の承認や管理ポリシーを無効化する機能はありません。
 
-フックの入口はexeです。削除候補を含まない呼び出しはそこで通過し、候補があるときだけPowerShellの構文解析を起動します。通常の読み取り操作へPowerShell起動時間を加算しない構成です。
-
 ## 保存先の実体検証で停止する場合
 
 MSIX版のアプリから配置すると、AppDataの新しいフォルダーがパッケージ専用のLocalCacheへ転送される場合があります。Prunletは指定パスと開いたハンドルの実体が異なると停止します。検証を無効化せず、exe・設定・復元データを`%USERPROFILE%\.local\Prunlet`など、転送されない専用ディレクトリへ配置してください。CodexパッケージのLocalCacheを復元データの恒久保存先にすることは推奨しません。
 
-## 開発と検証
+## 開発資料
 
-開発時だけ、クローン内のビルドスクリプトを外部出力先付きで使います。
-
-```powershell
-$buildRoot = Join-Path ([IO.Path]::GetTempPath()) ('Codex\Prunlet\build-' + [guid]::NewGuid().ToString('N'))
-pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
-```
-
-`publish\prunlet.exe`は.NETランタイムを含む単一ファイルです。ローカルの開発ビルドはGitHubのlatestから導入したものとして扱いません。実際のCLI・stdio MCP・フックを動かすE2Eは[検証手順](docs/verification.md)にまとめています。ビルド・検証出力はリポジトリの外へ指定します。
+開発時のビルドと作業規約は[AGENTS.md](AGENTS.md)、構造と設計判断は[DESIGN.md](DESIGN.md)、E2Eの実行方法と検証範囲は[検証手順](docs/verification.md)を参照してください。
