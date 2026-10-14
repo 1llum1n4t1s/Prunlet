@@ -15,6 +15,7 @@ public sealed class PrunletConfig
         var result = JsonSerializer.Deserialize<PrunletConfig>(File.ReadAllText(path), JsonOptions)
             ?? throw new InvalidDataException("Configuration is empty.");
         result.Validate();
+        result.BackupDirectory = PathPolicy.Resolve(result.BackupDirectory, finalDirectory: true, allowMissing: false);
         return result;
     }
 

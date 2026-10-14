@@ -191,7 +191,7 @@ Test-Case 'paths-file rejects malformed encoding structure paths counts and ambi
         @{ Name = 'empty'; Json = '[]' }, @{ Name = 'object'; Json = '{}' }, @{ Name = 'null'; Json = 'null' },
         @{ Name = 'nonstring'; Json = '[1]' }, @{ Name = 'null-entry'; Json = '[null]' }, @{ Name = 'malformed'; Json = '["unterminated' },
         @{ Name = 'relative'; Json = (ConvertTo-Json -InputObject @($file, 'relative.txt') -Compress) },
-        @{ Name = 'namespace'; Json = (ConvertTo-Json -InputObject @($file, ('\\?\' + $file)) -Compress) },
+        @{ Name = 'device'; Json = (ConvertTo-Json -InputObject @($file, ('\\.\' + $file)) -Compress) },
         @{ Name = 'duplicate'; Json = (ConvertTo-Json -InputObject @($file, $file) -Compress) },
         @{ Name = 'recovery'; Json = (ConvertTo-Json -InputObject @($file, (Join-Path $script:Recovery 'protected-input.txt')) -Compress) },
         @{ Name = 'over-count'; Json = (ConvertTo-Json -InputObject @(1..257 | ForEach-Object { $file }) -Compress) }
@@ -292,6 +292,87 @@ Test-Case 'recovery directory targets reject the whole preflight batch' {
     Assert-True ([IO.File]::ReadAllText($protected) -eq 'keep recovery data') 'Recovery directory source changed.'
 }
 Test-Case 'relative path rejected' { Assert-Rejected @('delete', '--', 'relative.txt') '' }
+# パス表記で拒否・誤判定する失敗を先に列挙する: slash/extended拒否、実体重複、復元先侵入、旧記録書換え、短縮名への復元。
+Test-Case 'slash and extended local targets preserve bytes time and physical recovery paths' {
+    foreach ($format in @('slash', 'extended')) {
+        $file = New-File ('canonical-' + $format + '.txt') 'canonical target bytes'
+        $hash = File-Digest $file; $time = [IO.File]::GetLastWriteTimeUtc($file)
+        $argument = if ($format -eq 'slash') { $file.Replace('\', '/') } else { '\\?\' + $file }
+        $dry = Invoke-Prunlet @('delete', '--dry-run', '--', $argument)
+        Assert-True ($dry.ExitCode -eq 0 -and $dry.Json.items[0].status -eq 'would_delete') 'Ordinary path spelling was refused.'
+        $deleted = Invoke-Prunlet @('delete', '--', $argument)
+        Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($file) -and $deleted.Json.items[0].path -ceq $file) 'Target was not recorded using its physical path.'
+        $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+        Assert-True ($restored.ExitCode -eq 0 -and (File-Digest $file) -ceq $hash -and [IO.File]::GetLastWriteTimeUtc($file) -eq $time) 'Canonical-path recovery differs.'
+        $missing = Invoke-Prunlet @('delete', '--dry-run', '--', (($file + '.missing').Replace('\', '/')))
+        Assert-True ($missing.ExitCode -eq 0 -and $missing.Json.items[0].status -eq 'already_absent') 'Missing target was not resolved through its physical parent.'
+    }
+}
+Test-Case 'equivalent target spellings cannot duplicate files or enter recovery storage' {
+    $file = New-File 'canonical-duplicate.txt'
+    $hash = File-Digest $file
+    $count = @([IO.Directory]::EnumerateDirectories($script:Recovery)).Count
+    $inputFile = Write-PathsFile 'canonical-duplicates.json' @($file, ('\\?\' + $file))
+    Assert-Rejected @('delete', '--paths-file', $inputFile) $file
+    $protected = Join-Path $script:Recovery 'canonical-protected.txt'
+    [IO.File]::WriteAllText($protected, 'keep physical recovery bytes')
+    foreach ($alias in @($protected.Replace('\', '/'), ('\\?\' + $protected))) {
+        Assert-Rejected @('delete', '--', $alias) $protected
+    }
+    Assert-True ((File-Digest $file) -ceq $hash -and [IO.File]::ReadAllText($protected) -eq 'keep physical recovery bytes' -and @([IO.Directory]::EnumerateDirectories($script:Recovery)).Count -eq $count) 'Canonical preflight changed bytes or operation count.'
+}
+Test-Case 'paths-file spelling and backup spelling resolve without changing source data' {
+    $configPath = Join-Path $outputRoot 'canonical-config.json'
+    $init = Invoke-ProcessJson $ExecutablePath @('--config', $configPath, 'init', '--backup-directory', ('\\?\' + $script:Recovery))
+    Assert-True ($init.ExitCode -eq 0 -and $init.Json.backupDirectory -ceq $script:Recovery) 'Init did not store the physical backup path.'
+    foreach ($format in @('slash', 'extended')) {
+        $file = New-File ('canonical-input-' + $format + '.txt') 'input canonical bytes'
+        $hash = File-Digest $file
+        $inputFile = Write-PathsFile ('canonical-input-' + $format + '.json') @($file)
+        $inputAlias = if ($format -eq 'slash') { $inputFile.Replace('\', '/') } else { '\\?\' + $inputFile }
+        $deleted = Invoke-ProcessJson $ExecutablePath @('--config', $configPath, 'delete', '--paths-file', $inputAlias)
+        Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($file)) 'Paths-file spelling failed.'
+        $restored = Invoke-ProcessJson $ExecutablePath @('--config', $configPath, 'restore', $deleted.Json.operationId)
+        Assert-True ($restored.ExitCode -eq 0 -and (File-Digest $file) -ceq $hash) 'Paths-file canonical recovery differs.'
+    }
+}
+Test-Case 'legacy schema 1 target spelling remains unchanged during physical restore and purge' {
+    $file = New-File 'legacy-canonical-target.txt' 'legacy target bytes'
+    $hash = File-Digest $file
+    $deleted = Invoke-Prunlet @('delete', '--', $file)
+    Assert-True ($deleted.ExitCode -eq 0) 'Legacy fixture deletion failed.'
+    $manifestPath = Join-Path $script:Recovery ($deleted.Json.operationId + '\manifest.json')
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -Depth 30
+    $manifest.items[0].path = $file.Substring(0, 1).ToLowerInvariant() + $file.Substring(1)
+    [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 30))
+    $manifestHash = File-Digest $manifestPath
+    $deleteResultPath = Join-Path $script:Recovery ($deleted.Json.operationId + '\delete-result.json')
+    $deleteResult = Get-Content -LiteralPath $deleteResultPath -Raw | ConvertFrom-Json -Depth 30
+    $deleteResult.items[0].path = $manifest.items[0].path
+    [IO.File]::WriteAllText($deleteResultPath, ($deleteResult | ConvertTo-Json -Depth 30))
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0 -and (File-Digest $file) -ceq $hash -and (File-Digest $manifestPath) -ceq $manifestHash) 'Legacy manifest was changed or restored incorrectly.'
+    $purged = Invoke-Prunlet @('purge', $deleted.Json.operationId, '--apply')
+    Assert-True ($purged.ExitCode -eq 0 -and (File-Digest $manifestPath) -ceq $manifestHash -and (File-Digest $file) -ceq $hash) 'Legacy physical purge changed source or manifest.'
+}
+Test-Case '8.3 parent spelling records and restores the physical long path' {
+    $file = New-File 'short-alias-canonical-long-filename.txt' 'short name target bytes'
+    $fso = New-Object -ComObject Scripting.FileSystemObject
+    try { $shortDirectory = [string]$fso.GetFolder($script:Scope).ShortPath } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($fso) }
+    Assert-True (!$shortDirectory.Equals($script:Scope, [StringComparison]::OrdinalIgnoreCase)) 'This volume does not provide an 8.3 parent fixture.'
+    $alias = Join-Path $shortDirectory ([IO.Path]::GetFileName($file))
+    $hash = File-Digest $file
+    $deleted = Invoke-Prunlet @('delete', '--', $alias)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($file) -and $deleted.Json.items[0].path -ceq $file) 'Short-name target was refused or recorded as an alias.'
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0 -and (File-Digest $file) -ceq $hash) 'Short-name target did not restore to the long physical path.'
+    $duplicates = Write-PathsFile 'short-name-duplicate.json' @($file, $alias)
+    Assert-Rejected @('delete', '--paths-file', $duplicates) $file
+    $fso = New-Object -ComObject Scripting.FileSystemObject
+    try { $shortRecovery = [string]$fso.GetFolder($script:Recovery).ShortPath } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($fso) }
+    $protected = Join-Path $script:Recovery 'short-name-protected.txt'; [IO.File]::WriteAllText($protected, 'keep short recovery')
+    Assert-Rejected @('delete', '--', (Join-Path $shortRecovery 'short-name-protected.txt')) $protected
+}
 Test-Case 'wildcard rejected' { Assert-Rejected @('delete', '--', (Join-Path $script:Scope '*.txt')) '' }
 Test-Case 'directory rejected' { Assert-Rejected @('delete', '--', $script:Scope) '' }
 Test-Case 'empty deletion rejected' { Assert-Rejected @('delete', '--') '' }

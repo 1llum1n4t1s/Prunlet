@@ -320,10 +320,17 @@ public sealed partial class DeletionService
             var item = items[index];
             var entry = manifest.Items[index];
             if (item is null || item.Path != entry.Path || !statuses.Contains(item.Status, StringComparer.Ordinal)
-                || (item.BackupPath is not null && item.BackupPath != BackupPath(directory, index))
+                || (item.BackupPath is not null && ResolveRecordedBackupPath(item.BackupPath) != BackupPath(directory, index))
                 || (item.Sha256 is not null && !item.Sha256.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
                 || (item.Size is not null && item.Size != entry.Size))
                 throw new InvalidDataException("Operation outcome item is invalid.");
         }
+    }
+
+    private static string ResolveRecordedBackupPath(string path)
+    {
+        if (PathPolicy.Absolute(path) != path) throw new InvalidDataException("Recorded recovery path is not canonical.");
+        var parent = PathPolicy.Resolve(Path.GetDirectoryName(path)!, finalDirectory: true, allowMissing: false);
+        return Path.Combine(parent, Path.GetFileName(path));
     }
 }

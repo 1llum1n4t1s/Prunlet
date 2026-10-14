@@ -17,6 +17,7 @@ Codexの通常経路は、対象の絶対パスをそのままの文字列をUTF
 
 上のプレースホルダーは共通AGENTSに記録したパスと今回作成した実パスへ置き換える。CMDのtool callでは、たとえば `tools.exec_command({cmd: "<installed-exe> --config <absolute-config> delete --paths-file <absolute-json-file>", shell: "cmd.exe", login: false})` として直接渡す。`-- <literal-path>...`もCLIでは対応するが、CMDの引用が必要な対象には配列ファイルを使う。
 
+- 通常ファイルのMSIX転送・8.3短縮名・slash表記・拡張長のローカルドライブ表記に対応する。入力の実体を検証し、結果の`path`と新しい復元記録は実体パスを示す。
 - 範囲確認が必要なら、削除前に`--dry-run`で確認する。CLIのJSON結果と終了コードを読み、各対象の成功・失敗を判定する。
 - 成功時の`operationId`を保持し、復元は同じexeと設定の`restore`へ渡す。既存の復元先を上書きしない。
 - 削除対象フォルダーの事前登録・追加許可は不要。ユーザーが依頼した削除対象、または現在の作業で清掃が許可された一時ファイルを、保存場所を理由に追加確認せず処理する。

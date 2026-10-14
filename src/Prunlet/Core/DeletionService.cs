@@ -15,7 +15,7 @@ public sealed partial class DeletionService
         {
             Schema = config.Schema,
             AllowedRoots = config.AllowedRoots?.ToArray() ?? [],
-            BackupDirectory = PathPolicy.Absolute(config.BackupDirectory)
+            BackupDirectory = PathPolicy.Resolve(config.BackupDirectory, finalDirectory: true, allowMissing: false)
         };
     }
 
@@ -133,7 +133,7 @@ public sealed partial class DeletionService
 
     private string ValidateTarget(string path)
     {
-        var normalized = PathPolicy.Absolute(path);
+        var normalized = PathPolicy.Resolve(path);
         if (PathPolicy.Within(normalized, config.BackupDirectory))
             throw new ArgumentException($"Target path is inside the recovery directory: {normalized}");
         return normalized;
@@ -204,8 +204,10 @@ public sealed partial class DeletionService
         foreach (var entry in manifest.Items)
         {
             if (entry is null) throw new InvalidDataException("Manifest contains a null entry.");
-            var normalized = ValidateTarget(entry.Path);
-            if (normalized != entry.Path || !seen.Add(normalized)) throw new InvalidDataException("Manifest path is not canonical or duplicated.");
+            // schema 1 の記録文字列は変更せず、実行時の実体解決とは分けて検査する。
+            var normalized = PathPolicy.Absolute(entry.Path);
+            if (normalized != entry.Path || !seen.Add(normalized) || PathPolicy.Within(normalized, config.BackupDirectory))
+                throw new InvalidDataException("Manifest path is not canonical, duplicated, or inside the recovery directory.");
             if (entry.State is not ("backup_ready" or "already_absent" or "failed")) throw new InvalidDataException("Invalid manifest state.");
             if (entry.State == "backup_ready" && (entry.Size is null or < 0 || entry.Sha256 is null
                 || entry.Sha256.Length != 64 || !entry.Sha256.All(char.IsAsciiHexDigit)))
@@ -213,9 +215,10 @@ public sealed partial class DeletionService
         }
     }
 
-    private static void RestoreOne(ManifestEntry entry, FileOperationResult item)
+    private void RestoreOne(ManifestEntry entry, FileOperationResult item)
     {
-        using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(entry.Path)!);
+        var target = ValidateTarget(entry.Path);
+        using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(target)!);
         using var backupHandle = NativeFiles.OpenBackup(item.BackupPath!);
         NativeFiles.Verify(backupHandle, item.BackupPath!);
         using var backup = new FileStream(backupHandle, FileAccess.Read);
@@ -223,22 +226,22 @@ public sealed partial class DeletionService
         if (backup.Length != entry.Size || !digest.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("Backup hash or size differs from the manifest.");
         backup.Position = 0;
-        if (Path.Exists(entry.Path)) { item.Status = "conflict"; item.Error = "Original path already exists; nothing was overwritten."; return; }
+        if (Path.Exists(target)) { item.Status = "conflict"; item.Error = "Original path already exists; nothing was overwritten."; return; }
         Microsoft.Win32.SafeHandles.SafeFileHandle destinationHandle;
-        try { destinationHandle = NativeFiles.CreateDestination(entry.Path); }
-        catch (IOException) when (Path.Exists(entry.Path)) { item.Status = "conflict"; item.Error = "Original path was concurrently created; nothing was overwritten."; return; }
+        try { destinationHandle = NativeFiles.CreateDestination(target); }
+        catch (IOException) when (Path.Exists(target)) { item.Status = "conflict"; item.Error = "Original path was concurrently created; nothing was overwritten."; return; }
         using (destinationHandle)
         using (var destination = new FileStream(destinationHandle, FileAccess.ReadWrite))
         {
             try
             {
-                NativeFiles.Verify(destinationHandle, entry.Path);
+                NativeFiles.Verify(destinationHandle, target);
                 backup.CopyTo(destination);
                 destination.Flush(true);
                 destination.Position = 0;
                 if (!Convert.ToHexString(SHA256.HashData(destination)).Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
                     throw new IOException("Restored file hash verification failed.");
-                if (entry.LastWriteUtc.HasValue) File.SetLastWriteTimeUtc(entry.Path, entry.LastWriteUtc.Value);
+                if (entry.LastWriteUtc.HasValue) File.SetLastWriteTimeUtc(target, entry.LastWriteUtc.Value);
                 item.Status = "restored";
             }
             catch (Exception original) when (IsOperational(original))

@@ -6,8 +6,11 @@ internal static class PathPolicy
 {
     internal static string Absolute(string? value)
     {
+        // 拡張長形式も通常のローカルドライブに限り、同じ構文検査へ通す。
+        if (value?.StartsWith(@"\\?\", StringComparison.Ordinal) == true) value = value[4..];
+        value = value?.Replace('/', '\\');
         if (string.IsNullOrWhiteSpace(value) || value.Length < 3 || !char.IsAsciiLetter(value[0])
-            || value[1] != ':' || value[2] != '\\' || value.Contains('/')
+            || value[1] != ':' || value[2] != '\\'
             || value.AsSpan(2).Contains(':') || value.IndexOfAny(['*', '?', '\0']) >= 0)
             throw new ArgumentException("Use an absolute local drive path without wildcards, ADS, UNC, or device syntax.");
         var path = value.TrimEnd('\\');
@@ -32,8 +35,41 @@ internal static class PathPolicy
 
     internal static void ExistingDirectory(string path)
     {
-        Inspect(path, true);
-        if (!Directory.Exists(path)) throw new DirectoryNotFoundException($"Required directory does not exist: {path}");
+        Resolve(path, finalDirectory: true, allowMissing: false);
+    }
+
+    // 入力の全祖先と、ハンドルが示す実体の全祖先を固定してから実体パスを返す。
+    // 欠損対象は最後に確認できた実体の親へ連結し、短縮名やホスト転送を引き継がない。
+    internal static string Resolve(string path, bool finalDirectory = false, bool allowMissing = true)
+    {
+        path = Absolute(path);
+        var components = Components(path).ToArray();
+        using var lease = new DirectoryLease();
+        var pinned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var actual = path[..3];
+        for (var i = 0; i < components.Length; i++)
+        {
+            var directory = i != components.Length - 1 || finalDirectory;
+            SafeFileHandle handle;
+            try { handle = directory ? NativeFiles.OpenDirectory(components[i]) : NativeFiles.OpenInspect(components[i]); }
+            catch (Exception ex) when (allowMissing && ex is FileNotFoundException or DirectoryNotFoundException)
+            {
+                if (i == 0) throw;
+                foreach (var suffix in components.Skip(i)) actual = Path.Combine(actual, Path.GetFileName(suffix));
+                return actual;
+            }
+            lease.Handles.Add(handle);
+            actual = NativeFiles.ResolveVerified(handle, directory);
+            var parent = directory ? actual : Path.GetDirectoryName(actual)!;
+            foreach (var ancestor in Components(parent))
+            {
+                if (!pinned.Add(ancestor)) continue;
+                var canonicalHandle = NativeFiles.OpenDirectory(ancestor);
+                lease.Handles.Add(canonicalHandle);
+                NativeFiles.Verify(canonicalHandle, ancestor, directory: true);
+            }
+        }
+        return actual;
     }
 
     // OPEN_REPARSE_POINT と削除共有を許さない親ハンドルで、検査後の差し替えを阻止する。
@@ -55,24 +91,7 @@ internal static class PathPolicy
 
     internal static void Inspect(string path, bool finalDirectory = false)
     {
-        var components = Components(path).ToArray();
-        for (var i = 0; i < components.Length; i++)
-        {
-            FileAttributes attributes;
-            try { attributes = File.GetAttributes(components[i]); }
-            catch (FileNotFoundException) { return; }
-            catch (DirectoryNotFoundException) { return; }
-            if ((attributes & FileAttributes.ReparsePoint) != 0)
-                throw new ArgumentException($"Reparse points are not allowed: {components[i]}");
-            var expectDirectory = i != components.Length - 1 || finalDirectory;
-            if (((attributes & FileAttributes.Directory) != 0) != expectDirectory)
-                throw new ArgumentException(expectDirectory ? "An ancestor is not a directory." : "Only files may be deleted or restored.");
-            if (expectDirectory)
-            {
-                using var handle = NativeFiles.OpenDirectory(components[i]);
-                NativeFiles.Verify(handle, components[i], directory: true);
-            }
-        }
+        Resolve(path, finalDirectory);
     }
 
     private static IEnumerable<string> Components(string path)

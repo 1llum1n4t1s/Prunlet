@@ -102,7 +102,7 @@ internal static class Program
 
     private static string[] ReadDeletePathsFile(string path)
     {
-        var normalized = PathPolicy.Absolute(path);
+        var normalized = PathPolicy.Resolve(path, allowMissing: false);
         using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(normalized)!);
         using var handle = NativeFiles.OpenBackup(normalized);
         NativeFiles.Verify(handle, normalized);
@@ -139,6 +139,7 @@ internal static class Program
         if (backupDirectory is null) throw new ArgumentException("Specify a backup directory.");
         var config = new PrunletConfig { Schema = 1, AllowedRoots = roots.ToArray(), BackupDirectory = backupDirectory };
         config.Validate();
+        config.BackupDirectory = PathPolicy.Resolve(config.BackupDirectory, finalDirectory: true, allowMissing: false);
         var parent = Path.GetDirectoryName(configPath)!;
         if (!Directory.Exists(parent)) throw new ArgumentException("Config parent directory must already exist.");
         // 初期化は既存の設定を上書きしない。

@@ -13,6 +13,7 @@ internal static class NativeFiles
     private const uint CaseSensitiveDirectory = 0x00000001;
 
     internal static SafeFileHandle OpenDirectory(string path) => Open(path, 0x80, 3, 3, OpenReparse | BackupSemantics);
+    internal static SafeFileHandle OpenInspect(string path) => Open(path, 0x80, 3, 3, OpenReparse);
     internal static SafeFileHandle OpenSource(string path) => Open(path, Read | Delete, 1, 3, OpenReparse);
     internal static SafeFileHandle OpenBackup(string path) => Open(path, Read, 1, 3, OpenReparse);
     internal static SafeFileHandle OpenPurgeTarget(string path) => Open(path, Read | Delete, 1, 3, OpenReparse);
@@ -59,6 +60,14 @@ internal static class NativeFiles
 
     internal static void Verify(SafeFileHandle handle, string expected, bool directory = false)
     {
+        var actual = ResolveVerified(handle, directory);
+        if (!actual.TrimEnd('\\').Equals(expected.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+            throw new IOException("Resolved handle path differs from the validated canonical path.");
+    }
+
+    // 表記の一致と、通常ファイル/ディレクトリであることの検査を分離する。
+    internal static string ResolveVerified(SafeFileHandle handle, bool directory = false)
+    {
         if (!GetFileInformationByHandle(handle, out var info)) ThrowLastError("Cannot inspect file handle");
         if ((info.Attributes & (uint)FileAttributes.ReparsePoint) != 0
             || ((info.Attributes & (uint)FileAttributes.Directory) != 0) != directory)
@@ -70,15 +79,13 @@ internal static class NativeFiles
             if (!GetFileInformationByHandleEx(handle, FileCaseSensitiveInfo, out var caseInfo, (uint)Marshal.SizeOf<CaseSensitiveInformation>()))
                 ThrowLastError("Cannot verify directory case sensitivity; this OS/filesystem is unsupported");
             if ((caseInfo.Flags & CaseSensitiveDirectory) != 0)
-                throw new IOException($"Case-sensitive directories are not supported: {expected}");
+                throw new IOException("Case-sensitive directories are not supported.");
         }
         var buffer = new StringBuilder(32768);
         var length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
         if (length == 0 || length >= buffer.Capacity) ThrowLastError("Cannot resolve file handle path");
         var actual = buffer.ToString();
-        if (actual.StartsWith("\\\\?\\", StringComparison.Ordinal)) actual = actual[4..];
-        if (!actual.TrimEnd('\\').Equals(expected.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
-            throw new IOException("Resolved handle path differs from the validated path (aliases are not supported).");
+        return PathPolicy.Absolute(actual);
     }
 
     internal static void VerifySingleLink(SafeFileHandle handle)
