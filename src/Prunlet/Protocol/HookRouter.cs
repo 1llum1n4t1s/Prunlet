@@ -15,9 +15,9 @@ internal static class HookRouter
     {
         try
         {
-            var payload = await Console.In.ReadToEndAsync();
-            if (payload.Length > 1_048_576) throw new ArgumentException("Hook input exceeds 1 MiB.");
-            using var document = JsonDocument.Parse(payload);
+            var payload = await BoundedInputReader.ReadToEndAsync(Console.In, BoundedInputReader.RequestLimit);
+            if (payload.ExceedsLimit) throw new ArgumentException("Hook input exceeds 1 MiB.");
+            using var document = JsonDocument.Parse(payload.Text);
             var input = document.RootElement;
             if (input.ValueKind != JsonValueKind.Object) throw new ArgumentException("Hook input must be an object.");
             if (!input.TryGetProperty("tool_name", out var name) || name.ValueKind != JsonValueKind.String)

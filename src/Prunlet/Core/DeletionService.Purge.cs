@@ -82,7 +82,7 @@ public sealed partial class DeletionService
                 held.Add(stream);
                 if (stream.Length != entry.Size || !HashStream(stream).Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException($"Recovery copy size/hash differs from manifest: {name}");
-                if (manifest.Schema == 3) VerifySpecialBackup(stream, entry);
+                if (manifest.Schema == 3) VerifySpecialBackupContents(stream, entry);
                 backups.Add(index, stream);
                 item.Status = "would_purge";
             }

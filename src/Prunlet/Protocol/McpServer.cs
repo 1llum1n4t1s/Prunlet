@@ -11,15 +11,16 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
 
     public async Task RunAsync(TextReader input, TextWriter output)
     {
-        while (await input.ReadLineAsync() is { } line)
+        var reader = new BoundedInputReader(input, BoundedInputReader.RequestLimit);
+        while (await reader.ReadLineAsync() is { } line)
         {
-            if (string.IsNullOrWhiteSpace(line)) continue;
+            if (line.IsWhiteSpace) continue;
             JsonElement? id = null;
             object response;
             try
             {
-                if (line.Length > 1_048_576) throw new RpcException(-32600, "Request exceeds 1 MiB.");
-                using var document = JsonDocument.Parse(line);
+                if (line.ExceedsLimit) throw new RpcException(-32600, "Request exceeds 1 MiB.");
+                using var document = JsonDocument.Parse(line.Text);
                 var request = document.RootElement;
                 if (request.ValueKind != JsonValueKind.Object) throw new RpcException(-32600, "Expected a JSON-RPC object.");
                 if (request.TryGetProperty("id", out var requestId))

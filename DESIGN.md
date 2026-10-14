@@ -13,6 +13,7 @@ PrunletはWindowsのファイル・フォルダーとシンボリックリンク
 | `Core/DeletionService.cs` / `Core/DeletionService.Directories.cs` / `Core/DeletionService.Specials.cs` / `Core/DeletionService.Purge.cs` | CLIとMCP共通の削除・復元処理、CLIの明示purge、SHA-256検証、永続記録 |
 | `Protocol/McpServer.cs` | 改行区切りJSON-RPC、初期化、3つのツールと引数検査。対象フォルダーの許可リストを設けない |
 | `Protocol/HookRouter.cs` | exeだけで入力を検査し、直接削除を拒否してCLI手順を案内。削除・自動置換は行わない |
+| `Protocol/BoundedInputReader.cs` | MCPとhookの入力を読み取り中に制限。単位と応答は[連携手順](docs/integration.md#hookの検査範囲)を参照 |
 | `integration/install-codex.ps1` / `uninstall-codex.ps1` / `configuration-common.ps1` | 他設定を保持したMCP・フック登録と解除、更新前バックアップ、所有マーカーと競合の検査 |
 | `integration/install-agent-instructions.ps1` / `integration/PRUNLET.md` | Codex共通AGENTSから専用指示を読む経路の登録・解除。管理マーカーとguideのハッシュを照合し、利用者の編集を保護 |
 | `scripts/` | 外部出力のビルド、GitHub最新HEADからの導入、実プロセスを使うE2E検証 |

@@ -69,6 +69,28 @@ function Invoke-ProcessJson([string]$FileName, [string[]]$Arguments, [string]$In
     } finally { $process.Dispose() }
 }
 function Invoke-Prunlet([string[]]$Arguments) { return Invoke-ProcessJson $ExecutablePath (@('--config', $script:Config) + $Arguments) }
+function Write-ProtocolInput([Diagnostics.Process]$Process, [string]$Text) {
+    $write = $Process.StandardInput.WriteAsync($Text)
+    Assert-True ($write.Wait(5000)) 'Protocol input write exceeded 5 seconds.'
+    $null = $write.GetAwaiter().GetResult()
+    $flush = $Process.StandardInput.FlushAsync()
+    Assert-True ($flush.Wait(5000)) 'Protocol input flush exceeded 5 seconds.'
+    $null = $flush.GetAwaiter().GetResult()
+}
+function Read-ProtocolResponse([Diagnostics.Process]$Process) {
+    $read = $Process.StandardOutput.ReadLineAsync()
+    Assert-True ($read.Wait(5000)) 'Protocol response exceeded 5 seconds with stdin open.'
+    $line = $read.GetAwaiter().GetResult()
+    Assert-True ($null -ne $line) 'Protocol output closed before its response.'
+    return $line | ConvertFrom-Json -Depth 30
+}
+function Complete-McpSession([Diagnostics.Process]$Process, [object]$ErrorTask) {
+    $remaining = $Process.StandardOutput.ReadToEndAsync()
+    $Process.StandardInput.Close()
+    Assert-True ($Process.WaitForExit(5000) -and $Process.ExitCode -eq 0) 'MCP did not exit successfully on EOF.'
+    Assert-True (!$remaining.GetAwaiter().GetResult()) 'MCP emitted an unexpected extra response.'
+    Assert-True (!$ErrorTask.GetAwaiter().GetResult()) 'MCP wrote unexpected stderr.'
+}
 function Test-Case([string]$Name, [scriptblock]$Body) {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     try { & $Body; $script:Results.Add(@{ name = $Name; passed = $true; milliseconds = $timer.Elapsed.TotalMilliseconds }) }
@@ -1142,6 +1164,95 @@ Test-Case 'MCP real stdio lifecycle/delete/restore/validation' {
         $process.StandardInput.Close()
         Assert-True ($process.WaitForExit(10000) -and $process.ExitCode -eq 0) 'MCP did not stop on EOF.'
         Assert-True (!$errTask.GetAwaiter().GetResult()) 'MCP wrote unexpected errors.'
+    } finally { if (!$process.HasExited) { $process.Kill($true) }; $process.Dispose() }
+}
+Test-Case 'MCP UTF16 limit accepts exact requests rejects overflow and resumes after whitespace' {
+    $limit = 1048576
+    $process = Start-ProcessInfo $ExecutablePath @('--config', $script:Config, 'mcp')
+    try {
+        $errTask = $process.StandardError.ReadToEndAsync()
+        $ping = '{"jsonrpc":"2.0","id":101,"method":"ping"}'
+        $prefix = '{"jsonrpc":"2.0","id":101,"method":"ping","padding":"'
+        # 非ASCIIとサロゲートペアで、UTF8バイト数やコードポイント数ではない境界を検査する。
+        $unicode = $prefix + '😀' + ('界' * ($limit - $prefix.Length - 4)) + '"}'
+        foreach ($request in @($ping.PadRight($limit), $unicode)) {
+            Assert-True ($request.Length -eq $limit) 'Exact-limit MCP fixture length differs.'
+            Write-ProtocolInput $process ($request + "`n")
+            $response = Read-ProtocolResponse $process
+            Assert-True ($response.id -eq 101 -and !$response.error) 'MCP rejected an exact-limit request.'
+            Write-ProtocolInput $process ($request + " `n" + $ping + "`n")
+            $overflow = Read-ProtocolResponse $process
+            Assert-True ($null -eq $overflow.id -and $overflow.error.code -eq -32600 -and $overflow.error.message -ceq 'Request exceeds 1 MiB.') 'MCP overflow rejection differs.'
+            $next = Read-ProtocolResponse $process
+            Assert-True ($next.id -eq 101 -and !$next.error) 'MCP did not resume after oversized input.'
+        }
+        Write-ProtocolInput $process ((' ' * ($limit + 1)) + "`n" + $ping + "`n")
+        $response = Read-ProtocolResponse $process
+        Assert-True ($response.id -eq 101 -and !$response.error) 'Oversized whitespace emitted a response or lost the next request.'
+        Complete-McpSession $process $errTask
+    } finally { if (!$process.HasExited) { $process.Kill($true) }; $process.Dispose() }
+}
+Test-Case 'MCP accepts LF CR CRLF buffer boundaries blank lines and final EOF request' {
+    $process = Start-ProcessInfo $ExecutablePath @('--config', $script:Config, 'mcp')
+    try {
+        $errTask = $process.StandardError.ReadToEndAsync()
+        $ping = '{"jsonrpc":"2.0","id":102,"method":"ping"}'
+        # CRを4096文字境界の両側に置き、続くLFが別の行へ漏れないことを確認する。
+        $frames = @(
+            ($ping.PadRight(4095) + "`r`n")
+            ($ping.PadRight(4095) + "`r`n")
+            ($ping + "`n")
+            ($ping + "`r")
+            ($ping + "`r`n")
+        )
+        foreach ($frame in $frames) {
+            Write-ProtocolInput $process $frame
+            $response = Read-ProtocolResponse $process
+            Assert-True ($response.id -eq 102 -and !$response.error) 'MCP line-ending response differs.'
+        }
+        Write-ProtocolInput $process ("`n `t`r`n" + $ping)
+        $process.StandardInput.Close()
+        $response = Read-ProtocolResponse $process
+        Assert-True ($response.id -eq 102 -and !$response.error) 'MCP did not handle blank lines and final EOF request.'
+        $remaining = $process.StandardOutput.ReadToEndAsync()
+        Assert-True ($process.WaitForExit(5000) -and $process.ExitCode -eq 0) 'MCP did not stop at final EOF.'
+        Assert-True (!$remaining.GetAwaiter().GetResult() -and !$errTask.GetAwaiter().GetResult()) 'MCP emitted extra output for line endings.'
+    } finally { if (!$process.HasExited) { $process.Kill($true) }; $process.Dispose() }
+}
+Test-Case 'MCP responds to 1024-byte ping while stdin remains open' {
+    $process = Start-ProcessInfo $ExecutablePath @('--config', $script:Config, 'mcp')
+    try {
+        $errTask = $process.StandardError.ReadToEndAsync()
+        $ping = '{"jsonrpc":"2.0","id":103,"method":"ping"}'
+        $frame = $ping.PadRight(1023) + "`n"
+        Assert-True ([Text.Encoding]::UTF8.GetByteCount($frame) -eq 1024) 'Interactive MCP fixture byte length differs.'
+        Write-ProtocolInput $process $frame
+        $response = Read-ProtocolResponse $process
+        Assert-True ($response.id -eq 103 -and !$response.error -and !$process.HasExited) 'MCP failed to respond with stdin open.'
+        Complete-McpSession $process $errTask
+    } finally { if (!$process.HasExited) { $process.Kill($true) }; $process.Dispose() }
+}
+Test-Case 'hook UTF16 exact limit passes and overflow denies without waiting for EOF' {
+    $limit = 1048576
+    $hook = '{"tool_name":"exec_command","tool_input":{"cmd":"echo bounded input"}}'
+    $prefix = '{"tool_name":"exec_command","tool_input":{"cmd":"echo bounded input"},"padding":"'
+    $unicode = $prefix + '😀' + ('界' * ($limit - $prefix.Length - 4)) + '"}'
+    foreach ($request in @($hook.PadRight($limit), $unicode)) {
+        Assert-True ($request.Length -eq $limit) 'Exact-limit hook fixture length differs.'
+        $result = Invoke-ProcessJson $ExecutablePath @('--config', $script:Config, 'hook') $request
+        Assert-True ($result.ExitCode -eq 0 -and $null -ne $result.Json -and !$result.Json.hookSpecificOutput -and !$result.Stderr) 'Hook rejected an exact-limit request.'
+    }
+    $process = Start-ProcessInfo $ExecutablePath @('--config', $script:Config, 'hook')
+    try {
+        # EOFを渡さず応答を待ち、超過時の早期終了をbroken pipeの例外に依存せず検査する。
+        $outTask = $process.StandardOutput.ReadToEndAsync()
+        $errTask = $process.StandardError.ReadToEndAsync()
+        Write-ProtocolInput $process ($unicode + ' ')
+        Assert-True ($outTask.Wait(5000)) 'Oversized hook input waited for EOF.'
+        Assert-True ($process.WaitForExit(5000) -and $process.ExitCode -eq 0) 'Oversized hook process exit differs.'
+        $response = $outTask.GetAwaiter().GetResult() | ConvertFrom-Json -Depth 30
+        Assert-True ($response.hookSpecificOutput.permissionDecision -ceq 'deny' -and $response.hookSpecificOutput.permissionDecisionReason -ceq 'Prunlet could not inspect the hook input: Hook input exceeds 1 MiB.') 'Oversized hook denial reason differs.'
+        Assert-True ($errTask.GetAwaiter().GetResult().Trim() -ceq 'Prunlet hook: Hook input exceeds 1 MiB.') 'Oversized hook stderr differs.'
     } finally { if (!$process.HasExited) { $process.Kill($true) }; $process.Dispose() }
 }
 Test-Case 'native hook denies raw deletion without replacement or side effects' {

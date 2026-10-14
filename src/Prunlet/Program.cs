@@ -176,6 +176,17 @@ internal static class Program
 
     internal static bool HasErrors(object result)
     {
+        var typedItems = result switch
+        {
+            DeleteResult deleted => deleted.Items,
+            RestoreResult restored => restored.Items,
+            PurgeResult purged => purged.Items,
+            _ => null
+        };
+        if (typedItems is not null)
+            return typedItems.Any(item => !string.IsNullOrEmpty(item.Error) ||
+                item.Status is "failed" or "conflict" or "error" or "restore_failed");
+
         var json = JsonSerializer.SerializeToElement(result, JsonOptions);
         if (!json.TryGetProperty("items", out var items)) return false;
         return items.EnumerateArray().Any(item =>

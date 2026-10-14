@@ -318,6 +318,11 @@ public sealed partial class DeletionService
         backup.Position = 0;
         if (backup.Length != entry.Size || !Convert.ToHexString(SHA256.HashData(backup)).Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("Backup hash or size differs from the manifest.");
+        VerifySpecialBackupContents(backup, entry);
+    }
+
+    private static void VerifySpecialBackupContents(FileStream backup, ManifestEntry entry)
+    {
         if (entry.Kind is "symlink" or "junction")
         {
             backup.Position = 0; var bytes = new byte[checked((int)backup.Length)]; backup.ReadExactly(bytes);
