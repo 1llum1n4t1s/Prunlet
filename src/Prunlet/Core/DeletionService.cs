@@ -27,8 +27,9 @@ public sealed partial class DeletionService
         var normalized = paths.Select(ValidateAnyTarget).ToArray();
         for (var i = 0; i < normalized.Length; i++)
             for (var j = i + 1; j < normalized.Length; j++)
-                if (PathPolicy.Within(normalized[i], normalized[j]) || PathPolicy.Within(normalized[j], normalized[i]))
+                if (ExactWithin(normalized[i], normalized[j]) || ExactWithin(normalized[j], normalized[i]))
                     throw new ArgumentException("Duplicate or overlapping target paths are not allowed.");
+        if (normalized.Any(path => HasSpecialTarget(path, recursive))) return DeleteSpecial(normalized, dryRun, recursive);
         if (normalized.Any(IsDirectoryPath)) return DeleteTrees(normalized, dryRun, recursive);
         return DeleteFiles(normalized, dryRun);
     }
@@ -49,11 +50,11 @@ public sealed partial class DeletionService
             return result;
         }
 
-        using var backupRoot = PathPolicy.PinDirectories(config.BackupDirectory);
+        using var backupRoot = PathPolicy.PinRecoveryDirectories(config.BackupDirectory);
         var operationId = Guid.NewGuid().ToString("N");
         var directory = Path.Combine(config.BackupDirectory, operationId);
         NativeFiles.CreateDirectory(directory);
-        using var operationDirectories = PathPolicy.PinDirectories(directory);
+        using var operationDirectories = PathPolicy.PinRecoveryDirectories(directory);
         using var operationLock = NativeFiles.CreateDestination(Path.Combine(directory, "operation.lock"));
         NativeFiles.Verify(operationLock, Path.Combine(directory, "operation.lock"));
         result.OperationId = operationId;
@@ -116,18 +117,23 @@ public sealed partial class DeletionService
         if (!Guid.TryParseExact(operationId, "N", out var id) || id.ToString("N") != operationId)
             throw new ArgumentException("Operation ID must be a lowercase 32-character GUID.");
         var directory = Path.Combine(config.BackupDirectory, operationId);
-        using var directories = PathPolicy.PinDirectories(directory);
+        using var directories = PathPolicy.PinRecoveryDirectories(directory);
         using var operationLock = NativeFiles.OpenLock(Path.Combine(directory, "operation.lock"));
         NativeFiles.Verify(operationLock, Path.Combine(directory, "operation.lock"));
+        NativeFiles.VerifySingleLink(operationLock);
+        NativeFiles.RejectNamedStreams(Path.Combine(directory, "operation.lock"));
         if (Directory.EnumerateFileSystemEntries(directory).Any(path => Path.GetFileName(path).Equals("purge-intent.json", StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException("Recovery copies have been scheduled for purge; restoration is unavailable for this operation.");
         var manifestPath = Path.Combine(directory, "manifest.json");
         using var manifestHandle = NativeFiles.OpenBackup(manifestPath);
         NativeFiles.Verify(manifestHandle, manifestPath);
+        NativeFiles.VerifySingleLink(manifestHandle);
+        NativeFiles.RejectNamedStreams(manifestPath);
         using var manifestStream = new FileStream(manifestHandle, FileAccess.Read);
         if (manifestStream.Length > 8 * 1024 * 1024) throw new InvalidDataException("Manifest is too large.");
         var manifest = ReadValidatedJson<OperationManifest>(manifestStream);
         ValidateManifest(manifest, operationId);
+        if (manifest.Schema == 3) return RestoreSpecial(manifest, directory);
         if (manifest.Schema == 2) return RestoreTrees(manifest, directory);
         var result = new RestoreResult { OperationId = operationId };
         for (var i = 0; i < manifest.Items.Count; i++)
@@ -213,10 +219,10 @@ public sealed partial class DeletionService
 
     private void ValidateManifest(OperationManifest manifest, string operationId)
     {
-        if (manifest.Schema is not (1 or 2) || manifest.OperationId != operationId || manifest.CreatedUtc == default || manifest.Items is null
+        if (manifest.Schema is not (1 or 2 or 3) || manifest.OperationId != operationId || manifest.CreatedUtc == default || manifest.Items is null
             || manifest.Items.Count == 0 || (manifest.Schema == 1 && manifest.Items.Count > 256))
             throw new InvalidDataException("Manifest schema, ID, or item count is invalid.");
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seen = new HashSet<string>(manifest.Schema == 3 ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
         foreach (var entry in manifest.Items)
         {
             if (entry is null) throw new InvalidDataException("Manifest contains a null entry.");
@@ -226,14 +232,17 @@ public sealed partial class DeletionService
                 || (entry.Kind == "directory" && (normalized.Length == 3 || PathPolicy.Within(config.BackupDirectory, normalized))))
                 throw new InvalidDataException("Manifest path is not canonical, duplicated, or inside the recovery directory.");
             if (entry.State is not ("backup_ready" or "already_absent" or "failed")) throw new InvalidDataException("Invalid manifest state.");
-            if (entry.Kind is not ("file" or "directory") || (manifest.Schema == 1 && (entry.Kind != "file" || entry.TreeRoot is not null)))
+            if ((manifest.Schema == 3 ? entry.Kind is not ("file" or "directory" or "symlink" or "junction") : entry.Kind is not ("file" or "directory")) || (manifest.Schema == 1 && (entry.Kind != "file" || entry.TreeRoot is not null)))
                 throw new InvalidDataException("Invalid manifest entry kind or tree root.");
-            if (entry.Kind == "directory" && (entry.Size is not null || entry.Sha256 is not null))
+            if (manifest.Schema != 3 && (entry.Streams is not null || entry.ReparseTag is not null || entry.LinkDirectory || entry.CaseSensitive))
+                throw new InvalidDataException("Special metadata requires schema 3.");
+            if (manifest.Schema != 3 && entry.Kind == "directory" && (entry.Size is not null || entry.Sha256 is not null))
                 throw new InvalidDataException("Directory records cannot contain file backup metadata.");
-            if (entry.Kind == "file" && entry.State == "backup_ready" && (entry.Size is null or < 0 || entry.Sha256 is null
+            if ((entry.Kind == "file" || manifest.Schema == 3) && entry.State == "backup_ready" && (entry.Size is null or < 0 || entry.Sha256 is null
                 || entry.Sha256.Length != 64 || !entry.Sha256.All(char.IsAsciiHexDigit)))
                 throw new InvalidDataException("Manifest hash or size is invalid.");
         }
+        if (manifest.Schema == 3) ValidateSpecialManifest(manifest);
         if (manifest.Schema == 2) ValidateTreeManifest(manifest);
     }
 

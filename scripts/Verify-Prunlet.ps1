@@ -29,6 +29,7 @@ $script:Recovery = Join-Path $outputRoot 'recovery'
 $script:Config = Join-Path $outputRoot 'config.json'
 $null = New-Item -ItemType Directory -Path $script:Scope, $script:Recovery
 $script:Results = [Collections.Generic.List[object]]::new()
+$script:SymbolicRestoreEvidence = [Collections.Generic.List[object]]::new()
 
 function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { throw $Message } }
 function New-File([string]$Name, [string]$Content = 'Prunlet fixture') {
@@ -79,9 +80,9 @@ function Hook([string]$Command, [string]$ToolName = 'Bash', [string]$Field = 'co
     Assert-True ($result.ExitCode -eq 0) 'Hook process failed.'
     return $result.Json
 }
-function Assert-Rejected([string[]]$Arguments, [string]$UntouchedPath) {
+function Assert-Rejected([string[]]$Arguments, [string]$UntouchedPath, [string]$Context = '') {
     $result = Invoke-Prunlet $Arguments
-    Assert-True ($result.ExitCode -ne 0) 'Operation unexpectedly succeeded.'
+    Assert-True ($result.ExitCode -ne 0) ("Operation unexpectedly succeeded ($Context; $($Arguments -join ' ')): " + ($result.Json | ConvertTo-Json -Depth 30 -Compress))
     if ($UntouchedPath) { Assert-True ([IO.File]::Exists($UntouchedPath)) 'Original file was lost.' }
 }
 function File-Digest([string]$Path) {
@@ -120,8 +121,87 @@ function New-SymbolicFixture([string]$Path, [string]$Target) {
         $body = "$" + "ErrorActionPreference='Stop'; New-Item -ItemType SymbolicLink -Path '" + $Path.Replace("'", "''") + "' -Target '" + $Target.Replace("'", "''") + "' | Out-Null"
         [IO.File]::WriteAllText($helper, $body, [Text.UTF8Encoding]::new($false))
         $elevated = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', ('"' + $helper + '"')) -Verb RunAs -WindowStyle Hidden -PassThru -Wait
-        Assert-True ($elevated.ExitCode -eq 0 -and [IO.File]::Exists($Path)) 'Elevated link fixture creation failed.'
+        Assert-True ($elevated.ExitCode -eq 0 -and ((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) 'Elevated link fixture creation failed.'
     }
+}
+function Enable-CaseSensitiveFixture([string]$Path) {
+    $helper = Join-Path $outputRoot ('enable-case-fixture-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    $body = "& fsutil.exe file SetCaseSensitiveInfo '" + $Path.Replace("'", "''") + "' enable; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }"
+    [IO.File]::WriteAllText($helper, $body, [Text.UTF8Encoding]::new($false))
+    $elevated = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile','-File',('"' + $helper + '"')) -Verb RunAs -WindowStyle Hidden -PassThru -Wait
+    Assert-True ($elevated.ExitCode -eq 0) 'Cannot enable case-sensitive fixture.'
+    Assert-True (Get-CaseSensitiveFixtureFlag $Path) ('Case-sensitive fixture flag remained disabled after fsutil exit 0: ' + $Path)
+}
+function Get-CaseSensitiveFixtureFlag([string]$Path) {
+    if (!('PrunletVerificationDirectoryFlags' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class PrunletVerificationDirectoryFlags {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int informationClass, out uint flags, uint size);
+    public static bool IsCaseSensitive(string path) {
+        using (var handle = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+            if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (!GetFileInformationByHandleEx(handle, 23, out var flags, 4)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            return (flags & 1) != 0;
+        }
+    }
+}
+'@
+    }
+    return [PrunletVerificationDirectoryFlags]::IsCaseSensitive($Path)
+}
+function Enable-CaseSensitiveOperationFixture([string]$Path) {
+    Assert-True ([IO.Path]::GetDirectoryName($Path) -ceq $script:Recovery -and [IO.Path]::GetFileName($Path) -cmatch '^[a-f0-9]{32}$') 'Case-sensitive operation fixture must be inside this run recovery directory.'
+    Assert-True ([IO.Directory]::Exists($Path) -and !((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) 'Operation fixture directory must not be a link.'
+    $stash = Join-Path $outputRoot ('case-operation-stash-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $stash
+    $moved = [Collections.Generic.List[object]]::new()
+    try {
+        # fsutilは非空ディレクトリの設定に失敗しても終了コード0を返すため、fixtureの記録だけを一時退避する。
+        foreach ($file in [IO.Directory]::EnumerateFileSystemEntries($Path)) {
+            Assert-True ([IO.File]::Exists($file) -and !((Get-Item -LiteralPath $file -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) 'Operation fixture contains an unexpected member.'
+            $saved = Join-Path $stash ([IO.Path]::GetFileName($file))
+            [IO.File]::Move($file, $saved)
+            $moved.Add(@{ Original = $file; Saved = $saved })
+        }
+        Enable-CaseSensitiveFixture $Path
+    } finally {
+        foreach ($file in $moved) { [IO.File]::Move($file.Saved, $file.Original) }
+    }
+    Assert-True (Get-CaseSensitiveFixtureFlag $Path) 'Restored operation fixture lost the case-sensitive flag.'
+}
+function Invoke-ElevatedPrunletRestore([string]$OperationId) {
+    Assert-True ($OperationId -cmatch '^[a-f0-9]{32}$') 'Elevated restore requires a recorded operation ID.'
+    $stdoutPath = Join-Path $outputRoot ('elevated-restore-' + $OperationId + '.json')
+    $stderrPath = Join-Path $outputRoot ('elevated-restore-' + $OperationId + '.stderr.txt')
+    foreach ($path in @($ExecutablePath, $script:Config, $stdoutPath, $stderrPath)) {
+        Assert-True ([IO.Path]::IsPathFullyQualified($path) -and $path -notmatch '["%&|<>^!\r\n]') 'Elevated CMD path cannot be represented safely.'
+    }
+    # 通常と同じCLI/CoreをCMDから起動し、復元に必要な既存のOS特権だけを利用する。
+    $command = '""' + $ExecutablePath + '" --config "' + $script:Config + '" restore "' + $OperationId + '" > "' + $stdoutPath + '" 2> "' + $stderrPath + '""'
+    $process = Start-Process -FilePath 'cmd.exe' -ArgumentList ('/d /s /c ' + $command) -Verb RunAs -WindowStyle Hidden -PassThru -Wait
+    $json = if ([IO.File]::Exists($stdoutPath) -and [IO.File]::ReadAllText($stdoutPath).Trim()) { [IO.File]::ReadAllText($stdoutPath) | ConvertFrom-Json -Depth 100 } else { $null }
+    $stderr = if ([IO.File]::Exists($stderrPath)) { [IO.File]::ReadAllText($stderrPath) } else { '' }
+    return @{ ExitCode = $process.ExitCode; Json = $json; Stderr = $stderr }
+}
+function Restore-SymbolicFixture([string]$OperationId, [string]$Link, [string]$Target, [string]$TargetHash) {
+    $restored = Invoke-Prunlet @('restore', $OperationId)
+    if ($restored.ExitCode -eq 0) {
+        $script:SymbolicRestoreEvidence.Add(@{ operationId = $OperationId; nonelevatedExitCode = 0; usedElevation = $false })
+        return $restored
+    }
+    $errors = @($restored.Json.items | ForEach-Object { $_.error }) -join ' '
+    Assert-True ($errors -match 'privilege|特権') ('Unexpected nonelevated symbolic restore failure: ' + ($restored.Json | ConvertTo-Json -Depth 30 -Compress))
+    Assert-True (!(Test-Path -LiteralPath $Link) -and (File-Digest $Target) -ceq $TargetHash) 'Privilege rejection left a link or changed its target.'
+    $elevated = Invoke-ElevatedPrunletRestore $OperationId
+    $script:SymbolicRestoreEvidence.Add(@{ operationId = $OperationId; nonelevatedExitCode = $restored.ExitCode; nonelevatedError = $errors; usedElevation = $true; elevatedExitCode = $elevated.ExitCode })
+    return $elevated
 }
 function New-PurgeFixture([string]$Name, [int]$Count = 1) {
     $files = @(); $contents = @()
@@ -482,31 +562,53 @@ Test-Case 'nested locked file prevents deletion of every tree member' {
     } finally { $lock.Dispose() }
     Assert-TreeIntact $tree
 }
-Test-Case 'nested junction prevents deletion of siblings and external target' {
+Test-Case 'recursive junction deletion restores link without traversing external target' {
     $tree = New-TreeFixture 'directory-junction'
     $target = Join-Path $outputRoot 'directory-junction-target'; $null = New-Item -ItemType Directory -Path $target
     $file = Join-Path $target 'keep.txt'; [IO.File]::WriteAllText($file, 'external linked target')
     $link = Join-Path $tree.Nested 'link'; $null = New-Item -ItemType Junction -Path $link -Target $target
-    Assert-Rejected @('delete', '--recursive', '--', $tree.Root) $file
+    $hash = File-Digest $file
+    $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $tree.Root)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree.Root)) 'Recursive junction deletion failed.'
+    Assert-True ((File-Digest $file) -ceq $hash) 'Recursive traversal changed linked target.'
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0 -and ((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) 'Junction was not restored as a link.'
     Assert-TreeIntact $tree
-    Assert-True ([IO.File]::ReadAllText($file) -ceq 'external linked target') 'Recursive traversal changed linked target.'
+    Assert-True ((File-Digest $file) -ceq $hash -and (File-Digest (Join-Path $link 'keep.txt')) -ceq $hash) 'Restored junction target differs.'
 }
-Test-Case 'nested ADS and hardlink sources prevent every tree deletion' {
+Test-Case 'recursive ADS and hardlink deletion restores bytes and preserves external names' {
     foreach ($kind in @('ads', 'hardlink')) {
         $tree = New-TreeFixture ('directory-' + $kind)
         if ($kind -eq 'ads') { [IO.File]::WriteAllText($tree.Files[1] + ':custom', 'keep ADS') }
-        else { $null = New-Item -ItemType HardLink -Path (Join-Path $outputRoot 'directory-hardlink-alias.txt') -Target $tree.Files[1] }
-        Assert-Rejected @('delete', '--recursive', '--', $tree.Root) $tree.Files[0]
+        else { $alias = Join-Path $outputRoot 'directory-hardlink-alias.txt'; $null = New-Item -ItemType HardLink -Path $alias -Target $tree.Files[1] }
+        $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $tree.Root)
+        Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree.Root)) 'Special recursive deletion failed.'
+        if ($kind -eq 'hardlink') { Assert-True ((File-Digest $alias) -ceq $tree.Hashes[1]) 'Deletion changed external hardlink bytes.' }
+        $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+        Assert-True ($restored.ExitCode -eq 0) 'Special recursive restore failed.'
         Assert-TreeIntact $tree
         if ($kind -eq 'ads') { Assert-True ([IO.File]::ReadAllText($tree.Files[1] + ':custom') -ceq 'keep ADS') 'Nested ADS changed.' }
+        else { Assert-True ((File-Digest $alias) -ceq $tree.Hashes[1]) 'Restore changed external hardlink bytes.' }
     }
 }
-Test-Case 'directory ADS prevents deletion of every tree member' {
+Test-Case 'directory ADS roundtrip restores stream bytes and every tree member' {
     $tree = New-TreeFixture 'directory-own-ADS'
     [IO.File]::WriteAllText($tree.Nested + ':custom', 'keep directory ADS')
-    Assert-Rejected @('delete', '--recursive', '--', $tree.Root) $tree.Files[0]
+    $streamBytes = [byte[]](0, 255, 13, 10, 128, 42)
+    [IO.File]::WriteAllBytes($tree.Root + ':binary', $streamBytes)
+    $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $tree.Root)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree.Root)) 'Directory ADS deletion failed.'
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0) 'Directory ADS restore failed.'
     Assert-TreeIntact $tree
     Assert-True ([IO.File]::ReadAllText($tree.Nested + ':custom') -ceq 'keep directory ADS') 'Directory ADS changed.'
+    Assert-True ([Convert]::ToHexString([IO.File]::ReadAllBytes($tree.Root + ':binary')) -ceq [Convert]::ToHexString($streamBytes)) 'Root directory ADS bytes changed.'
+    $operationRoot = Join-Path $script:Recovery $deleted.Json.operationId
+    $manifestPath = Join-Path $operationRoot 'manifest.json'; $manifestHash = File-Digest $manifestPath
+    $purged = Invoke-Prunlet @('purge', $deleted.Json.operationId, '--apply')
+    Assert-True ($purged.ExitCode -eq 0 -and @([IO.Directory]::EnumerateFiles($operationRoot, '*.bak')).Count -eq 0 -and (File-Digest $manifestPath) -ceq $manifestHash) 'Special directory purge did not retain immutable manifest and remove copies.'
+    Assert-TreeIntact $tree
+    Assert-True ([IO.File]::ReadAllText($tree.Nested + ':custom') -ceq 'keep directory ADS' -and [Convert]::ToHexString([IO.File]::ReadAllBytes($tree.Root + ':binary')) -ceq [Convert]::ToHexString($streamBytes)) 'Special purge changed restored directory streams.'
 }
 Test-Case 'directory restore conflict never overwrites descendant file' {
     $tree = New-TreeFixture 'directory-restore-conflict'
@@ -547,19 +649,229 @@ Test-Case 'empty deletion rejected' { Assert-Rejected @('delete', '--') '' }
 Test-Case 'ADS path rejected' {
     $file = New-File 'ads-path.txt'; Assert-Rejected @('delete', '--', ($file + ':stream')) $file
 }
-Test-Case 'source carrying ADS is preserved' {
+Test-Case 'file ADS roundtrip restores named stream bytes' {
     $file = New-File 'ads-content.txt'; [IO.File]::WriteAllText($file + ':custom', 'preserve stream')
-    Assert-Rejected @('delete', '--', $file) $file
+    $hash = File-Digest $file
+    $bytes = [byte[]](0, 128, 255, 13, 10); [IO.File]::WriteAllBytes($file + ':binary', $bytes)
+    $deleted = Invoke-Prunlet @('delete', '--', $file)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($file)) 'File ADS deletion failed.'
+    if ($LegacyExecutablePath) {
+        $operationRoot = Join-Path $script:Recovery $deleted.Json.operationId
+        $manifestHash = File-Digest (Join-Path $operationRoot 'manifest.json')
+        $backupHash = File-Digest (Join-Path $operationRoot '0000.bak')
+        foreach ($command in @(@('restore', $deleted.Json.operationId), @('purge', $deleted.Json.operationId, '--apply'))) {
+            $legacy = Invoke-ProcessJson $LegacyExecutablePath (@('--config', $script:Config) + $command)
+            Assert-True ($legacy.ExitCode -ne 0 -and ![IO.File]::Exists($file) -and (File-Digest (Join-Path $operationRoot 'manifest.json')) -ceq $manifestHash -and (File-Digest (Join-Path $operationRoot '0000.bak')) -ceq $backupHash) 'Legacy executable mutated unsupported schema 3 operation.'
+        }
+    }
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0 -and (File-Digest $file) -ceq $hash) 'File ADS restore failed.'
     Assert-True ([IO.File]::ReadAllText($file + ':custom') -eq 'preserve stream') 'Alternate data stream changed.'
+    Assert-True ([Convert]::ToHexString([IO.File]::ReadAllBytes($file + ':binary')) -ceq [Convert]::ToHexString($bytes)) 'File ADS binary bytes changed.'
 }
 Test-Case 'locked source is preserved' {
     $file = New-File 'locked.txt'; $lock = [IO.File]::Open($file, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     try { Assert-Rejected @('delete', '--', $file) $file } finally { $lock.Dispose() }
 }
-Test-Case 'symbolic link rejected without changing target' {
+Test-Case 'special source dry run and locked batch preserve every source' {
+    $file = New-File 'special-preflight.txt' 'special source'
+    [IO.File]::WriteAllText($file + ':custom', 'stream source')
+    $locked = New-File 'special-preflight-locked.txt' 'locked source'
+    $before = @([IO.Directory]::EnumerateDirectories($script:Recovery)).Count
+    $dry = Invoke-Prunlet @('delete', '--dry-run', '--', $file)
+    Assert-True ($dry.ExitCode -eq 0 -and [IO.File]::ReadAllText($file + ':custom') -ceq 'stream source' -and @([IO.Directory]::EnumerateDirectories($script:Recovery)).Count -eq $before) 'Special dry run mutated source or recovery.'
+    $lock = [IO.File]::Open($locked, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try { Assert-Rejected @('delete', '--', $file, $locked) $file } finally { $lock.Dispose() }
+    Assert-True ([IO.File]::ReadAllText($file) -ceq 'special source' -and [IO.File]::ReadAllText($file + ':custom') -ceq 'stream source') 'Special preflight partially deleted a source.'
+}
+Test-Case 'special backup corruption rejects whole restore and purge before mutation' {
+    $first = New-File 'special-corrupt-first.txt' 'first source'
+    $second = New-File 'special-corrupt-second.txt' 'second source'
+    [IO.File]::WriteAllText($second + ':custom', 'second stream')
+    $deleted = Invoke-Prunlet @('delete', '--', $first, $second)
+    Assert-True ($deleted.ExitCode -eq 0) 'Special corruption fixture deletion failed.'
+    $root = Join-Path $script:Recovery $deleted.Json.operationId
+    $manifest = [IO.File]::ReadAllText((Join-Path $root 'manifest.json')) | ConvertFrom-Json -Depth 40
+    Assert-True ($manifest.schema -eq 3) 'Special operation did not use schema 3.'
+    $backups = @([IO.Directory]::EnumerateFiles($root) | Where-Object { [IO.Path]::GetExtension($_) -in @('.bak', '.bin') } | Sort-Object)
+    Assert-True ($backups.Count -eq 2) 'Special recovery copy count differs.'
+    $bytes = [IO.File]::ReadAllBytes($backups[1]); $bytes[$bytes.Length - 1] = $bytes[$bytes.Length - 1] -bxor 1
+    [IO.File]::WriteAllBytes($backups[1], $bytes)
+    $hashes = @($backups | ForEach-Object { File-Digest $_ })
+    Assert-Rejected @('restore', $deleted.Json.operationId) ''
+    Assert-True (![IO.File]::Exists($first) -and ![IO.File]::Exists($second)) 'Restore wrote an earlier source before detecting corrupt special copy.'
+    Assert-Rejected @('purge', $deleted.Json.operationId, '--apply') ''
+    for ($index = 0; $index -lt $backups.Count; $index++) { Assert-True ((File-Digest $backups[$index]) -ceq $hashes[$index]) 'Purge deleted an earlier copy before detecting corrupt special copy.' }
+    Assert-True (![IO.File]::Exists((Join-Path $root 'purge-intent.json'))) 'Corrupt special purge wrote an intent.'
+}
+Test-Case 'special manifest stream metadata rejects malicious names bounds and overlapping slices' {
+    foreach ($kind in @('stream-name', 'stream-overlap', 'stream-size', 'stream-hash', 'unexpected-kind')) {
+        $first = New-File ("special-manifest-$kind-first.txt") 'first bytes'
+        $second = New-File ("special-manifest-$kind-second.txt") 'second bytes'
+        [IO.File]::WriteAllText($second + ':custom', 'stream bytes')
+        $deleted = Invoke-Prunlet @('delete', '--', $first, $second)
+        Assert-True ($deleted.ExitCode -eq 0) 'Special manifest fixture deletion failed.'
+        $root = Join-Path $script:Recovery $deleted.Json.operationId
+        $path = Join-Path $root 'manifest.json'
+        $manifest = [IO.File]::ReadAllText($path) | ConvertFrom-Json -Depth 40
+        $entry = $manifest.items[1]
+        switch ($kind) {
+            'stream-name' { $entry.streams[1].name = '..\escape' }
+            'stream-overlap' { $entry.streams[1].offset = 0 }
+            'stream-size' { $entry.streams[1].size = [long]::MaxValue }
+            'stream-hash' { $entry.streams[1].sha256 = ('0' * 64) }
+            'unexpected-kind' { $entry.kind = 'unknown-link' }
+        }
+        [IO.File]::WriteAllText($path, ($manifest | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+        $backups = @([IO.Directory]::EnumerateFiles($root) | Where-Object { [IO.Path]::GetExtension($_) -in @('.bak', '.bin') } | Sort-Object)
+        Assert-True ($backups.Count -eq 2) 'Special manifest recovery copy count differs.'
+        $hashes = @($backups | ForEach-Object { File-Digest $_ })
+        Assert-Rejected @('restore', $deleted.Json.operationId) '' $kind
+        Assert-True (![IO.File]::Exists($first) -and ![IO.File]::Exists($second)) "Invalid stream manifest partially restored source ($kind)."
+        Assert-Rejected @('purge', $deleted.Json.operationId, '--apply') '' $kind
+        for ($index = 0; $index -lt $backups.Count; $index++) { Assert-True ((File-Digest $backups[$index]) -ceq $hashes[$index]) 'Invalid stream manifest changed recovery copy.' }
+    }
+}
+Test-Case 'schema 3 required entry and stream keys cannot silently default during restore or purge' {
+    foreach ($field in @('kind', 'treeRoot', 'caseSensitive', 'reparseTag', 'linkDirectory', 'streams', 'stream.name', 'stream.offset', 'stream.size', 'stream.sha256')) {
+        $file = New-File ("required-$($field.Replace('.', '-')).txt") 'required metadata source'
+        [IO.File]::WriteAllText($file + ':custom', 'required stream bytes')
+        $deleted = Invoke-Prunlet @('delete', '--', $file)
+        Assert-True ($deleted.ExitCode -eq 0) 'Required metadata fixture deletion failed.'
+        $root = Join-Path $script:Recovery $deleted.Json.operationId; $path = Join-Path $root 'manifest.json'
+        $manifest = [IO.File]::ReadAllText($path) | ConvertFrom-Json -Depth 40
+        Assert-True ($manifest.schema -eq 3) 'Required metadata fixture must use schema 3.'
+        if ($field.StartsWith('stream.')) { $manifest.items[0].streams[1].PSObject.Properties.Remove($field.Substring(7)) }
+        else { $manifest.items[0].PSObject.Properties.Remove($field) }
+        [IO.File]::WriteAllText($path, ($manifest | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+        $backup = Join-Path $root '0000.bak'; $hash = File-Digest $backup
+        Assert-Rejected @('restore', $deleted.Json.operationId) '' $field
+        Assert-True (![IO.File]::Exists($file)) "Missing required key restored source ($field)."
+        Assert-Rejected @('purge', $deleted.Json.operationId, '--apply') '' $field
+        Assert-True ((File-Digest $backup) -ceq $hash -and ![IO.File]::Exists((Join-Path $root 'purge-intent.json'))) "Missing required key purged source ($field)."
+    }
+}
+Test-Case 'missing true directory caseSensitive key is rejected before child restoration' {
+    $root = Join-Path $script:Scope 'case-missing-key'; $null = New-Item -ItemType Directory -Path $root
+    Enable-CaseSensitiveFixture $root
+    $upper = Join-Path $root 'Foo'; $lower = Join-Path $root 'foo'
+    [IO.File]::WriteAllText($upper, 'upper'); [IO.File]::WriteAllText($lower, 'lower')
+    $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $root)
+    Assert-True ($deleted.ExitCode -eq 0) 'Case-sensitive required key fixture deletion failed.'
+    $operationRoot = Join-Path $script:Recovery $deleted.Json.operationId; $path = Join-Path $operationRoot 'manifest.json'
+    $manifest = [IO.File]::ReadAllText($path) | ConvertFrom-Json -Depth 40
+    $entry = @($manifest.items | Where-Object { $_.path -ceq $root })[0]
+    Assert-True ($entry.caseSensitive) 'Fixture did not record true case-sensitive metadata.'
+    $entry.PSObject.Properties.Remove('caseSensitive')
+    [IO.File]::WriteAllText($path, ($manifest | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+    $copies = @([IO.Directory]::EnumerateFiles($operationRoot, '*.bak')); $hashes = @($copies | ForEach-Object { File-Digest $_ })
+    Assert-Rejected @('restore', $deleted.Json.operationId) '' 'missing true caseSensitive'
+    Assert-True (![IO.Directory]::Exists($root)) 'Missing caseSensitive flag created an insensitive parent.'
+    Assert-Rejected @('purge', $deleted.Json.operationId, '--apply') '' 'missing true caseSensitive'
+    for ($index = 0; $index -lt $copies.Count; $index++) { Assert-True ((File-Digest $copies[$index]) -ceq $hashes[$index]) 'Missing caseSensitive metadata changed recovery copy.' }
+}
+Test-Case 'case-sensitive existing ancestor preserves two paths-file leaf names and parent flag' {
+    $root = Join-Path $script:Scope 'case-leaf-batch'; $null = New-Item -ItemType Directory -Path $root
+    Enable-CaseSensitiveFixture $root
+    $upper = Join-Path $root 'Foo'; $lower = Join-Path $root 'foo'
+    [IO.File]::WriteAllText($upper, 'upper leaf'); [IO.File]::WriteAllText($lower, 'lower leaf')
+    $inputPath = Write-PathsFile 'case-leaf-paths.json' @($upper, $lower)
+    $deleted = Invoke-Prunlet @('delete', '--paths-file', $inputPath)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($upper) -and ![IO.File]::Exists($lower) -and [IO.Directory]::Exists($root)) 'Case-sensitive leaf batch deletion differs.'
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0 -and [IO.File]::ReadAllText($upper) -ceq 'upper leaf' -and [IO.File]::ReadAllText($lower) -ceq 'lower leaf') ('Case-sensitive leaf restore differs: ' + ($restored.Json | ConvertTo-Json -Depth 30 -Compress))
+    # 復元された既存の二名に加え、新しい大小名も区別できることを確認する。
+    [IO.File]::WriteAllText((Join-Path $root 'Probe'), 'upper probe'); [IO.File]::WriteAllText((Join-Path $root 'probe'), 'lower probe')
+    Assert-True ([IO.File]::ReadAllText((Join-Path $root 'Probe')) -ceq 'upper probe' -and [IO.File]::ReadAllText((Join-Path $root 'probe')) -ceq 'lower probe') 'Existing parent case-sensitive flag changed.'
+}
+Test-Case 'case-sensitive operation storage rejects restore and purge without mutation' {
+    $file = New-File 'case-operation-storage.txt' 'storage boundary source'
+    [IO.File]::WriteAllText($file + ':custom', 'storage boundary stream')
+    $deleted = Invoke-Prunlet @('delete', '--', $file)
+    Assert-True ($deleted.ExitCode -eq 0) 'Case-sensitive operation fixture deletion failed.'
+    $root = Join-Path $script:Recovery $deleted.Json.operationId
+    Enable-CaseSensitiveOperationFixture $root
+    $backup = Join-Path $root '0000.bak'; $hash = File-Digest $backup
+    $manifest = Join-Path $root 'manifest.json'; $manifestHash = File-Digest $manifest
+    Assert-Rejected @('restore', $deleted.Json.operationId) '' 'case-sensitive operation storage'
+    Assert-Rejected @('purge', $deleted.Json.operationId, '--apply') '' 'case-sensitive operation storage'
+    Assert-True (![IO.File]::Exists($file) -and (File-Digest $backup) -ceq $hash -and (File-Digest $manifest) -ceq $manifestHash -and ![IO.File]::Exists((Join-Path $root 'purge-intent.json'))) 'Case-sensitive storage rejection changed source or recovery.'
+}
+Test-Case 'symbolic link roundtrip preserves target content' {
     $target = New-File 'link-target.txt'; $link = Join-Path $script:Scope 'link.txt'
     New-SymbolicFixture $link $target
-    Assert-Rejected @('delete', '--', $link) $target
+    $hash = File-Digest $target
+    $deleted = Invoke-Prunlet @('delete', '--', $link)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($link) -and (File-Digest $target) -ceq $hash) 'Symbolic link deletion changed target.'
+    $restored = Restore-SymbolicFixture $deleted.Json.operationId $link $target $hash
+    Assert-True ($restored.ExitCode -eq 0) ('Symbolic link restore failed: ' + ($restored.Json | ConvertTo-Json -Depth 30 -Compress) + '; stderr=' + $restored.Stderr)
+    Assert-True (((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -and (File-Digest $link) -ceq $hash -and (File-Digest $target) -ceq $hash) 'Symbolic link restore changed target or link type.'
+}
+Test-Case 'directory symbolic link roundtrip never traverses target' {
+    $targetRoot = Join-Path $outputRoot 'directory-symbolic-target'; $null = New-Item -ItemType Directory -Path $targetRoot
+    $target = Join-Path $targetRoot 'keep.txt'; [IO.File]::WriteAllText($target, 'directory symbolic target')
+    $link = Join-Path $script:Scope 'directory-symbolic-link'
+    New-SymbolicFixture $link $targetRoot
+    $hash = File-Digest $target
+    $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $link)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($link) -and (File-Digest $target) -ceq $hash) 'Directory symbolic deletion traversed target.'
+    $restored = Restore-SymbolicFixture $deleted.Json.operationId $link $target $hash
+    Assert-True ($restored.ExitCode -eq 0) ('Directory symbolic restore failed: ' + ($restored.Json | ConvertTo-Json -Depth 30 -Compress) + '; stderr=' + $restored.Stderr)
+    Assert-True (((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -and (File-Digest (Join-Path $link 'keep.txt')) -ceq $hash -and (File-Digest $target) -ceq $hash) 'Directory symbolic restore differs.'
+    $purged = Invoke-Prunlet @('purge', $deleted.Json.operationId, '--apply')
+    Assert-True ($purged.ExitCode -eq 0 -and ![IO.File]::Exists((Join-Path (Join-Path $script:Recovery $deleted.Json.operationId) '0000.bak')) -and (File-Digest $target) -ceq $hash -and ((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) 'Reparse purge changed link or target.'
+}
+Test-Case 'hardlink selected names restore independent copies without changing external name' {
+    $source = New-File 'hardlink-selected-a.txt' 'shared original'
+    $selected = Join-Path $script:Scope 'hardlink-selected-b.txt'; $external = Join-Path $outputRoot 'hardlink-external.txt'
+    $null = New-Item -ItemType HardLink -Path $selected -Target $source
+    $null = New-Item -ItemType HardLink -Path $external -Target $source
+    $hash = File-Digest $external
+    $deleted = Invoke-Prunlet @('delete', '--', $source, $selected)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($source) -and ![IO.File]::Exists($selected) -and (File-Digest $external) -ceq $hash) 'Hardlink deletion changed external name.'
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0 -and (File-Digest $source) -ceq $hash -and (File-Digest $selected) -ceq $hash -and (File-Digest $external) -ceq $hash) 'Hardlink restoration bytes differ.'
+    [IO.File]::WriteAllText($source, 'independent restored content')
+    Assert-True ((File-Digest $selected) -ceq $hash -and (File-Digest $external) -ceq $hash) 'Restored copy unexpectedly shares external file identity.'
+}
+Test-Case 'special link manifest rejects unsupported tags and kind mismatch before restoring files' {
+    foreach ($kind in @('tag', 'kind')) {
+        $target = New-File ("special-link-manifest-$kind-target.txt") 'external target'
+        $first = New-File ("special-link-manifest-$kind-first.txt") 'first bytes'
+        $link = Join-Path $script:Scope ("special-link-manifest-$kind-link.txt")
+        New-SymbolicFixture $link $target
+        $targetHash = File-Digest $target
+        $deleted = Invoke-Prunlet @('delete', '--', $first, $link)
+        Assert-True ($deleted.ExitCode -eq 0) 'Special link manifest fixture deletion failed.'
+        $root = Join-Path $script:Recovery $deleted.Json.operationId; $path = Join-Path $root 'manifest.json'
+        $manifest = [IO.File]::ReadAllText($path) | ConvertFrom-Json -Depth 40
+        if ($kind -eq 'tag') { $manifest.items[1].reparseTag = 1 } else { $manifest.items[1].kind = 'junction' }
+        [IO.File]::WriteAllText($path, ($manifest | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+        Assert-Rejected @('restore', $deleted.Json.operationId) ''
+        Assert-True (![IO.File]::Exists($first) -and ![IO.File]::Exists($link) -and (File-Digest $target) -ceq $targetHash) 'Invalid reparse manifest partially restored or changed target.'
+        Assert-Rejected @('purge', $deleted.Json.operationId, '--apply') ''
+        Assert-True ([IO.File]::Exists((Join-Path $root '0000.bak')) -and [IO.File]::Exists((Join-Path $root '0001.bak'))) 'Invalid reparse purge removed copies.'
+    }
+}
+Test-Case 'reparse payload invalid offsets reject restore and purge even when whole-copy hash matches' {
+    $target = New-File 'reparse-offset-target.txt' 'external reparse target'
+    $first = New-File 'reparse-offset-first.txt' 'first source'
+    $link = Join-Path $script:Scope 'reparse-offset-link.txt'; New-SymbolicFixture $link $target
+    $targetHash = File-Digest $target
+    $deleted = Invoke-Prunlet @('delete', '--', $first, $link)
+    Assert-True ($deleted.ExitCode -eq 0) 'Reparse payload fixture deletion failed.'
+    $root = Join-Path $script:Recovery $deleted.Json.operationId; $path = Join-Path $root 'manifest.json'
+    $manifest = [IO.File]::ReadAllText($path) | ConvertFrom-Json -Depth 40
+    $backup = Join-Path $root '0001.bak'; $bytes = [IO.File]::ReadAllBytes($backup)
+    Assert-True ($bytes.Length -gt 20 -and $manifest.items[1].kind -eq 'symlink') 'Reparse fixture payload differs.'
+    # SYMLINK_REPARSE_BUFFERのSubstituteNameOffsetを範囲外へ変更する。
+    $bytes[8] = 255; $bytes[9] = 255; [IO.File]::WriteAllBytes($backup, $bytes)
+    $manifest.items[1].sha256 = File-Digest $backup
+    [IO.File]::WriteAllText($path, ($manifest | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+    $firstBackup = Join-Path $root '0000.bak'; $firstHash = File-Digest $firstBackup; $invalidHash = File-Digest $backup
+    Assert-Rejected @('restore', $deleted.Json.operationId) '' 'invalid raw reparse offset with matching copy hash'
+    Assert-Rejected @('purge', $deleted.Json.operationId, '--apply') '' 'invalid raw reparse offset with matching copy hash'
+    Assert-True (![IO.File]::Exists($first) -and ![IO.File]::Exists($link) -and (File-Digest $target) -ceq $targetHash -and (File-Digest $firstBackup) -ceq $firstHash -and (File-Digest $backup) -ceq $invalidHash -and ![IO.File]::Exists((Join-Path $root 'purge-intent.json'))) 'Invalid reparse payload changed sources target or recovery.'
 }
 Test-Case 'junction ancestor rejected without changing target' {
     $targetRoot = Join-Path $outputRoot 'junction-target'; $null = New-Item -ItemType Directory -Path $targetRoot
@@ -567,17 +879,16 @@ Test-Case 'junction ancestor rejected without changing target' {
     $link = Join-Path $script:Scope 'junction'; $null = New-Item -ItemType Junction -Path $link -Target $targetRoot
     Assert-Rejected @('delete', '--', (Join-Path $link 'target.txt')) $target
 }
-Test-Case 'case-sensitive ancestors are rejected' {
+Test-Case 'case-sensitive directory roundtrip preserves distinct Foo and foo names' {
     $caseRoot = Join-Path $script:Scope 'case-sensitive'; $null = New-Item -ItemType Directory -Path $caseRoot
-    $helper = Join-Path $outputRoot 'create-case-fixture.ps1'
-    $body = "& fsutil.exe file SetCaseSensitiveInfo '" + $caseRoot.Replace("'", "''") + "' enable; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }"
-    [IO.File]::WriteAllText($helper, $body, [Text.UTF8Encoding]::new($false))
-    $elevated = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile','-File',('"' + $helper + '"')) -Verb RunAs -WindowStyle Hidden -PassThru -Wait
-    Assert-True ($elevated.ExitCode -eq 0) 'Cannot enable case-sensitive fixture.'
-    $file = Join-Path $caseRoot 'file.txt'; [IO.File]::WriteAllText($file, 'case-sensitive data')
-    Assert-Rejected @('delete', '--', $file) $file
-    Assert-Rejected @('delete', '--recursive', '--', $caseRoot) $file
-    Assert-True ([IO.File]::ReadAllText($file) -ceq 'case-sensitive data') 'Recursive case-sensitive directory changed source.'
+    Enable-CaseSensitiveFixture $caseRoot
+    $upper = Join-Path $caseRoot 'Foo'; $lower = Join-Path $caseRoot 'foo'
+    [IO.File]::WriteAllText($upper, 'uppercase data'); [IO.File]::WriteAllText($lower, 'lowercase data')
+    Assert-True ([IO.File]::ReadAllText($upper) -ceq 'uppercase data') 'Case-sensitive fixture did not distinguish names.'
+    $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $caseRoot)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($caseRoot)) 'Case-sensitive directory deletion failed.'
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0 -and [IO.File]::ReadAllText($upper) -ceq 'uppercase data' -and [IO.File]::ReadAllText($lower) -ceq 'lowercase data') 'Case-sensitive distinct names were not restored.'
 }
 Test-Case 'restore conflict never overwrites' {
     $file = New-File 'conflict.txt' 'original'
@@ -1013,6 +1324,7 @@ $report = [ordered]@{
     legacyExecutable = if ($LegacyExecutablePath) { [IO.Path]::GetFullPath($LegacyExecutablePath) } else { $null }
     legacyExecutableSha256 = if ($LegacyExecutablePath -and [IO.File]::Exists($LegacyExecutablePath)) { (Get-FileHash -LiteralPath $LegacyExecutablePath -Algorithm SHA256).Hash } else { $null }
     outputDirectory = $outputRoot
+    symbolicRestoreEvidence = @($script:SymbolicRestoreEvidence)
     passed = $script:Results.Count - $failed.Count
     failed = $failed.Count
     results = @($script:Results)

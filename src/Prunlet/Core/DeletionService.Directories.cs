@@ -20,8 +20,9 @@ public sealed partial class DeletionService
             using var parents = PathPolicy.PinDirectories(canonicalParent);
             using var handle = NativeFiles.OpenAny(Path.Combine(canonicalParent, Path.GetFileName(absolute)));
             var directory = NativeFiles.IsDirectory(handle);
-            normalized = PathPolicy.Resolve(absolute, finalDirectory: directory);
-            NativeFiles.Verify(handle, normalized, directory);
+            normalized = NativeFiles.IsReparse(handle) ? NativeFiles.FinalPath(handle) : PathPolicy.Resolve(absolute, finalDirectory: directory);
+            if (NativeFiles.IsReparse(handle)) VerifySpecialHandle(handle, normalized);
+            else NativeFiles.Verify(handle, normalized, directory);
             if (directory && (normalized.Length == 3 || PathPolicy.Within(config.BackupDirectory, normalized)))
                 throw new ArgumentException("A drive root or ancestor of the recovery directory cannot be deleted.");
         }
@@ -39,6 +40,7 @@ public sealed partial class DeletionService
             using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(path) ?? path);
             using var handle = NativeFiles.OpenAny(path);
             var directory = NativeFiles.IsDirectory(handle);
+            if (NativeFiles.IsReparse(handle)) { VerifySpecialHandle(handle, path); return false; }
             NativeFiles.Verify(handle, path, directory);
             return directory;
         }
@@ -67,11 +69,11 @@ public sealed partial class DeletionService
         {
             if (!dryRun)
             {
-                storage = PathPolicy.PinDirectories(config.BackupDirectory);
+                storage = PathPolicy.PinRecoveryDirectories(config.BackupDirectory);
                 result.OperationId = manifest.OperationId = Guid.NewGuid().ToString("N");
                 directory = Path.Combine(config.BackupDirectory, manifest.OperationId);
                 NativeFiles.CreateDirectory(directory);
-                operation = PathPolicy.PinDirectories(directory);
+                operation = PathPolicy.PinRecoveryDirectories(directory);
                 operationLock = NativeFiles.CreateDestination(Path.Combine(directory, "operation.lock"));
                 NativeFiles.Verify(operationLock, Path.Combine(directory, "operation.lock"));
             }
@@ -172,6 +174,7 @@ public sealed partial class DeletionService
         {
             node.Directory = NativeFiles.OpenDirectory(node.Entry.Path);
             NativeFiles.Verify(node.Directory, node.Entry.Path, directory: true);
+            NativeFiles.RejectCaseSensitive(node.Directory);
             NativeFiles.RejectNamedStreams(node.Entry.Path);
             node.Identity = NativeFiles.Identity(node.Directory);
             node.Entry.LastWriteUtc = Directory.GetLastWriteTimeUtc(node.Entry.Path);
@@ -228,6 +231,7 @@ public sealed partial class DeletionService
                 }
                 using var handle = NativeFiles.OpenDirectorySource(node.Entry.Path);
                 NativeFiles.Verify(handle, node.Entry.Path, directory: true);
+                NativeFiles.RejectCaseSensitive(handle);
                 if (NativeFiles.Identity(handle) != node.Identity) throw new IOException("Prepared directory identity changed; deletion stopped.");
                 NativeFiles.RejectNamedStreams(node.Entry.Path);
                 if (Directory.EnumerateFileSystemEntries(node.Entry.Path).Any())

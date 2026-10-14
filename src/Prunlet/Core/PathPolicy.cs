@@ -35,7 +35,9 @@ internal static class PathPolicy
 
     internal static void ExistingDirectory(string path)
     {
-        Resolve(path, finalDirectory: true, allowMissing: false);
+        var actual = Resolve(path, finalDirectory: true, allowMissing: false);
+        using var directories = PinDirectories(actual);
+        foreach (var handle in directories.Handles) NativeFiles.RejectCaseSensitive(handle);
     }
 
     // 入力の全祖先と、ハンドルが示す実体の全祖先を固定してから実体パスを返す。
@@ -45,7 +47,7 @@ internal static class PathPolicy
         path = Absolute(path);
         var components = Components(path).ToArray();
         using var lease = new DirectoryLease();
-        var pinned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var pinned = new HashSet<string>(StringComparer.Ordinal);
         var actual = path[..3];
         for (var i = 0; i < components.Length; i++)
         {
@@ -84,6 +86,17 @@ internal static class PathPolicy
                 lease.Handles.Add(handle);
                 NativeFiles.Verify(handle, ancestor, directory: true);
             }
+            return lease;
+        }
+        catch { lease.Dispose(); throw; }
+    }
+
+    internal static DirectoryLease PinRecoveryDirectories(string path)
+    {
+        var lease = PinDirectories(path);
+        try
+        {
+            foreach (var handle in lease.Handles) NativeFiles.RejectCaseSensitive(handle);
             return lease;
         }
         catch { lease.Dispose(); throw; }

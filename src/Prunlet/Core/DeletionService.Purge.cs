@@ -11,7 +11,7 @@ public sealed partial class DeletionService
         if (!Guid.TryParseExact(operationId, "N", out var id) || id.ToString("N") != operationId)
             throw new ArgumentException("Operation ID must be a lowercase 32-character GUID.");
         var directory = Path.Combine(config.BackupDirectory, operationId);
-        using var directories = PathPolicy.PinDirectories(directory);
+        using var directories = PathPolicy.PinRecoveryDirectories(directory);
         using var operationLock = NativeFiles.OpenLock(Path.Combine(directory, "operation.lock"));
         NativeFiles.Verify(operationLock, Path.Combine(directory, "operation.lock"));
         NativeFiles.VerifySingleLink(operationLock);
@@ -29,7 +29,7 @@ public sealed partial class DeletionService
                 OperationId = operationId,
                 ManifestSha256 = manifestHash,
                 Targets = manifest.Items.Select((entry, index) => (entry, index))
-                    .Where(pair => pair.entry.State == "backup_ready" && pair.entry.Kind == "file")
+                    .Where(pair => HasRecoveryCopy(manifest, pair.entry))
                     .Select(pair => new PurgeTarget { Index = pair.index, Sha256 = pair.entry.Sha256!, Size = pair.entry.Size!.Value }).ToList()
             };
             var members = Directory.EnumerateFileSystemEntries(directory).Select(Path.GetFileName).ToHashSet(StringComparer.Ordinal);
@@ -41,7 +41,7 @@ public sealed partial class DeletionService
                 ValidatePurgeIntent(intent, expectedIntent);
             }
             var backupNames = manifest.Items.Select((entry, index) => (entry, index))
-                .Where(pair => pair.entry.State == "backup_ready" && pair.entry.Kind == "file")
+                .Where(pair => HasRecoveryCopy(manifest, pair.entry))
                 .ToDictionary(pair => $"{pair.index:D4}.bak", pair => pair.index, StringComparer.Ordinal);
             foreach (var name in members)
             {
@@ -56,9 +56,9 @@ public sealed partial class DeletionService
             for (var index = 0; index < manifest.Items.Count; index++)
             {
                 var entry = manifest.Items[index];
-                var item = new FileOperationResult { Path = entry.Path, Kind = entry.Kind, Status = "not_backed_up", Schema2Wire = manifest.Schema == 2 };
+                var item = new FileOperationResult { Path = entry.Path, Kind = entry.Kind, Status = "not_backed_up", Schema2Wire = manifest.Schema >= 2 };
                 result.Items.Add(item);
-                if (entry.State != "backup_ready" || entry.Kind != "file") continue;
+                if (!HasRecoveryCopy(manifest, entry)) continue;
                 item.BackupPath = BackupPath(directory, index);
                 item.Size = entry.Size;
                 item.Sha256 = entry.Sha256;
@@ -82,6 +82,7 @@ public sealed partial class DeletionService
                 held.Add(stream);
                 if (stream.Length != entry.Size || !HashStream(stream).Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException($"Recovery copy size/hash differs from manifest: {name}");
+                if (manifest.Schema == 3) VerifySpecialBackup(stream, entry);
                 backups.Add(index, stream);
                 item.Status = "would_purge";
             }
@@ -218,8 +219,17 @@ public sealed partial class DeletionService
         {
             RequireJsonArrayItems(document.RootElement, "items", ["path", "state"]);
             if (document.RootElement.GetProperty("schema").ValueKind == JsonValueKind.Number
-                && document.RootElement.GetProperty("schema").TryGetInt32(out var schema) && schema == 2)
-                RequireJsonArrayItems(document.RootElement, "items", ["path", "state", "kind", "treeRoot"]);
+                && document.RootElement.GetProperty("schema").TryGetInt32(out var schema))
+            {
+                if (schema == 2) RequireJsonArrayItems(document.RootElement, "items", ["path", "state", "kind", "treeRoot"]);
+                if (schema == 3)
+                {
+                    RequireJsonArrayItems(document.RootElement, "items", ["path", "state", "kind", "treeRoot", "caseSensitive", "reparseTag", "linkDirectory", "streams", "size", "sha256"]);
+                    foreach (var entry in document.RootElement.GetProperty("items").EnumerateArray())
+                        if (entry.GetProperty("streams").ValueKind != JsonValueKind.Null)
+                            RequireJsonArrayItems(entry, "streams", ["name", "offset", "size", "sha256"]);
+                }
+            }
         }
         if (typeof(T) == typeof(PurgeIntent))
             RequireJsonArrayItems(document.RootElement, "targets", ["index", "sha256", "size"]);
