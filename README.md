@@ -78,7 +78,7 @@ C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet
 ["C:\\work\\project\\unused.txt", "C:\\work\\project\\other.txt"]
 ```
 
-単純なパスは`delete [--dry-run] -- <絶対パス> [...]`でも指定できます。長い対象パスも通常のローカル絶対パスを入力します。`\\?\`は内部Win32呼出しだけで使用し、入力に付けません。元の削除がホストに拒否された場合、別shellやPrunletへ付け替えて再試行しません。
+単純なパスは`delete [--dry-run] -- <絶対パス> [...]`でも指定できます。長い対象パスも通常のローカル絶対パスで指定でき、`\\?\C:\...`形式も受け付けます。元の削除がホストに拒否された場合、別shellやPrunletへ付け替えて再試行しません。
 
 出力はJSONです。削除結果の`operationId`と各ファイルの`status`を確認してください。欠損ファイルは`already_absent`として返します。復元先にファイルが存在するときは上書きせず、バックアップを保持します。失敗時は終了コードが0以外になります。
 
@@ -102,7 +102,7 @@ C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet
 
 ## 保存先の実体検証で停止する場合
 
-MSIX版のアプリから配置すると、AppDataの新しいフォルダーがパッケージ専用のLocalCacheへ転送される場合があります。Prunletは指定パスと開いたハンドルの実体が異なると停止します。検証を無効化せず、exe・設定・復元データを`%USERPROFILE%\.local\Prunlet`など、転送されない専用ディレクトリへ配置してください。CodexパッケージのLocalCacheを復元データの恒久保存先にすることは推奨しません。
+MSIX版のアプリでは、AppDataの新しいフォルダーがパッケージ専用のLocalCacheへ転送される場合があります。通常ディレクトリの転送は実体へ解決して扱いますが、リンク・case-sensitive属性・実体を検証できない場合は停止します。エラーに示されたパスと属性を確認し、検証を無効化せず、必要ならexe・設定・復元データを`%USERPROFILE%\.local\Prunlet`などの専用ディレクトリへ配置してください。CodexパッケージのLocalCacheを復元データの恒久保存先にすることは推奨しません。
 
 ## 開発資料
 
