@@ -1,16 +1,16 @@
 # Prunletの設計
 
-PrunletはWindowsの通常ファイルを、検証済みの復元用コピーを保存してから削除するツールである。CLIとローカルstdio MCPを単一exeで提供する。通常入口はCMDのCLIで、Codexのフックは直接削除を検査・拒否してCLI手順を案内する。安全な消去や任意コード内の削除を監視する製品ではない。利用手順は[README](README.md)、開発・検証の規約は[AGENTS.md](AGENTS.md)を参照する。
+PrunletはWindowsの通常ファイル・フォルダーを、検証済みの復元用コピーを保存してから削除するツールである。CLIとローカルstdio MCPを単一exeで提供する。通常入口はCMDのCLIで、Codexのフックは直接削除を検査・拒否してCLI手順を案内する。安全な消去や任意コード内の削除を監視する製品ではない。利用手順は[README](README.md)、開発・検証の規約は[AGENTS.md](AGENTS.md)を参照する。
 
 ## 構成と責務
 
 | 実装 | 責務と境界 |
 | --- | --- |
 | `src/Prunlet/Program.cs` | CLIの引数検査、設定初期化、Coreへの振り分け、操作ID一覧、JSON出力と終了コード |
-| `Core/PrunletConfig.cs` | schema 1の設定と操作記録の型、バックアップ先の検証 |
+| `Core/PrunletConfig.cs` | schema 1の設定、file操作schema 1とdirectory操作schema 2の型、バックアップ先の検証 |
 | `Core/PathPolicy.cs` | ローカル絶対パスの正規化と実体解決、範囲判定、リンク検査、入力側・実体側の祖先ディレクトリのハンドル保持 |
 | `Core/NativeFiles.cs` | Win32による排他的作成、共有制限付きオープン、ハンドル実体・case-sensitive属性・ADS検査、ハンドルを使った削除 |
-| `Core/DeletionService.cs` / `Core/DeletionService.Purge.cs` | CLIとMCP共通の削除・復元処理、CLIの明示purge、SHA-256検証、永続記録 |
+| `Core/DeletionService.cs` / `Core/DeletionService.Directories.cs` / `Core/DeletionService.Purge.cs` | CLIとMCP共通の削除・復元処理、CLIの明示purge、SHA-256検証、永続記録 |
 | `Protocol/McpServer.cs` | 改行区切りJSON-RPC、初期化、3つのツールと引数検査。対象フォルダーの許可リストを設けない |
 | `Protocol/HookRouter.cs` | exeだけで入力を検査し、直接削除を拒否してCLI手順を案内。削除・自動置換は行わない |
 | `integration/install-codex.ps1` / `uninstall-codex.ps1` / `configuration-common.ps1` | 他設定を保持したMCP・フック登録と解除、更新前バックアップ、所有マーカーと競合の検査 |
@@ -21,7 +21,7 @@ PrunletはWindowsの通常ファイルを、検証済みの復元用コピーを
 
 ## 削除と復元のデータフロー
 
-1. 設定を検証し、1〜256件の対象を正規化する。重複、復元データ保存先内、不正パス、ディレクトリ・リンクを事前に拒否する。dry-runは読取り検査のみで操作フォルダーを作らない。
+1. 設定を検証し、1〜256件の対象を正規化する。重複、復元データ保存先内、不正パス、リンクを事前に拒否する。空ディレクトリは通常削除、非空ディレクトリは明示`recursive`だけで扱う。対象同士の祖先重複や復元データ保存先を包含するフォルダーも拒否する。dry-runは読取り検査のみで操作フォルダーを作らない。
 2. バックアップ先に32桁の小文字GUIDの操作フォルダーを排他的に作成する。祖先と操作フォルダーのハンドルを保持し、`operation.lock`を用意する。
 3. 各対象の親と元ファイルのハンドルを保持し、ADSを拒否する。`0000.bak`などへコピーし、ディスクへflush後、サイズとSHA-256を照合する。欠損は`already_absent`、項目ごとの準備失敗は`failed`として記録する。
 4. 元パス、サイズ、ハッシュ、最終書込日時、準備状態を含む`manifest.json`を新規作成してflushする。保存失敗なら元ファイルを削除しない。保存できた場合に限り、準備済み項目をハンドル経由で削除する。
@@ -30,6 +30,12 @@ PrunletはWindowsの通常ファイルを、検証済みの復元用コピーを
 復元は現在の設定の復元データ保存先保護とパス検証を再適用し、操作ロックを排他的に開いてmanifestのschema・ID・項目・パスを検証する。`backup_ready`のコピーをサイズ・ハッシュで照合し、元パスへ新規作成する。既存または並行作成された復元先は`conflict`として上書きしない。書込みをflushしてハッシュを確認し、最終書込日時を戻す。失敗時は今回作った部分ファイルの削除を試み、結果は固有名の`restore-result-*.json`へ保存する。
 
 manifestの`backup_ready`は復元用コピーの準備状態であり、削除成功を意味しない。操作一覧はバックアップ先のGUID形式のディレクトリ名を列挙し、復元可能性の検証は復元時に行う。復元済みでもコピーは自動削除しない。
+
+## フォルダーの削除と復元
+
+フォルダーを含む操作はschema 2のflat項目に`kind`（file/directory）と`treeRoot`を保存する。子を含む全ツリーを検査し、全fileの検証済みコピーと空ディレクトリの記録を永続化できたツリーだけを削除する。列挙中の下限budgetとUTF-8 manifestの実測で既存8 MiBの復元読込上限を削除前に検査する。fileを先に、directoryを子から親の順に削除し、ディレクトリの実体をハンドルで照合する。列挙後に追加された内容は削除せず、空でないディレクトリは残す。これは削除開始後の原子トランザクションではないため、途中失敗はoperationIdから復元する。準備失敗のツリーは削除を始めない。
+
+復元はrootと親子関係・型・物理パス・バックアップを検証し、空ディレクトリを含む階層を再作成する。既存の通常ディレクトリは使えるが、既存ファイルを上書きせず、rootがfileやlinkに置換されていればそのツリーを停止する。従来のschema 1 file操作はそのまま復元・整理できる。purgeはfileの検証済みコピーだけを明示整理し、directory記録・manifest・lockを保持する。
 
 ## 復元データの明示整理
 

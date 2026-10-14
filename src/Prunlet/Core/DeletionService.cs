@@ -19,7 +19,21 @@ public sealed partial class DeletionService
         };
     }
 
-    public DeleteResult Delete(string[] paths, bool dryRun = false)
+    public DeleteResult Delete(string[] paths, bool dryRun = false, bool recursive = false)
+    {
+        config.Validate();
+        ArgumentNullException.ThrowIfNull(paths);
+        if (paths.Length is 0 or > 256) throw new ArgumentException("Specify between 1 and 256 paths.");
+        var normalized = paths.Select(ValidateAnyTarget).ToArray();
+        for (var i = 0; i < normalized.Length; i++)
+            for (var j = i + 1; j < normalized.Length; j++)
+                if (PathPolicy.Within(normalized[i], normalized[j]) || PathPolicy.Within(normalized[j], normalized[i]))
+                    throw new ArgumentException("Duplicate or overlapping target paths are not allowed.");
+        if (normalized.Any(IsDirectoryPath)) return DeleteTrees(normalized, dryRun, recursive);
+        return DeleteFiles(normalized, dryRun);
+    }
+
+    private DeleteResult DeleteFiles(string[] paths, bool dryRun)
     {
         config.Validate();
         ArgumentNullException.ThrowIfNull(paths);
@@ -114,6 +128,7 @@ public sealed partial class DeletionService
         if (manifestStream.Length > 8 * 1024 * 1024) throw new InvalidDataException("Manifest is too large.");
         var manifest = ReadValidatedJson<OperationManifest>(manifestStream);
         ValidateManifest(manifest, operationId);
+        if (manifest.Schema == 2) return RestoreTrees(manifest, directory);
         var result = new RestoreResult { OperationId = operationId };
         for (var i = 0; i < manifest.Items.Count; i++)
         {
@@ -147,6 +162,7 @@ public sealed partial class DeletionService
             using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(path)!);
             using var handle = NativeFiles.OpenBackup(path);
             NativeFiles.Verify(handle, path);
+            NativeFiles.VerifySingleLink(handle);
             NativeFiles.RejectNamedStreams(path);
             using var stream = new FileStream(handle, FileAccess.Read);
             item.Size = stream.Length;
@@ -165,7 +181,7 @@ public sealed partial class DeletionService
         try
         {
             var sourceHandle = NativeFiles.OpenSource(path);
-            try { NativeFiles.Verify(sourceHandle, path); source = new FileStream(sourceHandle, FileAccess.Read); }
+            try { NativeFiles.Verify(sourceHandle, path); NativeFiles.VerifySingleLink(sourceHandle); source = new FileStream(sourceHandle, FileAccess.Read); }
             catch { sourceHandle.Dispose(); throw; }
             NativeFiles.RejectNamedStreams(path);
             var backupHandle = NativeFiles.CreateDestination(backupPath);
@@ -197,8 +213,8 @@ public sealed partial class DeletionService
 
     private void ValidateManifest(OperationManifest manifest, string operationId)
     {
-        if (manifest.Schema != 1 || manifest.OperationId != operationId || manifest.CreatedUtc == default || manifest.Items is null
-            || manifest.Items.Count is 0 or > 256)
+        if (manifest.Schema is not (1 or 2) || manifest.OperationId != operationId || manifest.CreatedUtc == default || manifest.Items is null
+            || manifest.Items.Count == 0 || (manifest.Schema == 1 && manifest.Items.Count > 256))
             throw new InvalidDataException("Manifest schema, ID, or item count is invalid.");
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in manifest.Items)
@@ -206,13 +222,19 @@ public sealed partial class DeletionService
             if (entry is null) throw new InvalidDataException("Manifest contains a null entry.");
             // schema 1 の記録文字列は変更せず、実行時の実体解決とは分けて検査する。
             var normalized = PathPolicy.Absolute(entry.Path);
-            if (normalized != entry.Path || !seen.Add(normalized) || PathPolicy.Within(normalized, config.BackupDirectory))
+            if (normalized != entry.Path || !seen.Add(normalized) || PathPolicy.Within(normalized, config.BackupDirectory)
+                || (entry.Kind == "directory" && (normalized.Length == 3 || PathPolicy.Within(config.BackupDirectory, normalized))))
                 throw new InvalidDataException("Manifest path is not canonical, duplicated, or inside the recovery directory.");
             if (entry.State is not ("backup_ready" or "already_absent" or "failed")) throw new InvalidDataException("Invalid manifest state.");
-            if (entry.State == "backup_ready" && (entry.Size is null or < 0 || entry.Sha256 is null
+            if (entry.Kind is not ("file" or "directory") || (manifest.Schema == 1 && (entry.Kind != "file" || entry.TreeRoot is not null)))
+                throw new InvalidDataException("Invalid manifest entry kind or tree root.");
+            if (entry.Kind == "directory" && (entry.Size is not null || entry.Sha256 is not null))
+                throw new InvalidDataException("Directory records cannot contain file backup metadata.");
+            if (entry.Kind == "file" && entry.State == "backup_ready" && (entry.Size is null or < 0 || entry.Sha256 is null
                 || entry.Sha256.Length != 64 || !entry.Sha256.All(char.IsAsciiHexDigit)))
                 throw new InvalidDataException("Manifest hash or size is invalid.");
         }
+        if (manifest.Schema == 2) ValidateTreeManifest(manifest);
     }
 
     private void RestoreOne(ManifestEntry entry, FileOperationResult item)
@@ -221,6 +243,8 @@ public sealed partial class DeletionService
         using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(target)!);
         using var backupHandle = NativeFiles.OpenBackup(item.BackupPath!);
         NativeFiles.Verify(backupHandle, item.BackupPath!);
+        NativeFiles.VerifySingleLink(backupHandle);
+        NativeFiles.RejectNamedStreams(item.BackupPath!);
         using var backup = new FileStream(backupHandle, FileAccess.Read);
         var digest = Convert.ToHexString(SHA256.HashData(backup)).ToLowerInvariant();
         if (backup.Length != entry.Size || !digest.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
@@ -271,7 +295,7 @@ public sealed partial class DeletionService
         catch (Exception ex) when (IsOperational(ex)) { warnings.Add($"Outcome record could not be persisted: {ex.Message}. Backups remain available."); }
     }
 
-    private static bool IsOperational(Exception ex) => ex is IOException or UnauthorizedAccessException or ArgumentException or System.Security.SecurityException;
+    private static bool IsOperational(Exception ex) => ex is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or System.Security.SecurityException;
 
     private sealed class PreparedFile(DirectoryLease parents, FileStream source, FileStream backup, ManifestEntry entry, FileOperationResult item) : IDisposable
     {

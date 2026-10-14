@@ -8,9 +8,9 @@ PrunletはWindows向けCLIとstdio MCPを一つのexeで提供します。Codex�
 
 ## エージェント共通指示
 
-`-RegisterCodex -RegisterAgentInstructions`を明示すると、Codex homeの`PRUNLET.md`を配置し、共通`AGENTS.md`の先頭へ管理マーカー付きの参照と、配置済みexe・設定の絶対パスを追加します。各リポジトリへの記載は不要です。削除では最初から`cmd.exe`・`login: false`のPrunlet CLIを使います。空白・Unicode・多数・長い対象パスは`--paths-file`で渡します。exe・設定のパス自体をCMDで安全に表現できない場合は、実行前に同じCoreのMCPを選びます。拒否された削除を別shellやPrunletへ付け替えて再試行しません。
+`-RegisterCodex -RegisterAgentInstructions`を明示すると、Codex homeの`PRUNLET.md`を配置し、共通`AGENTS.md`の先頭へ管理マーカー付きの参照と、配置済みexe・設定の絶対パスを追加します。各リポジトリへの記載は不要です。ファイル・フォルダー削除では最初から`cmd.exe`・`login: false`のPrunlet CLIを使います。空白・Unicode・多数・長い対象パスは`--paths-file`で渡します。exe・設定のパス自体をCMDで安全に表現できない場合は、実行前に同じCoreのMCPを選びます。拒否された削除を別shellやPrunletへ付け替えて再試行しません。
 
-この登録は共通AGENTSの専用ブロックを変更するため明示オプションにしています。旧MCP優先ブロックは既知の正確な内容とguideのハッシュを照合して移行します。既存本文を保持し、重複・不完全な管理マーカーや利用者が編集した指示を検出した場合は自動更新を拒否します。更新時に登録が途中で失敗した場合は、MCP・hookに加えてAGENTSと専用指示も復旧対象になります。
+この登録は共通AGENTSの専用ブロックを変更するため明示オプションにしています。旧ファイル専用CLIブロックと旧MCP優先ブロックは既知の正確な内容とguideのハッシュを照合して移行します。既存本文を保持し、重複・不完全な管理マーカーや利用者が編集した指示を検出した場合は自動更新を拒否します。更新時に登録が途中で失敗した場合は、MCP・hookに加えてAGENTSと専用指示も復旧対象になります。
 
 共通指示を登録した導入は更新時も同じオプションを渡します。オプションを省略した更新では共通指示は不変更です。その間に配置済みguideだけが更新された場合、古い共通指示を編集済みの指示と区別できないため、自動更新・解除は停止することがあります。
 
@@ -36,7 +36,7 @@ $config = Join-Path $env:USERPROFILE '.local\Prunlet\config.json'
 & $exe --config $config init --backup-directory 'D:\PrunletBackup'
 ```
 
-設定の形式は次のとおりです。ローカルドライブ内の通常ファイルを扱い、復元データ保存先内は通常削除から保護します。旧`allowedRoots`・`--allowed-root`・`-AllowedRoot`は互換用に受理しますが、対象フォルダーを制限しません。
+設定の形式は次のとおりです。ローカルドライブ内の通常ファイル・フォルダーを扱い、復元データ保存先内は通常削除から保護します。旧`allowedRoots`・`--allowed-root`・`-AllowedRoot`は互換用に受理しますが、対象フォルダーを制限しません。
 
 ```json
 {

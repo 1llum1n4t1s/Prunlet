@@ -72,7 +72,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                 protocolVersion = SupportedVersions.Contains(requestedVersion) ? requestedVersion : SupportedVersions[0],
                 capabilities = new { tools = new { listChanged = false } },
                 serverInfo = new { name = "prunlet", title = "Prunlet", version = "1.0.0" },
-                instructions = "Use delete_files for authorized absolute Windows file deletion without a configured target directory allowlist. Files inside the configured recovery directory are protected. Prunlet verifies recovery copies before deleting files. Use restore_files with the returned operationId to recover files. Use dryRun to inspect targets. Directories, recursion, wildcards and links are unsupported. Existing host approvals and policies still apply."
+                instructions = "Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true to include directory contents. The recovery directory and directories containing it are protected. Prunlet persists verified file copies and directory records before deletion. Use restore_files with operationId to recover files and directory structure. Use dryRun to inspect targets. Wildcards and links are unsupported. Existing host approvals and policies still apply."
             };
         }
         if (!ready) throw new RpcException(-32600, "Initialize and send notifications/initialized first.");
@@ -97,14 +97,16 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
             switch (name)
             {
                 case "delete_files":
-                    RejectExtraProperties(args, "paths", "dryRun");
+                    RejectExtraProperties(args, "paths", "dryRun", "recursive");
                     if (!args.TryGetProperty("paths", out var paths) || paths.ValueKind != JsonValueKind.Array || paths.GetArrayLength() == 0 || paths.GetArrayLength() > 256)
                         throw new RpcException(-32602, "Paths must contain 1 to 256 strings.");
                     if (paths.EnumerateArray().Any(path => path.ValueKind != JsonValueKind.String))
                         throw new RpcException(-32602, "Each path must be a string.");
                     if (args.TryGetProperty("dryRun", out var dryRun) && dryRun.ValueKind is not JsonValueKind.True and not JsonValueKind.False)
                         throw new RpcException(-32602, "DryRun must be boolean.");
-                    result = service.Delete(paths.EnumerateArray().Select(path => path.GetString()!).ToArray(), dryRun.ValueKind == JsonValueKind.True);
+                    if (args.TryGetProperty("recursive", out var recursive) && recursive.ValueKind is not JsonValueKind.True and not JsonValueKind.False)
+                        throw new RpcException(-32602, "Recursive must be boolean.");
+                    result = service.Delete(paths.EnumerateArray().Select(path => path.GetString()!).ToArray(), dryRun.ValueKind == JsonValueKind.True, recursive.ValueKind == JsonValueKind.True);
                     break;
                 case "restore_files":
                     RejectExtraProperties(args, "operationId");
@@ -133,14 +135,15 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
     [
         new
         {
-            name = "delete_files", title = "Delete files with recovery copies",
-            description = "Delete authorized absolute Windows file paths without a configured target directory allowlist after making verified recovery copies. Files inside the configured recovery directory are protected. Does not expand wildcards or delete directories/links.",
+            name = "delete_files", title = "Delete files and folders with recovery copies",
+            description = "Delete authorized absolute Windows files and empty directories after making verified recovery copies. Set recursive=true to delete directory contents, including empty subdirectories. The recovery directory and directories containing it are protected. Does not expand wildcards or follow links.",
             inputSchema = new
             {
                 type = "object", properties = new
                 {
                     paths = new { type = "array", items = new { type = "string" }, minItems = 1, maxItems = 256 },
-                    dryRun = new { type = "boolean", description = "Inspect without changing files." }
+                    dryRun = new { type = "boolean", description = "Inspect without changing files or directories." },
+                    recursive = new { type = "boolean", description = "Explicitly include all files and subdirectories of directory targets. Defaults to false." }
                 },
                 required = new[] { "paths" }, additionalProperties = false
             },

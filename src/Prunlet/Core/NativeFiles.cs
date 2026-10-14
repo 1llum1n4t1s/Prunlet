@@ -14,6 +14,8 @@ internal static class NativeFiles
 
     internal static SafeFileHandle OpenDirectory(string path) => Open(path, 0x80, 3, 3, OpenReparse | BackupSemantics);
     internal static SafeFileHandle OpenInspect(string path) => Open(path, 0x80, 3, 3, OpenReparse);
+    internal static SafeFileHandle OpenAny(string path) => Open(path, 0x80, 3, 3, OpenReparse | BackupSemantics);
+    internal static SafeFileHandle OpenDirectorySource(string path) => Open(path, 0x80 | Delete, 3, 3, OpenReparse | BackupSemantics);
     internal static SafeFileHandle OpenSource(string path) => Open(path, Read | Delete, 1, 3, OpenReparse);
     internal static SafeFileHandle OpenBackup(string path) => Open(path, Read, 1, 3, OpenReparse);
     internal static SafeFileHandle OpenPurgeTarget(string path) => Open(path, Read | Delete, 1, 3, OpenReparse);
@@ -93,6 +95,18 @@ internal static class NativeFiles
         if (!GetFileInformationByHandle(handle, out var info)) ThrowLastError("Cannot inspect recovery file handle");
         if (info.Links != 1)
             throw new IOException("Recovery files with multiple hard links cannot be purged.");
+    }
+
+    internal static bool IsDirectory(SafeFileHandle handle)
+    {
+        if (!GetFileInformationByHandle(handle, out var info)) ThrowLastError("Cannot inspect handle type");
+        return (info.Attributes & (uint)FileAttributes.Directory) != 0;
+    }
+
+    internal static string Identity(SafeFileHandle handle)
+    {
+        if (!GetFileInformationByHandle(handle, out var info)) ThrowLastError("Cannot inspect handle identity");
+        return $"{info.VolumeSerial:x8}:{info.FileIndexHigh:x8}{info.FileIndexLow:x8}";
     }
 
     internal static void DeleteHandle(SafeFileHandle handle)

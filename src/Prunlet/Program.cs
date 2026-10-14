@@ -8,7 +8,8 @@ internal static class Program
 {
     internal static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
-        WriteIndented = false
+        WriteIndented = false,
+        TypeInfoResolver = PrunletConfig.JsonOptions.TypeInfoResolver
     };
 
     private static async Task<int> Main(string[] args)
@@ -22,8 +23,8 @@ internal static class Program
                 Console.WriteLine("""
                     Prunlet — Windows file deletion with verified recovery copies.
                     prunlet --config <absolute-json-path> init --backup-directory <directory>
-                    prunlet --config <absolute-json-path> delete [--dry-run] -- <absolute-file-path> [...]
-                    prunlet --config <absolute-json-path> delete [--dry-run] --paths-file <absolute-json-file>
+                    prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]
+                    prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>
                     prunlet --config <absolute-json-path> restore <operation-id>
                     prunlet --config <absolute-json-path> purge <operation-id> [--dry-run | --apply]
                     prunlet --config <absolute-json-path> operations
@@ -31,7 +32,8 @@ internal static class Program
                     prunlet --config <absolute-json-path> hook [--hook-script <legacy-path>]
                     Legacy --allowed-root <directory> options are accepted but do not restrict target directories.
                     Files inside the configured recovery directory are protected.
-                    Directories, recursive deletion, wildcard expansion and links are unsupported.
+                    Empty directories are supported; deleting directory contents requires --recursive.
+                    Wildcard expansion and links are unsupported.
                     """);
                 return 0;
             }
@@ -56,16 +58,24 @@ internal static class Program
             switch (command)
             {
                 case "delete":
-                    var dryRun = commandArgs.Length > 0 && commandArgs[0] == "--dry-run";
-                    var offset = dryRun ? 1 : 0;
+                    var dryRun = false;
+                    var recursive = false;
+                    var offset = 0;
+                    while (offset < commandArgs.Length && commandArgs[offset] is "--dry-run" or "--recursive")
+                    {
+                        var option = commandArgs[offset++];
+                        if (option == "--dry-run" && !dryRun) dryRun = true;
+                        else if (option == "--recursive" && !recursive) recursive = true;
+                        else throw new ArgumentException($"Repeated delete option: {option}");
+                    }
                     string[] paths;
                     if (commandArgs.Length == offset + 2 && commandArgs[offset] == "--paths-file")
                         paths = ReadDeletePathsFile(commandArgs[offset + 1]);
                     else if (commandArgs.Length > offset + 1 && commandArgs[offset] == "--")
                         paths = commandArgs[(offset + 1)..];
                     else
-                        throw new ArgumentException("Use delete [--dry-run] -- <absolute-file-path> [...] or delete [--dry-run] --paths-file <absolute-json-file>.");
-                    result = service.Delete(paths, dryRun);
+                        throw new ArgumentException("Use delete [--dry-run] [--recursive] -- <absolute-path> [...] or delete [--dry-run] [--recursive] --paths-file <absolute-json-file>.");
+                    result = service.Delete(paths, dryRun, recursive);
                     break;
                 case "restore":
                     if (commandArgs.Length != 1) throw new ArgumentException("Restore requires exactly one operation id.");

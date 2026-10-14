@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
-    [Parameter(Mandatory)][string]$ReportPath
+    [Parameter(Mandatory)][string]$ReportPath,
+    [string]$LegacyExecutablePath
 )
 $ErrorActionPreference = 'Stop'
 if (-not [IO.Path]::IsPathFullyQualified($OutputDirectory) -or -not [IO.Path]::IsPathFullyQualified($ReportPath)) { throw 'Verification paths must be absolute.' }
@@ -86,6 +87,23 @@ function Assert-Rejected([string[]]$Arguments, [string]$UntouchedPath) {
 function File-Digest([string]$Path) {
     return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($Path))).ToLowerInvariant()
 }
+function New-TreeFixture([string]$Name) {
+    $root = Join-Path $script:Scope $Name
+    $nested = Join-Path $root '日本語 nested'
+    $empty = Join-Path $nested 'empty leaf'
+    $null = New-Item -ItemType Directory -Path $empty -Force
+    $first = Join-Path $root 'first.bin'
+    $second = Join-Path $nested 'second.txt'
+    [IO.File]::WriteAllBytes($first, [byte[]](0, 1, 127, 128, 255, 13, 10))
+    [IO.File]::WriteAllText($second, 'recursive 日本語 bytes', [Text.UTF8Encoding]::new($false))
+    return @{ Root = $root; Nested = $nested; Empty = $empty; Files = @($first, $second); Hashes = @((File-Digest $first), (File-Digest $second)) }
+}
+function Assert-TreeIntact([object]$Tree) {
+    Assert-True ([IO.Directory]::Exists($Tree.Empty)) 'Empty descendant directory was lost.'
+    for ($index = 0; $index -lt $Tree.Files.Count; $index++) {
+        Assert-True ([IO.File]::Exists($Tree.Files[$index]) -and (File-Digest $Tree.Files[$index]) -ceq $Tree.Hashes[$index]) 'Tree file bytes changed.'
+    }
+}
 function Write-InputFile([string]$Name, [string]$Json) {
     $path = Join-Path $outputRoot $Name
     [IO.File]::WriteAllText($path, $Json, [Text.UTF8Encoding]::new($false))
@@ -132,6 +150,25 @@ Test-Case 'init' {
     Assert-True ($result.ExitCode -eq 0 -and [IO.File]::Exists($script:Config)) 'Init failed.'
 }
 Test-Case 'init never overwrites config' { Assert-Rejected @('init', '--allowed-root', $script:Scope, '--backup-directory', $script:Recovery) $script:Config }
+if ($LegacyExecutablePath) {
+    Test-Case 'new file-only schema 1 operation restores and purges through legacy executable' {
+        Assert-True ([IO.Path]::IsPathFullyQualified($LegacyExecutablePath) -and [IO.File]::Exists($LegacyExecutablePath)) 'Legacy executable must be an existing absolute path.'
+        $file = New-File 'legacy-executable-roundtrip.bin' 'new schema 1 bytes 日本語'
+        $hash = File-Digest $file
+        $deleted = Invoke-Prunlet @('delete', '--', $file)
+        Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($file)) 'New file-only deletion failed.'
+        $operationRoot = Join-Path $script:Recovery $deleted.Json.operationId
+        $manifestPath = Join-Path $operationRoot 'manifest.json'
+        $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -Depth 30
+        Assert-True ($manifest.schema -eq 1 -and !$manifest.items[0].PSObject.Properties['kind'] -and !$manifest.items[0].PSObject.Properties['treeRoot']) 'New file-only manifest expanded the legacy wire schema.'
+        $manifestHash = File-Digest $manifestPath
+        $restored = Invoke-ProcessJson $LegacyExecutablePath @('--config', $script:Config, 'restore', $deleted.Json.operationId)
+        Assert-True ($restored.ExitCode -eq 0 -and (File-Digest $file) -ceq $hash) 'Legacy executable could not restore the new schema 1 operation.'
+        $purged = Invoke-ProcessJson $LegacyExecutablePath @('--config', $script:Config, 'purge', $deleted.Json.operationId, '--apply')
+        Assert-True ($purged.ExitCode -eq 0 -and @($purged.Json.items | Where-Object status -eq 'purged').Count -eq 1 -and @([IO.Directory]::EnumerateFiles($operationRoot, '*.bak')).Count -eq 0) 'Legacy executable could not purge the new schema 1 operation.'
+        Assert-True ((File-Digest $file) -ceq $hash -and (File-Digest $manifestPath) -ceq $manifestHash -and [IO.File]::Exists((Join-Path $operationRoot 'operation.lock'))) 'Legacy compatibility changed source bytes or retained metadata.'
+    }
+}
 Test-Case 'schema 1 omitted null stale and overlapping legacy roots do not restrict targets' {
     $original = [IO.File]::ReadAllBytes($script:Config)
     try {
@@ -374,7 +411,138 @@ Test-Case '8.3 parent spelling records and restores the physical long path' {
     Assert-Rejected @('delete', '--', (Join-Path $shortRecovery 'short-name-protected.txt')) $protected
 }
 Test-Case 'wildcard rejected' { Assert-Rejected @('delete', '--', (Join-Path $script:Scope '*.txt')) '' }
-Test-Case 'directory rejected' { Assert-Rejected @('delete', '--', $script:Scope) '' }
+Test-Case 'nonempty directory requires explicit recursive opt-in' {
+    $tree = New-TreeFixture 'directory-no-recursive'
+    $count = @([IO.Directory]::EnumerateDirectories($script:Recovery)).Count
+    Assert-Rejected @('delete', '--', $tree.Root) ''
+    Assert-TreeIntact $tree
+    Assert-True (@([IO.Directory]::EnumerateDirectories($script:Recovery)).Count -eq $count) 'Missing recursive opt-in created a recovery operation.'
+}
+Test-Case 'empty directory delete and restore without recursive opt-in' {
+    $root = Join-Path $script:Scope 'empty directory 日本語'; $null = New-Item -ItemType Directory -Path $root
+    $deleted = Invoke-Prunlet @('delete', '--', $root)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($root)) 'Empty directory deletion failed.'
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0 -and [IO.Directory]::Exists($root) -and @([IO.Directory]::EnumerateFileSystemEntries($root)).Count -eq 0) 'Empty directory restoration failed.'
+}
+Test-Case 'recursive paths-file dry-run preserves tree and creates no recovery operation' {
+    $tree = New-TreeFixture 'directory-dry-run'
+    $inputFile = Write-PathsFile 'directory-dry-run.json' @($tree.Root)
+    $count = @([IO.Directory]::EnumerateDirectories($script:Recovery)).Count
+    $dry = Invoke-Prunlet @('delete', '--recursive', '--dry-run', '--paths-file', $inputFile)
+    Assert-True ($dry.ExitCode -eq 0 -and $dry.Json.dryRun) 'Recursive dry-run failed.'
+    Assert-TreeIntact $tree
+    Assert-True (@([IO.Directory]::EnumerateDirectories($script:Recovery)).Count -eq $count) 'Recursive dry-run created a recovery operation.'
+}
+Test-Case 'recursive CLI flag ordering is equivalent and duplicate flags are rejected' {
+    $tree = New-TreeFixture 'directory-cli-flags'
+    $count = @([IO.Directory]::EnumerateDirectories($script:Recovery)).Count
+    $first = Invoke-Prunlet @('delete', '--recursive', '--dry-run', '--', $tree.Root)
+    $reverse = Invoke-Prunlet @('delete', '--dry-run', '--recursive', '--', $tree.Root)
+    Assert-True ($first.ExitCode -eq 0 -and $reverse.ExitCode -eq 0 -and $first.Json.dryRun -and $reverse.Json.dryRun) 'CLI recursive flag order changed dry-run outcome.'
+    Assert-True (($first.Json.items | ConvertTo-Json -Depth 20 -Compress) -ceq ($reverse.Json.items | ConvertTo-Json -Depth 20 -Compress)) 'CLI recursive flag order changed planned items.'
+    foreach ($arguments in @(@('delete', '--recursive', '--recursive', '--', $tree.Root), @('delete', '--recursive', '--dry-run', '--dry-run', '--', $tree.Root))) {
+        Assert-Rejected $arguments ''
+    }
+    Assert-TreeIntact $tree
+    Assert-True (@([IO.Directory]::EnumerateDirectories($script:Recovery)).Count -eq $count) 'Flag validation or dry-run created recovery data.'
+}
+Test-Case 'recursive CLI deletion restores exact binary bytes and empty subdirectories' {
+    $tree = New-TreeFixture 'directory-roundtrip'
+    $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $tree.Root)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree.Root)) 'Recursive tree deletion failed.'
+    $operationRoot = Join-Path $script:Recovery $deleted.Json.operationId
+    $manifest = [IO.File]::ReadAllText((Join-Path $operationRoot 'manifest.json')) | ConvertFrom-Json -Depth 30
+    Assert-True ($manifest.schema -eq 2 -and @($manifest.items | Where-Object kind -eq 'directory').Count -eq 3 -and @($manifest.items | Where-Object kind -eq 'file').Count -eq 2) 'Directory manifest did not persist all tree entries.'
+    Assert-True (@(Get-ChildItem -LiteralPath $operationRoot -Filter '*.bak').Count -eq 2) 'File recovery copies do not match tree files.'
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0) 'Recursive tree restoration failed.'
+    Assert-TreeIntact $tree
+}
+Test-Case 'recursive deletion refuses overlapping roots before mutation' {
+    $tree = New-TreeFixture 'directory-overlap'
+    foreach ($paths in @(@($tree.Root, $tree.Files[0]), @($tree.Nested, $tree.Root))) {
+        Assert-Rejected (@('delete', '--recursive', '--') + $paths) ''
+        Assert-TreeIntact $tree
+    }
+}
+Test-Case 'recursive deletion protects recovery directory and its ancestor' {
+    $sentinel = Join-Path $script:Recovery 'directory-protection.txt'; [IO.File]::WriteAllText($sentinel, 'keep recovery')
+    foreach ($root in @($script:Recovery, $outputRoot)) {
+        Assert-Rejected @('delete', '--recursive', '--', $root) $sentinel
+        Assert-True ([IO.File]::ReadAllText($sentinel) -ceq 'keep recovery' -and [IO.File]::Exists($script:Config)) 'Protected ancestor deletion changed recovery or config.'
+    }
+}
+Test-Case 'nested locked file prevents deletion of every tree member' {
+    $tree = New-TreeFixture 'directory-locked'
+    $lock = [IO.File]::Open($tree.Files[1], [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        Assert-Rejected @('delete', '--recursive', '--', $tree.Root) $tree.Files[0]
+        Assert-True ([IO.File]::Exists($tree.Files[1]) -and [IO.Directory]::Exists($tree.Empty)) 'Locked tree was partially deleted.'
+    } finally { $lock.Dispose() }
+    Assert-TreeIntact $tree
+}
+Test-Case 'nested junction prevents deletion of siblings and external target' {
+    $tree = New-TreeFixture 'directory-junction'
+    $target = Join-Path $outputRoot 'directory-junction-target'; $null = New-Item -ItemType Directory -Path $target
+    $file = Join-Path $target 'keep.txt'; [IO.File]::WriteAllText($file, 'external linked target')
+    $link = Join-Path $tree.Nested 'link'; $null = New-Item -ItemType Junction -Path $link -Target $target
+    Assert-Rejected @('delete', '--recursive', '--', $tree.Root) $file
+    Assert-TreeIntact $tree
+    Assert-True ([IO.File]::ReadAllText($file) -ceq 'external linked target') 'Recursive traversal changed linked target.'
+}
+Test-Case 'nested ADS and hardlink sources prevent every tree deletion' {
+    foreach ($kind in @('ads', 'hardlink')) {
+        $tree = New-TreeFixture ('directory-' + $kind)
+        if ($kind -eq 'ads') { [IO.File]::WriteAllText($tree.Files[1] + ':custom', 'keep ADS') }
+        else { $null = New-Item -ItemType HardLink -Path (Join-Path $outputRoot 'directory-hardlink-alias.txt') -Target $tree.Files[1] }
+        Assert-Rejected @('delete', '--recursive', '--', $tree.Root) $tree.Files[0]
+        Assert-TreeIntact $tree
+        if ($kind -eq 'ads') { Assert-True ([IO.File]::ReadAllText($tree.Files[1] + ':custom') -ceq 'keep ADS') 'Nested ADS changed.' }
+    }
+}
+Test-Case 'directory ADS prevents deletion of every tree member' {
+    $tree = New-TreeFixture 'directory-own-ADS'
+    [IO.File]::WriteAllText($tree.Nested + ':custom', 'keep directory ADS')
+    Assert-Rejected @('delete', '--recursive', '--', $tree.Root) $tree.Files[0]
+    Assert-TreeIntact $tree
+    Assert-True ([IO.File]::ReadAllText($tree.Nested + ':custom') -ceq 'keep directory ADS') 'Directory ADS changed.'
+}
+Test-Case 'directory restore conflict never overwrites descendant file' {
+    $tree = New-TreeFixture 'directory-restore-conflict'
+    $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $tree.Root)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree.Root)) 'Conflict fixture deletion failed.'
+    $null = New-Item -ItemType Directory -Path $tree.Nested -Force
+    [IO.File]::WriteAllText($tree.Files[1], 'new occupant')
+    Assert-Rejected @('restore', $deleted.Json.operationId) $tree.Files[1]
+    Assert-True ([IO.File]::ReadAllText($tree.Files[1]) -ceq 'new occupant') 'Directory restore overwrote existing file.'
+    Assert-True ([IO.File]::Exists($tree.Files[0]) -and (File-Digest $tree.Files[0]) -ceq $tree.Hashes[0]) 'Unconflicted sibling did not restore.'
+    $siblingHash = File-Digest $tree.Files[0]
+    Move-Item -LiteralPath $tree.Files[1] -Destination (Join-Path $outputRoot 'directory-conflict-occupant.txt')
+    $retried = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($retried.ExitCode -eq 1 -and @($retried.Json.items | Where-Object { $_.path -ceq $tree.Files[0] -and $_.status -eq 'conflict' }).Count -eq 1 -and @($retried.Json.items | Where-Object { $_.path -ceq $tree.Files[1] -and $_.status -eq 'restored' }).Count -eq 1) 'Retry did not recover the missing file while reporting the existing sibling conflict.'
+    Assert-True ((File-Digest $tree.Files[0]) -ceq $siblingHash) 'Retry changed already-restored sibling bytes.'
+    Assert-TreeIntact $tree
+}
+Test-Case 'directory restore refuses linked metadata and linked source ancestors' {
+    foreach ($kind in @('metadata', 'ancestor')) {
+        $tree = New-TreeFixture ('directory-restore-link-' + $kind)
+        $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $tree.Root)
+        Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree.Root)) 'Linked restore fixture deletion failed.'
+        if ($kind -eq 'metadata') {
+            $manifest = Join-Path (Join-Path $script:Recovery $deleted.Json.operationId) 'manifest.json'
+            $saved = Join-Path $outputRoot 'directory-linked-manifest.json'
+            Move-Item -LiteralPath $manifest -Destination $saved
+            New-SymbolicFixture $manifest $saved
+        } else {
+            $target = Join-Path $outputRoot 'directory-restore-linked-target'; $null = New-Item -ItemType Directory -Path $target
+            $null = New-Item -ItemType Junction -Path $tree.Root -Target $target
+        }
+        Assert-Rejected @('restore', $deleted.Json.operationId) ''
+        Assert-True (![IO.File]::Exists($tree.Files[0]) -and ![IO.File]::Exists($tree.Files[1])) 'Linked restore wrote source files.'
+        if ($kind -eq 'ancestor') { Assert-True (@([IO.Directory]::EnumerateFileSystemEntries($target)).Count -eq 0) 'Restore wrote through linked ancestor.' }
+    }
+}
 Test-Case 'empty deletion rejected' { Assert-Rejected @('delete', '--') '' }
 Test-Case 'ADS path rejected' {
     $file = New-File 'ads-path.txt'; Assert-Rejected @('delete', '--', ($file + ':stream')) $file
@@ -408,6 +576,8 @@ Test-Case 'case-sensitive ancestors are rejected' {
     Assert-True ($elevated.ExitCode -eq 0) 'Cannot enable case-sensitive fixture.'
     $file = Join-Path $caseRoot 'file.txt'; [IO.File]::WriteAllText($file, 'case-sensitive data')
     Assert-Rejected @('delete', '--', $file) $file
+    Assert-Rejected @('delete', '--recursive', '--', $caseRoot) $file
+    Assert-True ([IO.File]::ReadAllText($file) -ceq 'case-sensitive data') 'Recursive case-sensitive directory changed source.'
 }
 Test-Case 'restore conflict never overwrites' {
     $file = New-File 'conflict.txt' 'original'
@@ -639,6 +809,25 @@ Test-Case 'MCP real stdio lifecycle/delete/restore/validation' {
         Assert-True (!$outsideRestored.result.isError -and [IO.File]::ReadAllText((Join-Path $outputRoot 'outside.txt')) -eq 'outside') 'MCP unrestricted restore differs.'
         $list = Rpc @{jsonrpc='2.0';id=8;method='tools/call';params=@{name='list_operations';arguments=@{}}}
         Assert-True (!$list.result.isError) 'MCP operations failed.'
+        $deleteTool = $tools.result.tools | Where-Object name -eq 'delete_files'
+        Assert-True ($deleteTool.inputSchema.properties.recursive.type -eq 'boolean') 'MCP recursive schema missing.'
+        $tree = New-TreeFixture 'directory-MCP'
+        $badRecursive = Rpc @{jsonrpc='2.0';id=10;method='tools/call';params=@{name='delete_files';arguments=@{paths=@($tree.Root);recursive='true'}}}
+        Assert-True ($badRecursive.error.code -eq -32602) 'MCP accepted non-boolean recursive.'
+        Assert-TreeIntact $tree
+        $noRecursive = Rpc @{jsonrpc='2.0';id=11;method='tools/call';params=@{name='delete_files';arguments=@{paths=@($tree.Root)}}}
+        Assert-True ($noRecursive.result.isError) 'MCP nonempty directory did not require opt-in.'
+        Assert-TreeIntact $tree
+        $beforeDry = @([IO.Directory]::EnumerateDirectories($script:Recovery)).Count
+        $dryTree = Rpc @{jsonrpc='2.0';id=12;method='tools/call';params=@{name='delete_files';arguments=@{paths=@($tree.Root);recursive=$true;dryRun=$true}}}
+        Assert-True (!$dryTree.result.isError -and $dryTree.result.structuredContent.dryRun) 'MCP recursive dry-run failed.'
+        Assert-TreeIntact $tree
+        Assert-True (@([IO.Directory]::EnumerateDirectories($script:Recovery)).Count -eq $beforeDry) 'MCP tree dry-run created recovery data.'
+        $deletedTree = Rpc @{jsonrpc='2.0';id=13;method='tools/call';params=@{name='delete_files';arguments=@{paths=@($tree.Root);recursive=$true}}}
+        Assert-True (!$deletedTree.result.isError -and ![IO.Directory]::Exists($tree.Root)) 'MCP recursive deletion failed.'
+        $restoredTree = Rpc @{jsonrpc='2.0';id=14;method='tools/call';params=@{name='restore_files';arguments=@{operationId=$deletedTree.result.structuredContent.operationId}}}
+        Assert-True (!$restoredTree.result.isError) 'MCP directory restoration failed.'
+        Assert-TreeIntact $tree
         $process.StandardInput.Close()
         Assert-True ($process.WaitForExit(10000) -and $process.ExitCode -eq 0) 'MCP did not stop on EOF.'
         Assert-True (!$errTask.GetAwaiter().GetResult()) 'MCP wrote unexpected errors.'
@@ -821,6 +1010,8 @@ $report = [ordered]@{
     timestampUtc = [DateTime]::UtcNow.ToString('O')
     executable = [IO.Path]::GetFullPath($ExecutablePath)
     executableSha256 = (Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash
+    legacyExecutable = if ($LegacyExecutablePath) { [IO.Path]::GetFullPath($LegacyExecutablePath) } else { $null }
+    legacyExecutableSha256 = if ($LegacyExecutablePath -and [IO.File]::Exists($LegacyExecutablePath)) { (Get-FileHash -LiteralPath $LegacyExecutablePath -Algorithm SHA256).Hash } else { $null }
     outputDirectory = $outputRoot
     passed = $script:Results.Count - $failed.Count
     failed = $failed.Count

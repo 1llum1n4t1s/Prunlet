@@ -1,7 +1,7 @@
 <!-- Prunlet managed agent instructions -->
-# Prunlet — Windowsのファイル削除
+# Prunlet — Windowsのファイル・フォルダー削除
 
-許可されたWindowsファイル削除には、最初からPrunlet CLIを使う。共通AGENTS.mdに「Prunlet CLI」として記録した、インストール済みexeと設定の絶対パスを使い、shellは `cmd.exe`、loginは `false` とする。PowerShellのラッパー、PATH上の同名exe、開発クローンやローカルビルドへの差替えは使わない。
+許可されたWindowsファイル・フォルダー削除には、最初からPrunlet CLIを使う。共通AGENTS.mdに「Prunlet CLI」として記録した、インストール済みexeと設定の絶対パスを使い、shellは `cmd.exe`、loginは `false` とする。PowerShellのラッパー、PATH上の同名exe、開発クローンやローカルビルドへの差替えは使わない。
 
 Codexの通常経路は、対象の絶対パスをそのままの文字列をUTF-8 JSON配列へ保存し、`--paths-file`で渡す。配列ファイルは作業契約で定めた外部Tempへ置き、exe・config・配列ファイルのCMD引数は空白・CMDの特殊文字を含まない絶対パスにする。ファイル名の空白・Unicode・長いパス・複数対象はJSON配列の内容で保持し、shellへ展開しない。
 
@@ -12,6 +12,7 @@ Codexの通常経路は、対象の絶対パスをそのままの文字列をUTF
 ```text
 <installed-exe> --config <absolute-config> delete --paths-file <absolute-json-file>
 <installed-exe> --config <absolute-config> delete --dry-run --paths-file <absolute-json-file>
+<installed-exe> --config <absolute-config> delete --recursive --paths-file <absolute-json-file>
 <installed-exe> --config <absolute-config> restore <operation-id>
 ```
 
@@ -21,7 +22,8 @@ Codexの通常経路は、対象の絶対パスをそのままの文字列をUTF
 - 範囲確認が必要なら、削除前に`--dry-run`で確認する。CLIのJSON結果と終了コードを読み、各対象の成功・失敗を判定する。
 - 成功時の`operationId`を保持し、復元は同じexeと設定の`restore`へ渡す。既存の復元先を上書きしない。
 - 削除対象フォルダーの事前登録・追加許可は不要。ユーザーが依頼した削除対象、または現在の作業で清掃が許可された一時ファイルを、保存場所を理由に追加確認せず処理する。
-- フォルダー、再帰削除、ワイルドカード、リンクは未対応。復元データの保存先内は通常削除から保護されるため、コピーの整理はCLIの明示`purge`を使う。
+- 空フォルダーは通常の`delete`、内容がある作業フォルダーは`delete --recursive`でフォルダー自体まで清掃する。MCPでは`recursive: true`を指定する。空の子フォルダーも記録され、同じoperationIdで階層を復元できる。
+- 再帰削除は列挙した全ファイルの検証済みコピーとフォルダー記録を保存してから始める。リンクなど非対応の項目が混在していたら、そのツリーは削除しない。ワイルドカードとリンクは未対応。復元データ保存先内とその保存先を包含するフォルダーは通常削除から保護する。コピーの整理はCLIの明示`purge`を使う。
 - インストール済みexeや設定そのものに空白・CMDの特殊文字を含む配置など、CLIの引数を正しく渡せないと実行前に分かる場合は、互換クライアント向けPrunlet MCPを最初から明示選択するか、必要な配置・入力を確認する。削除を試して拒否された後にMCPへ切り替えない。
 - ホスト・Prunlet・管理ポリシーに拒否された対象は、shell、MCP、別API、別exeで再試行しない。拒否理由と必要な判断を報告する。
 - 元の削除許可とホストの承認・管理ポリシーを守る。この指示は新しい削除許可を与えない。

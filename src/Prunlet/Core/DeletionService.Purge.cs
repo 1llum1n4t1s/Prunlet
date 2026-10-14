@@ -29,7 +29,7 @@ public sealed partial class DeletionService
                 OperationId = operationId,
                 ManifestSha256 = manifestHash,
                 Targets = manifest.Items.Select((entry, index) => (entry, index))
-                    .Where(pair => pair.entry.State == "backup_ready")
+                    .Where(pair => pair.entry.State == "backup_ready" && pair.entry.Kind == "file")
                     .Select(pair => new PurgeTarget { Index = pair.index, Sha256 = pair.entry.Sha256!, Size = pair.entry.Size!.Value }).ToList()
             };
             var members = Directory.EnumerateFileSystemEntries(directory).Select(Path.GetFileName).ToHashSet(StringComparer.Ordinal);
@@ -41,7 +41,7 @@ public sealed partial class DeletionService
                 ValidatePurgeIntent(intent, expectedIntent);
             }
             var backupNames = manifest.Items.Select((entry, index) => (entry, index))
-                .Where(pair => pair.entry.State == "backup_ready")
+                .Where(pair => pair.entry.State == "backup_ready" && pair.entry.Kind == "file")
                 .ToDictionary(pair => $"{pair.index:D4}.bak", pair => pair.index, StringComparer.Ordinal);
             foreach (var name in members)
             {
@@ -56,9 +56,9 @@ public sealed partial class DeletionService
             for (var index = 0; index < manifest.Items.Count; index++)
             {
                 var entry = manifest.Items[index];
-                var item = new FileOperationResult { Path = entry.Path, Status = "not_backed_up" };
+                var item = new FileOperationResult { Path = entry.Path, Kind = entry.Kind, Status = "not_backed_up", Schema2Wire = manifest.Schema == 2 };
                 result.Items.Add(item);
-                if (entry.State != "backup_ready") continue;
+                if (entry.State != "backup_ready" || entry.Kind != "file") continue;
                 item.BackupPath = BackupPath(directory, index);
                 item.Size = entry.Size;
                 item.Sha256 = entry.Sha256;
@@ -215,7 +215,12 @@ public sealed partial class DeletionService
             : ["operationId", "dryRun", "purgedBytes", "items", "warnings"];
         RequireJsonProperties(document.RootElement, required);
         if (typeof(T) == typeof(OperationManifest))
+        {
             RequireJsonArrayItems(document.RootElement, "items", ["path", "state"]);
+            if (document.RootElement.GetProperty("schema").ValueKind == JsonValueKind.Number
+                && document.RootElement.GetProperty("schema").TryGetInt32(out var schema) && schema == 2)
+                RequireJsonArrayItems(document.RootElement, "items", ["path", "state", "kind", "treeRoot"]);
+        }
         if (typeof(T) == typeof(PurgeIntent))
             RequireJsonArrayItems(document.RootElement, "targets", ["index", "sha256", "size"]);
         try { return document.RootElement.Deserialize<T>(PrunletConfig.JsonOptions) ?? throw new InvalidDataException("Operation metadata is empty."); }
@@ -302,7 +307,7 @@ public sealed partial class DeletionService
         {
             var result = ReadValidatedJson<RestoreResult>(stream);
             operationId = result.OperationId; items = result.Items; warnings = result.Warnings;
-            statuses = ["restored", "conflict", "not_backed_up", "failed"];
+            statuses = ["restored", "already_present", "conflict", "not_backed_up", "failed"];
         }
         else
         {
@@ -319,7 +324,8 @@ public sealed partial class DeletionService
         {
             var item = items[index];
             var entry = manifest.Items[index];
-            if (item is null || item.Path != entry.Path || !statuses.Contains(item.Status, StringComparer.Ordinal)
+            if (item is null || item.Path != entry.Path || item.Kind != entry.Kind || !statuses.Contains(item.Status, StringComparer.Ordinal)
+                || (item.Status == "already_present" && entry.Kind != "directory")
                 || (item.BackupPath is not null && ResolveRecordedBackupPath(item.BackupPath) != BackupPath(directory, index))
                 || (item.Sha256 is not null && !item.Sha256.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
                 || (item.Size is not null && item.Size != entry.Size))
