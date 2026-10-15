@@ -90,6 +90,12 @@ MCPの1行とhookの入力全体は、UTF-16の文字数で1,048,576文字まで
 
 ## 解除と復元
 
+自動整理のWindowsタスクはCodex連携とは独立しています。次のCodex登録解除でも維持されます。タスクだけを解除する場合は、配置済み`uninstall-maintenance.ps1`へ同じexe・設定を渡します。解除後も実削除時の自動整理は行われますが、使っていない間の期限切れ整理は行われません。
+
+```powershell
+& (Join-Path $bin 'uninstall-maintenance.ps1') -ExecutablePath $exe -ConfigPath $config
+```
+
 ```powershell
 & (Join-Path $bin 'uninstall-codex.ps1') -ExecutablePath $exe -ConfigPath $config -BackupDirectory $rollback
 ```

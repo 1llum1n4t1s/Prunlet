@@ -10,6 +10,8 @@ public sealed class PrunletConfig
     // 旧設定との互換性のため保持する。対象パスの制限には使用しない。
     public string[] AllowedRoots { get; set; } = [];
     public string BackupDirectory { get; set; } = string.Empty;
+    public int RetentionDays { get; set; } = 7;
+    public long MaxRecoveryBytes { get; set; } = 10L * 1024 * 1024 * 1024;
 
     public static PrunletConfig Load(string path)
     {
@@ -24,6 +26,8 @@ public sealed class PrunletConfig
     {
         if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Prunlet supports Windows only.");
         if (Schema != 1) throw new InvalidDataException("Unsupported configuration schema.");
+        if (RetentionDays is < 1 or > 36500) throw new InvalidDataException("retentionDays must be between 1 and 36500.");
+        if (MaxRecoveryBytes <= 0) throw new InvalidDataException("maxRecoveryBytes must be positive.");
         var backup = PathPolicy.Absolute(BackupDirectory);
         PathPolicy.ExistingDirectory(backup);
     }

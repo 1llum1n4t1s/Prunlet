@@ -82,7 +82,7 @@ public sealed partial class DeletionService
                     try { NativeFiles.Verify(backupHandle, backupPath); backup = new FileStream(backupHandle, FileAccess.ReadWrite); }
                     catch { backupHandle.Dispose(); throw; }
                     node.Backup = backup;
-                    CaptureSpecial(source, node.Entry, backup);
+                    CaptureSpecial(source, node.Entry, backup, reserve: ReserveRecoveryBytes);
                     backup.Flush(true);
                     VerifySpecialBackup(backup, node.Entry);
                     node.Entry.State = node.Item.Status = "backup_ready";
@@ -176,7 +176,7 @@ public sealed partial class DeletionService
         foreach (var child in children) ScanSpecial(child, root, recursive, nodes, manifest, result);
     }
 
-    private static void CaptureSpecial(SafeFileHandle source, ManifestEntry entry, FileStream? destination, Action? verified = null)
+    private static void CaptureSpecial(SafeFileHandle source, ManifestEntry entry, FileStream? destination, Action? verified = null, Action<int>? reserve = null)
     {
         VerifySpecialHandle(source, entry.Path);
         var directory = NativeFiles.IsDirectory(source);
@@ -191,7 +191,8 @@ public sealed partial class DeletionService
                 throw new IOException("Prepared reparse object type changed.");
             // 未対応のリンク付随ストリームは、リンク先を開かず安全側に拒否する。
             if (NativeFiles.NamedStreams(source).Count != 0) throw new IOException("Named streams on reparse points are unsupported.");
-            destination?.Write(bytes); total.AppendData(bytes); offset = bytes.Length;
+            if (destination is not null) { reserve?.Invoke(bytes.Length); destination.Write(bytes); }
+            total.AppendData(bytes); offset = bytes.Length;
         }
         else
         {
@@ -218,7 +219,7 @@ public sealed partial class DeletionService
                     using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
                     var buffer = new byte[128 * 1024]; int count;
                     while ((count = stream.Read(buffer)) != 0)
-                    { destination?.Write(buffer, 0, count); digest.AppendData(buffer, 0, count); total.AppendData(buffer, 0, count); record.Size += count; }
+                    { if (destination is not null) { reserve?.Invoke(count); destination.Write(buffer, 0, count); } digest.AppendData(buffer, 0, count); total.AppendData(buffer, 0, count); record.Size += count; }
                     record.Sha256 = Convert.ToHexString(digest.GetHashAndReset()).ToLowerInvariant();
                     offset = checked(offset + record.Size); entry.Streams.Add(record);
                 }

@@ -53,3 +53,13 @@ pwsh -NoProfile -File .\scripts\Verify-LargeOperations.ps1 -ExecutablePath <今�
 ```
 
 32,769ファイルをschema 3とschema 2の両方で削除・復元し、実manifestと結果が8 MiBを超えること、全ファイルの内容、既存ファイルの非上書き、purgeの検査・適用・再適用を確認します。CLI子プロセスの時間・メモリ・ハンドル数も記録します。通常E2Eでは旧schema 1/2/3の途中コピー、schema 2 purge intentの再開・改竄、正常コピーの破損、未知項目・link・ADS・hardlink、不正な巨大tokenや切断JSONを確認します。
+
+## 復元データの自動整理
+
+保持期限・容量制限を変更した場合は、通常E2Eに加えて次を実行します。出力先は新しい外部絶対パス、レポートの親は事前作成済みにします。
+
+```powershell
+pwsh -NoProfile -File .\scripts\Verify-Retention.ps1 -ExecutablePath <今回のexe> -OutputDirectory <新しい外部Temp> -ReportPath <外部JSONレポート>
+```
+
+既定の7日・10 GiBと旧設定の互換性、期限切れ・容量超過の古い操作からの整理、実削除前の自動整理、dry-runの不変更、大きすぎる入力の保全を確認します。容量境界には小さな設定値を使い、schema 2とADSを持つschema 3の実コピーを検証します。破損コピー・未検証の途中コピー・稼働中ロック・未知項目・reparse pointの保全と警告、整理後の復元拒否、途中のpurge intentからの再開、繰り返し実行時の記録増殖も確認します。2プロセスの実削除を3回競合させ、復元コピーの合計が共通の容量上限を超えないことも確認します。検証fixtureではmanifestの日時を変更して期限を再現し、実ユーザーの復元データは使用しません。

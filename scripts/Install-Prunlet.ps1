@@ -90,7 +90,7 @@ function Expand-CheckedArchive([string]$Archive, [string]$Destination) {
         $rootName = @($roots)[0]
         $root = Join-Path $Destination $rootName
         if (!(Test-Path -LiteralPath $root -PathType Container)) { throw 'Source archive root is not a directory.' }
-        foreach ($required in @('src\Prunlet\Prunlet.csproj', 'scripts\Publish-Prunlet.ps1', 'integration\configuration-common.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1', 'integration\install-agent-instructions.ps1', 'integration\PRUNLET.md')) {
+        foreach ($required in @('src\Prunlet\Prunlet.csproj', 'scripts\Publish-Prunlet.ps1', 'integration\configuration-common.ps1', 'integration\maintenance-task.ps1', 'integration\uninstall-maintenance.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1', 'integration\install-agent-instructions.ps1', 'integration\PRUNLET.md')) {
             if (!(Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Latest source is not installable; required file missing: $required. Publish the source to the repository default branch first." }
         }
         return $root
@@ -132,7 +132,7 @@ if ($RegisterCodex -and $SettingsBackupDirectory) { $SettingsBackupDirectory = A
 if (!(Get-Command dotnet -ErrorAction SilentlyContinue)) { throw '.NET 10 SDK is required. Install the SDK and run this installer again.' }
 $sdks = @(& dotnet --list-sdks)
 if ($LASTEXITCODE -ne 0 -or !($sdks | Where-Object { $_ -match '^10\.' })) { throw '.NET 10 SDK is required; an installed runtime alone cannot build latest source.' }
-$products = @('bin\prunlet.exe', 'bin\configuration-common.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
+$products = @('bin\prunlet.exe', 'bin\configuration-common.ps1', 'bin\maintenance-task.ps1', 'bin\uninstall-maintenance.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
 $retiredProducts = @('bin\codex-pretooluse.ps1')
 $previousGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
 $previousGuideSha256 = if (Test-Path -LiteralPath $previousGuidePath -PathType Leaf) { (Get-FileHash -LiteralPath $previousGuidePath -Algorithm SHA256).Hash } else { $null }
@@ -152,6 +152,8 @@ $createdDirectories = [Collections.Generic.List[object]]::new()
 $createdConfig = $null
 $profileSnapshot = [Collections.Generic.List[object]]::new()
 $registrationStarted = $false
+$maintenanceState = $null
+$maintenanceStarted = $false
 $retiredOperations = [Collections.Generic.List[string]]::new()
 try {
     try { $mutexAcquired = $installationMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $mutexAcquired = $true }
@@ -173,6 +175,9 @@ try {
         $instructionParameters = @{ SourceGuidePath = (Join-Path $sourceRoot 'integration\PRUNLET.md'); CodexHome = $CodexHome; BackupDirectory = $(if ($SettingsBackupDirectory) { $SettingsBackupDirectory } else { $updateBackup }); PreviousGuideSha256 = $previousGuideSha256; ExecutablePath = (Join-Path $InstallDirectory 'bin\prunlet.exe'); ConfigPath = $configPath }
         & (Join-Path $sourceRoot 'integration\install-agent-instructions.ps1') @instructionParameters -ValidateOnly | Out-Null
     }
+    # 所有していない既存タスクは製品ファイルを書き換える前に拒否する。
+    . (Join-Path $sourceRoot 'integration\maintenance-task.ps1')
+    $maintenanceState = Get-PrunletMaintenanceState (Join-Path $InstallDirectory 'bin\prunlet.exe') $configPath
     $buildRoot = Join-Path $WorkDirectory 'build'
     & (Join-Path $sourceRoot 'scripts\Publish-Prunlet.ps1') -OutputDirectory $buildRoot -Runtime $Runtime | Out-Null
     $exe = Join-Path $buildRoot 'publish\prunlet.exe'
@@ -252,6 +257,12 @@ try {
             & (Join-Path $InstallDirectory 'bin\install-agent-instructions.ps1') @instructionParameters | Out-Null
         }
     }
+    # Codex連携とは独立した製品機能として、無操作時もログイン中に日次保守する。
+    New-Item -ItemType Directory -Path $updateBackup -Force | Out-Null
+    if ($maintenanceState.previousXml) { [IO.File]::WriteAllText((Join-Path $updateBackup 'maintenance-task.xml'), $maintenanceState.previousXml, [Text.Encoding]::Unicode) }
+    [ordered]@{ purpose = 'Restore the owned maintenance task if this installation fails.'; installDirectory = $InstallDirectory; taskName = $maintenanceState.name; taskPath = '\'; existed = [bool]$maintenanceState.previousXml; previousXml = $(if ($maintenanceState.previousXml) { 'maintenance-task.xml' } else { $null }); restore = 'First verify current task ownership using maintenance-task.ps1; restore previous XML if existed, otherwise unregister only the owned task.' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $updateBackup 'maintenance-task-backup-info.json') -Encoding utf8NoBOM
+    $maintenanceStarted = $true
+    Register-PrunletMaintenanceTask $maintenanceState
     # 廃止したバックエンドもCoreの検証済みバックアップ付き削除で退役する。
     foreach ($relative in $retiredProducts) {
         $target = Assert-PlainPath (Join-Path $InstallDirectory $relative) 'Retired product path'
@@ -270,10 +281,13 @@ try {
         $retiredOperations.Add([string]$retirement.operationId)
         $retirementJson | Set-Content -LiteralPath (Join-Path $updateBackup 'retired-products.json') -Encoding utf8NoBOM
     }
-    [ordered]@{ status = 'installed'; installDirectory = $InstallDirectory; configPath = $configPath; repository = $Repository; defaultBranch = $branch; commitSha = $sha; sourceInfoPath = (Join-Path $InstallDirectory 'source-info.json'); updateBackupDirectory = $(if ($saved.Count -or $profileSnapshot.Count) { $updateBackup } else { $null }); retiredOperationIds = @($retiredOperations.ToArray()); codexRegistered = [bool]$RegisterCodex; agentInstructionsRegistered = [bool]$RegisterAgentInstructions; requiresHookTrust = [bool]$RegisterCodex } | ConvertTo-Json
+    [ordered]@{ status = 'installed'; installDirectory = $InstallDirectory; configPath = $configPath; repository = $Repository; defaultBranch = $branch; commitSha = $sha; sourceInfoPath = (Join-Path $InstallDirectory 'source-info.json'); updateBackupDirectory = $updateBackup; maintenanceTaskName = $maintenanceState.name; retiredOperationIds = @($retiredOperations.ToArray()); codexRegistered = [bool]$RegisterCodex; agentInstructionsRegistered = [bool]$RegisterAgentInstructions; requiresHookTrust = [bool]$RegisterCodex } | ConvertTo-Json
 } catch {
     $originalError = $_
     $rollbackErrors = [Collections.Generic.List[string]]::new()
+    if ($maintenanceStarted) {
+        try { Restore-PrunletMaintenanceTask $maintenanceState } catch { $rollbackErrors.Add("Maintenance task: $_") }
+    }
     if ($registrationStarted) {
         foreach ($profile in $profileSnapshot) {
             try {
@@ -287,9 +301,9 @@ try {
                 elseif (Test-Path -LiteralPath $target) { throw 'Configuration path became a directory.' }
             } catch { $rollbackErrors.Add("Codex profile ${target}: $_") }
         }
-        # プロファイルを戻せない場合は、残った登録が指す実行ファイルを消さず保全する。
-        if ($rollbackErrors.Count) { throw "Installation failed: $originalError. Installed products were retained because Codex profile rollback failed. Recover profiles from ${updateBackup}: $($rollbackErrors -join '; ')" }
     }
+    # 連携やタスクを戻せない場合は、残った登録が指す実行ファイルを消さず保全する。
+    if ($rollbackErrors.Count) { throw "Installation failed: $originalError. Installed products were retained because registration rollback failed. Recover registrations from ${updateBackup}: $($rollbackErrors -join '; ')" }
     foreach ($relative in $changed) {
         try {
             $target = Assert-PlainPath (Join-Path $InstallDirectory $relative) 'Rollback path'

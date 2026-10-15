@@ -22,6 +22,7 @@ internal static class NativeFiles
     internal static SafeFileHandle OpenPurgeTarget(string path) => Open(path, Read | Delete, 1, 3, OpenReparse);
     internal static SafeFileHandle CreateDestination(string path) => Open(path, Read | Write | Delete, 1, 1, OpenReparse);
     internal static SafeFileHandle OpenLock(string path) => Open(path, Read | Write, 0, 3, OpenReparse);
+    internal static SafeFileHandle OpenOrCreateLock(string path) => Open(path, Read | Write, 0, 4, OpenReparse);
 
     internal static void CreateDirectory(string path)
     {

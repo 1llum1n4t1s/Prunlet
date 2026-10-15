@@ -73,7 +73,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                 protocolVersion = SupportedVersions.Contains(requestedVersion) ? requestedVersion : SupportedVersions[0],
                 capabilities = new { tools = new { listChanged = false } },
                 serverInfo = new { name = "prunlet", title = "Prunlet", version = "1.0.1" },
-                instructions = "Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true to include directory contents. The recovery directory and directories containing it are protected. Prunlet persists verified file copies and directory records before deletion. Use restore_files with operationId to recover files and directory structure. Use dryRun to inspect targets. Symbolic links and junctions are deleted as links without following their targets. ADS and case-sensitive directory names are preserved. Hard links restore as independent snapshots. Wildcards and unknown reparse tags are unsupported. Existing host approvals and policies still apply."
+                instructions = "Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true to include directory contents. The recovery directory and directories containing it are protected. Prunlet persists verified file copies and directory records before deletion. Recovery copies expire after 7 days by default; a shared 10 GiB budget may evict older operations sooner. Deletion applies this retention policy. Use restore_files with operationId while copies are retained to recover files and directory structure. Use dryRun to inspect targets. Symbolic links and junctions are deleted as links without following their targets. ADS and case-sensitive directory names are preserved. Hard links restore as independent snapshots. Wildcards and unknown reparse tags are unsupported. Existing host approvals and policies still apply."
             };
         }
         if (!ready) throw new RpcException(-32600, "Initialize and send notifications/initialized first.");
@@ -137,7 +137,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
         new
         {
             name = "delete_files", title = "Delete files and folders with recovery copies",
-            description = "Delete authorized absolute Windows files and empty directories after making verified recovery copies. Set recursive=true to delete directory contents, including empty subdirectories. The recovery directory and directories containing it are protected. Does not expand wildcards or follow links.",
+            description = "Delete authorized absolute Windows files and empty directories after making verified recovery copies. Set recursive=true to delete directory contents, including empty subdirectories. Real deletion automatically expires recovery copies after 7 days and evicts oldest copies for a shared 10 GiB budget by default. The recovery directory and directories containing it are protected. Does not expand wildcards or follow links.",
             inputSchema = new
             {
                 type = "object", properties = new
@@ -153,7 +153,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
         new
         {
             name = "restore_files", title = "Restore a deletion operation",
-            description = "Restore verified recovery copies by operationId; never overwrite existing destination files.",
+            description = "Restore verified recovery copies by operationId while they remain within the retention policy; never overwrite existing destination files.",
             inputSchema = new
             {
                 type = "object", properties = new { operationId = new { type = "string" } },

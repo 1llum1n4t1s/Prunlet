@@ -7,6 +7,12 @@ public sealed partial class DeletionService
 {
     public PurgeResult Purge(string operationId, bool apply = false)
     {
+        using var coordination = AcquireRecoveryCoordination(create: apply);
+        return PurgeCore(operationId, apply);
+    }
+
+    private PurgeResult PurgeCore(string operationId, bool apply)
+    {
         config.Validate();
         if (!Guid.TryParseExact(operationId, "N", out var id) || id.ToString("N") != operationId)
             throw new ArgumentException("Operation ID must be a lowercase 32-character GUID.");
@@ -334,17 +340,22 @@ public sealed partial class DeletionService
             var expectedSize = partial?.Size ?? entry.Size;
             if (item is null || item.Path != entry.Path || item.Kind != entry.Kind || !statuses.Contains(item.Status, StringComparer.Ordinal)
                 || (item.Status == "already_present" && entry.Kind != "directory")
-                || (item.BackupPath is not null && ResolveRecordedBackupPath(item.BackupPath) != BackupPath(directory, index))
+                || (item.BackupPath is not null && ResolveRecordedBackupPath(item.BackupPath, directory) != BackupPath(directory, index))
                 || (item.Sha256 is not null && !item.Sha256.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
                 || (item.Size is not null && item.Size != expectedSize))
                 throw new InvalidDataException("Operation outcome item is invalid.");
         }
     }
 
-    private static string ResolveRecordedBackupPath(string path)
+    private static string ResolveRecordedBackupPath(string path, string pinnedDirectory)
     {
         if (PathPolicy.Absolute(path) != path) throw new InvalidDataException("Recorded recovery path is not canonical.");
-        var parent = PathPolicy.Resolve(Path.GetDirectoryName(path)!, finalDirectory: true, allowMissing: false);
+        var recordedParent = Path.GetDirectoryName(path)!;
+        // PurgeCoreが全祖先と共に固定している正規の親だけ、項目ごとの再解決を省略する。
+        // 別表記の親はMSIX転送や8.3短縮名も含め、従来どおり実体を検証する。
+        var parent = recordedParent.Equals(pinnedDirectory, StringComparison.Ordinal)
+            ? pinnedDirectory
+            : PathPolicy.Resolve(recordedParent, finalDirectory: true, allowMissing: false);
         return Path.Combine(parent, Path.GetFileName(path));
     }
 }

@@ -93,7 +93,17 @@ function Complete-McpSession([Diagnostics.Process]$Process, [object]$ErrorTask) 
 }
 function Test-Case([string]$Name, [scriptblock]$Body) {
     $timer = [Diagnostics.Stopwatch]::StartNew()
-    try { & $Body; $script:Results.Add(@{ name = $Name; passed = $true; milliseconds = $timer.Elapsed.TotalMilliseconds }) }
+    try {
+        # 改竄・リンクを残すケースを隔離し、次のケースの容量検査へ持ち込まない。
+        $script:Recovery = Join-Path $outputRoot ('case-recovery-' + $script:Results.Count)
+        $null = [IO.Directory]::CreateDirectory($script:Recovery)
+        if ([IO.File]::Exists($script:Config)) {
+            $configuration = [IO.File]::ReadAllText($script:Config) | ConvertFrom-Json
+            $configuration.backupDirectory = $script:Recovery
+            [IO.File]::WriteAllText($script:Config, ($configuration | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+        }
+        & $Body; $script:Results.Add(@{ name = $Name; passed = $true; milliseconds = $timer.Elapsed.TotalMilliseconds })
+    }
     catch { $script:Results.Add(@{ name = $Name; passed = $false; milliseconds = $timer.Elapsed.TotalMilliseconds; error = $_.Exception.Message }); Write-Warning "$Name : $($_.Exception.Message)" }
 }
 function Hook([string]$Command, [string]$ToolName = 'Bash', [string]$Field = 'command') {
@@ -679,8 +689,8 @@ Test-Case 'directory restore conflict never overwrites descendant file' {
     Assert-True ((File-Digest $tree.Files[0]) -ceq $siblingHash) 'Retry changed already-restored sibling bytes.'
     Assert-TreeIntact $tree
 }
-Test-Case 'directory restore refuses linked metadata and linked source ancestors' {
-    foreach ($kind in @('metadata', 'ancestor')) {
+foreach ($kind in @('metadata', 'ancestor')) {
+    Test-Case "directory restore refuses linked $kind" {
         $tree = New-TreeFixture ('directory-restore-link-' + $kind)
         $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $tree.Root)
         Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree.Root)) 'Linked restore fixture deletion failed.'
@@ -1016,7 +1026,11 @@ Test-Case 'manifest recovery-directory target rejected before restore' {
     Assert-True (![IO.File]::Exists($outside)) 'Manifest tamper wrote into recovery storage.'
 }
 Test-Case 'operations lists recorded ids' {
-    $result = Invoke-Prunlet @('operations'); Assert-True ($result.ExitCode -eq 0 -and $result.Json.operations.Count -ge 1) 'No operations listed.'
+    $file = New-File 'operation-list.txt'
+    $deleted = Invoke-Prunlet @('delete', '--', $file)
+    Assert-True ($deleted.ExitCode -eq 0) 'Operation list fixture deletion failed.'
+    $result = Invoke-Prunlet @('operations')
+    Assert-True ($result.ExitCode -eq 0 -and @($result.Json.operations | Where-Object operationId -CEQ $deleted.Json.operationId).Count -eq 1) 'Recorded operation was not listed.'
 }
 
 Test-Case 'purge defaults to read-only inspection and apply keeps metadata with idempotent outcome' {

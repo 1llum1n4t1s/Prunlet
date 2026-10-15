@@ -15,6 +15,8 @@ public sealed partial class DeletionService
         {
             Schema = config.Schema,
             AllowedRoots = config.AllowedRoots?.ToArray() ?? [],
+            RetentionDays = config.RetentionDays,
+            MaxRecoveryBytes = config.MaxRecoveryBytes,
             BackupDirectory = PathPolicy.Resolve(config.BackupDirectory, finalDirectory: true, allowMissing: false)
         };
     }
@@ -29,6 +31,30 @@ public sealed partial class DeletionService
             for (var j = i + 1; j < normalized.Length; j++)
                 if (ExactWithin(normalized[i], normalized[j]) || ExactWithin(normalized[j], normalized[i]))
                     throw new ArgumentException("Duplicate or overlapping target paths are not allowed.");
+        if (dryRun) return DeleteDispatch(normalized, true, recursive);
+        using var coordination = AcquireRecoveryCoordination(create: true);
+        var preview = DeleteDispatch(normalized, true, recursive);
+        if (preview.Items.Any(item => item.Status == "failed"))
+            throw new IOException("Deletion preflight failed; no originals or recovery copies were removed. " +
+                string.Join(" ", preview.Items.Where(item => item.Error is not null).Select(item => item.Error)));
+        var incoming = preview.Items.Aggregate(0L, (sum, item) => checked(sum + (item.Size ?? 0)));
+        if (incoming > config.MaxRecoveryBytes)
+            throw new IOException("The incoming recovery copy exceeds maxRecoveryBytes; original targets were retained.");
+        var maintenance = MaintainRecoveryCore(apply: true, incoming);
+        if (!maintenance.CapacityKnown || !maintenance.BudgetSatisfied)
+            throw new IOException("Recovery capacity could not be safely made available; original targets were retained. " + string.Join(" ", maintenance.Warnings));
+        remainingRecoveryBytes = config.MaxRecoveryBytes - maintenance.RetainedBytesAfter;
+        try
+        {
+            var result = DeleteDispatch(normalized, false, recursive);
+            result.Warnings.AddRange(maintenance.Warnings);
+            return result;
+        }
+        finally { remainingRecoveryBytes = null; }
+    }
+
+    private DeleteResult DeleteDispatch(string[] normalized, bool dryRun, bool recursive)
+    {
         if (normalized.Any(path => HasSpecialTarget(path, recursive))) return DeleteSpecial(normalized, dryRun, recursive);
         if (normalized.Any(IsDirectoryPath)) return DeleteTrees(normalized, dryRun, recursive);
         return DeleteFiles(normalized, dryRun);
@@ -114,6 +140,7 @@ public sealed partial class DeletionService
     public RestoreResult Restore(string operationId)
     {
         config.Validate();
+        using var coordination = AcquireRecoveryCoordination(create: true);
         if (!Guid.TryParseExact(operationId, "N", out var id) || id.ToString("N") != operationId)
             throw new ArgumentException("Operation ID must be a lowercase 32-character GUID.");
         var directory = Path.Combine(config.BackupDirectory, operationId);
@@ -179,7 +206,7 @@ public sealed partial class DeletionService
         return item;
     }
 
-    private static PreparedFile Prepare(string path, string backupPath, ManifestEntry entry, FileOperationResult item)
+    private PreparedFile Prepare(string path, string backupPath, ManifestEntry entry, FileOperationResult item)
     {
         var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(path)!);
         FileStream? source = null, backup = null;
@@ -199,6 +226,7 @@ public sealed partial class DeletionService
             int count;
             while ((count = source.Read(buffer)) != 0)
             {
+                ReserveRecoveryBytes(count);
                 backup.Write(buffer, 0, count);
                 digest.AppendData(buffer, 0, count);
             }

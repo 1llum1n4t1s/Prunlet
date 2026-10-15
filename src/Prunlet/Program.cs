@@ -27,11 +27,14 @@ internal static class Program
                     prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>
                     prunlet --config <absolute-json-path> restore <operation-id>
                     prunlet --config <absolute-json-path> purge <operation-id> [--dry-run | --apply]
+                    prunlet --config <absolute-json-path> maintain [--dry-run | --apply]
                     prunlet --config <absolute-json-path> operations
                     prunlet --config <absolute-json-path> mcp
                     prunlet --config <absolute-json-path> hook [--hook-script <legacy-path>]
                     Legacy --allowed-root <directory> options are accepted but do not restrict target directories.
                     Files inside the configured recovery directory are protected.
+                    Recovery copies expire after 7 days by default and share a 10 GiB budget.
+                    Real deletion evicts expired/oldest copies as needed; maintain defaults to inspection only.
                     Empty directories are supported; deleting directory contents requires --recursive.
                     Wildcard expansion and links are unsupported.
                     """);
@@ -90,6 +93,11 @@ internal static class Program
                 case "operations":
                     if (commandArgs.Length != 0) throw new ArgumentException("Operations accepts no arguments.");
                     result = ListOperations(config);
+                    break;
+                case "maintain":
+                    if (commandArgs.Length > 1 || (commandArgs.Length == 1 && commandArgs[0] is not ("--dry-run" or "--apply")))
+                        throw new ArgumentException("Use maintain [--dry-run | --apply]. Maintenance inspects only unless --apply is specified.");
+                    result = service.MaintainRecovery(commandArgs.Length == 1 && commandArgs[0] == "--apply");
                     break;
                 case "mcp":
                     if (commandArgs.Length != 0) throw new ArgumentException("MCP accepts no arguments.");
@@ -176,6 +184,8 @@ internal static class Program
 
     internal static bool HasErrors(object result)
     {
+        if (result is RecoveryMaintenanceResult maintenance)
+            return !maintenance.Complete || !maintenance.CapacityKnown || !maintenance.BudgetSatisfied || maintenance.Operations.Any(HasErrors);
         var typedItems = result switch
         {
             DeleteResult deleted => deleted.Items,

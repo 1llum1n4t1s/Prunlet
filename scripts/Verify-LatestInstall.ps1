@@ -27,6 +27,33 @@ foreach ($path in @($OutputDirectory, $ReportPath)) {
 New-Item -ItemType Directory -Path $OutputDirectory, (Split-Path -Parent $ReportPath) -Force | Out-Null
 $fixtureUpdateBackupRoot = Join-Path $OutputDirectory 'update-backups'
 $results = [Collections.Generic.List[object]]::new()
+# 実ホストのタスクは一切登録せず、Task Scheduler境界だけをメモリー上で代替する。
+$global:PrunletMaintenanceFixture = @{ tasks = @{}; failAfterWrite = $false }
+function Get-ScheduledTask {
+    [CmdletBinding()] param([string]$TaskPath)
+    if ($TaskPath -cne '\') { throw 'Unexpected maintenance task folder.' }
+    foreach ($key in $global:PrunletMaintenanceFixture.tasks.Keys) { [pscustomobject]@{ TaskName = $key; TaskPath = '\' } }
+}
+function Export-ScheduledTask {
+    [CmdletBinding()] param([string]$TaskPath, [string]$TaskName)
+    if ($TaskPath -cne '\' -or !$global:PrunletMaintenanceFixture.tasks.ContainsKey($TaskName)) { throw 'Fixture task does not exist.' }
+    return $global:PrunletMaintenanceFixture.tasks[$TaskName]
+}
+function Register-ScheduledTask {
+    [CmdletBinding()] param([string]$TaskPath, [string]$TaskName, [string]$Xml, [switch]$Force)
+    if ($TaskPath -cne '\') { throw 'Unexpected maintenance task folder.' }
+    if ($global:PrunletMaintenanceFixture.tasks.ContainsKey($TaskName) -and !$Force) { throw 'Fixture task already exists.' }
+    $global:PrunletMaintenanceFixture.tasks[$TaskName] = $Xml
+    if ($global:PrunletMaintenanceFixture.failAfterWrite) {
+        $global:PrunletMaintenanceFixture.failAfterWrite = $false
+        throw 'Fixture maintenance registration failure.'
+    }
+}
+function Unregister-ScheduledTask {
+    [CmdletBinding(SupportsShouldProcess)] param([string]$TaskPath, [string]$TaskName)
+    if ($TaskPath -cne '\') { throw 'Unexpected maintenance task folder.' }
+    $global:PrunletMaintenanceFixture.tasks.Remove($TaskName)
+}
 function Assert-True([bool]$Value, [string]$Message) { if (!$Value) { throw $Message } }
 function Test-Case([string]$Name, [scriptblock]$Action) {
     try { & $Action; $results.Add(@{ name = $Name; passed = $true }) }
@@ -128,6 +155,38 @@ function Assert-Snapshot($Before) {
 }
 $beforeBackups = @(Get-ChildItem -LiteralPath $fixtureUpdateBackupRoot -Directory -Filter 'install-*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
 try {
+    Test-Case 'Maintenance XML preserves Unicode paths and limits privileges without shell commands' {
+        . (Join-Path $repoRoot 'integration\maintenance-task.ps1')
+        $taskExe = Join-Path $OutputDirectory '空白 & name\prunlet.exe'
+        $taskConfig = Join-Path $OutputDirectory '空白 & name\設定.json'
+        $state = Get-PrunletMaintenanceState $taskExe $taskConfig
+        Register-PrunletMaintenanceTask $state
+        $xml = [xml]$global:PrunletMaintenanceFixture.tasks[$state.name]
+        Assert-True ($xml.Task.Actions.Exec.Command -ceq $taskExe -and $xml.Task.Actions.Exec.Arguments -ceq ('--config "' + $taskConfig + '" maintain --apply')) 'Task altered quoted paths or invokes a shell.'
+        Assert-True ($xml.Task.Principals.Principal.RunLevel -ceq 'LeastPrivilege' -and $xml.Task.Principals.Principal.LogonType -ceq 'InteractiveToken') 'Task requires elevated or password logon.'
+        Assert-True ($xml.Task.Settings.MultipleInstancesPolicy -ceq 'IgnoreNew' -and $xml.Task.Settings.StartWhenAvailable -ceq 'true') 'Task lacks overlap or missed-run policy.'
+        Assert-True ($xml.Task.Triggers.CalendarTrigger.ScheduleByDay.DaysInterval -eq 1 -and $xml.Task.Triggers.LogonTrigger.UserId -ceq $state.sid) 'Task lacks daily or logon trigger.'
+        $global:PrunletMaintenanceFixture.tasks[$state.name] = $global:PrunletMaintenanceFixture.tasks[$state.name].Replace('<Hidden>true</Hidden>', '<Hidden>false</Hidden>')
+        $owned = Get-PrunletMaintenanceState $taskExe $taskConfig
+        Register-PrunletMaintenanceTask $owned
+        Assert-True ($global:PrunletMaintenanceFixture.tasks[$state.name] -ceq $owned.previousXml -and !$owned.attempted) 'Update rewrote an existing task setting.'
+        Restore-PrunletMaintenanceTask $owned
+        Assert-True ($global:PrunletMaintenanceFixture.tasks[$state.name] -ceq $owned.previousXml) 'Owned task rollback did not restore XML.'
+        $missing = Get-PrunletMaintenanceState $taskExe $taskConfig
+        $missing.attempted = $true
+        $global:PrunletMaintenanceFixture.tasks.Remove($state.name)
+        Restore-PrunletMaintenanceTask $missing
+        Assert-True ($global:PrunletMaintenanceFixture.tasks[$state.name] -ceq $missing.previousXml) 'Rollback did not restore a missing previous task.'
+        $foreign = $owned.previousXml.Replace($state.marker, 'Foreign task')
+        $global:PrunletMaintenanceFixture.tasks[$state.name] = $foreign
+        Expect-Failure { Get-PrunletMaintenanceState $taskExe $taskConfig } 'not owned'
+        Expect-Failure { Register-PrunletMaintenanceTask $owned } 'not owned'
+        Expect-Failure { Unregister-PrunletMaintenanceTask $taskExe $taskConfig } 'not owned'
+        Assert-True ($global:PrunletMaintenanceFixture.tasks[$state.name] -ceq $foreign) 'Foreign task was modified.'
+        $global:PrunletMaintenanceFixture.tasks[$state.name] = $owned.previousXml
+        & (Join-Path $repoRoot 'integration\uninstall-maintenance.ps1') -ExecutablePath $taskExe -ConfigPath $taskConfig | Out-Null
+        Assert-True (!$global:PrunletMaintenanceFixture.tasks.ContainsKey($state.name)) 'Explicit schedule uninstall retained owned task.'
+    }
     Test-Case 'Download failure preserves initial boundary' {
         $global:PrunletLatestFixture.failDownload = $true
         try { Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'network-work') } 'Fixture network failure' }
@@ -169,6 +228,27 @@ try {
             Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'broken-work') } 'Fixture publish failure'
         } finally { [IO.File]::WriteAllText($publishScript, $originalPublish); $global:PrunletLatestFixture.zip = $zipPath }
         Assert-True (!(Test-Path -LiteralPath $install)) 'Build failure created install files.'
+    }
+    Test-Case 'Maintenance registration failure rolls back new task and product files' {
+        $failedInstall = Join-Path $OutputDirectory 'schedule-failure-install'
+        $fixtureInstalls.Add($failedInstall)
+        $beforeTaskCount = $global:PrunletMaintenanceFixture.tasks.Count
+        $global:PrunletMaintenanceFixture.failAfterWrite = $true
+        Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $failedInstall -WorkDirectory (Join-Path $OutputDirectory 'schedule-failure-work') } 'Fixture maintenance registration failure'
+        Assert-True ($global:PrunletMaintenanceFixture.tasks.Count -eq $beforeTaskCount) 'Failed installation left a maintenance task.'
+        Assert-True (!(Test-Path -LiteralPath $failedInstall)) 'Failed maintenance registration left product files.'
+    }
+    Test-Case 'Foreign maintenance task blocks installation before product files change' {
+        . (Join-Path $repoRoot 'integration\maintenance-task.ps1')
+        $foreignInstall = Join-Path $OutputDirectory 'foreign-task-install'
+        $state = Get-PrunletMaintenanceState (Join-Path $foreignInstall 'bin\prunlet.exe') (Join-Path $foreignInstall 'config.json')
+        $foreign = '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo><Description>Foreign task</Description></RegistrationInfo></Task>'
+        $global:PrunletMaintenanceFixture.tasks[$state.name] = $foreign
+        try {
+            Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $foreignInstall -WorkDirectory (Join-Path $OutputDirectory 'foreign-task-work') } 'not owned'
+            Assert-True ($global:PrunletMaintenanceFixture.tasks[$state.name] -ceq $foreign) 'Foreign task changed during failed install.'
+            Assert-True (!(Test-Path -LiteralPath $foreignInstall)) 'Foreign task conflict created product files.'
+        } finally { $global:PrunletMaintenanceFixture.tasks.Remove($state.name) }
     }
     Test-Case 'Latest fixture installs without target registration and protects recovery storage' {
         & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -RegisterCodex -CodexHome $isolatedCodex -SettingsBackupDirectory $settingsBackup -WorkDirectory (Join-Path $OutputDirectory 'first-work') | Out-Null
@@ -644,6 +724,8 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
 } finally {
     Remove-Item Function:\Invoke-RestMethod, Function:\Invoke-WebRequest, Function:\Copy-Item
     Remove-Variable PrunletLatestFixture -Scope Global
+    Remove-Item Function:\Get-ScheduledTask, Function:\Export-ScheduledTask, Function:\Register-ScheduledTask, Function:\Unregister-ScheduledTask
+    Remove-Variable PrunletMaintenanceFixture -Scope Global
     # 検証インストールの更新バックアップだけを検証済み絶対パスから清掃する。
     $backupParent = $fixtureUpdateBackupRoot
     Get-ChildItem -LiteralPath $backupParent -Directory -Filter 'install-*' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notin $beforeBackups } | ForEach-Object {
