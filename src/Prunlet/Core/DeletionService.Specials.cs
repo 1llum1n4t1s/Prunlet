@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.Win32.SafeHandles;
@@ -24,7 +25,7 @@ public sealed partial class DeletionService
             if (NativeFiles.IsReparse(handle)) return true;
             var directory = NativeFiles.IsDirectory(handle);
             if ((directory && NativeFiles.IsCaseSensitive(handle)) || (!directory && NativeFiles.LinkCount(handle) != 1)
-                || NativeFiles.NamedStreams(path).Count != 0) return true;
+                || NativeFiles.NamedStreams(handle).Count != 0) return true;
             return directory && recursive && Directory.EnumerateFileSystemEntries(path).Any(child => HasSpecialTarget(child, true));
         }
         catch (FileNotFoundException) { return false; }
@@ -57,13 +58,9 @@ public sealed partial class DeletionService
             }
             return result;
         }
-        using var storage = PathPolicy.PinRecoveryDirectories(config.BackupDirectory);
-        result.OperationId = manifest.OperationId = Guid.NewGuid().ToString("N");
-        var directory = Path.Combine(config.BackupDirectory, manifest.OperationId);
-        NativeFiles.CreateDirectory(directory);
-        using var operation = PathPolicy.PinRecoveryDirectories(directory);
-        using var operationLock = NativeFiles.CreateDestination(Path.Combine(directory, "operation.lock"));
-        NativeFiles.Verify(operationLock, Path.Combine(directory, "operation.lock"));
+        using var operation = NewOperationLease.Create(config.BackupDirectory);
+        result.OperationId = manifest.OperationId = operation.OperationId;
+        var directory = operation.Directory;
         FileStream? manifestFile = null;
         try
         {
@@ -217,9 +214,14 @@ public sealed partial class DeletionService
                     if (NativeFiles.Identity(stream.SafeFileHandle) != NativeFiles.Identity(source)) throw new IOException("Stream belongs to a different object.");
                     var record = new ManifestStream { Name = name, Offset = offset };
                     using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                    var buffer = new byte[128 * 1024]; int count;
-                    while ((count = stream.Read(buffer)) != 0)
-                    { if (destination is not null) { reserve?.Invoke(count); destination.Write(buffer, 0, count); } digest.AppendData(buffer, 0, count); total.AppendData(buffer, 0, count); record.Size += count; }
+                    var buffer = ArrayPool<byte>.Shared.Rent(CopyBufferSize);
+                    try
+                    {
+                        int count;
+                        while ((count = stream.Read(buffer, 0, CopyBufferSize)) != 0)
+                        { if (destination is not null) { reserve?.Invoke(count); destination.Write(buffer, 0, count); } digest.AppendData(buffer, 0, count); total.AppendData(buffer, 0, count); record.Size += count; }
+                    }
+                    finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
                     record.Sha256 = Convert.ToHexString(digest.GetHashAndReset()).ToLowerInvariant();
                     offset = checked(offset + record.Size); entry.Streams.Add(record);
                 }
@@ -360,12 +362,12 @@ public sealed partial class DeletionService
                 }
                 catch { if (backup is null) handle.Dispose(); else backup.Dispose(); throw; }
             }
-            var blocked = new List<string>();
+            var blocked = new HashSet<string>(StringComparer.Ordinal);
             for (var i = 0; i < manifest.Items.Count; i++)
             {
                 var entry = manifest.Items[i]; var item = result.Items[i];
                 if (!copies.TryGetValue(i, out var backup)) continue;
-                if (blocked.Any(path => ExactWithin(entry.Path, path))) { item.Status = "conflict"; item.Error = "Parent directory could not be restored."; continue; }
+                if (HasBlockedAncestor(entry.Path, blocked)) { item.Status = "conflict"; item.Error = "Parent directory could not be restored."; continue; }
                 try
                 {
                     var parent = PathPolicy.Resolve(Path.GetDirectoryName(entry.Path)!, finalDirectory: true, allowMissing: false);
@@ -379,7 +381,7 @@ public sealed partial class DeletionService
                         {
                             using var existing = NativeFiles.OpenAny(target);
                             if (!NativeFiles.IsReparse(existing) && NativeFiles.IsDirectory(existing) && NativeFiles.IsCaseSensitive(existing) == entry.CaseSensitive
-                                && NativeFiles.NamedStreams(target).Count == 0 && entry.Streams!.Count == 0)
+                                && NativeFiles.NamedStreams(existing).Count == 0 && entry.Streams!.Count == 0)
                             { item.Status = "already_present"; pins.Add(PathPolicy.PinDirectories(target)); continue; }
                         }
                         item.Status = "conflict"; item.Error = "Original path already exists; nothing was overwritten.";
@@ -458,15 +460,26 @@ public sealed partial class DeletionService
         }
     }
 
+    private static bool HasBlockedAncestor(string path, HashSet<string> blocked)
+    {
+        for (string? ancestor = path; ancestor is not null; ancestor = Path.GetDirectoryName(ancestor))
+            if (blocked.Contains(ancestor)) return true;
+        return false;
+    }
+
     private static void CopyRange(Stream source, Stream? destination, long length, IncrementalHash? digest)
     {
-        var buffer = new byte[128 * 1024];
-        while (length > 0)
+        var buffer = ArrayPool<byte>.Shared.Rent(CopyBufferSize);
+        try
         {
-            var count = source.Read(buffer, 0, (int)Math.Min(buffer.Length, length));
-            if (count == 0) throw new InvalidDataException("Truncated stream container.");
-            destination?.Write(buffer, 0, count); digest?.AppendData(buffer, 0, count); length -= count;
+            while (length > 0)
+            {
+                var count = source.Read(buffer, 0, (int)Math.Min(CopyBufferSize, length));
+                if (count == 0) throw new InvalidDataException("Truncated stream container.");
+                destination?.Write(buffer, 0, count); digest?.AppendData(buffer, 0, count); length -= count;
+            }
         }
+        finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
     }
 
     private sealed class SpecialNode

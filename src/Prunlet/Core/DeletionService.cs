@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Security.Cryptography;
 using System.Text.Json;
 
@@ -6,6 +7,7 @@ namespace Prunlet.Core;
 public sealed partial class DeletionService
 {
     private readonly PrunletConfig config;
+    private const int CopyBufferSize = 128 * 1024;
 
     public DeletionService(PrunletConfig config)
     {
@@ -76,13 +78,9 @@ public sealed partial class DeletionService
             return result;
         }
 
-        using var backupRoot = PathPolicy.PinRecoveryDirectories(config.BackupDirectory);
-        var operationId = Guid.NewGuid().ToString("N");
-        var directory = Path.Combine(config.BackupDirectory, operationId);
-        NativeFiles.CreateDirectory(directory);
-        using var operationDirectories = PathPolicy.PinRecoveryDirectories(directory);
-        using var operationLock = NativeFiles.CreateDestination(Path.Combine(directory, "operation.lock"));
-        NativeFiles.Verify(operationLock, Path.Combine(directory, "operation.lock"));
+        using var operation = NewOperationLease.Create(config.BackupDirectory);
+        var operationId = operation.OperationId;
+        var directory = operation.Directory;
         result.OperationId = operationId;
         var manifest = new OperationManifest { OperationId = operationId };
         var prepared = new List<PreparedFile>();
@@ -186,12 +184,12 @@ public sealed partial class DeletionService
         return normalized;
     }
 
-    private static FileOperationResult CheckOnly(string path)
+    private static FileOperationResult CheckOnly(string path, bool parentsPinned = false)
     {
         var item = new FileOperationResult { Path = path };
         try
         {
-            using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(path)!);
+            using var parents = parentsPinned ? null : PathPolicy.PinDirectories(Path.GetDirectoryName(path)!);
             using var handle = NativeFiles.OpenBackup(path);
             NativeFiles.Verify(handle, path);
             NativeFiles.VerifySingleLink(handle);
@@ -206,9 +204,9 @@ public sealed partial class DeletionService
         return item;
     }
 
-    private PreparedFile Prepare(string path, string backupPath, ManifestEntry entry, FileOperationResult item)
+    private PreparedFile Prepare(string path, string backupPath, ManifestEntry entry, FileOperationResult item, bool parentsPinned = false)
     {
-        var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(path)!);
+        var parents = parentsPinned ? null : PathPolicy.PinDirectories(Path.GetDirectoryName(path)!);
         FileStream? source = null, backup = null;
         try
         {
@@ -222,14 +220,18 @@ public sealed partial class DeletionService
             entry.Size = source.Length;
             entry.LastWriteUtc = File.GetLastWriteTimeUtc(path);
             using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            var buffer = new byte[128 * 1024];
-            int count;
-            while ((count = source.Read(buffer)) != 0)
+            var buffer = ArrayPool<byte>.Shared.Rent(CopyBufferSize);
+            try
             {
-                ReserveRecoveryBytes(count);
-                backup.Write(buffer, 0, count);
-                digest.AppendData(buffer, 0, count);
+                int count;
+                while ((count = source.Read(buffer, 0, CopyBufferSize)) != 0)
+                {
+                    ReserveRecoveryBytes(count);
+                    backup.Write(buffer, 0, count);
+                    digest.AppendData(buffer, 0, count);
+                }
             }
+            finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
             backup.Flush(true);
             entry.Sha256 = Convert.ToHexString(digest.GetHashAndReset()).ToLowerInvariant();
             backup.Position = 0;
@@ -241,7 +243,7 @@ public sealed partial class DeletionService
             item.Size = entry.Size;
             return new PreparedFile(parents, source, backup, entry, item);
         }
-        catch { backup?.Dispose(); source?.Dispose(); parents.Dispose(); throw; }
+        catch { backup?.Dispose(); source?.Dispose(); parents?.Dispose(); throw; }
     }
 
     private void ValidateManifest(OperationManifest manifest, string operationId)
@@ -273,18 +275,24 @@ public sealed partial class DeletionService
         if (manifest.Schema == 2) ValidateTreeManifest(manifest);
     }
 
-    private void RestoreOne(ManifestEntry entry, FileOperationResult item)
+    private void RestoreOne(ManifestEntry entry, FileOperationResult item, FileStream? verifiedBackup = null)
     {
         var target = ValidateTarget(entry.Path);
         using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(target)!);
-        using var backupHandle = NativeFiles.OpenBackup(item.BackupPath!);
-        NativeFiles.Verify(backupHandle, item.BackupPath!);
-        NativeFiles.VerifySingleLink(backupHandle);
+        using var backupHandle = verifiedBackup is null ? NativeFiles.OpenBackup(item.BackupPath!) : null;
+        var heldHandle = verifiedBackup?.SafeFileHandle ?? backupHandle!;
+        NativeFiles.Verify(heldHandle, item.BackupPath!);
+        NativeFiles.VerifySingleLink(heldHandle);
         NativeFiles.RejectNamedStreams(item.BackupPath!);
-        using var backup = new FileStream(backupHandle, FileAccess.Read);
-        var digest = Convert.ToHexString(SHA256.HashData(backup)).ToLowerInvariant();
-        if (backup.Length != entry.Size || !digest.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException("Backup hash or size differs from the manifest.");
+        using var ownedBackup = verifiedBackup is null ? new FileStream(backupHandle!, FileAccess.Read) : null;
+        var backup = verifiedBackup ?? ownedBackup!;
+        // 呼び出し元が検証後も書込み・削除共有なしで保持するコピーは、その同じストリームを借用する。
+        if (verifiedBackup is null)
+        {
+            var digest = Convert.ToHexString(SHA256.HashData(backup)).ToLowerInvariant();
+            if (backup.Length != entry.Size || !digest.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("Backup hash or size differs from the manifest.");
+        }
         backup.Position = 0;
         if (Path.Exists(target)) { item.Status = "conflict"; item.Error = "Original path already exists; nothing was overwritten."; return; }
         Microsoft.Win32.SafeHandles.SafeFileHandle destinationHandle;
@@ -333,11 +341,11 @@ public sealed partial class DeletionService
 
     private static bool IsOperational(Exception ex) => ex is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or System.Security.SecurityException;
 
-    private sealed class PreparedFile(DirectoryLease parents, FileStream source, FileStream backup, ManifestEntry entry, FileOperationResult item) : IDisposable
+    private sealed class PreparedFile(DirectoryLease? parents, FileStream source, FileStream backup, ManifestEntry entry, FileOperationResult item) : IDisposable
     {
         internal FileStream Source { get; } = source;
         internal ManifestEntry Entry { get; } = entry;
         internal FileOperationResult Item { get; } = item;
-        public void Dispose() { backup.Dispose(); Source.Dispose(); parents.Dispose(); }
+        public void Dispose() { backup.Dispose(); Source.Dispose(); parents?.Dispose(); }
     }
 }

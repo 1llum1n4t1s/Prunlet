@@ -102,8 +102,13 @@ internal static class NativeFiles
 
     internal static string FinalPath(SafeFileHandle handle)
     {
-        var buffer = new StringBuilder(32768);
+        var buffer = new StringBuilder(512);
         var length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+        if (length >= buffer.Capacity)
+        {
+            buffer = new StringBuilder(32768);
+            length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+        }
         if (length == 0 || length >= buffer.Capacity) ThrowLastError("Cannot resolve file handle path");
         var actual = buffer.ToString();
         return PathPolicy.Absolute(actual);
@@ -138,12 +143,6 @@ internal static class NativeFiles
     internal static void RejectCaseSensitive(SafeFileHandle handle)
     {
         if (IsCaseSensitive(handle)) throw new IOException("Recovery storage cannot use case-sensitive directories.");
-    }
-
-    internal static List<string> NamedStreams(string path)
-    {
-        using var handle = OpenAny(path);
-        return NamedStreams(handle);
     }
 
     internal static List<string> NamedStreams(SafeFileHandle handle)

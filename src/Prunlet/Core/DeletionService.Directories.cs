@@ -59,20 +59,15 @@ public sealed partial class DeletionService
         var result = new DeleteResult { DryRun = dryRun };
         var manifest = new OperationManifest { Schema = 2 };
         var trees = new List<PreparedTree>();
-        DirectoryLease? storage = null, operation = null;
-        SafeFileHandle? operationLock = null;
+        NewOperationLease? operation = null;
         string? directory = null;
         try
         {
             if (!dryRun)
             {
-                storage = PathPolicy.PinRecoveryDirectories(config.BackupDirectory);
-                result.OperationId = manifest.OperationId = Guid.NewGuid().ToString("N");
-                directory = Path.Combine(config.BackupDirectory, manifest.OperationId);
-                NativeFiles.CreateDirectory(directory);
-                operation = PathPolicy.PinRecoveryDirectories(directory);
-                operationLock = NativeFiles.CreateDestination(Path.Combine(directory, "operation.lock"));
-                NativeFiles.Verify(operationLock, Path.Combine(directory, "operation.lock"));
+                operation = NewOperationLease.Create(config.BackupDirectory);
+                result.OperationId = manifest.OperationId = operation.OperationId;
+                directory = operation.Directory;
             }
             foreach (var path in paths)
             {
@@ -88,14 +83,15 @@ public sealed partial class DeletionService
                     {
                         if (dryRun)
                         {
-                            var check = CheckOnly(node.Entry.Path);
+                            // ScanTreeの全ディレクトリとtree.Parentsが全ファイル処理の終了まで祖先を固定する。
+                            var check = CheckOnly(node.Entry.Path, parentsPinned: true);
                             if (check.Status != "would_delete")
                                 throw new IOException(check.Error ?? "Tree member disappeared during inspection.");
                             node.Item.Size = check.Size;
                         }
                         else
                         {
-                            node.File = Prepare(node.Entry.Path, BackupPath(directory!, node.Index), node.Entry, node.Item);
+                            node.File = Prepare(node.Entry.Path, BackupPath(directory!, node.Index), node.Entry, node.Item, parentsPinned: true);
                             node.Entry.State = "backup_ready";
                         }
                     }
@@ -141,7 +137,7 @@ public sealed partial class DeletionService
         finally
         {
             foreach (var tree in trees) tree.Dispose();
-            operationLock?.Dispose(); operation?.Dispose(); storage?.Dispose();
+            operation?.Dispose();
         }
     }
 
@@ -273,16 +269,25 @@ public sealed partial class DeletionService
         var result = new RestoreResult { OperationId = manifest.OperationId };
         foreach (var entry in manifest.Items)
             result.Items.Add(new FileOperationResult { Path = entry.Path, Kind = entry.Kind, Status = "not_backed_up", Schema2Wire = true });
-        var handled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        for (var rootIndex = 0; rootIndex < manifest.Items.Count; rootIndex++)
+        var groups = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        var groupOrder = new List<List<int>>();
+        for (var index = 0; index < manifest.Items.Count; index++)
         {
-            var root = manifest.Items[rootIndex];
-            var key = root.TreeRoot ?? root.Path;
-            if (!handled.Add(key)) continue;
-            var indexes = manifest.Items.Select((entry, index) => (entry, index))
-                .Where(pair => (pair.entry.TreeRoot ?? pair.entry.Path) == key).Select(pair => pair.index).ToArray();
+            var entry = manifest.Items[index];
+            var key = entry.TreeRoot ?? entry.Path;
+            if (!groups.TryGetValue(key, out var indexes))
+            {
+                indexes = [];
+                groups.Add(key, indexes);
+                groupOrder.Add(indexes);
+            }
+            indexes.Add(index);
+        }
+        foreach (var indexes in groupOrder)
+        {
+            var root = manifest.Items[indexes[0]];
             if (root.State != "backup_ready") continue;
-            var copies = new List<FileStream>();
+            var copies = new Dictionary<int, FileStream>();
             var directoryPins = new List<DirectoryLease>();
             try
             {
@@ -303,7 +308,7 @@ public sealed partial class DeletionService
                         copy = new FileStream(handle, FileAccess.Read);
                         if (copy.Length != entry.Size || !Convert.ToHexString(SHA256.HashData(copy)).Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
                             throw new InvalidDataException("Backup hash or size differs from the manifest.");
-                        copies.Add(copy);
+                        copies.Add(index, copy);
                     }
                     catch { if (copy is null) handle.Dispose(); else copy.Dispose(); throw; }
                 }
@@ -313,7 +318,7 @@ public sealed partial class DeletionService
                     var item = result.Items[index];
                     if (entry.Kind == "file")
                     {
-                        try { RestoreOne(entry, item); }
+                        try { RestoreOne(entry, item, copies[index]); }
                         catch (Exception ex) when (IsOperational(ex)) { item.Status = "failed"; item.Error = ex.Message; }
                         continue;
                     }
@@ -328,7 +333,7 @@ public sealed partial class DeletionService
                     NativeFiles.RejectNamedStreams(target);
                     item.Status = existed ? "already_present" : "restored";
                 }
-                foreach (var index in indexes.Reverse())
+                foreach (var index in indexes.AsEnumerable().Reverse())
                 {
                     var entry = manifest.Items[index];
                     if (entry.Kind == "directory" && result.Items[index].Status == "restored" && entry.LastWriteUtc.HasValue)
@@ -353,7 +358,7 @@ public sealed partial class DeletionService
             finally
             {
                 for (var i = directoryPins.Count - 1; i >= 0; i--) directoryPins[i].Dispose();
-                foreach (var copy in copies) copy.Dispose();
+                foreach (var copy in copies.Values) copy.Dispose();
             }
         }
         TryWriteResult(Path.Combine(directory, $"restore-result-{Guid.NewGuid():N}.json"), result, result.Warnings);

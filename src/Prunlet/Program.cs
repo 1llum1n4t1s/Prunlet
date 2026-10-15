@@ -173,17 +173,18 @@ internal static class Program
     internal static object ListOperations(PrunletConfig config)
     {
         config.Validate();
-        return new
+        return new OperationsResult
         {
-            operations = Directory.EnumerateDirectories(config.BackupDirectory)
+            Operations = Directory.EnumerateDirectories(config.BackupDirectory)
                 .Where(p => Guid.TryParseExact(Path.GetFileName(p), "N", out _))
-                .Select(p => new { operationId = Path.GetFileName(p) })
-                .OrderBy(p => p.operationId, StringComparer.Ordinal).ToArray()
+                .Select(p => new OperationSummary { OperationId = Path.GetFileName(p) })
+                .OrderBy(p => p.OperationId, StringComparer.Ordinal).ToArray()
         };
     }
 
     internal static bool HasErrors(object result)
     {
+        if (result is OperationsResult) return false;
         if (result is RecoveryMaintenanceResult maintenance)
             return !maintenance.Complete || !maintenance.CapacityKnown || !maintenance.BudgetSatisfied || maintenance.Operations.Any(HasErrors);
         var typedItems = result switch
@@ -205,4 +206,14 @@ internal static class Program
     }
 
     private static void Write(object value) => Console.WriteLine(JsonSerializer.Serialize(value, JsonOptions));
+
+    private sealed class OperationsResult
+    {
+        public OperationSummary[] Operations { get; init; } = [];
+    }
+
+    private sealed class OperationSummary
+    {
+        public string OperationId { get; init; } = string.Empty;
+    }
 }
