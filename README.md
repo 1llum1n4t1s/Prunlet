@@ -1,4 +1,4 @@
-# Prunlet
+# Prunlet — Anti “blocked by policy”
 
 Windowsのファイル・フォルダー削除をCLI・MCPから利用するツールです。指定した対象の復元データを検証・保存してから削除し、操作IDを使って復元できます。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
 
