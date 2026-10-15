@@ -246,6 +246,37 @@ function Assert-PurgeRejected([object]$Fixture) {
     Assert-True (($members -join '|') -ceq (@([IO.Directory]::EnumerateFileSystemEntries($Fixture.Root) | Sort-Object) -join '|')) 'Rejected purge changed operation members.'
     foreach ($backup in $Fixture.Backups) { Assert-True ((File-Digest $backup) -ceq $digests[$backup]) 'Rejected purge changed recovery bytes.' }
 }
+function New-PartialPurgeFixture([int]$Schema = 1, [string]$State = 'failed') {
+    # 実デバイス障害を起こさず、旧版が永続化した途中失敗の状態を隔離して再現する。
+    $id = [guid]::NewGuid().ToString('N')
+    $root = Join-Path $script:Recovery $id
+    $null = [IO.Directory]::CreateDirectory($root)
+    [IO.File]::WriteAllBytes((Join-Path $root 'operation.lock'), [byte[]]@())
+    $items = @(); $backups = @(); $files = @()
+    foreach ($index in 0..2) {
+        $path = New-File "partial-$id-$index.txt" "original $index"
+        $backup = Join-Path $root ('{0:D4}.bak' -f $index)
+        [IO.File]::WriteAllText($backup, @('', 'partial bytes', 'verified recovery bytes')[$index], [Text.UTF8Encoding]::new($false))
+        $entry = [ordered]@{ path = $path; state = $(if ($index -eq 2) { 'backup_ready' } else { $State }); size = $(if ($index -eq 2) { (Get-Item -LiteralPath $backup).Length } else { 85220 }); sha256 = $(if ($index -eq 2) { File-Digest $backup } else { $null }) }
+        if ($Schema -ge 2) { $entry.kind = 'file'; $entry.treeRoot = $null }
+        if ($Schema -eq 3) {
+            $entry.streams = $null
+            if ($index -eq 2) { $entry.streams = @(@{ name = ''; offset = 0; size = $entry.size; sha256 = $entry.sha256 }) }
+            $entry.reparseTag = $null; $entry.linkDirectory = $false; $entry.caseSensitive = $false
+        }
+        $items += $entry; $backups += $backup; $files += $path
+    }
+    $manifest = @{ schema = $Schema; operationId = $id; createdUtc = [DateTimeOffset]::UtcNow.ToString('O'); items = $items }
+    [IO.File]::WriteAllText((Join-Path $root 'manifest.json'), ($manifest | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+    return @{ Id = $id; Root = $root; Backups = $backups; Files = $files }
+}
+function Write-PartialPurgeIntent([object]$Fixture) {
+    $manifestPath = Join-Path $Fixture.Root 'manifest.json'
+    $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -Depth 20
+    $targets = @(foreach ($index in 0..1) { @{ index = $index; sha256 = File-Digest $Fixture.Backups[$index]; size = (Get-Item -LiteralPath $Fixture.Backups[$index]).Length } })
+    $intent = @{ schema = 2; operationId = $Fixture.Id; manifestSha256 = File-Digest $manifestPath; createdUtc = [DateTimeOffset]::UtcNow.ToString('O'); targets = @(@{ index = 2; sha256 = $manifest.items[2].sha256; size = $manifest.items[2].size }); incompleteTargets = $targets }
+    [IO.File]::WriteAllText((Join-Path $Fixture.Root 'purge-intent.json'), ($intent | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+}
 
 Test-Case 'init' {
     $result = Invoke-Prunlet @('init', '--backup-directory', $script:Recovery)
@@ -1070,15 +1101,227 @@ Test-Case 'purge rejects operation directory link without following it for delet
     $result = Invoke-Prunlet @('purge', $fixture.Id, '--apply')
     Assert-True ($result.ExitCode -ne 0 -and (File-Digest $backup) -ceq $hash -and ![IO.File]::Exists((Join-Path $saved 'purge-intent.json'))) 'Purge followed operation link.'
 }
-Test-Case 'purge rejects unverified partial backup from a failed delete operation' {
-    $file = New-File 'purge-unverified-source.txt'
-    $lock = [IO.File]::Open($file, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-    try { $failed = Invoke-Prunlet @('delete', '--', $file) } finally { $lock.Dispose() }
-    Assert-True ($failed.ExitCode -ne 0 -and $failed.Json.operationId -and [IO.File]::Exists($file)) 'Failed-operation fixture differs.'
-    $root = Join-Path $script:Recovery $failed.Json.operationId
-    $partial = Join-Path $root '0000.bak'; [IO.File]::WriteAllText($partial, 'unverified partial bytes')
-    Assert-PurgeRejected @{ Id = $failed.Json.operationId; Root = $root; Backups = @($partial) }
-    Assert-True ([IO.File]::Exists($file)) 'Unverified operation source changed.'
+foreach ($partialSchema in 1..3) {
+    foreach ($partialState in @('failed', 'already_absent')) {
+        Test-Case "schema $partialSchema $partialState partial copies purge explicitly without restoring or changing manifest" {
+            $fixture = New-PartialPurgeFixture $partialSchema $partialState
+            $manifestPath = Join-Path $fixture.Root 'manifest.json'; $manifestHash = File-Digest $manifestPath
+            $hashes = @($fixture.Backups | ForEach-Object { File-Digest $_ })
+            $restored = Invoke-Prunlet @('restore', $fixture.Id)
+            Assert-True (@($restored.Json.items | Select-Object -First 2 | Where-Object status -eq 'not_backed_up').Count -eq 2) 'Partial copy was offered for restore.'
+            $members = @([IO.Directory]::EnumerateFileSystemEntries($fixture.Root) | Sort-Object)
+            $dry = Invoke-Prunlet @('purge', $fixture.Id, '--dry-run')
+            Assert-True ($dry.ExitCode -eq 0 -and @($dry.Json.items | Where-Object status -eq 'would_purge').Count -eq 3) 'Partial inspection failed.'
+            Assert-True (($members -join '|') -ceq (@([IO.Directory]::EnumerateFileSystemEntries($fixture.Root) | Sort-Object) -join '|')) 'Partial inspection wrote metadata.'
+            foreach ($index in 0..2) { Assert-True ((File-Digest $fixture.Backups[$index]) -ceq $hashes[$index]) 'Partial inspection changed bytes.' }
+            $applied = Invoke-Prunlet @('purge', $fixture.Id, '--apply')
+            Assert-True ($applied.ExitCode -eq 0 -and @($applied.Json.items | Where-Object status -eq 'purged').Count -eq 3) 'Partial apply failed.'
+            $intent = [IO.File]::ReadAllText((Join-Path $fixture.Root 'purge-intent.json')) | ConvertFrom-Json -Depth 20
+            Assert-True ($intent.schema -eq 2 -and $intent.targets.Count -eq 1 -and $intent.incompleteTargets.Count -eq 2) 'Partial intent schema or membership differs.'
+            foreach ($index in 0..1) {
+                $target = @($intent.incompleteTargets | Where-Object index -eq $index)
+                Assert-True ($target.Count -eq 1 -and $target[0].sha256 -ceq $hashes[$index] -and $target[0].size -eq @(0, 13)[$index]) 'Partial intent did not record actual size/hash.'
+            }
+            foreach ($backup in $fixture.Backups) { Assert-True (![IO.File]::Exists($backup)) 'Partial apply retained a recovery copy.' }
+            $again = Invoke-Prunlet @('purge', $fixture.Id, '--apply')
+            Assert-True ($again.ExitCode -eq 0 -and $again.Json.purgedBytes -eq 0 -and @($again.Json.items | Where-Object status -eq 'already_purged').Count -eq 3) 'Partial apply was not idempotent.'
+            Assert-Rejected @('restore', $fixture.Id) ''
+            Assert-True ((File-Digest $manifestPath) -ceq $manifestHash) 'Partial purge rewrote manifest.'
+            foreach ($index in 0..2) { Assert-True ([IO.File]::ReadAllText($fixture.Files[$index]) -ceq "original $index") 'Partial operation changed original source.' }
+        }
+    }
+}
+Test-Case 'partial purge resumes persisted intent and accepts only matching surviving bytes' {
+    $fixture = New-PartialPurgeFixture
+    Write-PartialPurgeIntent $fixture
+    $displaced = Join-Path $outputRoot 'partial-purge-interrupted-0000.bak'
+    [IO.File]::Move($fixture.Backups[0], $displaced)
+    $intentHash = File-Digest (Join-Path $fixture.Root 'purge-intent.json')
+    $result = Invoke-Prunlet @('purge', $fixture.Id, '--apply')
+    Assert-True ($result.ExitCode -eq 0 -and $result.Json.items[0].status -eq 'already_purged' -and $result.Json.items[1].status -eq 'purged') 'Partial purge did not resume.'
+    Assert-True ((File-Digest (Join-Path $fixture.Root 'purge-intent.json')) -ceq $intentHash -and [IO.File]::Exists($displaced)) 'Resume rewrote intent or touched displaced fixture.'
+    foreach ($kind in @('same-size', 'different-size')) {
+        $fixture = New-PartialPurgeFixture
+        Write-PartialPurgeIntent $fixture
+        [IO.File]::WriteAllText($fixture.Backups[1], $(if ($kind -eq 'same-size') { 'PARTIAL BYTES' } else { 'changed size' }))
+        Assert-PurgeRejected $fixture
+    }
+}
+Test-Case 'partial purge rejects unsafe members and never downgrades a corrupt verified backup' {
+    foreach ($kind in @('unknown', 'out-of-range', 'directory', 'hardlink', 'ADS', 'link', 'verified-corrupt')) {
+        $fixture = New-PartialPurgeFixture
+        switch ($kind) {
+            'unknown' { [IO.File]::WriteAllText((Join-Path $fixture.Root 'partial.tmp'), 'unknown') }
+            'out-of-range' { [IO.File]::WriteAllText((Join-Path $fixture.Root '0003.bak'), 'outside index') }
+            'directory' {
+                $saved = Join-Path $outputRoot ('partial-directory-displaced-' + $fixture.Id)
+                [IO.File]::Move($fixture.Backups[1], $saved)
+                $null = [IO.Directory]::CreateDirectory($fixture.Backups[1])
+                $fixture.Backups = @($fixture.Backups[0], $fixture.Backups[2])
+            }
+            'hardlink' { $null = New-Item -ItemType HardLink -Path (Join-Path $outputRoot ('partial-alias-' + $fixture.Id)) -Target $fixture.Backups[1] }
+            'ADS' { [IO.File]::WriteAllText($fixture.Backups[1] + ':unexpected', 'ADS') }
+            'link' {
+                $saved = Join-Path $outputRoot ('partial-displaced-' + $fixture.Id)
+                [IO.File]::Move($fixture.Backups[1], $saved)
+                New-SymbolicFixture $fixture.Backups[1] $saved
+            }
+            'verified-corrupt' { [IO.File]::WriteAllText($fixture.Backups[2], 'corrupt verified recovery bytes') }
+        }
+        Assert-PurgeRejected $fixture
+    }
+}
+Test-Case 'streaming manifest accepts 64 KiB whitespace after a colon without mutation' {
+    $fixture = New-PurgeFixture 'metadata-whitespace'
+    $manifestPath = Join-Path $fixture.Root 'manifest.json'
+    $text = [IO.File]::ReadAllText($manifestPath)
+    $text = $text.Insert($text.IndexOf(':') + 1, (' ' * 64KB))
+    [IO.File]::WriteAllText($manifestPath, $text, [Text.UTF8Encoding]::new($false))
+    $manifestHash = File-Digest $manifestPath; $backupHash = File-Digest $fixture.Backups[0]
+    $members = @([IO.Directory]::EnumerateFileSystemEntries($fixture.Root) | Sort-Object)
+    $dry = Invoke-Prunlet @('purge', $fixture.Id, '--dry-run')
+    Assert-True ($dry.ExitCode -eq 0 -and $dry.Json.items[0].status -eq 'would_purge') 'Valid whitespace spanning reader buffers was rejected.'
+    Assert-True ((File-Digest $manifestPath) -ceq $manifestHash -and (File-Digest $fixture.Backups[0]) -ceq $backupHash) 'Whitespace inspection changed fixture bytes.'
+    Assert-True (($members -join '|') -ceq (@([IO.Directory]::EnumerateFileSystemEntries($fixture.Root) | Sort-Object) -join '|')) 'Whitespace inspection wrote metadata.'
+}
+Test-Case 'streaming result accepts large UTF8 escaped error and warning strings across reader buffers' {
+    $fixture = New-PurgeFixture 'metadata-large-message'
+    $resultPath = Join-Path $fixture.Root 'delete-result.json'
+    $result = [IO.File]::ReadAllText($resultPath) | ConvertFrom-Json -AsHashtable -Depth 20
+    $longText = ('日本語 "quoted" \ path' + "`n`t") * 3000
+    Assert-True ($longText.Length -gt 16KB -and $longText.Length -lt 1MB) 'Message fixture is outside the intended valid range.'
+    $result.items[0].error = $longText
+    $result.warnings = @($longText)
+    [IO.File]::WriteAllText($resultPath, ($result | ConvertTo-Json -Depth 20 -Compress), [Text.UTF8Encoding]::new($false))
+    $resultHash = File-Digest $resultPath; $backupHash = File-Digest $fixture.Backups[0]
+    $dry = Invoke-Prunlet @('purge', $fixture.Id, '--dry-run')
+    Assert-True ($dry.ExitCode -eq 0 -and $dry.Json.items[0].status -eq 'would_purge') 'Valid long UTF8/escaped result messages were rejected.'
+    Assert-True ((File-Digest $resultPath) -ceq $resultHash -and (File-Digest $fixture.Backups[0]) -ceq $backupHash -and ![IO.File]::Exists((Join-Path $fixture.Root 'purge-intent.json'))) 'Long-message inspection changed fixture bytes or wrote intent.'
+}
+foreach ($partialKind in @('directory', 'symlink', 'junction')) {
+    Test-Case "schema 3 failed $partialKind partial copy purges without touching original target" {
+        $fixture = New-PartialPurgeFixture 3
+        $manifestPath = Join-Path $fixture.Root 'manifest.json'
+        $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -AsHashtable -Depth 20
+        $entry = $manifest.items[0]
+        $entry.kind = $partialKind
+        if ($partialKind -eq 'directory') { $entry.treeRoot = $entry.path }
+        elseif ($partialKind -eq 'symlink') { $entry.reparseTag = [Convert]::ToUInt32('A000000C', 16) }
+        else { $entry.reparseTag = [Convert]::ToUInt32('A0000003', 16); $entry.linkDirectory = $true }
+        # failed記録は実体のkindへアクセスせず、manifestに紐づく途中コピーだけを扱う。
+        [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+        $manifestHash = File-Digest $manifestPath
+        $sourceHashes = @($fixture.Files | ForEach-Object { File-Digest $_ })
+        $copyHashes = @($fixture.Backups | ForEach-Object { File-Digest $_ })
+        $members = @([IO.Directory]::EnumerateFileSystemEntries($fixture.Root) | Sort-Object)
+        $dry = Invoke-Prunlet @('purge', $fixture.Id, '--dry-run')
+        Assert-True ($dry.ExitCode -eq 0 -and @($dry.Json.items | Where-Object status -eq 'would_purge').Count -eq 3) 'Non-file partial inspection failed.'
+        Assert-True (($members -join '|') -ceq (@([IO.Directory]::EnumerateFileSystemEntries($fixture.Root) | Sort-Object) -join '|')) 'Non-file partial inspection wrote metadata.'
+        foreach ($index in 0..2) { Assert-True ((File-Digest $fixture.Backups[$index]) -ceq $copyHashes[$index]) 'Non-file partial inspection changed recovery bytes.' }
+        $applied = Invoke-Prunlet @('purge', $fixture.Id, '--apply')
+        Assert-True ($applied.ExitCode -eq 0 -and @($applied.Json.items | Where-Object status -eq 'purged').Count -eq 3) 'Non-file partial apply failed.'
+        $again = Invoke-Prunlet @('purge', $fixture.Id, '--apply')
+        Assert-True ($again.ExitCode -eq 0 -and $again.Json.purgedBytes -eq 0 -and @($again.Json.items | Where-Object status -eq 'already_purged').Count -eq 3) 'Non-file partial repeat was not idempotent.'
+        Assert-True ((File-Digest $manifestPath) -ceq $manifestHash) 'Non-file partial purge rewrote manifest.'
+        foreach ($index in 0..2) {
+            Assert-True (![IO.File]::Exists($fixture.Backups[$index]) -and (File-Digest $fixture.Files[$index]) -ceq $sourceHashes[$index]) 'Non-file partial purge retained recovery bytes or touched original target.'
+        }
+    }
+}
+foreach ($streamState in @('failed', 'backup_ready')) {
+    Test-Case "schema 3 $streamState 1025 stream records preserve state-specific recovery contract" {
+        $fixture = New-PartialPurgeFixture 3
+        $manifestPath = Join-Path $fixture.Root 'manifest.json'
+        $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -AsHashtable -Depth 20
+        $emptyHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+        if ($streamState -eq 'failed') {
+            $entryIndex = 0; $offset = 0
+            $streams = @(@{ name = ''; offset = 0; size = 0; sha256 = $emptyHash })
+        } else {
+            $entryIndex = 2; $offset = $manifest.items[2].size
+            $streams = @($manifest.items[2].streams)
+        }
+        foreach ($index in 1..1024) { $streams += @{ name = "stream-$index"; offset = $offset; size = 0; sha256 = $emptyHash } }
+        $manifest.items[$entryIndex].streams = $streams
+        [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+        $manifestHash = File-Digest $manifestPath
+        if ($streamState -eq 'backup_ready') {
+            Assert-PurgeRejected $fixture
+        } else {
+            $copyHashes = @($fixture.Backups | ForEach-Object { File-Digest $_ })
+            $members = @([IO.Directory]::EnumerateFileSystemEntries($fixture.Root) | Sort-Object)
+            $dry = Invoke-Prunlet @('purge', $fixture.Id, '--dry-run')
+            Assert-True ($dry.ExitCode -eq 0 -and @($dry.Json.items | Where-Object status -eq 'would_purge').Count -eq 3) 'Failed capture with 1025 stream records was rejected.'
+            Assert-True (($members -join '|') -ceq (@([IO.Directory]::EnumerateFileSystemEntries($fixture.Root) | Sort-Object) -join '|')) 'Failed stream inspection wrote metadata.'
+            foreach ($index in 0..2) { Assert-True ((File-Digest $fixture.Backups[$index]) -ceq $copyHashes[$index]) 'Failed stream inspection changed recovery bytes.' }
+            $applied = Invoke-Prunlet @('purge', $fixture.Id, '--apply')
+            Assert-True ($applied.ExitCode -eq 0 -and @($applied.Json.items | Where-Object status -eq 'purged').Count -eq 3) 'Failed capture with 1025 stream records could not purge partial copies.'
+            $again = Invoke-Prunlet @('purge', $fixture.Id, '--apply')
+            Assert-True ($again.ExitCode -eq 0 -and $again.Json.purgedBytes -eq 0 -and @($again.Json.items | Where-Object status -eq 'already_purged').Count -eq 3) 'Failed stream partial repeat was not idempotent.'
+            foreach ($backup in $fixture.Backups) { Assert-True (![IO.File]::Exists($backup)) 'Failed stream partial apply retained a recovery copy.' }
+        }
+        Assert-True ((File-Digest $manifestPath) -ceq $manifestHash) 'Stream-count validation changed manifest.'
+        foreach ($index in 0..2) { Assert-True ([IO.File]::ReadAllText($fixture.Files[$index]) -ceq "original $index") 'Stream-count validation changed original source.' }
+    }
+}
+Test-Case 'streaming metadata rejects duplicate missing truncated excessive depth and oversized tokens before mutation' {
+    foreach ($kind in @('duplicate-root', 'duplicate-entry', 'missing-root', 'missing-entry', 'truncated', 'depth', 'oversized-path', 'oversized-token')) {
+        $fixture = New-PartialPurgeFixture
+        $manifestPath = Join-Path $fixture.Root 'manifest.json'
+        $text = [IO.File]::ReadAllText($manifestPath)
+        switch ($kind) {
+            'duplicate-root' { $text = $text.Insert($text.IndexOf('{') + 1, '"schema":1,') }
+            'duplicate-entry' { $text = $text -replace '("path"\s*:)', '"state":"failed",$1' }
+            'missing-root' { $value = $text | ConvertFrom-Json -AsHashtable -Depth 20; $null = $value.Remove('createdUtc'); $text = $value | ConvertTo-Json -Depth 20 }
+            'missing-entry' { $value = $text | ConvertFrom-Json -AsHashtable -Depth 20; $null = $value.items[0].Remove('state'); $text = $value | ConvertTo-Json -Depth 20 }
+            'truncated' { $text = $text.Substring(0, $text.Length - 4) }
+            'depth' { $text = '{"items":' + ('[' * 20) + '0' + (']' * 20) + '}' }
+            'oversized-path' { $text = $text -replace '("path"\s*:\s*)"[^"]*"', ('$1"' + ('x' * 32769) + '"') }
+            'oversized-token' { $text = '{"schema":1,"operationId":"' + ('x' * (2MB)) + '"}' }
+        }
+        [IO.File]::WriteAllText($manifestPath, $text, [Text.UTF8Encoding]::new($false))
+        $hash = File-Digest $manifestPath
+        Assert-PurgeRejected $fixture
+        Assert-True ((File-Digest $manifestPath) -ceq $hash) 'Rejected streaming metadata was rewritten.'
+        Assert-Rejected @('restore', $fixture.Id) ''
+        foreach ($index in 0..2) { Assert-True ([IO.File]::ReadAllText($fixture.Files[$index]) -ceq "original $index") 'Malformed metadata changed original source.' }
+    }
+}
+Test-Case 'partial purge rejects malformed incomplete intent membership and hashes' {
+    foreach ($kind in @('missing', 'empty', 'duplicate', 'outside-index', 'verified-index', 'wrong-hash', 'wrong-size')) {
+        $fixture = New-PartialPurgeFixture
+        Write-PartialPurgeIntent $fixture
+        $intentPath = Join-Path $fixture.Root 'purge-intent.json'
+        $intent = [IO.File]::ReadAllText($intentPath) | ConvertFrom-Json -AsHashtable -Depth 20
+        switch ($kind) {
+            'missing' { $null = $intent.Remove('incompleteTargets') }
+            'empty' { $intent.incompleteTargets = @() }
+            'duplicate' { $intent.incompleteTargets = @($intent.incompleteTargets[0], $intent.incompleteTargets[0]) }
+            'outside-index' { $intent.incompleteTargets[0].index = 3 }
+            'verified-index' { $intent.incompleteTargets[0].index = 2 }
+            'wrong-hash' { $intent.incompleteTargets[0].sha256 = '0' * 64 }
+            'wrong-size' { $intent.incompleteTargets[0].size = 1 }
+        }
+        [IO.File]::WriteAllText($intentPath, ($intent | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+        $hash = File-Digest $intentPath
+        Assert-PurgeRejected $fixture
+        Assert-True ((File-Digest $intentPath) -ceq $hash) 'Rejected partial intent was rewritten.'
+    }
+}
+Test-Case 'legacy schema 1 purge intent resumes verified recovery without conversion' {
+    $fixture = New-PurgeFixture 'purge-legacy-intent' 2
+    $manifestPath = Join-Path $fixture.Root 'manifest.json'
+    $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -Depth 20
+    $targets = @(foreach ($index in 0..1) { @{ index = $index; sha256 = $manifest.items[$index].sha256; size = $manifest.items[$index].size } })
+    $intent = @{ schema = 1; operationId = $fixture.Id; manifestSha256 = File-Digest $manifestPath; createdUtc = [DateTimeOffset]::UtcNow.ToString('O'); targets = $targets }
+    $intentPath = Join-Path $fixture.Root 'purge-intent.json'
+    [IO.File]::WriteAllText($intentPath, ($intent | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+    $intentHash = File-Digest $intentPath
+    $displaced = Join-Path $outputRoot 'legacy-purge-interrupted-0000.bak'
+    [IO.File]::Move($fixture.Backups[0], $displaced)
+    $result = Invoke-Prunlet @('purge', $fixture.Id, '--apply')
+    Assert-True ($result.ExitCode -eq 0 -and $result.Json.items[0].status -eq 'already_purged' -and $result.Json.items[1].status -eq 'purged') 'Legacy intent resume failed.'
+    Assert-True ((File-Digest $intentPath) -ceq $intentHash -and [IO.File]::Exists($displaced)) 'Legacy intent was converted or displaced fixture changed.'
 }
 Test-Case 'purge rejects missing backup without intent and preserves displaced fixture copy' {
     $fixture = New-PurgeFixture 'purge-missing-backup'

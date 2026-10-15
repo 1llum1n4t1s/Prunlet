@@ -43,3 +43,13 @@ GitHub応答を検証用アーカイブへ差し替え、実際のインスト�
 フォルダー対応では、空フォルダーと空の子階層の削除・復元、非空の明示recursive、CLIとMCP、dry-run、schema 2と旧schema 1、包含・重複・復元データ祖先の拒否、子のlockで削除しないこと、link先を辿らないこと、ADS/hardlink/case-sensitiveの復元、復元時の衝突を検証します。列挙後の追加ファイル競合は、実際にそのタイミングを再現できた場合だけ合格にします。
 
 特殊対象ではschema 3のstream名・保存位置・hash・必須field・reparseタグと生offsetの改竄、case-sensitive保存先の拒否、Foo/fooの個別指定と往復を確認します。削除保留とADS共有のnative検証は、元対象を削除せず保留を取り消す方法でsingle-link、hard-link別名、directory、既知ADSを確認します。CLIの並行追加の瞬間にプロセスを強制終了する競合は未検証です。復元は保存時点のsnapshotであり、第三者の同時変更とプロセス終了を含む全変更の原子的保全を保証しません。
+
+## 大量操作と途中バックアップ
+
+大量操作に関係する変更では、通常E2Eに加えて次の独立したCLI E2Eを実行します。出力先は新しい外部絶対パス、レポートの親は事前作成済みにします。`-BaselineExecutablePath`は旧版の拒否を同じfixtureで比較する場合だけ指定します。
+
+```powershell
+pwsh -NoProfile -File .\scripts\Verify-LargeOperations.ps1 -ExecutablePath <今回のexe> -OutputDirectory <新しい外部Temp> -ReportPath <外部JSONレポート> [-BaselineExecutablePath <旧版exe>]
+```
+
+32,769ファイルをschema 3とschema 2の両方で削除・復元し、実manifestと結果が8 MiBを超えること、全ファイルの内容、既存ファイルの非上書き、purgeの検査・適用・再適用を確認します。CLI子プロセスの時間・メモリ・ハンドル数も記録します。通常E2Eでは旧schema 1/2/3の途中コピー、schema 2 purge intentの再開・改竄、正常コピーの破損、未知項目・link・ADS・hardlink、不正な巨大tokenや切断JSONを確認します。

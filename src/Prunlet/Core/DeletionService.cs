@@ -130,7 +130,6 @@ public sealed partial class DeletionService
         NativeFiles.VerifySingleLink(manifestHandle);
         NativeFiles.RejectNamedStreams(manifestPath);
         using var manifestStream = new FileStream(manifestHandle, FileAccess.Read);
-        if (manifestStream.Length > 8 * 1024 * 1024) throw new InvalidDataException("Manifest is too large.");
         var manifest = ReadValidatedJson<OperationManifest>(manifestStream);
         ValidateManifest(manifest, operationId);
         if (manifest.Schema == 3) return RestoreSpecial(manifest, directory);

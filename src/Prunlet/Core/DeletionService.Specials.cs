@@ -95,8 +95,6 @@ public sealed partial class DeletionService
             try
             {
                 ValidateManifest(manifest, manifest.OperationId);
-                if (JsonSerializer.SerializeToUtf8Bytes(manifest, PrunletConfig.JsonOptions).LongLength > MaximumManifestBytes)
-                    throw new IOException("Expanded operation manifest exceeds the recovery record limit.");
                 var manifestPath = Path.Combine(directory, "manifest.json");
                 var handle = NativeFiles.CreateDestination(manifestPath);
                 try { NativeFiles.Verify(handle, manifestPath); manifestFile = new FileStream(handle, FileAccess.ReadWrite); }
@@ -175,7 +173,6 @@ public sealed partial class DeletionService
         var item = new FileOperationResult { Path = path, Kind = kind, Status = "failed", Schema2Wire = true };
         nodes.Add(new SpecialNode { Entry = entry, Item = item, Index = manifest.Items.Count });
         manifest.Items.Add(entry); result.Items.Add(item);
-        if (nodes.Count > 32768) throw new IOException("Too many expanded operation entries.");
         foreach (var child in children) ScanSpecial(child, root, recursive, nodes, manifest, result);
     }
 

@@ -1,13 +1,10 @@
 using Microsoft.Win32.SafeHandles;
 using System.Security.Cryptography;
-using System.Text.Json;
 
 namespace Prunlet.Core;
 
 public sealed partial class DeletionService
 {
-    private const long MaximumManifestBytes = 8 * 1024 * 1024;
-
     private string ValidateAnyTarget(string path)
     {
         var absolute = PathPolicy.Absolute(path);
@@ -127,8 +124,6 @@ public sealed partial class DeletionService
             if (dryRun) return result;
             try
             {
-                if (JsonSerializer.SerializeToUtf8Bytes(manifest, PrunletConfig.JsonOptions).LongLength > MaximumManifestBytes)
-                    throw new IOException("Expanded operation manifest exceeds the 8 MiB recovery record limit.");
                 ValidateManifest(manifest, manifest.OperationId);
                 WriteNewJson(Path.Combine(directory!, "manifest.json"), manifest);
             }
@@ -168,8 +163,6 @@ public sealed partial class DeletionService
         var root = tree.Nodes[0].Entry.Path;
         var pending = new Queue<TreeNode>();
         pending.Enqueue(tree.Nodes[0]);
-        // パスだけでも上限を超える場合は、コピーや過大な展開を始めない。
-        long minimumRecordBytes = manifest.Items.Sum(entry => (long)entry.Path.Length + 64);
         while (pending.TryDequeue(out var node))
         {
             node.Directory = NativeFiles.OpenDirectory(node.Entry.Path);
@@ -181,9 +174,6 @@ public sealed partial class DeletionService
             var children = new List<string>();
             foreach (var child in Directory.EnumerateFileSystemEntries(node.Entry.Path))
             {
-                minimumRecordBytes += (long)child.Length + 64;
-                if (minimumRecordBytes > MaximumManifestBytes)
-                    throw new IOException("Expanded operation exceeds the 8 MiB recovery record limit.");
                 children.Add(child);
             }
             children.Sort(StringComparer.OrdinalIgnoreCase);

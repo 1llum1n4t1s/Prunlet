@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace Prunlet.Core;
 
 public sealed class PurgeResult
@@ -16,6 +18,9 @@ internal sealed class PurgeIntent
     public string ManifestSha256 { get; set; } = string.Empty;
     public DateTimeOffset CreatedUtc { get; set; } = DateTimeOffset.UtcNow;
     public List<PurgeTarget> Targets { get; set; } = [];
+    // schema 1 の既存記録には追加せず、復元不能な途中コピーだけを別に記録する。
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<PurgeTarget>? IncompleteTargets { get; set; }
 }
 
 internal sealed class PurgeTarget
