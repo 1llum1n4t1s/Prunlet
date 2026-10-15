@@ -188,14 +188,15 @@ internal static class NativeFiles
     internal static void ValidateStreamName(string name)
     {
         if (string.IsNullOrEmpty(name) || name.Length > 255 || name.IndexOfAny([':', '\\', '/', '*', '?', '"', '<', '>', '|']) >= 0
-            || name.Any(char.IsControl) || name.EndsWith('.') || name.EndsWith(' '))
+            || name.Any(char.IsControl))
             throw new InvalidDataException("Invalid alternate stream name.");
     }
 
     internal static SafeFileHandle OpenStream(string path, string name, bool create = false)
     {
         ValidateStreamName(name);
-        var handle = CreateFileW(Win32Path(path) + ":" + name, create ? Read | Write : Read, 5,
+        // ストリーム名の末尾空白・ピリオドも保持し、型を明示して同名の別ストリームを取り違えない。
+        var handle = CreateFileW(Win32Path(path) + ":" + name + ":$DATA", create ? Read | Write : Read, 5,
             IntPtr.Zero, create ? 1u : 3u, OpenReparse | BackupSemantics, IntPtr.Zero);
         if (handle.IsInvalid) { handle.Dispose(); ThrowLastError("Cannot open alternate stream"); }
         return handle;

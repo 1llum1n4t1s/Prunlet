@@ -722,6 +722,43 @@ Test-Case 'file ADS roundtrip restores named stream bytes' {
     Assert-True ([IO.File]::ReadAllText($file + ':custom') -eq 'preserve stream') 'Alternate data stream changed.'
     Assert-True ([Convert]::ToHexString([IO.File]::ReadAllBytes($file + ':binary')) -ceq [Convert]::ToHexString($bytes)) 'File ADS binary bytes changed.'
 }
+foreach ($kind in @('file', 'directory')) {
+Test-Case "$kind ADS trailing space and dot names remain distinct through delete restore and purge" {
+    $target = if ($kind -eq 'file') { New-File 'ads-exact-file.txt' 'unnamed content' } else {
+        $tree = New-TreeFixture 'ads-exact-directory'; $tree.Root
+    }
+    $names = @('same', 'same ', 'same.', ' ', '.', '..', '$DATA', '日本😀 ')
+    $streamPath = { param($name) '\\?\' + $target + ':' + $name + ':$DATA' }
+    foreach ($name in $names) { [IO.File]::WriteAllText((& $streamPath $name), ('exact:' + $name), [Text.UTF8Encoding]::new($false)) }
+    $arguments = @('delete'); if ($kind -eq 'directory') { $arguments += '--recursive' }
+    $before = @([IO.Directory]::EnumerateDirectories($script:Recovery)).Count
+    $dry = Invoke-Prunlet ($arguments + @('--dry-run', '--', $target))
+    Assert-True ($dry.ExitCode -eq 0 -and (Test-Path -LiteralPath $target) -and @([IO.Directory]::EnumerateDirectories($script:Recovery)).Count -eq $before) 'Exact stream dry-run mutated data.'
+    $deleted = Invoke-Prunlet ($arguments + @('--', $target))
+    Assert-True ($deleted.ExitCode -eq 0 -and !(Test-Path -LiteralPath $target)) 'Exact stream deletion failed.'
+    $operationRoot = Join-Path $script:Recovery $deleted.Json.operationId
+    $manifestPath = Join-Path $operationRoot 'manifest.json'
+    $manifestHash = File-Digest $manifestPath
+    $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -Depth 40
+    $entry = $manifest.items | Where-Object path -CEQ $target
+    $savedNames = @($entry.streams | Where-Object name -CNE '' | ForEach-Object name)
+    Assert-True ($savedNames.Count -eq $names.Count) 'Exact stream manifest count differs.'
+    foreach ($name in $names) { Assert-True ($savedNames -ccontains $name) 'Exact stream manifest name changed.' }
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0) 'Exact stream restore failed.'
+    if ($kind -eq 'directory') { Assert-TreeIntact $tree } else { Assert-True ([IO.File]::ReadAllText($target) -ceq 'unnamed content') 'Unnamed stream changed.' }
+    foreach ($name in $names) { Assert-True ([IO.File]::ReadAllText((& $streamPath $name)) -ceq ('exact:' + $name)) 'Distinct stream bytes changed.' }
+    [IO.File]::WriteAllText((& $streamPath 'same '), 'existing conflict')
+    $conflict = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($conflict.ExitCode -eq 1 -and [IO.File]::ReadAllText((& $streamPath 'same ')) -ceq 'existing conflict' -and [IO.File]::ReadAllText((& $streamPath 'same')) -ceq 'exact:same') 'Restore overwrote an exact stream conflict.'
+    foreach ($apply in @($false, $true, $true)) {
+        $purgeArgs = @('purge', $deleted.Json.operationId); if ($apply) { $purgeArgs += '--apply' }
+        $purged = Invoke-Prunlet $purgeArgs
+        Assert-True ($purged.ExitCode -eq 0 -and @($purged.Json.warnings).Count -eq 0 -and (File-Digest $manifestPath) -ceq $manifestHash) 'Exact stream purge failed or changed manifest.'
+    }
+    foreach ($name in $names) { Assert-True ([IO.File]::ReadAllText((& $streamPath $name)) -ceq $(if ($name -ceq 'same ') { 'existing conflict' } else { 'exact:' + $name })) 'Purge changed restored streams.' }
+}
+}
 Test-Case 'locked source is preserved' {
     $file = New-File 'locked.txt'; $lock = [IO.File]::Open($file, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     try { Assert-Rejected @('delete', '--', $file) $file } finally { $lock.Dispose() }
@@ -1369,6 +1406,8 @@ Test-Case 'MCP real stdio lifecycle/delete/restore/validation' {
         $tools = Rpc @{jsonrpc='2.0';id=2;method='tools/list';params=@{}}
         Assert-True ($tools.result.tools.Count -eq 3) 'MCP tools count differs.'
         $file = New-File '日本語 MCP.txt' 'MCP content'
+        $exactStream = '\\?\' + $file + ':trailing :$DATA'
+        [IO.File]::WriteAllText($exactStream, 'MCP trailing stream')
         # 削除notificationは副作用を起こさず、次のpingだけに応答する。
         $process.StandardInput.WriteLine((@{jsonrpc='2.0';method='tools/call';params=@{name='delete_files';arguments=@{paths=@($file)}}} | ConvertTo-Json -Depth 10 -Compress))
         $null = Rpc @{jsonrpc='2.0';id=3;method='ping'}
@@ -1377,6 +1416,7 @@ Test-Case 'MCP real stdio lifecycle/delete/restore/validation' {
         Assert-True (!$deleted.result.isError -and ![IO.File]::Exists($file)) 'MCP delete failed.'
         $restored = Rpc @{jsonrpc='2.0';id=5;method='tools/call';params=@{name='restore_files';arguments=@{operationId=$deleted.result.structuredContent.operationId}}}
         Assert-True (!$restored.result.isError -and [IO.File]::ReadAllText($file) -eq 'MCP content') 'MCP restore failed.'
+        Assert-True ([IO.File]::ReadAllText($exactStream) -ceq 'MCP trailing stream') 'MCP trailing stream changed.'
         $bad = Rpc @{jsonrpc='2.0';id=6;method='tools/call';params=@{name='delete_files';arguments=@{paths=@($file);dryRun='false'}}}
         Assert-True ($bad.error.code -eq -32602 -and [IO.File]::Exists($file)) 'Invalid arguments were not rejected.'
         $outside = Rpc @{jsonrpc='2.0';id=7;method='tools/call';params=@{name='delete_files';arguments=@{paths=@((Join-Path $outputRoot 'outside.txt'))}}}
