@@ -23,6 +23,8 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 
 大量操作に関係する変更では、通常E2Eに加えて`scripts/Verify-LargeOperations.ps1`へ今回のexeを渡す。[大量操作と途中バックアップの検証手順](docs/verification.md#大量操作と途中バックアップ)に従い、件数・記録サイズが旧上限を超えるschema 2/3の削除・復元・整理を確認する。
 
+保持期限・容量制限を変更した場合は、通常E2Eに加えて`scripts/Verify-Retention.ps1`へ今回のexeを渡す。[自動整理の検証手順](docs/verification.md#復元データの自動整理)に従い、旧設定の互換性、整理できないコピーの保全、並行削除時の容量上限を確認する。定期タスクの登録・解除を変更した場合は`scripts/Verify-LatestInstall.ps1`で所有者検証、既存タスクの保持、登録失敗時の復旧も確認する。
+
 リポジトリおよびCodex homeへ`bin`・`obj`・一時物・検証出力・バックアップを作らない。検証用出力とレポートには新しい外部絶対パスを渡し、レポートの親を事前に作る。検証後の保持と清掃は[検証手順](docs/verification.md)に従う。
 
 ## 導入と文書
