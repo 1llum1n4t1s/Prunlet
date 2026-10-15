@@ -11,6 +11,7 @@ PrunletはWindowsのファイル・フォルダーとシンボリックリンク
 | `Core/PathPolicy.cs` | ローカル絶対パスの正規化と実体解決、範囲判定、リンク検査、入力側・実体側の祖先ディレクトリのハンドル保持 |
 | `Core/NativeFiles.cs` | Win32による排他的作成、共有制限付きオープン、ハンドル実体・case-sensitive属性・ADS検査、ハンドルを使った削除 |
 | `Core/DeletionService.cs` / `Core/DeletionService.Directories.cs` / `Core/DeletionService.Specials.cs` / `Core/DeletionService.Purge.cs` | CLIとMCP共通の削除・復元処理、CLIの明示purge、SHA-256検証、永続記録 |
+| `Core/DeletionService.Metadata.cs` | 復元・整理で読む操作記録の共通検証。総件数・総バイト数ではなく、構造と個々の値を制限する増分読込み。詳細は[大量操作の記録](#大量操作の記録)を参照 |
 | `Protocol/McpServer.cs` | 改行区切りJSON-RPC、初期化、3つのツールと引数検査。対象フォルダーの許可リストを設けない |
 | `Protocol/HookRouter.cs` | exeだけで入力を検査し、直接削除を拒否してCLI手順を案内。削除・自動置換は行わない |
 | `Protocol/BoundedInputReader.cs` | MCPとhookの入力を読み取り中に制限。単位と応答は[連携手順](docs/integration.md#hookの検査範囲)を参照 |
