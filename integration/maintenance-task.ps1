@@ -42,7 +42,7 @@ function Register-PrunletMaintenanceTask($State) {
     $marker = & $escape $State.marker
     $command = & $escape $State.executable
     $arguments = & $escape $State.arguments
-    $start = [DateTime]::Today.AddHours(3).ToString('yyyy-MM-ddTHH:mm:ss')
+    $start = [DateTime]::Today.AddHours(3).ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
     # パスをshellへ渡さず、XMLのCommandとArgumentsへ別々に保存する。
     $xml = @"
 <?xml version="1.0" encoding="UTF-16"?>

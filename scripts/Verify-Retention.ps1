@@ -12,15 +12,9 @@ foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
 }
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $report = [IO.Path]::GetFullPath($ReportPath)
+. (Join-Path $PSScriptRoot 'Verification-Common.ps1')
 foreach ($destination in @($outputRoot, $report)) {
-    foreach ($forbidden in @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))) {
-        if ($destination.Equals($forbidden, [StringComparison]::OrdinalIgnoreCase) -or $destination.StartsWith($forbidden.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Verification output must be external.' }
-    }
-    $ancestor = $destination
-    while ($ancestor) {
-        if ((Test-Path -LiteralPath $ancestor) -and ((Get-Item -LiteralPath $ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Verification output must not traverse links.' }
-        $ancestor = [IO.Path]::GetDirectoryName($ancestor)
-    }
+    Assert-VerificationDestination $destination @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))
 }
 if (![IO.File]::Exists($ExecutablePath)) { throw 'Executable not found.' }
 if ((Test-Path -LiteralPath $outputRoot) -or (Test-Path -LiteralPath $report)) { throw 'OutputDirectory and ReportPath must be new.' }

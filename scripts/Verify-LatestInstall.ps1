@@ -68,8 +68,6 @@ function Expect-Failure([scriptblock]$Action, [string]$Pattern) {
 $allowed = Join-Path $OutputDirectory 'allowed'
 New-Item -ItemType Directory -Path $allowed | Out-Null
 $install = Join-Path $OutputDirectory 'installed'
-$fixtureInstalls = [Collections.Generic.List[string]]::new()
-$fixtureInstalls.Add($install)
 $isolatedCodex = Join-Path $OutputDirectory 'isolated-codex'
 $settingsBackup = Join-Path $OutputDirectory 'settings-backup'
 
@@ -85,8 +83,7 @@ Test-Case 'Repository output and linked install paths are refused' {
     Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory (Join-Path $repoRoot 'should-not-exist') -AllowedRoot $allowed } 'outside repositories'
     $linked = Join-Path $OutputDirectory 'linked-install'
     New-Item -ItemType Junction -Path $linked -Target $allowed | Out-Null
-    try { Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $linked -AllowedRoot $allowed } 'cannot traverse links' }
-    finally { Remove-Item -LiteralPath $linked }
+    Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $linked -AllowedRoot $allowed } 'cannot traverse links'
 }
 Test-Case 'Update backup root cannot be inside a repository or installation' {
     Expect-Failure { & $installer -UpdateBackupRoot $repoRoot -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'backup-repo-work') } 'outside repositories'
@@ -153,7 +150,6 @@ function Assert-Snapshot($Before) {
     Assert-True ($Before.Count -eq $after.Count) 'Installed file count changed on failure.'
     foreach ($key in $Before.Keys) { Assert-True ($Before[$key] -eq $after[$key]) "Installed file changed: $key" }
 }
-$beforeBackups = @(Get-ChildItem -LiteralPath $fixtureUpdateBackupRoot -Directory -Filter 'install-*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
 try {
     Test-Case 'Maintenance XML preserves Unicode paths and limits privileges without shell commands' {
         . (Join-Path $repoRoot 'integration\maintenance-task.ps1')
@@ -186,6 +182,24 @@ try {
         $global:PrunletMaintenanceFixture.tasks[$state.name] = $owned.previousXml
         & (Join-Path $repoRoot 'integration\uninstall-maintenance.ps1') -ExecutablePath $taskExe -ConfigPath $taskConfig | Out-Null
         Assert-True (!$global:PrunletMaintenanceFixture.tasks.ContainsKey($state.name)) 'Explicit schedule uninstall retained owned task.'
+    }
+    Test-Case 'Maintenance schedule uses Gregorian dates under non-Gregorian cultures' {
+        . (Join-Path $repoRoot 'integration\maintenance-task.ps1')
+        $originalCulture = [Globalization.CultureInfo]::CurrentCulture
+        $expected = [DateTime]::Today.AddHours(3)
+        try {
+            foreach ($cultureName in @('th-TH', 'ar-SA')) {
+                [Globalization.CultureInfo]::CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo($cultureName)
+                $cultureRoot = Join-Path $OutputDirectory ('culture-' + $cultureName)
+                $cultureState = Get-PrunletMaintenanceState (Join-Path $cultureRoot 'prunlet.exe') (Join-Path $cultureRoot 'config.json')
+                try {
+                    Register-PrunletMaintenanceTask $cultureState
+                    $xml = [xml]$global:PrunletMaintenanceFixture.tasks[$cultureState.name]
+                    $boundary = [Xml.XmlConvert]::ToDateTime($xml.Task.Triggers.CalendarTrigger.StartBoundary, [Xml.XmlDateTimeSerializationMode]::Unspecified)
+                    Assert-True ($boundary.Ticks -eq $expected.Ticks) "Task date changed under $cultureName."
+                } finally { $global:PrunletMaintenanceFixture.tasks.Remove($cultureState.name) }
+            }
+        } finally { [Globalization.CultureInfo]::CurrentCulture = $originalCulture }
     }
     Test-Case 'Download failure preserves initial boundary' {
         $global:PrunletLatestFixture.failDownload = $true
@@ -231,7 +245,6 @@ try {
     }
     Test-Case 'Maintenance registration failure rolls back new task and product files' {
         $failedInstall = Join-Path $OutputDirectory 'schedule-failure-install'
-        $fixtureInstalls.Add($failedInstall)
         $beforeTaskCount = $global:PrunletMaintenanceFixture.tasks.Count
         $global:PrunletMaintenanceFixture.failAfterWrite = $true
         Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $failedInstall -WorkDirectory (Join-Path $OutputDirectory 'schedule-failure-work') } 'Fixture maintenance registration failure'
@@ -311,7 +324,6 @@ try {
     Test-Case 'Partial Codex registration failure restores exact profile preimages' {
         foreach ($hookState in @('absent', 'existing')) {
             $partialInstall = Join-Path $OutputDirectory "partial-install-$hookState"
-            $fixtureInstalls.Add($partialInstall)
             $partialCodex = Join-Path $OutputDirectory "partial-codex-$hookState"
             $partialSettingsBackup = Join-Path $OutputDirectory "partial-settings-backup-$hookState"
             New-Item -ItemType Directory -Path $partialCodex | Out-Null
@@ -337,7 +349,6 @@ try {
     }
     Test-Case 'Allowed-root ancestor of work uses actual recovery topology' {
         $probeInstall = Join-Path $OutputDirectory 'probe-install'
-        $fixtureInstalls.Add($probeInstall)
         $probeWork = Join-Path $allowed 'probe-work'
         & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $probeInstall -AllowedRoot $allowed -WorkDirectory $probeWork | Out-Null
         $config = Join-Path $probeInstall 'config.json'
@@ -348,7 +359,6 @@ try {
         Assert-True (!(Test-Path -LiteralPath $probeWork)) 'Work inside allowed root was not cleaned.'
     }
     $instructionInstall = Join-Path $OutputDirectory 'instruction-install'
-    $fixtureInstalls.Add($instructionInstall)
     $instructionCodex = Join-Path $OutputDirectory 'instruction-codex'
     $instructionBackup = Join-Path $OutputDirectory 'instruction-backup'
     New-Item -ItemType Directory -Path $instructionCodex | Out-Null
@@ -408,7 +418,6 @@ try {
     }
     Test-Case 'Owned MCP-first instructions upgrade to CLI binding without changing the body' {
         $legacyInstall = Join-Path $OutputDirectory 'legacy-instruction-install'
-        $fixtureInstalls.Add($legacyInstall)
         $legacyCodex = Join-Path $OutputDirectory 'legacy-instruction-codex'
         New-Item -ItemType Directory -Path $legacyCodex | Out-Null
         & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $legacyInstall -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'legacy-instruction-base-work') | Out-Null
@@ -641,7 +650,6 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
     }
     Test-Case 'Instruction write failure rolls back MCP hooks and four profile files' {
         $lockedInstall = Join-Path $OutputDirectory 'instruction-locked-install'
-        $fixtureInstalls.Add($lockedInstall)
         $lockedCodex = Join-Path $OutputDirectory 'instruction-locked-codex'
         New-Item -ItemType Directory -Path $lockedCodex | Out-Null
         $lockedAgents = Join-Path $lockedCodex 'AGENTS.md'
@@ -726,13 +734,7 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
     Remove-Variable PrunletLatestFixture -Scope Global
     Remove-Item Function:\Get-ScheduledTask, Function:\Export-ScheduledTask, Function:\Register-ScheduledTask, Function:\Unregister-ScheduledTask
     Remove-Variable PrunletMaintenanceFixture -Scope Global
-    # 検証インストールの更新バックアップだけを検証済み絶対パスから清掃する。
-    $backupParent = $fixtureUpdateBackupRoot
-    Get-ChildItem -LiteralPath $backupParent -Directory -Filter 'install-*' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notin $beforeBackups } | ForEach-Object {
-        $manifest = Join-Path $_.FullName 'backup-info.json'
-        if (!(Test-Path -LiteralPath $manifest)) { $manifest = Join-Path $_.FullName 'profile-backup-info.json' }
-        if ((Test-Path -LiteralPath $manifest) -and ((Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).installDirectory -in $fixtureInstalls) -and !($_.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
-    }
+    # junctionと更新バックアップも隔離出力内に残し、結果確認後にPrunletで一括清掃する。
     [ordered]@{ verifiedUtc = [DateTimeOffset]::UtcNow.ToString('o'); failureConditions = $failureConditions; results = @($results.ToArray()); passed = !@($results | Where-Object { !$_.passed }).Count; retention = 'Keep this report as reproducible installer verification evidence; delete when superseded.'; reproduce = 'Run scripts/Verify-LatestInstall.ps1 with new external OutputDirectory and ReportPath.' } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ReportPath -Encoding utf8NoBOM
 }
 Get-Content -LiteralPath $ReportPath -Raw

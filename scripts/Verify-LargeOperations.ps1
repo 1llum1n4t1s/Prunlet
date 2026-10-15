@@ -16,15 +16,9 @@ foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
 if ($BaselineExecutablePath -and ![IO.Path]::IsPathFullyQualified($BaselineExecutablePath)) { throw 'BaselineExecutablePath must be absolute.' }
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $report = [IO.Path]::GetFullPath($ReportPath)
+. (Join-Path $PSScriptRoot 'Verification-Common.ps1')
 foreach ($destination in @($outputRoot, $report)) {
-    foreach ($forbidden in @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))) {
-        if ($destination.Equals($forbidden, [StringComparison]::OrdinalIgnoreCase) -or $destination.StartsWith($forbidden.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Verification output must be external.' }
-    }
-    $ancestor = $destination
-    while ($ancestor) {
-        if ((Test-Path -LiteralPath $ancestor) -and ((Get-Item -LiteralPath $ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Verification output must not traverse links.' }
-        $ancestor = [IO.Path]::GetDirectoryName($ancestor)
-    }
+    Assert-VerificationDestination $destination @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))
 }
 if (Test-Path -LiteralPath $outputRoot) { throw 'OutputDirectory must be new.' }
 if (Test-Path -LiteralPath $report) { throw 'ReportPath must be new.' }
@@ -133,18 +127,23 @@ foreach ($schema in @(3, 2)) {
         Assert-True ($results.Count -gt 0 -and @($results | Where-Object { !$_.passed }).Count -eq 0) 'Earlier phase failed; fixture retained without further mutation.'
         if ($schema -eq 2) {
             # 外部名だけを同じCoreで削除し、元の32Kファイルはそのまま再利用する。
-            $removedAlias = Invoke-Cli @('delete', '--', $alias)
-            Assert-True ($removedAlias.ExitCode -eq 0 -and ![IO.File]::Exists($alias)) 'Special hardlink removal failed.'
-            $aliasPurge = Invoke-Cli @('purge', $removedAlias.Json.operationId, '--apply')
-            Assert-True ($aliasPurge.ExitCode -eq 0) 'Alias recovery purge failed.'
+            $response = Invoke-Cli @('delete', '--', $alias)
+            Assert-True ($response.ExitCode -eq 0 -and ![IO.File]::Exists($alias)) 'Special hardlink removal failed.'
+            $aliasOperationId = $response.Json.operationId
+            $response = $null
+            $response = Invoke-Cli @('purge', $aliasOperationId, '--apply')
+            Assert-True ($response.ExitCode -eq 0) 'Alias recovery purge failed.'
+            $response = $null
         }
         Assert-BaselineRejects @('delete', '--dry-run', '--recursive', '--', $tree)
-        $dry = Invoke-Cli @('delete', '--dry-run', '--recursive', '--', $tree)
-        Assert-True ($dry.ExitCode -eq 0 -and $dry.Json.items.Count -eq ($FileCount + 1)) 'Large candidate dry run failed.'
+        $response = Invoke-Cli @('delete', '--dry-run', '--recursive', '--', $tree)
+        Assert-True ($response.ExitCode -eq 0 -and $response.Json.items.Count -eq ($FileCount + 1)) 'Large candidate dry run failed.'
+        $response = $null
         Assert-FixtureIntact
-        $deleted = Invoke-Cli @('delete', '--recursive', '--', $tree)
-        Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree) -and $deleted.Json.items.Count -eq ($FileCount + 1)) 'Large recursive deletion failed.'
-        $id = $deleted.Json.operationId; $operationRoot = Join-Path $recovery $id
+        $response = Invoke-Cli @('delete', '--recursive', '--', $tree)
+        Assert-True ($response.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree) -and $response.Json.items.Count -eq ($FileCount + 1)) 'Large recursive deletion failed.'
+        $id = $response.Json.operationId; $operationRoot = Join-Path $recovery $id
+        $response = $null
         $manifestPath = Join-Path $operationRoot 'manifest.json'; $deleteResultPath = Join-Path $operationRoot 'delete-result.json'
         $manifestLength = (Get-Item -LiteralPath $manifestPath).Length; $deleteResultLength = (Get-Item -LiteralPath $deleteResultPath).Length
         Assert-True ($manifestLength -gt 8MB -and $deleteResultLength -gt 8MB) 'Fixture did not exceed both old metadata byte limits.'
@@ -154,26 +153,32 @@ foreach ($schema in @(3, 2)) {
         Assert-True ($prefixText -match ('"schema"\s*:\s*' + $schema + '\b')) 'Expected schema branch was not exercised.'
         $manifestHash = File-Digest $manifestPath
         if ($BaselineExecutablePath) {
-            $baselinePurge = Invoke-Cli @('purge', $id, '--dry-run') $BaselineExecutablePath
-            Assert-True ($baselinePurge.ExitCode -ne 0 -and ![IO.File]::Exists((Join-Path $operationRoot 'purge-intent.json'))) 'Baseline accepted oversized recovery metadata or wrote an intent.'
+            $response = Invoke-Cli @('purge', $id, '--dry-run') $BaselineExecutablePath
+            Assert-True ($response.ExitCode -ne 0 -and ![IO.File]::Exists((Join-Path $operationRoot 'purge-intent.json'))) 'Baseline accepted oversized recovery metadata or wrote an intent.'
+            $response = $null
             Assert-True ((File-Digest $manifestPath) -ceq $manifestHash) 'Baseline changed candidate manifest.'
         }
-        $restored = Invoke-Cli @('restore', $id)
-        Assert-True ($restored.ExitCode -eq 0 -and $restored.Json.items.Count -eq ($FileCount + 1)) 'Large restore failed.'
+        $response = Invoke-Cli @('restore', $id)
+        Assert-True ($response.ExitCode -eq 0 -and $response.Json.items.Count -eq ($FileCount + 1)) 'Large restore failed.'
+        $response = $null
         Assert-FixtureIntact
         # 全対象を異なる内容へ変更し、同じ内容を書き戻す偽の成功も検出する。
         for ($index = 0; $index -lt $FileCount; $index++) { [IO.File]::WriteAllText((Fixture-Path $index), "existing $index", [Text.UTF8Encoding]::new($false)) }
-        $conflict = Invoke-Cli @('restore', $id)
-        Assert-True ($conflict.ExitCode -ne 0 -and @($conflict.Json.items | Where-Object status -eq 'restored').Count -eq 0) 'Repeat restore overwrote an existing target.'
+        $response = Invoke-Cli @('restore', $id)
+        Assert-True ($response.ExitCode -ne 0 -and @($response.Json.items | Where-Object status -eq 'restored').Count -eq 0) 'Repeat restore overwrote an existing target.'
+        $response = $null
         Assert-FixtureIntact 'existing'
         for ($index = 0; $index -lt $FileCount; $index++) { [IO.File]::WriteAllText((Fixture-Path $index), "content $index", [Text.UTF8Encoding]::new($false)) }
-        $inspection = Invoke-Cli @('purge', $id, '--dry-run')
-        Assert-True ($inspection.ExitCode -eq 0 -and ![IO.File]::Exists((Join-Path $operationRoot 'purge-intent.json'))) 'Large purge inspection failed or mutated metadata.'
-        $purged = Invoke-Cli @('purge', $id, '--apply')
-        Assert-True ($purged.ExitCode -eq 0 -and $purged.Json.purgedBytes -gt 0) 'Large purge failed.'
+        $response = Invoke-Cli @('purge', $id, '--dry-run')
+        Assert-True ($response.ExitCode -eq 0 -and ![IO.File]::Exists((Join-Path $operationRoot 'purge-intent.json'))) 'Large purge inspection failed or mutated metadata.'
+        $response = $null
+        $response = Invoke-Cli @('purge', $id, '--apply')
+        Assert-True ($response.ExitCode -eq 0 -and $response.Json.purgedBytes -gt 0) 'Large purge failed.'
+        $response = $null
         Assert-True (@([IO.Directory]::EnumerateFiles($operationRoot, '*.bak')).Count -eq 0) 'Large purge retained recovery copies.'
-        $again = Invoke-Cli @('purge', $id, '--apply')
-        Assert-True ($again.ExitCode -eq 0 -and $again.Json.purgedBytes -eq 0 -and @($again.Json.items | Where-Object status -eq 'purged').Count -eq 0) 'Large purge repeat was not idempotent.'
+        $response = Invoke-Cli @('purge', $id, '--apply')
+        Assert-True ($response.ExitCode -eq 0 -and $response.Json.purgedBytes -eq 0 -and @($response.Json.items | Where-Object status -eq 'purged').Count -eq 0) 'Large purge repeat was not idempotent.'
+        $response = $null
         Assert-True ((File-Digest $manifestPath) -ceq $manifestHash) 'Large lifecycle changed manifest.'
         Assert-FixtureIntact
         $operations.Add(@{ schema = $schema; operationId = $id; entries = $FileCount + 1; manifestBytes = $manifestLength; deleteResultBytes = $deleteResultLength; manifestSha256 = $manifestHash })
@@ -183,14 +188,16 @@ if (@($results | Where-Object { !$_.passed }).Count -eq 0) {
     Test-Case 'successful large fixture cleanup uses candidate CLI and purges only its own operation' {
         Assert-FixtureIntact
         Assert-True (![IO.File]::Exists($alias)) 'Unexpected special alias remains; fixture retained.'
-        $cleanupDelete = Invoke-Cli @('delete', '--recursive', '--', $tree)
-        Assert-True ($cleanupDelete.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree)) 'Candidate CLI fixture cleanup failed.'
-        $cleanupId = $cleanupDelete.Json.operationId
+        $response = Invoke-Cli @('delete', '--recursive', '--', $tree)
+        Assert-True ($response.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree)) 'Candidate CLI fixture cleanup failed.'
+        $cleanupId = $response.Json.operationId
+        $response = $null
         Assert-True ($cleanupId -cmatch '^[0-9a-f]{32}$') 'Cleanup operation ID is invalid.'
         $cleanupOperationRoot = Join-Path $recovery $cleanupId
         Assert-True ([IO.Directory]::Exists($cleanupOperationRoot)) 'Cleanup operation was not recorded in isolated recovery.'
-        $cleanupPurge = Invoke-Cli @('purge', $cleanupId, '--apply')
-        Assert-True ($cleanupPurge.ExitCode -eq 0 -and @([IO.Directory]::EnumerateFiles($cleanupOperationRoot, '*.bak')).Count -eq 0) 'Candidate CLI cleanup recovery purge failed.'
+        $response = Invoke-Cli @('purge', $cleanupId, '--apply')
+        Assert-True ($response.ExitCode -eq 0 -and @([IO.Directory]::EnumerateFiles($cleanupOperationRoot, '*.bak')).Count -eq 0) 'Candidate CLI cleanup recovery purge failed.'
+        $response = $null
         Assert-True (![IO.Directory]::Exists($tree)) 'Large fixture root remains after cleanup.'
     }
 }

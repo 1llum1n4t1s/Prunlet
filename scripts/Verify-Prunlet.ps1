@@ -10,16 +10,10 @@ if (-not [IO.Path]::IsPathFullyQualified($OutputDirectory) -or -not [IO.Path]::I
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
+. (Join-Path $PSScriptRoot 'Verification-Common.ps1')
 foreach ($destination in @($outputRoot, [IO.Path]::GetFullPath($ReportPath))) {
     if (-not [IO.Path]::IsPathFullyQualified($destination)) { throw 'Verification paths must be absolute.' }
-    foreach ($forbidden in @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))) {
-        if ($destination.Equals($forbidden, [StringComparison]::OrdinalIgnoreCase) -or $destination.StartsWith($forbidden.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Verification output must be external.' }
-    }
-    $ancestor = $destination
-    while ($ancestor) {
-        if ((Test-Path -LiteralPath $ancestor) -and ((Get-Item -LiteralPath $ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Verification output must not traverse links.' }
-        $ancestor = [IO.Path]::GetDirectoryName($ancestor)
-    }
+    Assert-VerificationDestination $destination @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))
 }
 if (Test-Path -LiteralPath $outputRoot) { throw 'OutputDirectory must be new, not an existing directory.' }
 if (Test-Path -LiteralPath $ReportPath) { throw 'ReportPath must be new.' }
@@ -419,9 +413,10 @@ Test-Case 'paths-file input handle closes before deleting that same input file' 
 }
 Test-Case 'long path existing and missing dry runs differ and real delete restores bytes and timestamp' {
     $directory = $script:Scope
-    foreach ($index in 1..4) { $directory = Join-Path $directory ('long-' + $index + '-' + ('x' * 64)); $null = New-Item -ItemType Directory -Path $directory }
+    foreach ($index in 1..8) { $directory = Join-Path $directory ('long-' + $index + '-' + ('x' * 64)); $null = New-Item -ItemType Directory -Path $directory }
     $file = Join-Path $directory '長い path.txt'; [IO.File]::WriteAllText($file, 'long path recovery bytes', [Text.UTF8Encoding]::new($false))
     Assert-True ($file.Length -gt 260) 'Long path fixture did not exceed MAX_PATH.'
+    Assert-True ($file.Length -gt 512) 'Long path fixture did not exercise handle-path buffer expansion.'
     $hash = File-Digest $file; $time = [IO.File]::GetLastWriteTimeUtc($file)
     $recoveryCount = @([IO.Directory]::EnumerateDirectories($script:Recovery)).Count
     $dry = Invoke-Prunlet @('delete', '--dry-run', '--', $file)
