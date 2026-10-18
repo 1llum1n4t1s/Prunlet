@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Diagnostics;
 using Microsoft.Win32.SafeHandles;
 
 namespace Prunlet.Core;
@@ -221,8 +220,6 @@ public sealed partial class DeletionService
             if (!create && !Directory.EnumerateFileSystemEntries(config.BackupDirectory)
                 .Any(member => Path.GetFileName(member).Equals("maintenance.lock", StringComparison.OrdinalIgnoreCase)))
                 return new RecoveryCoordination(root, null);
-            var timeout = TimeSpan.FromSeconds(60);
-            var waiting = Stopwatch.StartNew();
             while (true)
             {
                 try
@@ -233,11 +230,8 @@ public sealed partial class DeletionService
                 catch (FileNotFoundException) when (!create) { return new RecoveryCoordination(root, null); }
                 catch (IOException ex) when (ex.InnerException is Win32Exception { NativeErrorCode: 32 or 33 })
                 {
-                    // 排他を維持し、他操作が保持している間だけ有限時間待つ。
-                    var remaining = timeout - waiting.Elapsed;
-                    if (remaining <= TimeSpan.Zero)
-                        throw new IOException($"Timed out after 60 seconds waiting for the recovery coordination lock: {path}", ex);
-                    Thread.Sleep(remaining < TimeSpan.FromMilliseconds(100) ? remaining : TimeSpan.FromMilliseconds(100));
+                    // 大量操作は数分以上かかる。取得競合だけを解放まで待ち、排他と容量上限を維持する。
+                    Thread.Sleep(100);
                 }
             }
             NativeFiles.Verify(handle, path);

@@ -30,7 +30,7 @@ $results = [Collections.Generic.List[object]]::new()
 $commands = [Collections.Generic.List[object]]::new()
 $binaryHash = (Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash.ToLowerInvariant()
 
-# 想定する失敗: 短期競合の即失敗、保持継続時の無限待機、ロード中DLLの即失敗、
+# 想定する失敗: 短期競合の即失敗、60秒を超える調停待機の打ち切り、ロード中DLLの即失敗、
 # 失敗後の元対象・検証済みコピーの欠損、読み取り専用属性の無断解除。
 # バックアップ・identity検証エラーの非再試行は、Core担当の確認範囲とする。
 Add-Type -TypeDefinition @'
@@ -120,37 +120,42 @@ function Assert-Backup([string]$SourceHash) {
     Assert-True ($matching.Count -eq 1) 'Verified backup bytes differ.'
     $script:Evidence.backup = @{ path = $matching[0].FullName; sha256 = Digest $matching[0].FullName; manifest = $manifests[0].FullName; state = $entry[0].state }
 }
-foreach ($persistent in @($false, $true)) {
-    $name = if ($persistent) { 'maintenance-lock-timeout' } else { 'maintenance-lock-released' }
+foreach ($longWait in @($false, $true)) {
+    $name = if ($longWait) { 'maintenance-lock-long-wait-released' } else { 'maintenance-lock-released' }
     Test-Case $name {
         $source = Join-Path $script:CaseRoot 'source.txt'; [IO.File]::WriteAllText($source, 'maintenance contention fixture')
         $hash = Digest $source; $script:Evidence.sourceSha256 = $hash
-        if (!$persistent) {
-            $script:Evidence.plannedHoldMilliseconds = [Math]::Max(10000, $script:Evidence.initMilliseconds * 2 + 2000)
-            Assert-True ($script:Evidence.plannedHoldMilliseconds -lt 60000) 'Initialization is too slow to verify transient contention within the 60 second coordination bound.'
-        }
+        $script:Evidence.plannedHoldMilliseconds = if ($longWait) {
+            # 起動時間を見込んでも旧60秒上限を超えるまで保持する。
+            [Math]::Max(65000, $script:Evidence.initMilliseconds * 2 + 62000)
+        } else { [Math]::Max(10000, $script:Evidence.initMilliseconds * 2 + 2000) }
+        $timeoutSeconds = [int][Math]::Ceiling($script:Evidence.plannedHoldMilliseconds / 1000) + 30
         $script:HeldLock = [IO.FileStream]::new((Join-Path $script:Recovery 'maintenance.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         try {
             $result = Invoke-Cli @('delete', '--', $source) {
                 param($milliseconds)
-                if (!$persistent -and $script:HeldLock -and $milliseconds -ge $script:Evidence.plannedHoldMilliseconds) {
+                if ($longWait -and $script:HeldLock -and $milliseconds -ge 61000 -and !$script:Evidence.checkedBeyondSixtySeconds) {
+                    $script:Evidence.checkedBeyondSixtySeconds = $milliseconds
+                    Assert-True (!$process.HasExited) 'CLI exited while the coordination lock was still held beyond 60 seconds.'
+                    Assert-True ([IO.File]::Exists($source) -and (Digest $source) -ceq $hash) 'Coordination wait changed the source beyond 60 seconds.'
+                    Assert-True (@(Manifests).Count -eq 0 -and @(Get-ChildItem -LiteralPath $script:Recovery -Filter '*.bak' -Recurse -File).Count -eq 0) 'Coordination wait changed backup state beyond 60 seconds.'
+                }
+                if ($script:HeldLock -and $milliseconds -ge $script:Evidence.plannedHoldMilliseconds) {
                     $script:Evidence.releaseMilliseconds = $milliseconds
                     $script:Evidence.cliAliveBeforeRelease = !$process.HasExited
                     $script:Evidence.manifestCountBeforeRelease = @(Manifests).Count
                     Assert-True ($script:Evidence.cliAliveBeforeRelease -and $script:Evidence.manifestCountBeforeRelease -eq 0) 'CLI must still be alive without a manifest before lock release.'
+                    Assert-True ([IO.File]::Exists($source) -and (Digest $source) -ceq $hash) 'Coordination wait changed the source before release.'
+                    $script:Evidence.backupCountBeforeRelease = @(Get-ChildItem -LiteralPath $script:Recovery -Filter '*.bak' -Recurse -File).Count
+                    Assert-True ($script:Evidence.backupCountBeforeRelease -eq 0) 'Coordination wait created backup bytes before lock release.'
                     $script:HeldLock.Dispose(); $script:HeldLock = $null
                 }
-            }
+            } $timeoutSeconds
             $script:Evidence.cliMilliseconds = $result.Milliseconds
-            if ($persistent) {
-                Assert-True ($result.ExitCode -ne 0 -and $result.Milliseconds -ge 59000 -and $result.Milliseconds -lt 75000) 'Coordination timeout did not honor the 60 second bound.'
-                Assert-True ([IO.File]::Exists($source) -and (Digest $source) -ceq $hash) 'Coordination timeout changed the source.'
-                Assert-True (@(Manifests).Count -eq 0) 'Coordination timeout created an operation manifest.'
-            } else {
-                Assert-True ($script:Evidence.releaseMilliseconds -ge $script:Evidence.plannedHoldMilliseconds -and $script:Evidence.cliAliveBeforeRelease -and $script:Evidence.manifestCountBeforeRelease -eq 0) 'CLI did not wait before manifest creation.'
-                Assert-True ($result.ExitCode -eq 0 -and ![IO.File]::Exists($source)) 'Released coordination lock did not allow deletion.'
-                Assert-Backup $hash
-            }
+            if ($longWait) { Assert-True ($script:Evidence.checkedBeyondSixtySeconds -ge 61000) 'CLI did not remain alive beyond 60 seconds.' }
+            Assert-True ($script:Evidence.releaseMilliseconds -ge $script:Evidence.plannedHoldMilliseconds -and $script:Evidence.cliAliveBeforeRelease -and $script:Evidence.manifestCountBeforeRelease -eq 0) 'CLI did not wait before manifest creation.'
+            Assert-True ($result.ExitCode -eq 0 -and ![IO.File]::Exists($source)) 'Released coordination lock did not allow deletion.'
+            Assert-Backup $hash
         } finally { if ($script:HeldLock) { $script:HeldLock.Dispose(); $script:HeldLock = $null } }
     }
 }
