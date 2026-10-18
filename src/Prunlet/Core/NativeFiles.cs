@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
@@ -281,7 +282,30 @@ internal static class NativeFiles
     }
 
     internal static void DeleteHandle(SafeFileHandle handle)
-        => SetDeletePending(handle, true);
+    {
+        var timeout = TimeSpan.FromSeconds(10);
+        var timer = Stopwatch.StartNew();
+        while (true)
+        {
+            try { SetDeletePending(handle, true); return; }
+            catch (IOException ex) when (IsTransientDeletionFailure(handle, ex))
+            {
+                // DLLのイメージ解放などを同じ検証済みハンドルで待つ。権限や削除方式は変えない。
+                var remaining = timeout - timer.Elapsed;
+                if (remaining <= TimeSpan.Zero)
+                    throw new IOException("Windows still refused deletion after 10 seconds. Close applications using this item before retrying. " + ex.Message, ex);
+                Thread.Sleep((int)Math.Min(100, Math.Ceiling(remaining.TotalMilliseconds)));
+            }
+        }
+    }
+
+    private static bool IsTransientDeletionFailure(SafeFileHandle handle, IOException error)
+    {
+        if (error.InnerException is not Win32Exception { NativeErrorCode: 5 or 32 or 33 }) return false;
+        // 書込み共有のあるディレクトリ・リンクや、読み取り専用属性の拒否は待機しない。
+        const FileAttributes excluded = FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.ReadOnly;
+        return GetFileInformationByHandle(handle, out var info) && (info.Attributes & (uint)excluded) == 0;
+    }
 
     internal static void SetDeletePending(SafeFileHandle handle, bool pending)
     {
@@ -311,7 +335,11 @@ internal static class NativeFiles
         finally { Marshal.FreeHGlobal(buffer); }
     }
 
-    private static void ThrowLastError(string message) => throw new IOException($"{message}: {new Win32Exception(Marshal.GetLastWin32Error()).Message}");
+    private static void ThrowLastError(string message)
+    {
+        var error = new Win32Exception(Marshal.GetLastWin32Error());
+        throw new IOException($"{message}: {error.Message}", error);
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct FileInformation
