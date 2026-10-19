@@ -21,6 +21,8 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 
 実装変更後は[検証手順](docs/verification.md)のコマンドで`scripts/Verify-Prunlet.ps1`に今回のexeを渡し、CLI・stdio MCP・フックのE2Eを実行する。インストーラーや共通指示の登録・解除を変更した場合は`scripts/Verify-LatestInstall.ps1`も実行し、検証用アーカイブの結果と実GitHubの結果を区別する。終了コード、`passed` / `failed`、外部JSONレポートを読んで判定する。Codex自身のフック読込・承認と共通指示の読込・MCP選択はスクリプトの検証範囲外なので、連携変更時は同文書の実ホスト確認も行う。
 
+case-sensitive属性の復元を変更した場合は、通常E2Eの権限別ケースで、必要権限を付与した復元の成功、属性変更権限不足時の失敗と復元コピーの保全、同じ属性への不要な書込みをせずModify権限で復元できることを確認する。成功ケースだけで権限不足時の安全性を判断しない。
+
 大量操作に関係する変更では、通常E2Eに加えて`scripts/Verify-LargeOperations.ps1`へ今回のexeを渡す。[大量操作と途中バックアップの検証手順](docs/verification.md#大量操作と途中バックアップ)に従い、件数・記録サイズが旧上限を超えるschema 2/3の削除・復元・整理を確認する。
 
 保持期限・容量制限を変更した場合は、通常E2Eに加えて`scripts/Verify-Retention.ps1`へ今回のexeを渡す。[自動整理の検証手順](docs/verification.md#復元データの自動整理)に従い、旧設定の互換性、整理できないコピーの保全、並行削除時の容量上限を確認する。定期タスクの登録・解除を変更した場合は`scripts/Verify-LatestInstall.ps1`で所有者検証、既存タスクの保持、登録失敗時の復旧も確認する。
