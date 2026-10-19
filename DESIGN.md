@@ -14,6 +14,7 @@ PrunletはWindowsのファイル・フォルダーとシンボリックリンク
 | `Core/DeletionService.Operations.cs` | schema 1/2/3共通の新規操作の作成と保持。復元領域・操作フォルダー・操作ロックを一括管理し、作成失敗時も取得済みハンドルを逆順に解放 |
 | `Core/DeletionService.Metadata.cs` | 復元・整理で読む操作記録の共通検証。総件数・総バイト数ではなく、構造と個々の値を制限する増分読込み。詳細は[大量操作の記録](#大量操作の記録)を参照 |
 | `Core/DeletionService.Retention.cs` | 保持期限・容量の走査と整理候補の選択、共通purgeへの委譲、復元領域の排他とコピー書込み容量の予約 |
+| `Core/DeletionService.HistoryCompaction.cs` / `Core/HistoryCompactionResult.cs` | 整理済み履歴の検証とNTFS圧縮、操作・ファイル単位の結果と物理容量。CLIの明示検査・適用と保持制御の自動経路で共用 |
 | `Protocol/McpServer.cs` | 改行区切りJSON-RPC、初期化、3つのツールと引数検査。対象フォルダーの許可リストを設けない |
 | `Protocol/HookRouter.cs` | exeだけで入力を検査し、直接削除を拒否してCLI手順を案内。削除・自動置換は行わない |
 | `Protocol/BoundedInputReader.cs` | MCPとhookの入力を読み取り中に制限。単位と応答は[連携手順](docs/integration.md#hookの検査範囲)を参照 |
