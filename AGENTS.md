@@ -27,6 +27,8 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 
 リポジトリおよびCodex homeへ`bin`・`obj`・一時物・検証出力・バックアップを作らない。検証用出力とレポートには新しい外部絶対パスを渡し、レポートの親を事前に作る。検証後の保持と清掃は[検証手順](docs/verification.md)に従う。
 
+履歴圧縮を変更した場合は、通常E2Eに加えて`scripts/Verify-HistoryCompaction.ps1`でdry-runの不変更、物理容量の減少とJSON内容一致、冪等性、既存操作IDの互換性、ロック・リンク・不正metadataの保持を確認する。自動経路は`scripts/Verify-AutomaticHistory.ps1`でmaintain・CLI/MCP削除からの発火、保護対象の保持、既圧縮の再実行と容量集計の分離を確認し、`scripts/Verify-AutomaticHistorySchedule.ps1`で隔離した一回限りの時刻トリガーによる実行を確認する。手順は[履歴圧縮の検証](docs/verification.md#操作履歴の圧縮)を参照する。
+
 ## 導入と文書
 
 対外表記ではREADME冒頭の副題を併記する。今後のX告知では本文と紹介画像に同じ副題を毎回含め、GitHubの説明欄も同じ表記に揃える。X告知本文には、README冒頭に沿った紹介文を毎回1文入れる。その紹介文には、`blocked by policy`による清掃の停止を減らす目的と、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約する使い方を含める。

@@ -28,6 +28,7 @@ internal static class Program
                     prunlet --config <absolute-json-path> restore <operation-id>
                     prunlet --config <absolute-json-path> purge <operation-id> [--dry-run | --apply]
                     prunlet --config <absolute-json-path> maintain [--dry-run | --apply]
+                    prunlet --config <absolute-json-path> compact-history [--dry-run | --apply]
                     prunlet --config <absolute-json-path> operations
                     prunlet --config <absolute-json-path> mcp
                     prunlet --config <absolute-json-path> hook [--hook-script <legacy-path>]
@@ -98,6 +99,11 @@ internal static class Program
                     if (commandArgs.Length > 1 || (commandArgs.Length == 1 && commandArgs[0] is not ("--dry-run" or "--apply")))
                         throw new ArgumentException("Use maintain [--dry-run | --apply]. Maintenance inspects only unless --apply is specified.");
                     result = service.MaintainRecovery(commandArgs.Length == 1 && commandArgs[0] == "--apply");
+                    break;
+                case "compact-history":
+                    if (commandArgs.Length > 1 || (commandArgs.Length == 1 && commandArgs[0] is not ("--dry-run" or "--apply")))
+                        throw new ArgumentException("Use compact-history [--dry-run | --apply]. History compression inspects only unless --apply is specified.");
+                    result = service.CompactHistory(commandArgs.Length == 1 && commandArgs[0] == "--apply");
                     break;
                 case "mcp":
                     if (commandArgs.Length != 0) throw new ArgumentException("MCP accepts no arguments.");
@@ -185,6 +191,9 @@ internal static class Program
     internal static bool HasErrors(object result)
     {
         if (result is OperationsResult) return false;
+        if (result is HistoryCompactionResult history)
+            return history.Operations.Any(operation => operation.Status == "failed" || !string.IsNullOrEmpty(operation.Error)
+                || operation.Files.Any(file => file.Status == "failed" || !string.IsNullOrEmpty(file.Error)));
         if (result is RecoveryMaintenanceResult maintenance)
             return !maintenance.Complete || !maintenance.CapacityKnown || !maintenance.BudgetSatisfied || maintenance.Operations.Any(HasErrors);
         var typedItems = result switch

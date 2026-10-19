@@ -66,6 +66,22 @@ pwsh -NoProfile -File .\scripts\Verify-LargeOperations.ps1 -ExecutablePath <今�
 
 32,769ファイルをschema 3とschema 2の両方で削除・復元し、実manifestと結果が8 MiBを超えること、全ファイルの内容、既存ファイルの非上書き、purgeの検査・適用・再適用を確認します。CLI子プロセスの時間・メモリ・ハンドル数も記録します。通常E2Eでは旧schema 1/2/3の途中コピー、schema 2 purge intentの再開・改竄、正常コピーの破損、未知項目・link・ADS・hardlink、不正な巨大tokenや切断JSONを確認します。
 
+## 操作履歴の圧縮
+
+履歴圧縮を変更した場合は、通常E2Eに加えて次を実行します。出力先とレポートは新しい外部絶対パスを指定し、親ディレクトリを事前に用意します。Windowsローカルの作業規約に従い、TEMP/TMPもD上の今回の作業領域へ指定します。
+
+```powershell
+pwsh -NoProfile -File .\scripts\Verify-HistoryCompaction.ps1 -ExecutablePath <今回のexe> -OutputDirectory <新しい外部D作業領域> -ReportPath <外部DのJSONレポート>
+pwsh -NoProfile -File .\scripts\Verify-AutomaticHistory.ps1 -ExecutablePath <今回のexe> -OutputDirectory <別の新しい外部D作業領域> -ReportPath <別の外部DのJSONレポート>
+pwsh -NoProfile -File .\scripts\Verify-AutomaticHistorySchedule.ps1 -ExecutablePath <今回のexe> -OutputDirectory <さらに別の新しい外部D作業領域> -ReportPath <さらに別の外部DのJSONレポート>
+```
+
+正常にpurge済みの操作で、dry-runの全バイト・属性不変更、適用前後のJSONのSHA-256と長さ一致、物理容量の減少、繰り返し適用、操作一覧・復元拒否・再purgeの互換性を確認します。復元コピーと不明項目を持つ操作、不正なmanifest・intent・結果、ADS・hardlink・reparse・ReadOnly、共通ロックと操作ロックの競合は内容を保全することを確認します。実ユーザーの履歴には検証fixtureを混ぜません。削減量は実測した物理容量で判断し、論理容量やドライブ空き容量の差だけでは判定しません。
+
+自動経路ではschema 1/2/3のmaintainによる検査・適用・再実行、CLI/MCP削除時に今回purgeした操作だけが圧縮されること、手動purgeの履歴が保持され次のmaintainで整理されることを確認します。既圧縮でもリンク・ADS・読み取り専用・未知memberは検査し、`skipped_compressed`は本文の妥当性を認定しない結果として扱います。保持理由はhistoryCompaction内で確認し、復元コピーの容量と履歴圧縮の物理削減量を混ぜません。
+
+時刻トリガーの検証では、隔離した設定と一回限りのタスクを使い、手動起動せずに`maintain --apply`の発火・終了コード・SHA-256一致・物理容量減少を確認します。検証用タスクは固有名と説明・アクションの所有情報を照合して解除します。実運用のタスクの登録・解除は行いません。
+
 ## 復元データの自動整理
 
 保持期限・容量制限を変更した場合は、通常E2Eに加えて次を実行します。出力先は新しい外部絶対パス、レポートの親は事前作成済みにします。

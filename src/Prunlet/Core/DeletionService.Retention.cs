@@ -16,6 +16,7 @@ public sealed class RecoveryMaintenanceResult
     public bool CapacityKnown { get; set; }
     public bool BudgetSatisfied { get; set; }
     public bool Complete { get; set; }
+    public HistoryCompactionResult HistoryCompaction { get; set; } = new();
     public List<PurgeResult> Operations { get; set; } = [];
     public List<string> Warnings { get; set; } = [];
 }
@@ -28,10 +29,10 @@ public sealed partial class DeletionService
     {
         config.Validate();
         using var coordination = AcquireRecoveryCoordination(create: apply);
-        return MaintainRecoveryCore(apply, incomingBytes: 0);
+        return MaintainRecoveryCore(apply, incomingBytes: 0, compactAllHistory: true);
     }
 
-    private RecoveryMaintenanceResult MaintainRecoveryCore(bool apply, long incomingBytes)
+    private RecoveryMaintenanceResult MaintainRecoveryCore(bool apply, long incomingBytes, bool compactAllHistory = false)
     {
         var result = new RecoveryMaintenanceResult
         {
@@ -79,6 +80,12 @@ public sealed partial class DeletionService
         result.BudgetSatisfied = result.CapacityKnown && result.RetainedBytesAfter <= config.MaxRecoveryBytes - incomingBytes;
         if (!result.CapacityKnown) result.Warnings.Add("Recovery capacity is unknown because some data is busy or cannot be safely inspected.");
         else if (!result.BudgetSatisfied) result.Warnings.Add("Retained recovery data exceeds the available recovery budget; unverified copies were retained.");
+        // 定期・明示maintainは既存履歴も対象とする。削除前は今回purgeした操作だけを検証し、
+        // 毎削除で全履歴を開き直さない。共通ロックは呼出し元が保持済み。
+        result.HistoryCompaction = CompactHistoryCore(apply, automatic: true,
+            operationIds: compactAllHistory ? null : result.Operations.Select(operation => operation.OperationId));
+        foreach (var operation in result.HistoryCompaction.Operations.Where(operation => operation.Status == "failed"))
+            result.Warnings.Add($"History operation {operation.OperationId} could not be compressed: {operation.Error}");
         result.Warnings = result.Warnings.Distinct(StringComparer.Ordinal).ToList();
         result.Complete = result.BudgetSatisfied && result.Warnings.Count == 0
             && result.Operations.All(operation => operation.Items.All(item => item.Status != "failed"));

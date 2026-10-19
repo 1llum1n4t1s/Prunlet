@@ -20,6 +20,7 @@ internal static class NativeFiles
     internal static SafeFileHandle OpenDirectorySource(string path) => Open(path, 0x80 | Delete, 3, 3, OpenReparse | BackupSemantics);
     internal static SafeFileHandle OpenSource(string path) => Open(path, Read | Delete, 1, 3, OpenReparse);
     internal static SafeFileHandle OpenBackup(string path) => Open(path, Read, 1, 3, OpenReparse);
+    internal static SafeFileHandle OpenHistoryCompression(string path) => Open(path, Read | Write, 1, 3, OpenReparse);
     internal static SafeFileHandle OpenPurgeTarget(string path) => Open(path, Read | Delete, 1, 3, OpenReparse);
     internal static SafeFileHandle CreateDestination(string path) => Open(path, Read | Write | Delete, 1, 1, OpenReparse);
     internal static SafeFileHandle OpenLock(string path) => Open(path, Read | Write, 0, 3, OpenReparse);
@@ -67,6 +68,47 @@ internal static class NativeFiles
             if (Marshal.GetLastWin32Error() != 38) ThrowLastError("Cannot finish alternate data stream inspection");
         }
         finally { FindClose(search); }
+    }
+
+    // winioctl.h: FSCTL_GET_COMPRESSION (15), FSCTL_SET_COMPRESSION (16).
+    // winbase.h: FileCompressionInfo / FILE_COMPRESSION_INFO。パスによる容量再解決をしない。
+    internal static (ushort Format, long PhysicalBytes) HistoryCompressionInfo(SafeFileHandle handle)
+    {
+        if (!GetFileInformationByHandle(handle, out var attributes)) ThrowLastError("Cannot inspect history attributes");
+        const uint allowed = (uint)(FileAttributes.Normal | FileAttributes.Archive | FileAttributes.Compressed | FileAttributes.NotContentIndexed);
+        if ((attributes.Attributes & ~allowed) != 0)
+            throw new IOException("History compression requires an ordinary writable file without sparse, encrypted, offline, or unknown attributes.");
+        var fileSystem = new StringBuilder(64);
+        if (!GetVolumeInformationByHandleW(handle, null, 0, out _, out _, out var flags, fileSystem, (uint)fileSystem.Capacity))
+            ThrowLastError("Cannot inspect history filesystem");
+        if (fileSystem.ToString() != "NTFS" || (flags & 0x10) == 0)
+            throw new IOException("History compression requires NTFS file compression support.");
+        var bytes = new byte[2];
+        if (!DeviceIoControl(handle, 0x0009003C, null, 0, bytes, bytes.Length, out var count, IntPtr.Zero))
+            ThrowLastError("Cannot inspect history compression format");
+        if (count != 2) throw new IOException("Invalid history compression format response.");
+        var format = (ushort)(bytes[0] | bytes[1] << 8);
+        if (format is not (0 or 2)) throw new IOException("Unsupported history compression format.");
+        if (!GetFileInformationByHandleEx(handle, 8, out CompressionInformation info, (uint)Marshal.SizeOf<CompressionInformation>()))
+            ThrowLastError("Cannot measure history physical bytes");
+        if (info.CompressionFormat != format || info.CompressedFileSize < 0)
+            throw new IOException("Inconsistent history compression information.");
+        // CompressedFileSizeは小さい非圧縮データではEOFを返すため、割当量と同一視しない。
+        // FILE_STANDARD_INFOはresident領域も含む現在の割当量を同じハンドルから返す。
+        if (!GetFileInformationByHandleEx(handle, 1, out StandardInformation allocation, (uint)Marshal.SizeOf<StandardInformation>()))
+            ThrowLastError("Cannot measure history allocation bytes");
+        if (allocation.AllocationSize < 0 || allocation.EndOfFile != RandomAccess.GetLength(handle)
+            || allocation.Directory != 0 || allocation.DeletePending != 0)
+            throw new IOException("Inconsistent history allocation information.");
+        return (format, allocation.AllocationSize);
+    }
+
+    internal static void CompressHistory(SafeFileHandle handle)
+    {
+        // COMPRESSION_FORMAT_LZNT1。元の内容・名前・ID・ACLを保持したまま圧縮する。
+        byte[] format = [2, 0];
+        if (!DeviceIoControl(handle, 0x0009C040, format, format.Length, null, 0, out _, IntPtr.Zero))
+            ThrowLastError("Cannot compress history metadata");
     }
 
     private static SafeFileHandle Open(string path, uint access, uint share, uint disposition, uint flags)
@@ -129,7 +171,7 @@ internal static class NativeFiles
 
     internal static bool IsCaseSensitive(SafeFileHandle handle)
     {
-        if (!GetFileInformationByHandleEx(handle, FileCaseSensitiveInfo, out var info, (uint)Marshal.SizeOf<CaseSensitiveInformation>()))
+        if (!GetFileInformationByHandleEx(handle, FileCaseSensitiveInfo, out CaseSensitiveInformation info, (uint)Marshal.SizeOf<CaseSensitiveInformation>()))
             ThrowLastError("Cannot inspect directory case sensitivity");
         return (info.Flags & CaseSensitiveDirectory) != 0;
     }
@@ -356,6 +398,22 @@ internal static class NativeFiles
     private struct CaseSensitiveInformation { public uint Flags; }
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct CompressionInformation
+    {
+        public long CompressedFileSize;
+        public ushort CompressionFormat;
+        public byte CompressionUnitShift, ChunkShift, ClusterShift, Reserved1, Reserved2, Reserved3;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct StandardInformation
+    {
+        public long AllocationSize, EndOfFile;
+        public uint NumberOfLinks;
+        public byte DeletePending, Directory;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct UnicodeString { public ushort Length, MaximumLength; public IntPtr Buffer; }
     [StructLayout(LayoutKind.Sequential)]
     private struct ObjectAttributes { public int Length; public IntPtr RootDirectory, ObjectName; public uint Attributes; public IntPtr SecurityDescriptor, SecurityQualityOfService; }
@@ -404,6 +462,16 @@ internal static class NativeFiles
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, out CaseSensitiveInformation info, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, out CompressionInformation info, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, out StandardInformation info, uint size);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetVolumeInformationByHandleW(SafeFileHandle handle, StringBuilder? volumeName, uint volumeNameSize,
+        out uint serial, out uint maximumComponentLength, out uint flags, StringBuilder fileSystem, uint fileSystemSize);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint size, uint flags);
     [DllImport("kernel32.dll", SetLastError = true)]
