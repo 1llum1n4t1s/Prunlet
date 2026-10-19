@@ -178,9 +178,12 @@ internal static class NativeFiles
 
     internal static void SetCaseSensitive(SafeFileHandle handle, bool enabled)
     {
+        // 同じ属性への再設定でもWindowsは変更権限を要求する。既定のままなら書き込まない。
+        if (IsCaseSensitive(handle) == enabled) return;
         var info = new CaseSensitiveInformation { Flags = enabled ? CaseSensitiveDirectory : 0u };
         if (!SetFileInformationByHandle(handle, FileCaseSensitiveInfo, ref info, (uint)Marshal.SizeOf<CaseSensitiveInformation>()))
             ThrowLastError("Cannot restore directory case sensitivity");
+        if (IsCaseSensitive(handle) != enabled) throw new IOException("Restored directory case sensitivity differs from the saved value.");
     }
 
     internal static void RejectCaseSensitive(SafeFileHandle handle)

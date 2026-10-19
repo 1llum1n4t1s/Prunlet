@@ -162,6 +162,10 @@ try {
         Assert-True ($xml.Task.Principals.Principal.RunLevel -ceq 'LeastPrivilege' -and $xml.Task.Principals.Principal.LogonType -ceq 'InteractiveToken') 'Task requires elevated or password logon.'
         Assert-True ($xml.Task.Settings.MultipleInstancesPolicy -ceq 'IgnoreNew' -and $xml.Task.Settings.StartWhenAvailable -ceq 'true') 'Task lacks overlap or missed-run policy.'
         Assert-True ($xml.Task.Triggers.CalendarTrigger.ScheduleByDay.DaysInterval -eq 1 -and $xml.Task.Triggers.LogonTrigger.UserId -ceq $state.sid) 'Task lacks daily or logon trigger.'
+        $boundary = [Xml.XmlConvert]::ToDateTime($xml.Task.Triggers.CalendarTrigger.StartBoundary, [Xml.XmlDateTimeSerializationMode]::Unspecified)
+        Assert-True ($boundary.TimeOfDay -eq [TimeSpan]::FromHours(3) -and $xml.Task.Triggers.CalendarTrigger.Enabled -ceq 'true') 'Daily maintenance is not enabled at 03:00.'
+        Assert-True ($xml.Task.Triggers.LogonTrigger.Enabled -ceq 'true' -and $xml.Task.Settings.Enabled -ceq 'true') 'Missed overnight maintenance cannot run at the next logon.'
+        Assert-True ($xml.Task.Settings.DisallowStartIfOnBatteries -ceq 'false' -and $xml.Task.Settings.StopIfGoingOnBatteries -ceq 'false') 'Battery operation prevents catch-up maintenance.'
         $global:PrunletMaintenanceFixture.tasks[$state.name] = $global:PrunletMaintenanceFixture.tasks[$state.name].Replace('<Hidden>true</Hidden>', '<Hidden>false</Hidden>')
         $owned = Get-PrunletMaintenanceState $taskExe $taskConfig
         Register-PrunletMaintenanceTask $owned

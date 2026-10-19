@@ -170,6 +170,15 @@ public static class PrunletVerificationDirectoryFlags {
     static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
     [DllImport("kernel32.dll", SetLastError=true)]
     static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int informationClass, out uint flags, uint size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass, ref uint flags, uint size);
+    public static int TryEnableCaseSensitive(string path) {
+        using (var handle = CreateFileW(path, 0x180, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+            if (handle.IsInvalid) return Marshal.GetLastWin32Error();
+            uint flags = 1;
+            return SetFileInformationByHandle(handle, 23, ref flags, 4) ? 0 : Marshal.GetLastWin32Error();
+        }
+    }
     public static bool IsCaseSensitive(string path) {
         using (var handle = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
             if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -531,10 +540,19 @@ Test-Case 'legacy schema 1 target spelling remains unchanged during physical res
     Assert-True ($purged.ExitCode -eq 0 -and (File-Digest $manifestPath) -ceq $manifestHash -and (File-Digest $file) -ceq $hash) 'Legacy physical purge changed source or manifest.'
 }
 Test-Case '8.3 parent spelling records and restores the physical long path' {
-    $file = New-File 'short-alias-canonical-long-filename.txt' 'short name target bytes'
+    $longDirectory = Join-Path $script:Scope 'short-alias-canonical-parent'
+    $null = [IO.Directory]::CreateDirectory($longDirectory)
+    $file = Join-Path $longDirectory 'short-alias-canonical-long-filename.txt'
+    [IO.File]::WriteAllText($file, 'short name target bytes')
+    # 自動生成が無効なボリュームでも、隔離したfixtureだけに実在する8.3名を付ける。
+    $fsutil = Join-Path $env:SystemRoot 'System32\fsutil.exe'
+    $shortNameResult = & $fsutil file setshortname $longDirectory PRNSRC~1 2>&1 | Out-String
+    Assert-True ($LASTEXITCODE -eq 0) ('Could not assign the source 8.3 fixture: ' + $shortNameResult)
+    $shortNameResult = & $fsutil file setshortname $script:Recovery PRNREC~1 2>&1 | Out-String
+    Assert-True ($LASTEXITCODE -eq 0) ('Could not assign the recovery 8.3 fixture: ' + $shortNameResult)
     $fso = New-Object -ComObject Scripting.FileSystemObject
-    try { $shortDirectory = [string]$fso.GetFolder($script:Scope).ShortPath } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($fso) }
-    Assert-True (!$shortDirectory.Equals($script:Scope, [StringComparison]::OrdinalIgnoreCase)) 'This volume does not provide an 8.3 parent fixture.'
+    try { $shortDirectory = [string]$fso.GetFolder($longDirectory).ShortPath } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($fso) }
+    Assert-True (!$shortDirectory.Equals($longDirectory, [StringComparison]::OrdinalIgnoreCase)) 'This volume does not provide an 8.3 parent fixture.'
     $alias = Join-Path $shortDirectory ([IO.Path]::GetFileName($file))
     $hash = File-Digest $file
     $deleted = Invoke-Prunlet @('delete', '--', $alias)
@@ -545,6 +563,7 @@ Test-Case '8.3 parent spelling records and restores the physical long path' {
     Assert-Rejected @('delete', '--paths-file', $duplicates) $file
     $fso = New-Object -ComObject Scripting.FileSystemObject
     try { $shortRecovery = [string]$fso.GetFolder($script:Recovery).ShortPath } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($fso) }
+    Assert-True (!$shortRecovery.Equals($script:Recovery, [StringComparison]::OrdinalIgnoreCase)) 'Recovery storage does not have an 8.3 fixture.'
     $protected = Join-Path $script:Recovery 'short-name-protected.txt'; [IO.File]::WriteAllText($protected, 'keep short recovery')
     Assert-Rejected @('delete', '--', (Join-Path $shortRecovery 'short-name-protected.txt')) $protected
 }
@@ -974,8 +993,18 @@ Test-Case 'junction ancestor rejected without changing target' {
     $link = Join-Path $script:Scope 'junction'; $null = New-Item -ItemType Junction -Path $link -Target $targetRoot
     Assert-Rejected @('delete', '--', (Join-Path $link 'target.txt')) $target
 }
+# 属性変更の失敗を先に列挙する: 復元先の権限不足、falseの不要な再設定、true属性の欠落、異なる大小文字の名前の衝突、失敗時の復元コピー消失。
 Test-Case 'case-sensitive directory roundtrip preserves distinct Foo and foo names' {
-    $caseRoot = Join-Path $script:Scope 'case-sensitive'; $null = New-Item -ItemType Directory -Path $caseRoot
+    $parent = Join-Path $script:Scope 'case-sensitive-full-control-parent'
+    $null = [IO.Directory]::CreateDirectory($parent)
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = Get-Acl -LiteralPath $parent
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new($identity, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit', [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+    $acl.AddAccessRule($rule)
+    Set-Acl -LiteralPath $parent -AclObject $acl
+    $grants = @((Get-Acl -LiteralPath $parent).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference -eq $identity -and $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl -and ($_.InheritanceFlags -band [Security.AccessControl.InheritanceFlags]::ContainerInherit) })
+    Assert-True ($grants.Count -gt 0) 'Case-sensitive restore parent lacks inheritable FullControl for the current user.'
+    $caseRoot = Join-Path $parent 'case-sensitive'; $null = New-Item -ItemType Directory -Path $caseRoot
     Enable-CaseSensitiveFixture $caseRoot
     $upper = Join-Path $caseRoot 'Foo'; $lower = Join-Path $caseRoot 'foo'
     [IO.File]::WriteAllText($upper, 'uppercase data'); [IO.File]::WriteAllText($lower, 'lowercase data')
@@ -984,6 +1013,68 @@ Test-Case 'case-sensitive directory roundtrip preserves distinct Foo and foo nam
     Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($caseRoot)) 'Case-sensitive directory deletion failed.'
     $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
     Assert-True ($restored.ExitCode -eq 0 -and [IO.File]::ReadAllText($upper) -ceq 'uppercase data' -and [IO.File]::ReadAllText($lower) -ceq 'lowercase data') 'Case-sensitive distinct names were not restored.'
+    Assert-True (Get-CaseSensitiveFixtureFlag $caseRoot) 'Restored directory lost its case-sensitive flag.'
+}
+Test-Case 'case-sensitive restore without attribute permission fails and retains recovery bytes' {
+    $parent = Join-Path $script:Scope 'case-sensitive-modify-parent'
+    $null = [IO.Directory]::CreateDirectory($parent)
+    $caseRoot = Join-Path $parent 'case-sensitive'; $null = [IO.Directory]::CreateDirectory($caseRoot)
+    Enable-CaseSensitiveFixture $caseRoot
+    $file = Join-Path $caseRoot 'kept.txt'; [IO.File]::WriteAllText($file, 'preserve denied restore bytes')
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity, [Security.AccessControl.FileSystemRights]::Modify, [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit', [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+    Set-Acl -LiteralPath $parent -AclObject $acl
+    $rules = @((Get-Acl -LiteralPath $parent).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    $modifyRights = [Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::Synchronize
+    Assert-True ($rules.Count -eq 1 -and $rules[0].IdentityReference -eq $identity -and $rules[0].AccessControlType -eq 'Allow' -and $rules[0].FileSystemRights -eq $modifyRights) 'Denied restore fixture must grant only current-user Modify.'
+    $probe = Join-Path $parent 'permission-probe'; $null = [IO.Directory]::CreateDirectory($probe)
+    Assert-True (!(Get-CaseSensitiveFixtureFlag $probe)) 'Permission probe unexpectedly inherited case sensitivity.'
+    Assert-True ([PrunletVerificationDirectoryFlags]::TryEnableCaseSensitive($probe) -eq 5) 'Modify fixture did not deny the actual case-sensitive attribute change with access denied.'
+    $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $caseRoot)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($caseRoot)) 'Denied restore fixture deletion failed.'
+    $operationRoot = Join-Path $script:Recovery $deleted.Json.operationId
+    $manifest = Join-Path $operationRoot 'manifest.json'; $manifestHash = File-Digest $manifest
+    $backups = @([IO.Directory]::EnumerateFiles($operationRoot) | Where-Object { [IO.Path]::GetExtension($_) -in @('.bak', '.bin') })
+    Assert-True ($backups.Count -gt 0) 'Denied restore fixture has no recovery copy.'
+    $hashes = @($backups | ForEach-Object { File-Digest $_ })
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -ne 0 -and ![IO.File]::Exists($file)) 'Restore ignored missing permission to enable case sensitivity.'
+    Assert-True ((File-Digest $manifest) -ceq $manifestHash) 'Denied restore changed the saved manifest.'
+    for ($index = 0; $index -lt $backups.Count; $index++) { Assert-True ((File-Digest $backups[$index]) -ceq $hashes[$index]) 'Denied restore changed recovery bytes.' }
+}
+Test-Case 'case-insensitive directory restores ADS and child under Modify without changing parent ACL' {
+    $parent = Join-Path $script:Scope 'case-insensitive-modify-parent'
+    $null = [IO.Directory]::CreateDirectory($parent)
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity, [Security.AccessControl.FileSystemRights]::Modify, [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit', [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+    Set-Acl -LiteralPath $parent -AclObject $acl
+    $parentAcl = Get-Acl -LiteralPath $parent
+    $rules = @($parentAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    $modifyRights = [Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::Synchronize
+    Assert-True ($rules.Count -eq 1 -and $rules[0].IdentityReference -eq $identity -and $rules[0].AccessControlType -eq 'Allow' -and $rules[0].FileSystemRights -eq $modifyRights) 'No-op restore fixture must grant only current-user Modify.'
+    $parentSddl = $parentAcl.Sddl
+    $probe = Join-Path $parent 'permission-probe'; $null = [IO.Directory]::CreateDirectory($probe)
+    Assert-True (!(Get-CaseSensitiveFixtureFlag $probe)) 'No-op permission probe unexpectedly inherited case sensitivity.'
+    Assert-True ([PrunletVerificationDirectoryFlags]::TryEnableCaseSensitive($probe) -eq 5) 'No-op Modify fixture must deny an actual attribute change with access denied.'
+    $caseRoot = Join-Path $parent 'case-insensitive'; $null = [IO.Directory]::CreateDirectory($caseRoot)
+    Assert-True (!(Get-CaseSensitiveFixtureFlag $caseRoot)) 'No-op restore source must start case-insensitive.'
+    $file = Join-Path $caseRoot 'child.txt'
+    [IO.File]::WriteAllText($file, 'Modify child bytes')
+    [IO.File]::WriteAllText($caseRoot + ':custom', 'Modify directory stream bytes')
+    $hash = File-Digest $file; $streamHash = File-Digest ($caseRoot + ':custom')
+    $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $caseRoot)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($caseRoot)) 'No-op Modify fixture deletion failed.'
+    $manifestPath = Join-Path (Join-Path $script:Recovery $deleted.Json.operationId) 'manifest.json'
+    $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -Depth 40
+    Assert-True ($manifest.schema -eq 3) 'Directory ADS fixture did not record schema 3.'
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0) ('Case-insensitive Modify restore failed: ' + ($restored.Json | ConvertTo-Json -Depth 30 -Compress))
+    Assert-True ((File-Digest $file) -ceq $hash -and (File-Digest ($caseRoot + ':custom')) -ceq $streamHash -and !(Get-CaseSensitiveFixtureFlag $caseRoot)) 'No-op Modify restore changed child bytes, directory ADS, or the false case-sensitive flag.'
+    Assert-True ((Get-Acl -LiteralPath $parent).Sddl -ceq $parentSddl) 'No-op Modify restore changed its parent ACL.'
 }
 Test-Case 'restore conflict never overwrites' {
     $file = New-File 'conflict.txt' 'original'
