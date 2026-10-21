@@ -54,7 +54,7 @@ pwsh -NoProfile -File $installer -RegisterCodex -RegisterAgentInstructions
 
 上の`-RegisterAgentInstructions`は、Codex homeの`PRUNLET.md`と、共通`AGENTS.md`の専用参照・配置済みexeと設定の絶対パスを登録する明示オプションです。各リポジトリへ追記せず、最初からCMD上のPrunlet CLIで削除するようCodexへ指示します。exe・設定のパス自体をCMDで安全に表現できない場合は、実行前に同じCoreを使うMCPを選びます。共通指示を変更したくない場合はこのオプションを外してください。
 
-共通指示を登録した導入の更新でも、同じ`-RegisterAgentInstructions`を指定してください。指定しない更新では共通指示に書き込みません。古い共通指示と新しい配置済みguideが異なる場合は、利用者の編集との区別を付けられないため自動更新・解除を拒否します。
+共通指示を登録した導入の更新でも、同じ`-RegisterAgentInstructions`を指定してください。指定しない更新では共通指示に書き込みません。その間に配置済みguideだけが更新されると、古い共通指示を利用者の編集と区別できず、後の自動更新・解除が停止することがあります。詳細は[エージェント共通指示](docs/integration.md#エージェント共通指示)を参照してください。
 
 更新時は最新版のインストーラーを再取得して実行します。既存の`config.json`と復元データを保持します。削除対象フォルダーの事前登録は不要です。旧`-AllowedRoot`は互換引数として受理しますが、削除範囲を制限しません。配置先は`-InstallDirectory`で変更できます。利用者のクローンパスをCodex設定へ登録することはありません。
 
