@@ -1502,6 +1502,7 @@ Test-Case 'MCP real stdio lifecycle/delete/restore/validation' {
         }
         $result = Rpc @{ jsonrpc = '2.0'; id = 1; method = 'initialize'; params = @{protocolVersion = '2025-11-25'; capabilities = @{}; clientInfo = @{name = 'prunlet-e2e'; version = 'development'}} }
         Assert-True ($result.result.protocolVersion -eq '2025-11-25') 'Version negotiation failed.'
+        Assert-True ($result.result.serverInfo.version -ceq [Diagnostics.FileVersionInfo]::GetVersionInfo($ExecutablePath).ProductVersion) 'MCP server version differs from the executable product version.'
         $process.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
         $tools = Rpc @{jsonrpc='2.0';id=2;method='tools/list';params=@{}}
         Assert-True ($tools.result.tools.Count -eq 3) 'MCP tools count differs.'

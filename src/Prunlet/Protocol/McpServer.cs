@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Reflection;
 using Prunlet.Core;
 
 namespace Prunlet.Protocol;
@@ -40,7 +41,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                     continue;
                 }
                 var parameters = request.TryGetProperty("params", out var p) ? p : default;
-                var result = Dispatch(method, parameters);
+                var result = DispatchWithProgress(method, parameters, output);
                 response = new { jsonrpc = "2.0", id, result };
             }
             catch (JsonException)
@@ -60,6 +61,30 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
         }
     }
 
+    private object DispatchWithProgress(string method, JsonElement parameters, TextWriter output)
+    {
+        // 進捗は要求に紐づけ、最終応答後やtokenのない要求へ流さない。
+        if (method != "tools/call" || parameters.ValueKind != JsonValueKind.Object ||
+            !parameters.TryGetProperty("_meta", out var metadata) || metadata.ValueKind != JsonValueKind.Object ||
+            !metadata.TryGetProperty("progressToken", out var token) ||
+            (token.ValueKind != JsonValueKind.String && (token.ValueKind != JsonValueKind.Number || !token.TryGetInt64(out _))))
+            return Dispatch(method, parameters);
+
+        long progress = 0;
+        void Report(TimeSpan elapsed, bool acquired)
+        {
+            output.WriteLine(JsonSerializer.Serialize(new
+            {
+                jsonrpc = "2.0", method = "notifications/progress",
+                @params = new { progressToken = token, progress = ++progress, message = Program.RecoveryLockMessage(elapsed, acquired) }
+            }, Program.JsonOptions));
+            output.Flush();
+        }
+        service.RecoveryLockProgress += Report;
+        try { return Dispatch(method, parameters); }
+        finally { service.RecoveryLockProgress -= Report; }
+    }
+
     private object Dispatch(string method, JsonElement parameters)
     {
         if (method == "ping") return new { };
@@ -72,7 +97,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
             {
                 protocolVersion = SupportedVersions.Contains(requestedVersion) ? requestedVersion : SupportedVersions[0],
                 capabilities = new { tools = new { listChanged = false } },
-                serverInfo = new { name = "prunlet", title = "Prunlet", version = "1.0.1" },
+                serverInfo = new { name = "prunlet", title = "Prunlet", version = typeof(McpServer).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion },
                 instructions = "Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true to include directory contents. The recovery directory and directories containing it are protected. Prunlet persists verified file copies and directory records before deletion. Recovery copies expire after 7 days by default; a shared 10 GiB budget may evict older operations sooner. Deletion applies this retention policy. Use restore_files with operationId while copies are retained to recover files and directory structure. Use dryRun to inspect targets. Symbolic links and junctions are deleted as links without following their targets. ADS and case-sensitive directory names are preserved. Hard links restore as independent snapshots. Wildcards and unknown reparse tags are unsupported. Existing host approvals and policies still apply."
             };
         }

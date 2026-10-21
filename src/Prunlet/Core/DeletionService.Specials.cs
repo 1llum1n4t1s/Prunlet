@@ -239,7 +239,22 @@ public sealed partial class DeletionService
     private static bool EquivalentSpecial(ManifestEntry left, ManifestEntry right) => left.Kind == right.Kind && left.Size == right.Size
         && left.Sha256 == right.Sha256 && left.ReparseTag == right.ReparseTag && left.LinkDirectory == right.LinkDirectory
         && left.CaseSensitive == right.CaseSensitive
-        && JsonSerializer.Serialize(left.Streams, PrunletConfig.JsonOptions) == JsonSerializer.Serialize(right.Streams, PrunletConfig.JsonOptions);
+        && EquivalentStreams(left.Streams, right.Streams);
+
+    private static bool EquivalentStreams(List<ManifestStream>? left, List<ManifestStream>? right)
+    {
+        if (ReferenceEquals(left, right)) return true;
+        if (left is null || right is null || left.Count != right.Count) return false;
+        for (var i = 0; i < left.Count; i++)
+        {
+            var a = left[i]; var b = right[i];
+            if (ReferenceEquals(a, b)) continue;
+            if (a is null || b is null || !string.Equals(a.Name, b.Name, StringComparison.Ordinal)
+                || a.Offset != b.Offset || a.Size != b.Size || !string.Equals(a.Sha256, b.Sha256, StringComparison.Ordinal))
+                return false;
+        }
+        return true;
+    }
 
     private static void MarkSpecialDeleted(SafeFileHandle source, ManifestEntry entry)
     {
@@ -345,7 +360,8 @@ public sealed partial class DeletionService
         var result = new RestoreResult { OperationId = manifest.OperationId };
         foreach (var entry in manifest.Items) result.Items.Add(new FileOperationResult { Path = entry.Path, Kind = entry.Kind, Schema2Wire = true, Status = "not_backed_up" });
         var copies = new Dictionary<int, FileStream>();
-        var pins = new List<DirectoryLease>();
+        var pins = new DirectoryLease();
+        var pinnedDirectories = new Dictionary<string, SafeFileHandle>(StringComparer.Ordinal);
         try
         {
             // どの復元先も作る前に、全コピーとストリーム記録を検証する。
@@ -382,7 +398,7 @@ public sealed partial class DeletionService
                             using var existing = NativeFiles.OpenAny(target);
                             if (!NativeFiles.IsReparse(existing) && NativeFiles.IsDirectory(existing) && NativeFiles.IsCaseSensitive(existing) == entry.CaseSensitive
                                 && NativeFiles.NamedStreams(existing).Count == 0 && entry.Streams!.Count == 0)
-                            { item.Status = "already_present"; pins.Add(PathPolicy.PinDirectories(target)); continue; }
+                            { item.Status = "already_present"; PathPolicy.PinDirectories(target, pins, pinnedDirectories); continue; }
                         }
                         item.Status = "conflict"; item.Error = "Original path already exists; nothing was overwritten.";
                         if (entry.Kind == "directory") blocked.Add(entry.Path);
@@ -390,7 +406,7 @@ public sealed partial class DeletionService
                     }
                     RestoreSpecialOne(entry, target, backup);
                     item.Status = "restored";
-                    if (entry.Kind == "directory") pins.Add(PathPolicy.PinDirectories(target));
+                    if (entry.Kind == "directory") PathPolicy.PinDirectories(target, pins, pinnedDirectories);
                 }
                 catch (Exception ex) when (IsOperational(ex))
                 { item.Status = "failed"; item.Error = ex.Message; if (entry.Kind == "directory") blocked.Add(entry.Path); }
@@ -402,7 +418,7 @@ public sealed partial class DeletionService
         }
         catch (Exception ex) when (IsOperational(ex))
         { foreach (var item in result.Items.Where(item => item.Status == "not_backed_up")) { item.Status = "failed"; item.Error = ex.Message; } }
-        finally { for (var i = pins.Count - 1; i >= 0; i--) pins[i].Dispose(); foreach (var backup in copies.Values) backup.Dispose(); }
+        finally { pins.Dispose(); foreach (var backup in copies.Values) backup.Dispose(); }
         TryWriteResult(Path.Combine(directory, $"restore-result-{Guid.NewGuid():N}.json"), result, result.Warnings);
         return result;
     }

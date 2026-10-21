@@ -288,7 +288,8 @@ public sealed partial class DeletionService
             var root = manifest.Items[indexes[0]];
             if (root.State != "backup_ready") continue;
             var copies = new Dictionary<int, FileStream>();
-            var directoryPins = new List<DirectoryLease>();
+            var directoryPins = new DirectoryLease();
+            var pinnedDirectories = new Dictionary<string, SafeFileHandle>(StringComparer.Ordinal);
             try
             {
                 // ツリーの全コピーを検証し固定してから復元先に変更を加える。
@@ -328,8 +329,7 @@ public sealed partial class DeletionService
                     using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(target)!);
                     var existed = Path.Exists(target);
                     if (!existed) NativeFiles.CreateDirectory(target);
-                    var pin = PathPolicy.PinDirectories(target);
-                    directoryPins.Add(pin);
+                    PathPolicy.PinDirectories(target, directoryPins, pinnedDirectories);
                     NativeFiles.RejectNamedStreams(target);
                     item.Status = existed ? "already_present" : "restored";
                 }
@@ -357,7 +357,7 @@ public sealed partial class DeletionService
             }
             finally
             {
-                for (var i = directoryPins.Count - 1; i >= 0; i--) directoryPins[i].Dispose();
+                directoryPins.Dispose();
                 foreach (var copy in copies.Values) copy.Dispose();
             }
         }

@@ -32,6 +32,8 @@ $binaryHash = (Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash
 
 # 想定する失敗: 短期競合の即失敗、60秒を超える調停待機の打ち切り、ロード中DLLの即失敗、
 # 失敗後の元対象・検証済みコピーの欠損、読み取り専用属性の無断解除。
+# 待機進捗の終了時までのバッファリング、繰返し・取得通知の欠落、無競合時の不要な出力、
+# MCPのtokenなし通知・token型変更・進捗逆行・stdout結果JSONへの診断混入。
 # バックアップ・identity検証エラーの非再試行は、Core担当の確認範囲とする。
 Add-Type -TypeDefinition @'
 using System;
@@ -48,6 +50,21 @@ function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { th
 function Digest([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 function Save-Json([string]$Path, [object]$Value) { [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false)) }
 function Manifests { @(Get-ChildItem -LiteralPath $script:Recovery -Filter manifest.json -Recurse -File) }
+function Receive-Lines($Reader, [ref]$Pending, $Lines, $Timer) {
+    while ($null -ne $Pending.Value -and $Pending.Value.IsCompleted) {
+        $line = $Pending.Value.GetAwaiter().GetResult()
+        if ($null -eq $line) { $Pending.Value = $null; break }
+        $Lines.Add(@{ text = $line; milliseconds = $Timer.Elapsed.TotalMilliseconds })
+        $Pending.Value = $Reader.ReadLineAsync()
+    }
+}
+function Assert-LockMessages($Lines) {
+    $waiting = @($Lines | Where-Object { $_.text -cmatch '^\[prunlet\] Waiting for recovery lock \([0-9]+\.[0-9]s elapsed\)\.$' })
+    $acquired = @($Lines | Where-Object { $_.text -cmatch '^\[prunlet\] Recovery lock acquired after [0-9]+\.[0-9]s\.$' })
+    Assert-True ($waiting.Count -ge 2 -and $acquired.Count -eq 1 -and $Lines.Count -eq $waiting.Count + 1) 'Expected repeated waiting messages and one acquired message only.'
+    Assert-True ($Lines[-1].text -ceq $acquired[0].text) 'Acquired message must follow all waiting messages.'
+    Assert-True ($waiting[0].milliseconds -lt $script:Evidence.releaseMilliseconds -and $waiting[1].milliseconds -lt $script:Evidence.releaseMilliseconds) 'Waiting messages were not received before lock release.'
+}
 function Invoke-Cli([string[]]$Arguments, [scriptblock]$Tick = {}, [int]$TimeoutSeconds = 75) {
     $values = @('--config', $script:Config) + $Arguments
     foreach ($value in @($ExecutablePath) + $values) { if ($value -match '["%&|<>^!\r\n]') { throw 'Unsafe CMD argument.' } }
@@ -65,23 +82,28 @@ function Invoke-Cli([string[]]$Arguments, [scriptblock]$Tick = {}, [int]$Timeout
     try {
         $null = $process.Start()
         $started = $true
-        $stdout = $process.StandardOutput.ReadToEndAsync(); $stderr = $process.StandardError.ReadToEndAsync()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderrLines = [Collections.Generic.List[object]]::new()
+        $stderrPending = $process.StandardError.ReadLineAsync()
         while (!$process.WaitForExit(25)) {
+            Receive-Lines $process.StandardError ([ref]$stderrPending) $stderrLines $timer
             & $Tick $timer.Elapsed.TotalMilliseconds
             if ($timer.Elapsed.TotalSeconds -gt $TimeoutSeconds) { throw 'CLI exceeded timeout.' }
         }
-        $raw = $stdout.GetAwaiter().GetResult(); $errorText = $stderr.GetAwaiter().GetResult()
+        while ($null -ne $stderrPending) { Receive-Lines $process.StandardError ([ref]$stderrPending) $stderrLines $timer }
+        $raw = $stdout.GetAwaiter().GetResult(); $errorText = ($stderrLines | ForEach-Object text) -join [Environment]::NewLine
         [IO.File]::WriteAllText($stdoutPath, $raw); [IO.File]::WriteAllText($stderrPath, $errorText)
         $entry = @{ case = [IO.Path]::GetFileName($script:CaseRoot); arguments = $Arguments; exitCode = $process.ExitCode; milliseconds = $timer.Elapsed.TotalMilliseconds; stdout = $stdoutPath; stderr = $stderrPath }
         $commands.Add($entry)
         $recorded = $true
         $json = if ($raw.Trim()) { $raw | ConvertFrom-Json -Depth 40 } else { $null }
-        return @{ ExitCode = $process.ExitCode; Json = $json; Milliseconds = $entry.milliseconds }
+        return @{ ExitCode = $process.ExitCode; Json = $json; Milliseconds = $entry.milliseconds; StderrLines = @($stderrLines) }
     } catch {
         if ($started -and !$recorded) {
             if (!$process.HasExited) { $process.Kill($true); $process.WaitForExit() }
             [IO.File]::WriteAllText($stdoutPath, $stdout.GetAwaiter().GetResult())
-            [IO.File]::WriteAllText($stderrPath, $stderr.GetAwaiter().GetResult())
+            while ($null -ne $stderrPending) { Receive-Lines $process.StandardError ([ref]$stderrPending) $stderrLines $timer }
+            [IO.File]::WriteAllText($stderrPath, (($stderrLines | ForEach-Object text) -join [Environment]::NewLine))
             $commands.Add(@{ case = [IO.Path]::GetFileName($script:CaseRoot); arguments = $Arguments; exitCode = $process.ExitCode; milliseconds = $timer.Elapsed.TotalMilliseconds; stdout = $stdoutPath; stderr = $stderrPath; harnessError = $_.Exception.Message })
         }
         throw
@@ -141,6 +163,7 @@ foreach ($longWait in @($false, $true)) {
                     Assert-True (@(Manifests).Count -eq 0 -and @(Get-ChildItem -LiteralPath $script:Recovery -Filter '*.bak' -Recurse -File).Count -eq 0) 'Coordination wait changed backup state beyond 60 seconds.'
                 }
                 if ($script:HeldLock -and $milliseconds -ge $script:Evidence.plannedHoldMilliseconds) {
+                    Assert-True ($stderrLines.Count -ge 2) 'Repeated CLI wait messages must arrive while the lock is still held.'
                     $script:Evidence.releaseMilliseconds = $milliseconds
                     $script:Evidence.cliAliveBeforeRelease = !$process.HasExited
                     $script:Evidence.manifestCountBeforeRelease = @(Manifests).Count
@@ -155,8 +178,108 @@ foreach ($longWait in @($false, $true)) {
             if ($longWait) { Assert-True ($script:Evidence.checkedBeyondSixtySeconds -ge 61000) 'CLI did not remain alive beyond 60 seconds.' }
             Assert-True ($script:Evidence.releaseMilliseconds -ge $script:Evidence.plannedHoldMilliseconds -and $script:Evidence.cliAliveBeforeRelease -and $script:Evidence.manifestCountBeforeRelease -eq 0) 'CLI did not wait before manifest creation.'
             Assert-True ($result.ExitCode -eq 0 -and ![IO.File]::Exists($source)) 'Released coordination lock did not allow deletion.'
+            $script:Evidence.stderrLines = $result.StderrLines
+            Assert-LockMessages $result.StderrLines
             Assert-Backup $hash
         } finally { if ($script:HeldLock) { $script:HeldLock.Dispose(); $script:HeldLock = $null } }
+    }
+}
+Test-Case 'maintenance-lock-uncontended-quiet' {
+    $source = Join-Path $script:CaseRoot 'source.txt'; [IO.File]::WriteAllText($source, 'uncontended fixture')
+    $hash = Digest $source
+    $result = Invoke-Cli @('delete', '--', $source)
+    Assert-True ($result.ExitCode -eq 0 -and ![IO.File]::Exists($source) -and $result.StderrLines.Count -eq 0) 'Uncontended CLI deletion should succeed without stderr diagnostics.'
+    Assert-Backup $hash
+}
+foreach ($tokenCase in @('string', 'number', 'absent')) {
+    Test-Case "mcp-maintenance-lock-$tokenCase" {
+        $source = Join-Path $script:CaseRoot 'source.txt'; [IO.File]::WriteAllText($source, 'MCP coordination fixture')
+        $hash = Digest $source
+        $token = if ($tokenCase -eq 'string') { 'lock-progress-token' } else { [long]123 }
+        $stdoutLines = [Collections.Generic.List[object]]::new()
+        $stderrLines = [Collections.Generic.List[object]]::new()
+        $stdoutPath = Join-Path $script:CaseRoot 'mcp.stdout.jsonl'
+        $stderrPath = Join-Path $script:CaseRoot 'mcp.stderr.txt'
+        $info = [Diagnostics.ProcessStartInfo]::new('cmd.exe')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+        $info.RedirectStandardInput = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false); $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+        $info.Arguments = '/d /s /c ""' + $ExecutablePath + '" --config "' + $script:Config + '" mcp"'
+        $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $started = $false; $stdoutPending = $null; $stderrPending = $null; $script:HeldLock = $null
+        try {
+            $null = $process.Start(); $started = $true
+            $stderrPending = $process.StandardError.ReadLineAsync()
+            $process.StandardInput.WriteLine((@{ jsonrpc = '2.0'; id = 1; method = 'initialize'; params = @{ protocolVersion = '2025-11-25'; capabilities = @{}; clientInfo = @{ name = 'prunlet-lock-e2e'; version = 'development' } } } | ConvertTo-Json -Depth 10 -Compress))
+            $process.StandardInput.Flush()
+            $initialize = $process.StandardOutput.ReadLineAsync()
+            Assert-True ($initialize.Wait(10000)) 'MCP initialization timed out.'
+            $initialized = $initialize.GetAwaiter().GetResult()
+            $stdoutLines.Add(@{ text = $initialized; milliseconds = $timer.Elapsed.TotalMilliseconds })
+            Assert-True (($initialized | ConvertFrom-Json).id -eq 1) 'MCP initialization response differs.'
+            $process.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
+            $script:HeldLock = [IO.FileStream]::new((Join-Path $script:Recovery 'maintenance.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            $parameters = @{ name = 'delete_files'; arguments = @{ paths = @($source) } }
+            if ($tokenCase -ne 'absent') { $parameters._meta = @{ progressToken = $token } }
+            $process.StandardInput.WriteLine((@{ jsonrpc = '2.0'; id = 2; method = 'tools/call'; params = $parameters } | ConvertTo-Json -Depth 10 -Compress))
+            $process.StandardInput.Flush()
+            $stdoutPending = $process.StandardOutput.ReadLineAsync()
+            $holdStarted = $timer.Elapsed.TotalMilliseconds
+            $response = $null
+            while ($null -eq $response) {
+                Receive-Lines $process.StandardOutput ([ref]$stdoutPending) $stdoutLines $timer
+                Receive-Lines $process.StandardError ([ref]$stderrPending) $stderrLines $timer
+                $responses = @($stdoutLines | ForEach-Object { $_.text | ConvertFrom-Json -Depth 40 } | Where-Object { $_.id -eq 2 })
+                if ($responses.Count -gt 0) { $response = $responses[0]; break }
+                if ($script:HeldLock -and $timer.Elapsed.TotalMilliseconds - $holdStarted -ge 7500) {
+                    Assert-True (!$process.HasExited -and $stderrLines.Count -ge 2) 'MCP wait diagnostics must arrive before lock release.'
+                    $beforeRelease = @($stdoutLines | ForEach-Object { $_.text | ConvertFrom-Json -Depth 40 } | Where-Object { $_.method -eq 'notifications/progress' })
+                    if ($tokenCase -eq 'absent') { Assert-True ($beforeRelease.Count -eq 0) 'MCP sent progress without a token.' }
+                    else { Assert-True ($beforeRelease.Count -ge 2) 'MCP progress notifications must arrive before lock release.' }
+                    Assert-True ([IO.File]::Exists($source) -and (Digest $source) -ceq $hash -and @(Manifests).Count -eq 0 -and @(Get-ChildItem -LiteralPath $script:Recovery -Filter '*.bak' -Recurse -File).Count -eq 0) 'MCP lock wait changed source or backup state.'
+                    $script:Evidence.releaseMilliseconds = $timer.Elapsed.TotalMilliseconds
+                    $script:HeldLock.Dispose(); $script:HeldLock = $null
+                }
+                if ($process.HasExited -or $timer.Elapsed.TotalSeconds -gt 30) { throw 'MCP lock request exited early or exceeded timeout.' }
+                Start-Sleep -Milliseconds 25
+            }
+            Assert-True ($null -eq $script:HeldLock -and !$response.result.isError -and $null -ne $response.result.structuredContent.operationId -and ![IO.File]::Exists($source)) 'MCP delete did not complete successfully after lock release.'
+            $process.StandardInput.Close()
+            Assert-True ($process.WaitForExit(10000) -and $process.ExitCode -eq 0) 'MCP did not shut down cleanly.'
+            while ($null -ne $stdoutPending) { Receive-Lines $process.StandardOutput ([ref]$stdoutPending) $stdoutLines $timer }
+            while ($null -ne $stderrPending) { Receive-Lines $process.StandardError ([ref]$stderrPending) $stderrLines $timer }
+            Assert-LockMessages $stderrLines
+            $messages = @($stdoutLines | ForEach-Object { $_.text | ConvertFrom-Json -Depth 40 })
+            $notifications = @($messages | Where-Object { $_.method -eq 'notifications/progress' })
+            Assert-True (@($messages | Where-Object { $_.id -eq 2 }).Count -eq 1 -and $messages.Count -eq 2 + $notifications.Count -and $messages[-1].id -eq 2) 'MCP stdout contained unexpected messages, duplicate results, or progress after completion.'
+            if ($tokenCase -eq 'absent') { Assert-True ($notifications.Count -eq 0) 'MCP sent progress without a token.' }
+            else {
+                Assert-True ($notifications.Count -eq $stderrLines.Count) 'MCP progress and stderr message counts differ.'
+                $previous = 0
+                for ($i = 0; $i -lt $notifications.Count; $i++) {
+                    $notification = $notifications[$i]
+                    Assert-True ($notification.jsonrpc -eq '2.0' -and $null -eq $notification.id -and $notification.params.progressToken -ceq $token -and $notification.params.progressToken.GetType() -eq $token.GetType()) 'MCP progress token value or type changed.'
+                    Assert-True ($notification.params.progress -gt $previous -and $notification.params.PSObject.Properties.Name -notcontains 'total' -and $notification.params.message -ceq $stderrLines[$i].text) 'MCP progress is not monotonic or its message differs.'
+                    $previous = $notification.params.progress
+                }
+            }
+            $script:Evidence.stderrLines = @($stderrLines)
+            $script:Evidence.progressNotifications = $notifications
+            $script:Evidence.result = $response
+            Assert-Backup $hash
+        } finally {
+            if ($script:HeldLock) { $script:HeldLock.Dispose(); $script:HeldLock = $null }
+            if ($started) {
+                if (!$process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+                while ($null -ne $stdoutPending) { Receive-Lines $process.StandardOutput ([ref]$stdoutPending) $stdoutLines $timer }
+                while ($null -ne $stderrPending) { Receive-Lines $process.StandardError ([ref]$stderrPending) $stderrLines $timer }
+                [IO.File]::WriteAllText($stdoutPath, (($stdoutLines | ForEach-Object text) -join [Environment]::NewLine))
+                [IO.File]::WriteAllText($stderrPath, (($stderrLines | ForEach-Object text) -join [Environment]::NewLine))
+                $commands.Add(@{ case = [IO.Path]::GetFileName($script:CaseRoot); arguments = @('mcp'); exitCode = $process.ExitCode; milliseconds = $timer.Elapsed.TotalMilliseconds; stdout = $stdoutPath; stderr = $stderrPath })
+            }
+            $process.Dispose()
+        }
     }
 }
 foreach ($persistent in @($false, $true)) {

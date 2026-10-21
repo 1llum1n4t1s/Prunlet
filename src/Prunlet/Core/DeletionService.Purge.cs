@@ -300,7 +300,7 @@ public sealed partial class DeletionService
             throw new InvalidDataException("Operation membership changed; purge stopped without touching unknown members.");
     }
 
-    private static void ValidatePurgeOutcome(FileStream stream, string kind, OperationManifest manifest, string directory, PurgeIntent? intent)
+    private static List<FileOperationResult> ValidatePurgeOutcome(FileStream stream, string kind, OperationManifest manifest, string directory, PurgeIntent? intent)
     {
         List<FileOperationResult> items;
         List<string> warnings;
@@ -345,6 +345,7 @@ public sealed partial class DeletionService
                 || (item.Size is not null && item.Size != expectedSize))
                 throw new InvalidDataException("Operation outcome item is invalid.");
         }
+        return items;
     }
 
     private static string ResolveRecordedBackupPath(string path, string pinnedDirectory)

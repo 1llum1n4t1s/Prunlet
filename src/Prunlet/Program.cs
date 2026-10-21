@@ -37,7 +37,7 @@ internal static class Program
                     Recovery copies expire after 7 days by default and share a 10 GiB budget.
                     Real deletion evicts expired/oldest copies as needed; maintain defaults to inspection only.
                     Empty directories are supported; deleting directory contents requires --recursive.
-                    Wildcard expansion and links are unsupported.
+                    Wildcard expansion is unsupported. Links are deleted without following their targets.
                     """);
                 return 0;
             }
@@ -58,6 +58,11 @@ internal static class Program
             }
             var config = PrunletConfig.Load(configPath);
             var service = new DeletionService(config);
+            service.RecoveryLockProgress += (elapsed, acquired) =>
+            {
+                Console.Error.WriteLine(RecoveryLockMessage(elapsed, acquired));
+                Console.Error.Flush();
+            };
             object result;
             switch (command)
             {
@@ -175,6 +180,11 @@ internal static class Program
         Write(new { status = "initialized", configPath, config.AllowedRoots, config.BackupDirectory });
         return 0;
     }
+
+    internal static string RecoveryLockMessage(TimeSpan elapsed, bool acquired) =>
+        acquired
+            ? string.Create(System.Globalization.CultureInfo.InvariantCulture, $"[prunlet] Recovery lock acquired after {elapsed.TotalSeconds:F1}s.")
+            : string.Create(System.Globalization.CultureInfo.InvariantCulture, $"[prunlet] Waiting for recovery lock ({elapsed.TotalSeconds:F1}s elapsed).");
 
     internal static object ListOperations(PrunletConfig config)
     {

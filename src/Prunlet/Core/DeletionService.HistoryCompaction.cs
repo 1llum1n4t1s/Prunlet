@@ -146,11 +146,10 @@ public sealed partial class DeletionService
         {
             var kind = PurgeMetadataKind(name);
             if (kind is null) continue;
-            ValidatePurgeOutcome(stream, kind, manifest, directory, intent);
+            var items = ValidatePurgeOutcome(stream, kind, manifest, directory, intent);
             if (kind == "purge")
             {
-                var outcome = ReadValidatedJson<PurgeResult>(stream);
-                completed |= outcome.Items.All(item => (item.Status is "purged" or "already_purged" or "not_backed_up")
+                completed |= items.All(item => (item.Status is "purged" or "already_purged" or "not_backed_up")
                     && string.IsNullOrEmpty(item.Error));
             }
         }

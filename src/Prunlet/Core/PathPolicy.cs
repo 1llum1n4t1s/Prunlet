@@ -91,6 +91,36 @@ internal static class PathPolicy
         catch { lease.Dispose(); throw; }
     }
 
+    // 同じ復元範囲で固定済みの祖先を共有し、失敗時は今回の取得分だけを戻す。
+    internal static void PinDirectories(string path, DirectoryLease lease, Dictionary<string, SafeFileHandle> pinned)
+    {
+        var firstHandle = lease.Handles.Count;
+        var addedPaths = new List<string>();
+        try
+        {
+            foreach (var ancestor in Components(path))
+            {
+                if (pinned.TryGetValue(ancestor, out var existing))
+                {
+                    NativeFiles.Verify(existing, ancestor, directory: true);
+                    continue;
+                }
+                var handle = NativeFiles.OpenDirectory(ancestor);
+                lease.Handles.Add(handle);
+                NativeFiles.Verify(handle, ancestor, directory: true);
+                addedPaths.Add(ancestor);
+                pinned.Add(ancestor, handle);
+            }
+        }
+        catch
+        {
+            for (var i = lease.Handles.Count - 1; i >= firstHandle; i--) lease.Handles[i].Dispose();
+            lease.Handles.RemoveRange(firstHandle, lease.Handles.Count - firstHandle);
+            foreach (var ancestor in addedPaths) pinned.Remove(ancestor);
+            throw;
+        }
+    }
+
     internal static DirectoryLease PinRecoveryDirectories(string path)
     {
         var lease = PinDirectories(path);
