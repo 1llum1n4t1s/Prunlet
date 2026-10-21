@@ -72,6 +72,12 @@ function Assert-SimpleIntegrationToml([string]$Text) {
         }
     }
 }
+function Test-TomlTrailingValues([string]$Text, [int]$Offset) {
+    $after = $Text.Substring($Offset)
+    $nextTable = [regex]::Match($after, '(?m)^[ \t]*\[')
+    $remainder = if ($nextTable.Success) { $after.Substring(0, $nextTable.Index) } else { $after }
+    return @($remainder -split '\r?\n' | Where-Object { $_.Trim() -and $_ -notmatch '^[ \t]*#' }).Count -gt 0
+}
 function Remove-OwnedBlock([string]$Text, [string]$Name) {
     $pattern = '(?m)^# BEGIN PRUNLET ' + [regex]::Escape($Name) + '\r?\n[\s\S]*?^# END PRUNLET ' + [regex]::Escape($Name) + '(?:\r?\n|$)'
     $matches = [regex]::Matches($Text, $pattern)
@@ -81,20 +87,14 @@ function Remove-OwnedBlock([string]$Text, [string]$Name) {
         $lines = @($block.Value -split '\r?\n' | Where-Object { $_ -and $_ -notmatch '^# (?:BEGIN|END) PRUNLET ' })
         if ($Name -eq 'MCP' -and ($lines.Count -ne 3 -or $lines[0] -cne '[mcp_servers.prunlet]' -or $lines[1] -notmatch '^command = "' -or $lines[2] -notmatch '^args = \[')) { throw 'Prunlet MCP block was edited; preserve it and review before uninstall.' }
         if ($Name -eq 'MCP') {
-            $after = $Text.Substring($block.Index + $block.Length)
-            $nextTable = [regex]::Match($after, '(?m)^[ \t]*\[')
-            $mcpRemainder = if ($nextTable.Success) { $after.Substring(0, $nextTable.Index) } else { $after }
-            if (@($mcpRemainder -split '\r?\n' | Where-Object { $_.Trim() -and $_ -notmatch '^[ \t]*#' }).Count) {
+            if (Test-TomlTrailingValues $Text ($block.Index + $block.Length)) {
                 throw 'User settings follow the Prunlet MCP marker; review before changing registration to preserve their table ownership.'
             }
         }
         if ($Name -eq 'HOOK-FEATURE') {
             if (@($lines | Where-Object { $_ -cne '[features]' -and $_ -cne 'hooks = true' }).Count -or @($lines | Where-Object { $_ -ceq 'hooks = true' }).Count -ne 1) { throw 'Prunlet hook feature block was edited; preserve it and review before uninstall.' }
             if ($lines -contains '[features]') {
-                $after = $Text.Substring($block.Index + $block.Length)
-                $nextTable = [regex]::Match($after, '(?m)^[ \t]*\[')
-                $featureRemainder = if ($nextTable.Success) { $after.Substring(0, $nextTable.Index) } else { $after }
-                if (@($featureRemainder -split '\r?\n' | Where-Object { $_.Trim() -and $_ -notmatch '^[ \t]*#' }).Count) {
+                if (Test-TomlTrailingValues $Text ($block.Index + $block.Length)) {
                     # 利用者が追加したfeatures値の所属テーブルを維持する。
                     return $Text.Remove($block.Index, $block.Length).Insert($block.Index, "[features]`n")
                 }

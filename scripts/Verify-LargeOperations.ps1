@@ -62,7 +62,11 @@ function Invoke-Cli([string[]]$Arguments, [string]$Executable = $ExecutablePath)
             try {
                 if ($null -eq $cli) {
                     $child = Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $process.Id) | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.Equals($Executable, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
-                    if ($child) { $cli = [Diagnostics.Process]::GetProcessById($child.ProcessId) }
+                    if ($child) {
+                        # 列挙後に終了した短命CLIは計測対象なしとし、結果JSONと終了コードの検証は続ける。
+                        try { $cli = [Diagnostics.Process]::GetProcessById($child.ProcessId) }
+                        catch [ArgumentException] { }
+                    }
                 }
                 if ($cli) {
                     $cli.Refresh()

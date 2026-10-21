@@ -22,7 +22,7 @@ while ($ancestor) {
 $intermediate = Join-Path $outputRoot 'obj'
 $publish = Join-Path $outputRoot 'publish'
 New-Item -ItemType Directory -Path $intermediate, $publish -Force | Out-Null
-& dotnet publish (Join-Path $repoRoot 'src\Prunlet\Prunlet.csproj') -c Release -r $Runtime --self-contained true -o $publish "-p:BaseIntermediateOutputPath=$intermediate\" "-p:BaseOutputPath=$outputRoot\bin\" '-p:PublishSingleFile=true' '-p:IncludeNativeLibrariesForSelfExtract=true' '-p:DebugType=None' '-p:DebugSymbols=false'
+& dotnet publish (Join-Path $repoRoot 'src\Prunlet\Prunlet.csproj') -c Release -r $Runtime --self-contained true -o $publish "-p:BaseIntermediateOutputPath=$intermediate\" "-p:BaseOutputPath=$outputRoot\bin\" '-p:PublishSingleFile=true' '-p:IncludeNativeLibrariesForSelfExtract=true' '-p:DebugType=None' '-p:DebugSymbols=false' '-p:UseSharedCompilation=false'
 if ($LASTEXITCODE -ne 0) { throw "Publish failed: $LASTEXITCODE" }
 $exe = Join-Path $publish 'prunlet.exe'
 [ordered]@{ executable = $exe; runtime = $Runtime; sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; bytes = (Get-Item -LiteralPath $exe).Length } | ConvertTo-Json
