@@ -34,23 +34,14 @@ $script:CaseRoot = $null; $script:Config = $null; $script:Recovery = $null
 # 非NTFS・未対応圧縮、ReadOnly/暗号化/sparse/未知属性、ADS/hardlink/reparse、破損JSON、
 # 不正intent/outcome、未知member・payload・未完履歴、lock競合・処理中の名前差替え、FSCTL失敗。
 # このE2EはNTFS上で実行する。非NTFS/EFS/FSCTL失敗の注入は行わない。
-. (Join-Path $PSScriptRoot 'HistoryVerification-Common.ps1')
-function Start-Cli([string[]]$Arguments, [switch]$Mcp) {
-    $values = @('--config', $script:Config) + $Arguments
-    foreach ($value in @($ExecutablePath) + $values) { if ($value -match '["%&|<>^!\r\n]') { throw 'Unsafe CMD argument.' } }
-    $info = [Diagnostics.ProcessStartInfo]::new('cmd.exe')
-    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
-    $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.RedirectStandardInput = [bool]$Mcp
-    $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false); $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
-    $info.Arguments = '/d /s /c ""' + $ExecutablePath + '" ' + (($values | ForEach-Object { '"' + $_ + '"' }) -join ' ') + '"'
-    $info.Environment['TEMP'] = Join-Path $outputRoot 'temp'; $info.Environment['TMP'] = Join-Path $outputRoot 'temp'
-    $info.Environment['UseSharedCompilation'] = 'false'; $info.Environment['MSBUILDDISABLENODEREUSE'] = '1'
-    $info.Environment['DOTNET_BUNDLE_EXTRACT_BASE_DIR'] = Join-Path $outputRoot 'runtime-cache'
-    $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
-    $null = $process.Start()
-    if ($Mcp) { return @{ Process = $process; Stderr = $process.StandardError.ReadToEndAsync() } }
-    return @{ Process = $process; Stdout = $process.StandardOutput.ReadToEndAsync(); Stderr = $process.StandardError.ReadToEndAsync(); Arguments = $Arguments }
+$script:CliEnvironment = @{
+    TEMP = Join-Path $outputRoot 'temp'
+    TMP = Join-Path $outputRoot 'temp'
+    UseSharedCompilation = 'false'
+    MSBUILDDISABLENODEREUSE = '1'
+    DOTNET_BUNDLE_EXTRACT_BASE_DIR = Join-Path $outputRoot 'runtime-cache'
 }
+. (Join-Path $PSScriptRoot 'HistoryVerification-Common.ps1')
 # 実装前に列挙した失敗: 登録権限不足、時刻トリガー不発火、CLI引数/環境変数の誤り、
 # タスク終了コードと実行時刻の不一致、圧縮せず成功扱い、JSON/SHA変更、物理削減なし、
 # 同名タスクとの衝突、所有確認なしの解除、失敗時のタスク解除漏れ。

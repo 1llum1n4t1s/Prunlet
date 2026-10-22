@@ -28,20 +28,10 @@ $script:CaseRoot = $null; $script:Config = $null; $script:Recovery = $null
 # 非NTFS・未対応圧縮、ReadOnly/暗号化/sparse/未知属性、ADS/hardlink/reparse、破損JSON、
 # 不正intent/outcome、未知member・payload・未完履歴、lock競合・処理中の名前差替え、FSCTL失敗。
 # このE2EはNTFS上で実行する。非NTFS/EFS/FSCTL失敗の注入は行わない。
-. (Join-Path $PSScriptRoot 'HistoryVerification-Common.ps1')
-function Start-Cli([string[]]$Arguments) {
-    $values = @('--config', $script:Config) + $Arguments
-    foreach ($value in @($ExecutablePath) + $values) { if ($value -match '["%&|<>^!\r\n]') { throw 'Unsafe CMD argument.' } }
-    $info = [Diagnostics.ProcessStartInfo]::new('cmd.exe')
-    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
-    $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
-    $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false); $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
-    $info.Arguments = '/d /s /c ""' + $ExecutablePath + '" ' + (($values | ForEach-Object { '"' + $_ + '"' }) -join ' ') + '"'
-    $info.Environment['DOTNET_BUNDLE_EXTRACT_BASE_DIR'] = Join-Path $outputRoot 'runtime-cache'
-    $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
-    $null = $process.Start()
-    return @{ Process = $process; Stdout = $process.StandardOutput.ReadToEndAsync(); Stderr = $process.StandardError.ReadToEndAsync(); Arguments = $Arguments }
+$script:CliEnvironment = @{
+    DOTNET_BUNDLE_EXTRACT_BASE_DIR = Join-Path $outputRoot 'runtime-cache'
 }
+. (Join-Path $PSScriptRoot 'HistoryVerification-Common.ps1')
 function Wait-CompressionStart($Running, [string]$Directory) {
     $watch = [Diagnostics.Stopwatch]::StartNew()
     while (!$Running.Process.HasExited -and $watch.ElapsedMilliseconds -lt 20000) {

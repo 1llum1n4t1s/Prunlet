@@ -9,6 +9,21 @@ function Digest([string]$Path) {
 
 function Save-Json([string]$Path, [object]$Value) { [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 50), [Text.UTF8Encoding]::new($false)) }
 
+function Start-Cli([string[]]$Arguments, [switch]$Mcp) {
+    $values = @('--config', $script:Config) + $Arguments
+    foreach ($value in @($ExecutablePath) + $values) { if ($value -match '["%&|<>^!\r\n]') { throw 'Unsafe CMD argument.' } }
+    $info = [Diagnostics.ProcessStartInfo]::new('cmd.exe')
+    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.RedirectStandardInput = [bool]$Mcp
+    $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false); $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    $info.Arguments = '/d /s /c ""' + $ExecutablePath + '" ' + (($values | ForEach-Object { '"' + $_ + '"' }) -join ' ') + '"'
+    foreach ($entry in $script:CliEnvironment.GetEnumerator()) { $info.Environment[$entry.Key] = $entry.Value }
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
+    $null = $process.Start()
+    if ($Mcp) { return @{ Process = $process; Stderr = $process.StandardError.ReadToEndAsync() } }
+    return @{ Process = $process; Stdout = $process.StandardOutput.ReadToEndAsync(); Stderr = $process.StandardError.ReadToEndAsync(); Arguments = $Arguments }
+}
+
 function Finish-Cli($Running) {
     $process = $Running.Process
     try {
