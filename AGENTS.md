@@ -25,6 +25,8 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 
 case-sensitive属性の復元を変更した場合は、通常E2Eの権限別ケースで、必要権限を付与した復元の成功、属性変更権限不足時の失敗と復元コピーの保全、同じ属性への不要な書込みをせずModify権限で復元できることを確認する。成功ケースだけで権限不足時の安全性を判断しない。
 
+読み取り専用対象の削除や通常属性の保存・復元を変更した場合は、[通常E2Eの検証範囲](docs/verification.md)に従い、dry-runと拒否時の元属性・コピーの保全、ハードリンクの別名とリンク先の不変更、schema 1/2/3の旧記録互換性、不正属性の拒否、圧縮境界での属性復元を確認する。ロード中の読み取り専用DLLの失敗時保全は`scripts/Verify-TransientLocks.ps1`でも確認する。
+
 大量操作に関係する変更では、通常E2Eに加えて`scripts/Verify-LargeOperations.ps1`へ今回のexeを渡す。[大量操作と途中バックアップの検証手順](docs/verification.md#大量操作と途中バックアップ)に従い、件数・記録サイズが旧上限を超えるschema 2/3の削除・復元・整理を確認する。
 
 保持期限・容量制限を変更した場合は、通常E2Eに加えて`scripts/Verify-Retention.ps1`へ今回のexeを渡す。[自動整理の検証手順](docs/verification.md#復元データの自動整理)に従い、旧設定の互換性、整理できないコピーの保全、並行削除時の容量制御を確認する。上限を超える単一操作については、複数入力の合計とschema 2/3を含むバックアップ・復元、dry-runの不変更、次回削除・maintainでの通常上限の再適用、整理できない既存コピーがある場合の元対象とコピーの保全も確認する。定期タスクの登録・解除を変更した場合は`scripts/Verify-LatestInstall.ps1`で所有者検証、既存タスクの保持、登録失敗時の復旧も確認する。
