@@ -284,7 +284,7 @@ try {
         [IO.File]::WriteAllText($target, 'unregistered install target')
         $deleted = (& $installedExe --config $installedConfig delete -- $target | ConvertFrom-Json)
         Assert-True ($LASTEXITCODE -eq 0 -and ![IO.File]::Exists($target)) 'Installed CLI requires target registration.'
-        $restored = (& $installedExe --config $installedConfig restore $deleted.operationId | ConvertFrom-Json)
+        $null = (& $installedExe --config $installedConfig restore $deleted.operationId | ConvertFrom-Json)
         Assert-True ($LASTEXITCODE -eq 0 -and [IO.File]::ReadAllText($target) -eq 'unregistered install target') 'Installed unrestricted restore differs.'
         $protected = Join-Path $install 'recovery\protected-install-target.txt'
         [IO.File]::WriteAllText($protected, 'keep recovery storage')
