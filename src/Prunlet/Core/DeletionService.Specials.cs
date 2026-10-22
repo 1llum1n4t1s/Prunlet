@@ -19,14 +19,34 @@ public sealed partial class DeletionService
         try
         {
             using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(path)!);
-            if (parents.Handles.Any(NativeFiles.IsCaseSensitive)) return true;
+            return HasSpecialTarget(path, recursive, parents.Handles);
+        }
+        catch (FileNotFoundException) { return false; }
+        catch (DirectoryNotFoundException) { return false; }
+    }
+
+    private static bool HasSpecialTarget(string path, bool recursive, List<SafeFileHandle> ancestors)
+    {
+        try
+        {
+            // 再帰元が保持している祖先を借用し、変更検査は各子で繰り返す。
+            foreach (var ancestor in ancestors) _ = NativeFiles.ResolveVerified(ancestor, directory: true);
+            if (ancestors.Any(NativeFiles.IsCaseSensitive)) return true;
             using var handle = NativeFiles.OpenAny(path);
             VerifySpecialHandle(handle, path);
             if (NativeFiles.IsReparse(handle)) return true;
             var directory = NativeFiles.IsDirectory(handle);
             if ((directory && NativeFiles.IsCaseSensitive(handle)) || (!directory && NativeFiles.LinkCount(handle) != 1)
                 || NativeFiles.NamedStreams(handle).Count != 0) return true;
-            return directory && recursive && Directory.EnumerateFileSystemEntries(path).Any(child => HasSpecialTarget(child, true));
+            if (!directory || !recursive) return false;
+            ancestors.Add(handle);
+            try
+            {
+                foreach (var child in Directory.EnumerateFileSystemEntries(path))
+                    if (HasSpecialTarget(child, true, ancestors)) return true;
+                return false;
+            }
+            finally { ancestors.RemoveAt(ancestors.Count - 1); }
         }
         catch (FileNotFoundException) { return false; }
         catch (DirectoryNotFoundException) { return false; }
@@ -215,11 +235,12 @@ public sealed partial class DeletionService
                     if (NativeFiles.Identity(stream.SafeFileHandle) != NativeFiles.Identity(source)) throw new IOException("Stream belongs to a different object.");
                     var record = new ManifestStream { Name = name, Offset = offset };
                     using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                    var buffer = ArrayPool<byte>.Shared.Rent(CopyBufferSize);
+                    var bufferSize = (int)Math.Clamp(stream.Length, 1L, CopyBufferSize);
+                    var buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
                     try
                     {
                         int count;
-                        while ((count = stream.Read(buffer, 0, CopyBufferSize)) != 0)
+                        while ((count = stream.Read(buffer, 0, bufferSize)) != 0)
                         { if (destination is not null) { reserve?.Invoke(count); destination.Write(buffer, 0, count); } digest.AppendData(buffer, 0, count); total.AppendData(buffer, 0, count); record.Size += count; }
                     }
                     finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }

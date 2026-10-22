@@ -142,11 +142,12 @@ public sealed partial class DeletionService
     }
 
     private static TreeNode AddTreeEntry(PreparedTree tree, OperationManifest manifest, DeleteResult result,
-        string path, string kind, string? root)
+        string path, string kind, string? root, TreeNode? parent = null)
     {
         var node = new TreeNode
         {
             Index = manifest.Items.Count,
+            Parent = parent,
             Entry = new ManifestEntry { Path = path, Kind = kind, TreeRoot = root, Schema2Wire = true },
             Item = new FileOperationResult { Path = path, Kind = kind, Status = "failed", Schema2Wire = true }
         };
@@ -175,15 +176,44 @@ public sealed partial class DeletionService
             }
             children.Sort(StringComparer.OrdinalIgnoreCase);
             if (!recursive && children.Count != 0) throw new IOException("Nonempty directories require explicit recursive deletion.");
+            var ancestors = new Stack<TreeNode>();
+            for (var ancestor = node; ancestor is not null; ancestor = ancestor.Parent) ancestors.Push(ancestor);
             foreach (var child in children)
             {
-                var canonical = ValidateAnyTarget(child);
+                var (canonical, directory) = InspectPinnedTreeChild(tree, ancestors, child);
                 if (!PathPolicy.Within(canonical, root) || !canonical.Equals(child, StringComparison.OrdinalIgnoreCase))
                     throw new IOException("Tree member resolves outside its recorded hierarchy.");
-                var nested = AddTreeEntry(tree, manifest, result, canonical, IsDirectoryPath(canonical) ? "directory" : "file", root);
+                var nested = AddTreeEntry(tree, manifest, result, canonical, directory ? "directory" : "file", root, node);
                 if (nested.Entry.Kind == "directory") pending.Enqueue(nested);
             }
         }
+    }
+
+    private (string Path, bool Directory) InspectPinnedTreeChild(PreparedTree tree, Stack<TreeNode> ancestors, string child)
+    {
+        try
+        {
+            var absolute = PathPolicy.Absolute(child);
+            // 固定済み祖先を再取得せず、型・reparse・実体パスは子ごとに再検査する。
+            foreach (var ancestor in tree.Parents!.Handles) _ = NativeFiles.ResolveVerified(ancestor, directory: true);
+            foreach (var ancestor in ancestors) NativeFiles.Verify(ancestor.Directory!, ancestor.Entry.Path, directory: true);
+            using var handle = NativeFiles.OpenAny(absolute);
+            var reparse = NativeFiles.IsReparse(handle);
+            var directory = NativeFiles.IsDirectory(handle);
+            var canonical = NativeFiles.FinalPath(handle);
+            if (reparse) VerifySpecialHandle(handle, canonical);
+            else NativeFiles.Verify(handle, canonical, directory);
+            if (directory && (canonical.Length == 3 || PathPolicy.Within(config.BackupDirectory, canonical)))
+                throw new ArgumentException("A drive root or ancestor of the recovery directory cannot be deleted.");
+            if (PathPolicy.Within(canonical, config.BackupDirectory))
+                throw new ArgumentException("Target path is inside the recovery directory.");
+            return (canonical, directory && !reparse);
+        }
+        catch (FileNotFoundException) { }
+        catch (DirectoryNotFoundException) { }
+        // 列挙後に消失した子は、従来の正規化・再出現検査を通して準備処理へ渡す。
+        var missing = ValidateAnyTarget(child);
+        return (missing, IsDirectoryPath(missing));
     }
 
     private static void DeletePreparedTree(PreparedTree tree)
@@ -382,6 +412,7 @@ public sealed partial class DeletionService
     private sealed class TreeNode
     {
         internal int Index { get; init; }
+        internal TreeNode? Parent { get; init; }
         internal ManifestEntry Entry { get; init; } = null!;
         internal FileOperationResult Item { get; init; } = null!;
         internal PreparedFile? File { get; set; }

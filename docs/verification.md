@@ -68,6 +68,20 @@ pwsh -NoProfile -File .\scripts\Verify-LargeOperations.ps1 -ExecutablePath <今�
 
 32,769ファイルをschema 3とschema 2の両方で削除・復元し、実manifestと結果が8 MiBを超えること、全ファイルの内容、既存ファイルの非上書き、purgeの検査・適用・再適用を確認します。CLI子プロセスの時間・メモリ・ハンドル数も記録します。通常E2Eでは旧schema 1/2/3の途中コピー、schema 2 purge intentの再開・改竄、正常コピーの破損、未知項目・link・ADS・hardlink、不正な巨大tokenや切断JSONを確認します。
 
+## 削除性能の比較
+
+削除速度を変更する場合は、通常E2Eに加えて次を実行します。`OutputDirectory`は新しい外部絶対パス、`ReportPath`も未使用の外部絶対パスとし、レポートの親は事前に用意します。WindowsローカルではD上の今回の作業領域を使います。旧版を比較する場合は`-BaselineExecutablePath`を指定し、省略時は今回のexeだけを測定します。
+
+```powershell
+pwsh -NoProfile -File .\scripts\Verify-DeletionPerformance.ps1 -ExecutablePath <今回のexe> -BaselineExecutablePath <変更前のexe> -OutputDirectory <新しい外部D作業領域> -ReportPath <外部DのJSONレポート> -Iterations 3
+```
+
+512個の32バイトファイル、深さ8の階層に128個の小ファイル、ルートと128個のファイルにADSを持つschema 3、0・1・1,024・131,071・131,072・131,073バイトの境界ケースを使います。境界サイズは通常データとschema 3の先頭6ファイルのADSで確認します。試行ごとにfixture・設定・復元先・TEMP/TMP・bundle展開先を独立させ、新旧の順序を交互に入れ替えます。削除の終了コード・全項目のstatus・元位置の不存在、schema、復元後の全ファイルとADSの全バイト、既存ファイルとの衝突時の非上書きを確認します。
+
+`delete --recursive`だけの経過時間・CLI自身のCPU時間・10 ms間隔で採取したworking setのピークとprivate bytesの最大値を試行別に記録し、成功した試行の経過時間中央値を集計します。メモリを採取できなかった短命プロセスの値は`null`です。CLI起動・復元コピーの永続化を含み、fixture作成と復元検証は時間に含みません。ウォームアップやOSキャッシュの消去は行わず、初回展開・ファイルキャッシュ・ディスクや他プロセスの負荷の影響が残るため、同じ環境で複数回比較します。性能値への閾値判定は設けません。
+
+終了コードとレポートの`passed` / `failed`、`results`の各試行、`summary`を読んで判定します。子プロセスの既定タイムアウトは120秒（`-ProcessTimeoutSeconds`で変更可）です。スクリプトは清掃しないため、利用中プロセスとリンクを確認したうえで、不要になった今回の`OutputDirectory`だけを配置済みPrunletで清掃します。失敗の再現に必要なfixtureと最小限のレポートは保持します。
+
 ## 操作履歴の圧縮
 
 履歴圧縮を変更した場合は、通常E2Eに加えて次を実行します。出力先とレポートは新しい外部絶対パスを指定し、親ディレクトリを事前に用意します。Windowsローカルの作業規約に従い、TEMP/TMPもD上の今回の作業領域へ指定します。

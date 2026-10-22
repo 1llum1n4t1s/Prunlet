@@ -224,11 +224,12 @@ public sealed partial class DeletionService
             entry.Attributes = NativeFiles.RestorableAttributes(source.SafeFileHandle);
             entry.LastWriteUtc = File.GetLastWriteTimeUtc(path);
             using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            var buffer = ArrayPool<byte>.Shared.Rent(CopyBufferSize);
+            var bufferSize = (int)Math.Clamp(source.Length, 1L, CopyBufferSize);
+            var buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
             try
             {
                 int count;
-                while ((count = source.Read(buffer, 0, CopyBufferSize)) != 0)
+                while ((count = source.Read(buffer, 0, bufferSize)) != 0)
                 {
                     ReserveRecoveryBytes(count);
                     backup.Write(buffer, 0, count);
