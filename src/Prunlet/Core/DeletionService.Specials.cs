@@ -222,17 +222,17 @@ public sealed partial class DeletionService
                         { if (destination is not null) { reserve?.Invoke(count); destination.Write(buffer, 0, count); } digest.AppendData(buffer, 0, count); total.AppendData(buffer, 0, count); record.Size += count; }
                     }
                     finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
-                    record.Sha256 = Convert.ToHexString(digest.GetHashAndReset()).ToLowerInvariant();
+                    record.Sha256 = Convert.ToHexStringLower(digest.GetHashAndReset());
                     offset = checked(offset + record.Size); entry.Streams.Add(record);
                 }
                 if (!names.SequenceEqual(NativeFiles.NamedStreams(source), StringComparer.Ordinal)) throw new IOException("Alternate stream membership changed during capture.");
-                entry.Size = offset; entry.Sha256 = Convert.ToHexString(total.GetHashAndReset()).ToLowerInvariant();
+                entry.Size = offset; entry.Sha256 = Convert.ToHexStringLower(total.GetHashAndReset());
                 verified?.Invoke();
                 return;
             }
             finally { foreach (var stream in held) stream.Dispose(); }
         }
-        entry.Size = offset; entry.Sha256 = Convert.ToHexString(total.GetHashAndReset()).ToLowerInvariant();
+        entry.Size = offset; entry.Sha256 = Convert.ToHexStringLower(total.GetHashAndReset());
         verified?.Invoke();
     }
 

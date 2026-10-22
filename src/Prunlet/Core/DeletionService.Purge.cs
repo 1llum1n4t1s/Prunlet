@@ -232,7 +232,7 @@ public sealed partial class DeletionService
     private static string HashStream(FileStream stream)
     {
         stream.Position = 0;
-        var hash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+        var hash = Convert.ToHexStringLower(SHA256.HashData(stream));
         stream.Position = 0;
         return hash;
     }

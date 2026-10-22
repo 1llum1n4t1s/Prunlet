@@ -25,8 +25,10 @@ $commands = [Collections.Generic.List[object]]::new()
 $script:CaseRoot = $null; $script:Config = $null; $script:Recovery = $null
 
 # 想定する失敗: 旧設定の既定値欠落、期限の誤判定、容量整理の順序違反、dry-runの変更、
-# 大きすぎる入力の部分削除、破損・稼働中コピーの削除、ADSの過少計上、未知項目の追跡、
-# 整理後の復元成功、繰り返し実行時の記録増殖。各ケースを独立した復元先で検証する。
+# 上限超過入力の拒否・バックアップ欠落・部分削除、次回操作での上限復帰漏れ、
+# 破損・稼働中コピーの削除、ADS・複数対象の過少計上、未知項目の追跡、
+# 整理後の誤った復元成功、並行超過入力の容量累積、繰り返し実行時の記録増殖。
+# 各ケースを独立した復元先で検証する。
 function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { throw $Message } }
 function Digest([string]$Path) {
     $stream = [IO.File]::OpenRead($Path)
@@ -144,12 +146,90 @@ Test-Case 'automatic-capacity-before-delete' {
     $fresh = Delete-Source (New-Source 'incoming.txt')
     Assert-True ((Backups $old).Count -eq 0 -and (Backups $fresh).Count -eq 1) 'Real delete exceeded the recovery budget.'
 }
-Test-Case 'oversized-input-preserves-source-and-existing-recovery' {
-    $old = Delete-Source (New-Source 'retained.txt' 32); Set-Age $old 8; Set-Policy 64
+foreach ($existing in @($false, $true)) {
+Test-Case "oversized-input-backup-and-restore-existing-$existing" {
+    $old = if ($existing) { Delete-Source (New-Source 'retained.txt' 32) } else { $null }
+    Set-Policy 64
+    $source = New-Source 'oversized.txt' 65; $hash = Digest $source
+    $root = Delete-Source $source
+    Assert-True ((Backups $root).Count -eq 1 -and (Digest (Backups $root)[0]) -ceq $hash) 'Oversized deletion did not retain a verified backup.'
+    if ($old) { Assert-True ((Backups $old).Count -eq 0) 'Oversized deletion retained earlier payload.' }
+    $restore = Invoke-Cli @('restore', [IO.Path]::GetFileName($root))
+    Assert-True ($restore.ExitCode -eq 0 -and [IO.File]::Exists($source) -and (Digest $source) -ceq $hash) 'Oversized backup was not restorable.'
+    $config = [IO.File]::ReadAllText($script:Config) | ConvertFrom-Json
+    Assert-True ($config.maxRecoveryBytes -eq 64) 'Oversized deletion permanently changed the configured limit.'
+}
+}
+Test-Case 'oversized-multiple-inputs-use-total-size' {
+    Set-Policy 64
+    $sources = @((New-Source 'first.txt' 40), (New-Source 'second.txt' 41))
+    $hashes = @($sources | ForEach-Object { Digest $_ })
+    $result = Invoke-Cli (@('delete', '--') + $sources)
+    Assert-True ($result.ExitCode -eq 0) 'Combined oversized deletion failed.'
+    $root = Join-Path $script:Recovery $result.Json.operationId
+    $backups = Backups $root; [Array]::Sort($backups)
+    Assert-True ($backups.Count -eq 2) 'Combined oversized deletion missed a backup.'
+    foreach ($index in 0..1) { Assert-True (![IO.File]::Exists($sources[$index]) -and (Digest $backups[$index]) -ceq $hashes[$index]) 'Combined oversized deletion changed or omitted payload.' }
+    $restore = Invoke-Cli @('restore', $result.Json.operationId)
+    Assert-True ($restore.ExitCode -eq 0) 'Combined oversized restore failed.'
+    foreach ($index in 0..1) { Assert-True ((Digest $sources[$index]) -ceq $hashes[$index]) 'Combined oversized restore changed payload.' }
+}
+foreach ($schema in @(2, 3)) {
+Test-Case "oversized-schema-$schema-tree-backup-and-restore" {
+    Set-Policy 64
+    $tree = Join-Path $script:CaseRoot 'tree'; $null = [IO.Directory]::CreateDirectory($tree)
+    $source = Join-Path $tree 'payload.txt'
+    [IO.File]::WriteAllBytes($source, [byte[]](1..$(if ($schema -eq 3) { 40 } else { 65 })))
+    $hash = Digest $source
+    if ($schema -eq 3) { [IO.File]::WriteAllBytes($source + ':custom', [byte[]](1..40)); $adsHash = Digest ($source + ':custom') }
+    $root = Delete-Source $tree -Recursive
+    $manifest = [IO.File]::ReadAllText((Join-Path $root 'manifest.json')) | ConvertFrom-Json
+    Assert-True ($manifest.schema -eq $schema -and (Backups $root).Count -gt 0) 'Oversized tree used the wrong schema or omitted its backup.'
+    $restore = Invoke-Cli @('restore', [IO.Path]::GetFileName($root))
+    Assert-True ($restore.ExitCode -eq 0 -and (Digest $source) -ceq $hash) 'Oversized tree restore changed payload.'
+    if ($schema -eq 3) { Assert-True ((Digest ($source + ':custom')) -ceq $adsHash) 'Oversized ADS restore changed the stream.' }
+}
+}
+Test-Case 'oversized-delete-dry-run-is-unchanged' {
+    $old = Delete-Source (New-Source 'retained.txt' 32); Set-Policy 64
     $source = New-Source 'oversized.txt' 65; $hash = Digest $source; $snapshot = Snapshot $script:Recovery
-    $result = Invoke-Cli @('delete', '--', $source)
-    Assert-True ($result.ExitCode -ne 0 -and [IO.File]::Exists($source) -and (Digest $source) -ceq $hash) 'Oversized source was changed.'
-    Assert-True ((Snapshot $script:Recovery) -ceq $snapshot) 'Impossible incoming request discarded old recovery.'
+    $dry = Invoke-Cli @('delete', '--dry-run', '--', $source)
+    Assert-True ($dry.ExitCode -eq 0 -and [IO.File]::Exists($source) -and (Digest $source) -ceq $hash -and (Snapshot $script:Recovery) -ceq $snapshot) 'Oversized dry-run changed its source or recovery.'
+}
+foreach ($next in @('maintain', 'delete')) {
+Test-Case "oversized-copy-expires-on-next-$next" {
+    Set-Policy 64
+    $root = Delete-Source (New-Source 'oversized.txt' 65)
+    if ($next -eq 'maintain') {
+        $result = Invoke-Cli @('maintain', '--apply')
+        Assert-True ($result.ExitCode -eq 0 -and $result.Json.retainedBytesAfter -le 64) 'Next maintenance did not reapply the configured budget.'
+    } else {
+        $fresh = Delete-Source (New-Source 'incoming.txt' 32)
+        Assert-True ((Backups $fresh).Count -eq 1) 'Next delete did not retain its own recovery.'
+    }
+    Assert-True ((Backups $root).Count -eq 0) 'Next operation retained the oversized copy above the normal limit.'
+}
+}
+foreach ($protected in @('corrupt', 'locked', 'unknown')) {
+Test-Case "oversized-input-preserves-$protected-recovery" {
+    $lock = $null
+    if ($protected -eq 'unknown') {
+        $root = Join-Path $script:Recovery 'unrecognized'; $null = [IO.Directory]::CreateDirectory($root)
+        $backup = Join-Path $root 'payload'; [IO.File]::WriteAllBytes($backup, [byte[]](1..32))
+    } else {
+        $root = Delete-Source (New-Source 'retained.txt' 32)
+        $backup = (Backups $root)[0]
+        if ($protected -eq 'corrupt') { [IO.File]::WriteAllBytes($backup, [byte[]](2..33)) }
+        else { $lock = [IO.File]::Open((Join-Path $root 'operation.lock'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    }
+    try {
+        Set-Policy 64
+        $backupHash = Digest $backup; $source = New-Source 'oversized.txt' 65; $sourceHash = Digest $source
+        $result = Invoke-Cli @('delete', '--', $source)
+        Assert-True ($result.ExitCode -ne 0 -and [IO.File]::Exists($source) -and (Digest $source) -ceq $sourceHash) 'Protected recovery allowed oversized deletion or its source changed.'
+        Assert-True ([IO.File]::Exists($backup) -and (Digest $backup) -ceq $backupHash) 'Oversized deletion discarded protected recovery.'
+    } finally { if ($lock) { $lock.Dispose() } }
+}
 }
 Test-Case 'delete-dry-run-preserves-expired-recovery' {
     $old = Delete-Source (New-Source 'expired.txt'); Set-Age $old 8; Set-Policy 64
@@ -281,10 +361,11 @@ Test-Case 'resume-partially-applied-purge-intent' {
     $result = Invoke-Cli @('maintain', '--apply')
     Assert-True ($result.ExitCode -eq 0 -and (Backups $root).Count -eq 0 -and (Digest $intentPath) -ceq $intentHash) 'Partial purge did not resume from its persisted intent.'
 }
-Test-Case 'concurrent-deletes-share-one-capacity-budget' {
+foreach ($incomingBytes in @(1048576, 1048577)) {
+Test-Case "concurrent-deletes-share-one-capacity-budget-$incomingBytes" {
     Set-Policy 1048576
     foreach ($round in 1..3) {
-        $processes = @(); $data = [byte[]]::new(1048576); [Random]::new($round).NextBytes($data)
+        $processes = @(); $data = [byte[]]::new($incomingBytes); [Random]::new($round).NextBytes($data)
         try {
             foreach ($index in 1..2) {
                 $source = Join-Path $script:CaseRoot "parallel-$round-$index.bin"; [IO.File]::WriteAllBytes($source, $data); $hash = Digest $source
@@ -302,14 +383,20 @@ Test-Case 'concurrent-deletes-share-one-capacity-budget' {
                 $process = $entry.process
                 if (!$process.WaitForExit(60000)) { $process.Kill($true); $process.WaitForExit(); throw 'Concurrent delete timed out.' }
                 $json = $entry.stdout.GetAwaiter().GetResult() | ConvertFrom-Json -Depth 50
-                $commands.Add(@{ case = 'concurrent-deletes-share-one-capacity-budget'; arguments = @('delete', $entry.source); exitCode = $process.ExitCode; response = $json; stderr = $entry.stderr.GetAwaiter().GetResult() })
-                if ($process.ExitCode -eq 0) { $successes++; Assert-True (![IO.File]::Exists($entry.source)) 'Successful concurrent delete retained its source.' }
+                $commands.Add(@{ case = [IO.Path]::GetFileName($script:CaseRoot); arguments = @('delete', $entry.source); exitCode = $process.ExitCode; response = $json; stderr = $entry.stderr.GetAwaiter().GetResult() })
+                if ($process.ExitCode -eq 0) {
+                    $successes++; Assert-True (![IO.File]::Exists($entry.source)) 'Successful concurrent delete retained its source.'
+                    $entry.operationRoot = Join-Path $script:Recovery $json.operationId
+                }
                 else { Assert-True ([IO.File]::Exists($entry.source) -and (Digest $entry.source) -ceq $entry.hash) 'Rejected concurrent delete changed its source.' }
             }
             $bytes = (Get-ChildItem -LiteralPath $script:Recovery -Recurse -Filter '*.bak' -File | Measure-Object Length -Sum).Sum
-            Assert-True ($successes -ge 1 -and $bytes -le 1048576) 'Concurrent deletes exceeded the shared recovery budget or both failed.'
+            Assert-True ($successes -ge 1 -and $bytes -eq $incomingBytes) 'Concurrent deletes accumulated recovery above their effective budget or both failed.'
+            $remaining = @($processes | Where-Object { $_.operationRoot -and (Backups $_.operationRoot).Count -gt 0 })
+            Assert-True ($remaining.Count -eq 1 -and (Digest (Backups $remaining[0].operationRoot)[0]) -ceq $remaining[0].hash) 'Concurrent deletion did not preserve the final verified backup.'
         } finally { foreach ($entry in $processes) { if (!$entry.process.HasExited) { $entry.process.Kill($true); $entry.process.WaitForExit() }; $entry.process.Dispose() } }
     }
+}
 }
 
 $passed = @($results | Where-Object passed).Count; $failed = $results.Count - $passed

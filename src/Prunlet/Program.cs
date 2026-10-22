@@ -186,7 +186,7 @@ internal static class Program
             ? string.Create(System.Globalization.CultureInfo.InvariantCulture, $"[prunlet] Recovery lock acquired after {elapsed.TotalSeconds:F1}s.")
             : string.Create(System.Globalization.CultureInfo.InvariantCulture, $"[prunlet] Waiting for recovery lock ({elapsed.TotalSeconds:F1}s elapsed).");
 
-    internal static object ListOperations(PrunletConfig config)
+    private static object ListOperations(PrunletConfig config)
     {
         config.Validate();
         return new OperationsResult
@@ -217,11 +217,7 @@ internal static class Program
             return typedItems.Any(item => !string.IsNullOrEmpty(item.Error) ||
                 item.Status is "failed" or "conflict" or "error" or "restore_failed");
 
-        var json = JsonSerializer.SerializeToElement(result, JsonOptions);
-        if (!json.TryGetProperty("items", out var items)) return false;
-        return items.EnumerateArray().Any(item =>
-            item.TryGetProperty("error", out var error) && error.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(error.GetString()) ||
-            item.TryGetProperty("status", out var status) && status.GetString() is "failed" or "conflict" or "error" or "restore_failed");
+        return false;
     }
 
     private static void Write(object value) => Console.WriteLine(JsonSerializer.Serialize(value, JsonOptions));

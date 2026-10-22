@@ -59,8 +59,7 @@ public sealed partial class DeletionService
                     if (frames.Count == 0 || IsMetadataArray(frames.Peek().Shape))
                         throw new InvalidDataException("Operation metadata property is misplaced.");
                     var frame = frames.Peek();
-                    ValidateMetadataString(ref reader, 128);
-                    var name = reader.GetString()!;
+                    var name = ValidateMetadataString(ref reader, 128);
                     if (!frame.Properties.Add(name)) throw new InvalidDataException("Operation metadata has duplicated properties.");
                     frame.PendingName = name;
                     frame.Pending = MetadataProperty(frame.Shape, name);
@@ -171,10 +170,13 @@ public sealed partial class DeletionService
         return value.Shape != MetadataShape.Scalar ? 64 : value.Token == JsonTokenType.String ? value.Characters * 6 + 2 : 64;
     }
 
-    private static void ValidateMetadataString(ref Utf8JsonReader reader, int characters)
+    private static string ValidateMetadataString(ref Utf8JsonReader reader, int characters)
     {
-        if (reader.ValueSpan.Length > characters * 6 || reader.GetString()!.Length > characters)
+        if (reader.ValueSpan.Length > characters * 6)
             throw new InvalidDataException("Operation metadata string is too long.");
+        var value = reader.GetString()!;
+        if (value.Length > characters) throw new InvalidDataException("Operation metadata string is too long.");
+        return value;
     }
 
     private static MetadataValue MetadataProperty(MetadataShape shape, string property)
@@ -243,7 +245,7 @@ public sealed partial class DeletionService
     }
 
     private static bool HasMetadataFields(MetadataFrame frame, string[] fields) =>
-        fields.All(field => frame.Properties.Any(property => property.Equals(field, StringComparison.Ordinal)));
+        fields.All(field => frame.Properties.TryGetValue(field, out var actual) && actual.Equals(field, StringComparison.Ordinal));
 
     private static bool IsMetadataArray(MetadataShape shape) =>
         shape is MetadataShape.Entries or MetadataShape.Targets or MetadataShape.Streams or MetadataShape.Results or MetadataShape.Warnings;

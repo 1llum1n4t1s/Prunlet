@@ -41,16 +41,18 @@ public sealed partial class DeletionService
             throw new IOException("Deletion preflight failed; no originals or recovery copies were removed. " +
                 string.Join(" ", preview.Items.Where(item => item.Error is not null).Select(item => item.Error)));
         var incoming = preview.Items.Aggregate(0L, (sum, item) => checked(sum + (item.Size ?? 0)));
-        if (incoming > config.MaxRecoveryBytes)
-            throw new IOException("The incoming recovery copy exceeds maxRecoveryBytes; original targets were retained.");
+        // 単一操作のコピーは保持上限を超えても確保し、次回の整理で通常の上限へ戻す。
+        var operationBudget = Math.Max(config.MaxRecoveryBytes, incoming);
         var maintenance = MaintainRecoveryCore(apply: true, incoming);
         if (!maintenance.CapacityKnown || !maintenance.BudgetSatisfied)
             throw new IOException("Recovery capacity could not be safely made available; original targets were retained. " + string.Join(" ", maintenance.Warnings));
-        remainingRecoveryBytes = config.MaxRecoveryBytes - maintenance.RetainedBytesAfter;
+        remainingRecoveryBytes = operationBudget - maintenance.RetainedBytesAfter;
         try
         {
             var result = DeleteDispatch(normalized, false, recursive);
             result.Warnings.AddRange(maintenance.Warnings);
+            if (incoming > config.MaxRecoveryBytes)
+                result.Warnings.Add("This operation's recovery copy may exceed maxRecoveryBytes and is eligible for cleanup at the next deletion or maintenance run.");
             return result;
         }
         finally { remainingRecoveryBytes = null; }
@@ -71,7 +73,7 @@ public sealed partial class DeletionService
         var normalized = paths.Select(ValidateTarget).ToArray();
         if (normalized.Distinct(StringComparer.OrdinalIgnoreCase).Count() != normalized.Length)
             throw new ArgumentException("Duplicate paths are not allowed.");
-        foreach (var path in normalized) PathPolicy.Inspect(path);
+        foreach (var path in normalized) PathPolicy.Resolve(path);
         var result = new DeleteResult { DryRun = dryRun };
         if (dryRun)
         {
@@ -234,9 +236,9 @@ public sealed partial class DeletionService
             }
             finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
             backup.Flush(true);
-            entry.Sha256 = Convert.ToHexString(digest.GetHashAndReset()).ToLowerInvariant();
+            entry.Sha256 = Convert.ToHexStringLower(digest.GetHashAndReset());
             backup.Position = 0;
-            var backupHash = Convert.ToHexString(SHA256.HashData(backup)).ToLowerInvariant();
+            var backupHash = Convert.ToHexStringLower(SHA256.HashData(backup));
             if (entry.Sha256 != backupHash || backup.Length != entry.Size)
                 throw new IOException("Backup size/hash verification failed. Source was not deleted.");
             item.BackupPath = backupPath;
@@ -290,7 +292,7 @@ public sealed partial class DeletionService
         // 呼び出し元が検証後も書込み・削除共有なしで保持するコピーは、その同じストリームを借用する。
         if (verifiedBackup is null)
         {
-            var digest = Convert.ToHexString(SHA256.HashData(backup)).ToLowerInvariant();
+            var digest = Convert.ToHexStringLower(SHA256.HashData(backup));
             if (backup.Length != entry.Size || !digest.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("Backup hash or size differs from the manifest.");
         }

@@ -44,6 +44,8 @@ public sealed partial class DeletionService
         result.CapacityKnown = scan.Known;
         var now = DateTimeOffset.UtcNow;
         var expiry = now.AddDays(-config.RetentionDays);
+        // 上限より大きい操作は既存コピーを安全に整理し、今回の見積り分だけを予約する。
+        var retainedBudget = Math.Max(0, config.MaxRecoveryBytes - incomingBytes);
         foreach (var candidate in scan.Candidates.OrderBy(candidate => candidate.CreatedUtc).ThenBy(candidate => candidate.Id, StringComparer.Ordinal))
         {
             if (candidate.CreatedUtc > now)
@@ -51,7 +53,7 @@ public sealed partial class DeletionService
                 result.Warnings.Add($"Recovery operation {candidate.Id} has a future timestamp and was retained.");
                 continue;
             }
-            if (candidate.CreatedUtc > expiry && result.RetainedBytesAfter <= config.MaxRecoveryBytes - incomingBytes) continue;
+            if (candidate.CreatedUtc > expiry && result.RetainedBytesAfter <= retainedBudget) continue;
             try
             {
                 // 自動整理も既存のintent永続化・コピー検証・操作ロックを通す。
@@ -78,7 +80,7 @@ public sealed partial class DeletionService
             result.RetainedBytesAfter = after.Bytes;
             result.CapacityKnown = after.Known;
         }
-        result.BudgetSatisfied = result.CapacityKnown && result.RetainedBytesAfter <= config.MaxRecoveryBytes - incomingBytes;
+        result.BudgetSatisfied = result.CapacityKnown && result.RetainedBytesAfter <= retainedBudget;
         if (!result.CapacityKnown) result.Warnings.Add("Recovery capacity is unknown because some data is busy or cannot be safely inspected.");
         else if (!result.BudgetSatisfied) result.Warnings.Add("Retained recovery data exceeds the available recovery budget; unverified copies were retained.");
         // 定期・明示maintainは既存履歴も対象とする。削除前は今回purgeした操作だけを検証し、

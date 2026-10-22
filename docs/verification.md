@@ -92,4 +92,4 @@ pwsh -NoProfile -File .\scripts\Verify-AutomaticHistorySchedule.ps1 -ExecutableP
 pwsh -NoProfile -File .\scripts\Verify-Retention.ps1 -ExecutablePath <今回のexe> -OutputDirectory <新しい外部Temp> -ReportPath <外部JSONレポート>
 ```
 
-既定の7日・10 GiBと旧設定の互換性、期限切れ・容量超過の古い操作からの整理、実削除前の自動整理、dry-runの不変更、大きすぎる入力の保全を確認します。容量境界には小さな設定値を使い、schema 2とADSを持つschema 3の実コピーを検証します。破損コピー・未検証の途中コピー・稼働中ロック・未知項目・reparse pointの保全と警告、整理後の復元拒否、途中のpurge intentからの再開、繰り返し実行時の記録増殖も確認します。2プロセスの実削除を3回競合させ、復元コピーの合計が共通の容量上限を超えないことも確認します。検証fixtureではmanifestの日時を変更して期限を再現し、実ユーザーの復元データは使用しません。
+既定の7日・10 GiBと旧設定の互換性、期限切れ・容量超過の古い操作からの整理、実削除前の自動整理、dry-runの不変更を確認します。上限を超える単一ファイル・複数ファイルの合計・再帰ツリー・ADSを持つ対象も、検証済みコピーを保持して削除・復元できること、次の削除やmaintainで通常の上限へ整理されることを確認します。容量境界には小さな設定値を使い、schema 2とADSを持つschema 3の実コピーを検証します。破損コピー・未検証の途中コピー・稼働中ロック・未知項目・reparse pointの保全と警告、整理後の復元拒否、途中のpurge intentからの再開、繰り返し実行時の記録増殖も確認します。2プロセスの実削除を競合させ、通常サイズは共通の設定上限、上限超過の操作は1操作の見積りサイズ以内に復元コピーの合計が収まることも確認します。検証fixtureではmanifestの日時を変更して期限を再現し、実ユーザーの復元データは使用しません。

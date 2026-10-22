@@ -132,11 +132,6 @@ internal static class PathPolicy
         catch { lease.Dispose(); throw; }
     }
 
-    internal static void Inspect(string path, bool finalDirectory = false)
-    {
-        Resolve(path, finalDirectory);
-    }
-
     private static IEnumerable<string> Components(string path)
     {
         yield return path[..3];

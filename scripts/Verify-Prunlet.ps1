@@ -1487,6 +1487,10 @@ Test-Case 'purge rejects operation traversal and ambiguous apply arguments' {
 }
 
 Test-Case 'MCP real stdio lifecycle/delete/restore/validation' {
+    # 想定する失敗: MCPだけ上限超過を拒否する、ADSを見積りから漏らす、コピーを即時整理して復元できない。
+    $config = [IO.File]::ReadAllText($script:Config) | ConvertFrom-Json -AsHashtable
+    $config.maxRecoveryBytes = 8
+    [IO.File]::WriteAllText($script:Config, ($config | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
     $process = Start-ProcessInfo $ExecutablePath @('--config', $script:Config, 'mcp')
     try {
         $errTask = $process.StandardError.ReadToEndAsync()
@@ -1515,6 +1519,7 @@ Test-Case 'MCP real stdio lifecycle/delete/restore/validation' {
         Assert-True ([IO.File]::Exists($file)) 'MCP notification caused deletion.'
         $deleted = Rpc @{jsonrpc='2.0';id=4;method='tools/call';params=@{name='delete_files';arguments=@{paths=@($file)}}}
         Assert-True (!$deleted.result.isError -and ![IO.File]::Exists($file)) 'MCP delete failed.'
+        Assert-True (@($deleted.result.structuredContent.warnings | Where-Object { $_ -match 'maxRecoveryBytes' }).Count -gt 0) 'MCP oversized recovery warning missing.'
         $restored = Rpc @{jsonrpc='2.0';id=5;method='tools/call';params=@{name='restore_files';arguments=@{operationId=$deleted.result.structuredContent.operationId}}}
         Assert-True (!$restored.result.isError -and [IO.File]::ReadAllText($file) -eq 'MCP content') 'MCP restore failed.'
         Assert-True ([IO.File]::ReadAllText($exactStream) -ceq 'MCP trailing stream') 'MCP trailing stream changed.'
