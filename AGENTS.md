@@ -27,13 +27,15 @@ case-sensitive属性の復元を変更した場合は、通常E2Eの権限別ケ
 
 大量操作に関係する変更では、通常E2Eに加えて`scripts/Verify-LargeOperations.ps1`へ今回のexeを渡す。[大量操作と途中バックアップの検証手順](docs/verification.md#大量操作と途中バックアップ)に従い、件数・記録サイズが旧上限を超えるschema 2/3の削除・復元・整理を確認する。
 
-保持期限・容量制限を変更した場合は、通常E2Eに加えて`scripts/Verify-Retention.ps1`へ今回のexeを渡す。[自動整理の検証手順](docs/verification.md#復元データの自動整理)に従い、旧設定の互換性、整理できないコピーの保全、並行削除時の容量上限を確認する。定期タスクの登録・解除を変更した場合は`scripts/Verify-LatestInstall.ps1`で所有者検証、既存タスクの保持、登録失敗時の復旧も確認する。
+保持期限・容量制限を変更した場合は、通常E2Eに加えて`scripts/Verify-Retention.ps1`へ今回のexeを渡す。[自動整理の検証手順](docs/verification.md#復元データの自動整理)に従い、旧設定の互換性、整理できないコピーの保全、並行削除時の容量制御を確認する。上限を超える単一操作については、複数入力の合計とschema 2/3を含むバックアップ・復元、dry-runの不変更、次回削除・maintainでの通常上限の再適用、整理できない既存コピーがある場合の元対象とコピーの保全も確認する。定期タスクの登録・解除を変更した場合は`scripts/Verify-LatestInstall.ps1`で所有者検証、既存タスクの保持、登録失敗時の復旧も確認する。
 
 リポジトリおよびCodex homeへ`bin`・`obj`・一時物・検証出力・バックアップを作らない。検証用出力とレポートには新しい外部絶対パスを渡し、レポートの親を事前に作る。検証後の保持と清掃は[検証手順](docs/verification.md)に従う。
 
 履歴圧縮を変更した場合は、通常E2Eに加えて`scripts/Verify-HistoryCompaction.ps1`でdry-runの不変更、物理容量の減少とJSON内容一致、冪等性、既存操作IDの互換性、ロック・リンク・不正metadataの保持を確認する。自動経路は`scripts/Verify-AutomaticHistory.ps1`でmaintain・CLI/MCP削除からの発火、保護対象の保持、既圧縮の再実行と容量集計の分離を確認し、`scripts/Verify-AutomaticHistorySchedule.ps1`で隔離した一回限りの時刻トリガーによる実行を確認する。手順は[履歴圧縮の検証](docs/verification.md#操作履歴の圧縮)を参照する。
 
 ## 導入と文書
+
+Dependabotと依存検証・自動マージのworkflowを変更する場合は、[依存更新の境界](DESIGN.md#依存更新の境界)にある検証条件と権限分離を維持する。依存検証CIの成功は、変更内容に応じた上記の追加E2Eを代替しない。
 
 対外表記ではREADME冒頭の副題を併記する。今後のX告知では本文と紹介画像に同じ副題を毎回含め、GitHubの説明欄も同じ表記に揃える。X告知本文には、README冒頭に沿った紹介文を毎回1文入れる。その紹介文には、`blocked by policy`による清掃の停止を減らす目的と、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約する使い方を含める。
 

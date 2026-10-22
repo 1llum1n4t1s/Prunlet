@@ -133,3 +133,9 @@ hookの起動はシステムの`cmd.exe /d /c call`を明示し、Codexが引き
 配置済みの旧PowerShell backendは、更新前の製品バックアップを検証してからCoreによるバックアップ付き削除で退役させる。通常経路に旧backendを残さない。
 
 検証は実exe・stdio・hook・登録スクリプトを別プロセスで動かし、外部JSONレポートへ結果を残す。latest導入のE2Eは検証用アーカイブと実GitHubの確認を区別する。Codex自身のhook読込・拒否・承認、共通指示の読込とCLI選択は別途実ホストで確認する。[検証手順](docs/verification.md)を参照する。
+
+## 依存更新の境界
+
+`.github/dependabot.yml`はGitHub ActionsとNuGetの更新を毎週月曜09:00（日本時間）に確認し、minor・patchをまとめ、majorは個別PRにする。`.github/workflows/dependency-validation.yml`はDependabotのPRまたは手動起動を対象に、Windows・.NET 10でrestore・buildとCLI・MCP・hookの通常E2Eを行う。出力はrunnerの一時領域へ分離し、checkoutの認証情報を保持せず、権限はcontentsの読取りに限定する。
+
+`.github/workflows/dependabot-auto-merge.yml`は、書込み権限を持つ処理を信頼済み既定ブランチ側で実行し、PRのコードは実行しない。対象は所有者`1llum1n4t1s`のリポジトリで、同一リポジトリから既定ブランチへ向けたDependabotの非draft PRに限る。依存更新として判定できる差分と署名済みコミットを検査し、workflowの変更は`uses`の参照更新だけを許可する。PRのhead SHAに対応する依存検証の最新実行が成功し、他のcheck・commit statusにも失敗や未完了がなく、競合がない場合だけマージを試みる。直前にhead・既定ブランチのSHAとマージ可能状態を再確認し、変更や未検証状態があれば保留する。GitHub側のマージ要件も維持する。依存検証の成功と書込み処理を分離することで、未検証のPRコードをマージ権限で実行する経路を避ける。
