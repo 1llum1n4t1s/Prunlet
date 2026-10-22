@@ -176,6 +176,7 @@ public sealed partial class DeletionService
     private static void CaptureSpecial(SafeFileHandle source, ManifestEntry entry, FileStream? destination, Action? verified = null, Action<int>? reserve = null)
     {
         VerifySpecialHandle(source, entry.Path);
+        entry.Attributes = NativeFiles.RestorableAttributes(source);
         var directory = NativeFiles.IsDirectory(source);
         using var total = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         long offset = 0;
@@ -238,7 +239,7 @@ public sealed partial class DeletionService
 
     private static bool EquivalentSpecial(ManifestEntry left, ManifestEntry right) => left.Kind == right.Kind && left.Size == right.Size
         && left.Sha256 == right.Sha256 && left.ReparseTag == right.ReparseTag && left.LinkDirectory == right.LinkDirectory
-        && left.CaseSensitive == right.CaseSensitive
+        && left.CaseSensitive == right.CaseSensitive && left.Attributes == right.Attributes
         && EquivalentStreams(left.Streams, right.Streams);
 
     private static bool EquivalentStreams(List<ManifestStream>? left, List<ManifestStream>? right)
@@ -258,7 +259,7 @@ public sealed partial class DeletionService
 
     private static void MarkSpecialDeleted(SafeFileHandle source, ManifestEntry entry)
     {
-        NativeFiles.SetDeletePending(source, true);
+        NativeFiles.SetOriginalDeletePending(source, true);
         try
         {
             // 最後の名前を削除保留にすると、新しいストリームの作成も拒否される。
@@ -269,7 +270,7 @@ public sealed partial class DeletionService
         }
         catch (Exception original)
         {
-            try { NativeFiles.SetDeletePending(source, false); }
+            try { NativeFiles.SetOriginalDeletePending(source, false); }
             catch (Exception cancellation)
             { throw new IOException($"{original.Message} Pending deletion could not be cancelled: {cancellation.Message}", original); }
             throw;
@@ -362,6 +363,7 @@ public sealed partial class DeletionService
         var copies = new Dictionary<int, FileStream>();
         var pins = new DirectoryLease();
         var pinnedDirectories = new Dictionary<string, SafeFileHandle>(StringComparer.Ordinal);
+        var restoredDirectories = new Dictionary<int, SafeFileHandle>();
         try
         {
             // どの復元先も作る前に、全コピーとストリーム記録を検証する。
@@ -406,14 +408,18 @@ public sealed partial class DeletionService
                     }
                     RestoreSpecialOne(entry, target, backup);
                     item.Status = "restored";
-                    if (entry.Kind == "directory") PathPolicy.PinDirectories(target, pins, pinnedDirectories);
+                    if (entry.Kind == "directory")
+                    {
+                        PathPolicy.PinDirectories(target, pins, pinnedDirectories);
+                        restoredDirectories.Add(i, pinnedDirectories[target]);
+                    }
                 }
                 catch (Exception ex) when (IsOperational(ex))
                 { item.Status = "failed"; item.Error = ex.Message; if (entry.Kind == "directory") blocked.Add(entry.Path); }
             }
             for (var i = manifest.Items.Count - 1; i >= 0; i--)
-                if (manifest.Items[i].Kind == "directory" && result.Items[i].Status == "restored" && manifest.Items[i].LastWriteUtc is DateTime stamp)
-                    try { Directory.SetLastWriteTimeUtc(manifest.Items[i].Path, stamp); }
+                if (manifest.Items[i].Kind == "directory" && result.Items[i].Status == "restored")
+                    try { RestoreDirectoryMetadata(manifest.Items[i], restoredDirectories[i]); }
                     catch (Exception ex) when (IsOperational(ex)) { result.Items[i].Status = "failed"; result.Items[i].Error = ex.Message; }
         }
         catch (Exception ex) when (IsOperational(ex))
@@ -432,15 +438,14 @@ public sealed partial class DeletionService
 
     private static void RestoreSpecialOne(ManifestEntry entry, string target, FileStream backup)
     {
+        var directory = entry.Kind == "directory" || entry.LinkDirectory;
+        SafeFileHandle handle;
         if (entry.Kind == "symlink")
         {
             backup.Position = 0; var bytes = new byte[checked((int)backup.Length)]; backup.ReadExactly(bytes);
-            NativeFiles.CreateSymbolicDestination(target, bytes, entry.LinkDirectory);
-            return;
+            handle = NativeFiles.CreateSymbolicDestination(target, bytes, entry.LinkDirectory);
         }
-        var directory = entry.Kind == "directory" || entry.LinkDirectory;
-        SafeFileHandle handle;
-        if (directory)
+        else if (directory)
         {
             handle = NativeFiles.CreateDirectoryDestination(target);
         }
@@ -452,8 +457,12 @@ public sealed partial class DeletionService
                 VerifySpecialHandle(handle, target);
                 if (entry.Kind is "symlink" or "junction")
                 {
-                    backup.Position = 0; var bytes = new byte[checked((int)backup.Length)]; backup.ReadExactly(bytes);
-                    NativeFiles.WriteReparse(handle, bytes);
+                    if (entry.Kind == "junction")
+                    {
+                        backup.Position = 0; var bytes = new byte[checked((int)backup.Length)]; backup.ReadExactly(bytes);
+                        NativeFiles.WriteReparse(handle, bytes);
+                    }
+                    NativeFiles.RestoreAttributes(handle, entry.Attributes);
                     return;
                 }
                 if (directory) NativeFiles.SetCaseSensitive(handle, entry.CaseSensitive);
@@ -465,11 +474,15 @@ public sealed partial class DeletionService
                     if (destination.Length != record.Size || !Convert.ToHexString(SHA256.HashData(destination)).Equals(record.Sha256, StringComparison.OrdinalIgnoreCase))
                         throw new IOException("Restored stream hash or size differs.");
                 }
-                if (!directory && entry.LastWriteUtc is DateTime timestamp) File.SetLastWriteTimeUtc(target, timestamp);
+                if (!directory)
+                {
+                    if (entry.LastWriteUtc is DateTime timestamp) NativeFiles.RestoreLastWriteTime(handle, timestamp);
+                    NativeFiles.RestoreAttributes(handle, entry.Attributes);
+                }
             }
             catch (Exception original) when (IsOperational(original))
             {
-                try { NativeFiles.DeleteHandle(handle); }
+                try { NativeFiles.DeleteOriginalHandle(handle); }
                 catch (Exception cleanup) when (IsOperational(cleanup)) { throw new IOException($"{original.Message} Partial object cleanup failed: {cleanup.Message}", original); }
                 throw;
             }

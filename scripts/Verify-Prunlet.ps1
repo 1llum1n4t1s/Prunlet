@@ -25,6 +25,9 @@ $null = New-Item -ItemType Directory -Path $script:Scope, $script:Recovery
 $script:Results = [Collections.Generic.List[object]]::new()
 $script:SymbolicRestoreEvidence = [Collections.Generic.List[object]]::new()
 
+# 読み取り専用対応で想定する失敗: 削除不可、dry-runの属性変更、復元時の通常属性・内容・時刻の欠落、
+# 再帰/ADS/MCPの経路漏れ、外部hardlink・リンク先の属性変更、旧manifest非互換、不正属性の受理、
+# ACL拒否・ロード中DLL失敗後の元属性や検証済みコピーの欠損（DLLはVerify-TransientLocksで確認）。
 function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { throw $Message } }
 function New-File([string]$Name, [string]$Content = 'Prunlet fixture') {
     $path = Join-Path $script:Scope $Name
@@ -653,19 +656,22 @@ Test-Case 'recursive junction deletion restores link without traversing external
     Assert-TreeIntact $tree
     Assert-True ((File-Digest $file) -ceq $hash -and (File-Digest (Join-Path $link 'keep.txt')) -ceq $hash) 'Restored junction target differs.'
 }
-Test-Case 'recursive ADS and hardlink deletion restores bytes and preserves external names' {
+Test-Case 'recursive read-only ADS and hardlink deletion restores bytes attributes and preserves external names' {
     foreach ($kind in @('ads', 'hardlink')) {
         $tree = New-TreeFixture ('directory-' + $kind)
         if ($kind -eq 'ads') { [IO.File]::WriteAllText($tree.Files[1] + ':custom', 'keep ADS') }
         else { $alias = Join-Path $outputRoot 'directory-hardlink-alias.txt'; $null = New-Item -ItemType HardLink -Path $alias -Target $tree.Files[1] }
+        $attributes = [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::Archive
+        [IO.File]::SetAttributes($tree.Files[1], $attributes)
         $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $tree.Root)
         Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree.Root)) 'Special recursive deletion failed.'
-        if ($kind -eq 'hardlink') { Assert-True ((File-Digest $alias) -ceq $tree.Hashes[1]) 'Deletion changed external hardlink bytes.' }
+        if ($kind -eq 'hardlink') { Assert-True ((File-Digest $alias) -ceq $tree.Hashes[1] -and [IO.File]::GetAttributes($alias) -eq $attributes) 'Deletion changed external hardlink bytes or attributes.' }
         $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
         Assert-True ($restored.ExitCode -eq 0) 'Special recursive restore failed.'
         Assert-TreeIntact $tree
+        Assert-True ([IO.File]::GetAttributes($tree.Files[1]) -eq $attributes) 'Special recursive restore changed read-only file attributes.'
         if ($kind -eq 'ads') { Assert-True ([IO.File]::ReadAllText($tree.Files[1] + ':custom') -ceq 'keep ADS') 'Nested ADS changed.' }
-        else { Assert-True ((File-Digest $alias) -ceq $tree.Hashes[1]) 'Restore changed external hardlink bytes.' }
+        else { Assert-True ((File-Digest $alias) -ceq $tree.Hashes[1] -and [IO.File]::GetAttributes($alias) -eq $attributes) 'Restore changed external hardlink bytes or attributes.' }
     }
 }
 Test-Case 'directory ADS roundtrip restores stream bytes and every tree member' {
@@ -911,15 +917,23 @@ Test-Case 'case-sensitive operation storage rejects restore and purge without mu
     Assert-Rejected @('purge', $deleted.Json.operationId, '--apply') '' 'case-sensitive operation storage'
     Assert-True (![IO.File]::Exists($file) -and (File-Digest $backup) -ceq $hash -and (File-Digest $manifest) -ceq $manifestHash -and ![IO.File]::Exists((Join-Path $root 'purge-intent.json'))) 'Case-sensitive storage rejection changed source or recovery.'
 }
-Test-Case 'symbolic link roundtrip preserves target content' {
+Test-Case 'read-only symbolic link restores its attributes and preserves target content' {
     $target = New-File 'link-target.txt'; $link = Join-Path $script:Scope 'link.txt'
     New-SymbolicFixture $link $target
+    & attrib +r +h $link /l
+    Assert-True ($LASTEXITCODE -eq 0) 'Could not set attributes on the symbolic link itself.'
+    $linkAttributes = (Get-Item -LiteralPath $link -Force).Attributes
+    Assert-True (($linkAttributes -band ([IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Hidden)) -eq ([IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Hidden)) 'Symbolic link fixture is not read-only and hidden.'
+    [IO.File]::SetAttributes($target, [IO.FileAttributes]::ReadOnly)
     $hash = File-Digest $target
     $deleted = Invoke-Prunlet @('delete', '--', $link)
     Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($link) -and (File-Digest $target) -ceq $hash) 'Symbolic link deletion changed target.'
+    Assert-True ([IO.File]::GetAttributes($target) -eq [IO.FileAttributes]::ReadOnly) 'Symbolic link deletion changed target attributes.'
     $restored = Restore-SymbolicFixture $deleted.Json.operationId $link $target $hash
+    Assert-True ([IO.File]::GetAttributes($target) -eq [IO.FileAttributes]::ReadOnly) 'Symbolic link restore changed target attributes.'
     Assert-True ($restored.ExitCode -eq 0) ('Symbolic link restore failed: ' + ($restored.Json | ConvertTo-Json -Depth 30 -Compress) + '; stderr=' + $restored.Stderr)
     Assert-True (((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -and (File-Digest $link) -ceq $hash -and (File-Digest $target) -ceq $hash) 'Symbolic link restore changed target or link type.'
+    Assert-True ((Get-Item -LiteralPath $link -Force).Attributes -eq $linkAttributes) 'Symbolic link restore changed the original link attributes.'
 }
 Test-Case 'directory symbolic link roundtrip never traverses target' {
     $targetRoot = Join-Path $outputRoot 'directory-symbolic-target'; $null = New-Item -ItemType Directory -Path $targetRoot
@@ -1096,10 +1110,126 @@ Test-Case 'restore operation traversal rejected' { Assert-Rejected @('restore', 
 Test-Case 'duplicate deletion paths rejected before mutation' {
     $file = New-File 'duplicate.txt'; Assert-Rejected @('delete', '--', $file, $file) $file
 }
-Test-Case 'read-only source failure preserves original' {
-    $file = New-File 'read-only.txt'; [IO.File]::SetAttributes($file, [IO.FileAttributes]::ReadOnly)
-    try { Assert-Rejected @('delete', '--', $file) $file }
-    finally { [IO.File]::SetAttributes($file, [IO.FileAttributes]::Normal) }
+Test-Case 'read-only schema 1 dry-run and roundtrip preserve bytes timestamp and ordinary attributes' {
+    foreach ($attributes in @([IO.FileAttributes]::ReadOnly, ([IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System -bor [IO.FileAttributes]::Archive))) {
+        $file = New-File ('read-only-' + [int]$attributes + '.txt') 'readonly 日本語 bytes'
+        [IO.File]::SetLastWriteTimeUtc($file, [datetime]::new(2021, 2, 3, 4, 5, 6, [DateTimeKind]::Utc))
+        [IO.File]::SetAttributes($file, $attributes)
+        $hash = File-Digest $file; $time = [IO.File]::GetLastWriteTimeUtc($file)
+        $members = @([IO.Directory]::EnumerateFileSystemEntries($script:Recovery))
+        $dry = Invoke-Prunlet @('delete', '--dry-run', '--', $file)
+        Assert-True ($dry.ExitCode -eq 0 -and (File-Digest $file) -ceq $hash -and [IO.File]::GetAttributes($file) -eq $attributes -and [IO.File]::GetLastWriteTimeUtc($file) -eq $time) 'Read-only dry-run changed source.'
+        Assert-True ((@([IO.Directory]::EnumerateFileSystemEntries($script:Recovery)) -join '|') -ceq ($members -join '|')) 'Read-only dry-run wrote recovery data.'
+        $deleted = Invoke-Prunlet @('delete', '--', $file)
+        Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($file)) 'Read-only deletion failed.'
+        $manifest = [IO.File]::ReadAllText((Join-Path (Join-Path $script:Recovery $deleted.Json.operationId) 'manifest.json')) | ConvertFrom-Json
+        Assert-True ($manifest.schema -eq 1) 'Ordinary read-only file must retain schema 1.'
+        $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+        Assert-True ($restored.ExitCode -eq 0 -and (File-Digest $file) -ceq $hash -and [IO.File]::GetAttributes($file) -eq $attributes -and [IO.File]::GetLastWriteTimeUtc($file) -eq $time) 'Read-only roundtrip changed bytes, timestamp or attributes.'
+    }
+}
+Test-Case 'recursive schema 2 restores read-only files and directories with ordinary attributes' {
+    $tree = New-TreeFixture 'read-only-tree'
+    $fileAttributes = [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::Archive
+    $directoryAttributes = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::System
+    [IO.File]::SetAttributes($tree.Files[1], $fileAttributes)
+    [IO.File]::SetAttributes($tree.Nested, $directoryAttributes)
+    $deleted = Invoke-Prunlet @('delete', '--recursive', '--', $tree.Root)
+    Assert-True ($deleted.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree.Root)) 'Read-only tree deletion failed.'
+    $manifest = [IO.File]::ReadAllText((Join-Path (Join-Path $script:Recovery $deleted.Json.operationId) 'manifest.json')) | ConvertFrom-Json
+    Assert-True ($manifest.schema -eq 2) 'Ordinary tree must retain schema 2.'
+    $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0) 'Read-only tree restore failed.'
+    Assert-TreeIntact $tree
+    Assert-True ([IO.File]::GetAttributes($tree.Files[1]) -eq $fileAttributes -and [IO.File]::GetAttributes($tree.Nested) -eq $directoryAttributes) 'Recursive restore changed ordinary attributes.'
+}
+# 構造属性だけの0とNormalの表現差で復元失敗しないことを、両方向の圧縮継承で確認する。
+Test-Case 'ordinary attributes none and Normal restore across NTFS compression boundaries' {
+    foreach ($compressedSource in @($true, $false)) {
+        $parent = Join-Path $script:Scope ('attribute-compression-' + $compressedSource)
+        $null = [IO.Directory]::CreateDirectory($parent)
+        $file = Join-Path $parent 'source.txt'
+        [IO.File]::WriteAllText($file, ('compression attribute fixture ' * 1000))
+        if ($compressedSource) { & compact.exe /c $file | Out-Null; Assert-True ($LASTEXITCODE -eq 0) 'Could not compress the source fixture.' }
+        [IO.File]::SetAttributes($file, [IO.FileAttributes]::Normal)
+        $sourceAttributes = if ($compressedSource) { [IO.FileAttributes]::Compressed } else { [IO.FileAttributes]::Normal }
+        Assert-True ([IO.File]::GetAttributes($file) -eq $sourceAttributes) 'Source fixture has unexpected ordinary or structural attributes.'
+        $hash = File-Digest $file; $timestamp = [IO.File]::GetLastWriteTimeUtc($file)
+        $deleted = Invoke-Prunlet @('delete', '--', $file)
+        Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($file)) 'Compression-boundary fixture deletion failed.'
+        if (!$compressedSource) { & compact.exe /c $parent | Out-Null; Assert-True ($LASTEXITCODE -eq 0) 'Could not enable compression inheritance on the destination.' }
+        $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+        Assert-True ($restored.ExitCode -eq 0 -and [IO.File]::Exists($file) -and (File-Digest $file) -ceq $hash -and [IO.File]::GetLastWriteTimeUtc($file) -eq $timestamp) 'Compression-boundary restore changed bytes or timestamp, or failed.'
+        $restoredAttributes = if ($compressedSource) { [IO.FileAttributes]::Normal } else { [IO.FileAttributes]::Compressed }
+        Assert-True ([IO.File]::GetAttributes($file) -eq $restoredAttributes) 'Compression-boundary restore added ordinary attributes.'
+    }
+}
+Test-Case 'read-only ACL deletion refusal preserves source attributes and any recovery copy' {
+    $parent = Join-Path $script:Scope 'read-only-acl'; $null = [IO.Directory]::CreateDirectory($parent)
+    $file = Join-Path $parent 'denied.txt'; [IO.File]::WriteAllText($file, 'ACL protected readonly')
+    $attributes = [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Archive
+    [IO.File]::SetAttributes($file, $attributes); $hash = File-Digest $file
+    $parentAcl = Get-Acl -LiteralPath $parent; $fileAcl = Get-Acl -LiteralPath $file
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    try {
+        $denyParent = Get-Acl -LiteralPath $parent
+        $denyParent.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity, [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles, [Security.AccessControl.AccessControlType]::Deny))
+        Set-Acl -LiteralPath $parent -AclObject $denyParent
+        $denyFile = Get-Acl -LiteralPath $file
+        $denyFile.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity, [Security.AccessControl.FileSystemRights]::Delete, [Security.AccessControl.AccessControlType]::Deny))
+        Set-Acl -LiteralPath $file -AclObject $denyFile
+        $rejected = Invoke-Prunlet @('delete', '--', $file)
+        Assert-True ($rejected.ExitCode -ne 0 -and [IO.File]::Exists($file)) 'ACL deletion was not rejected with source intact.'
+        Assert-True ((File-Digest $file) -ceq $hash -and [IO.File]::GetAttributes($file) -eq $attributes) 'ACL refusal changed source bytes or attributes.'
+        # DELETEハンドルの取得前に拒否した場合はコピーがなくてよい。作成済みなら内容を保つ。
+        if ($rejected.Json.operationId) {
+            Assert-True ($rejected.Json.operationId -cmatch '^[a-f0-9]{32}$') 'ACL refusal returned an invalid operation ID.'
+            $operationRoot = Join-Path $script:Recovery $rejected.Json.operationId
+            foreach ($copy in @(Get-ChildItem -LiteralPath $operationRoot -Filter '*.bak' -File)) { Assert-True ((File-Digest $copy.FullName) -ceq $hash) 'ACL refusal corrupted recovery copy.' }
+        }
+    } finally {
+        Set-Acl -LiteralPath $file -AclObject $fileAcl
+        Set-Acl -LiteralPath $parent -AclObject $parentAcl
+    }
+}
+Test-Case 'legacy manifests without ordinary attributes still restore schema 1 2 and 3' {
+    foreach ($schema in 1..3) {
+        $tree = $null
+        if ($schema -eq 2) { $tree = New-TreeFixture 'legacy-attributes-tree'; $file = $tree.Files[1]; $paths = @('delete', '--recursive', '--', $tree.Root) }
+        else {
+            $file = New-File ('legacy-attributes-' + $schema + '.txt') 'legacy attribute compatibility'
+            if ($schema -eq 3) { [IO.File]::WriteAllText($file + ':custom', 'legacy ADS') }
+            $paths = @('delete', '--', $file)
+        }
+        $hash = File-Digest $file
+        $deleted = Invoke-Prunlet $paths
+        Assert-True ($deleted.ExitCode -eq 0) 'Legacy attributes fixture deletion failed.'
+        $manifestPath = Join-Path (Join-Path $script:Recovery $deleted.Json.operationId) 'manifest.json'
+        $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -Depth 30
+        Assert-True ($manifest.schema -eq $schema) 'Legacy attributes fixture used unexpected schema.'
+        foreach ($entry in $manifest.items) { $entry.PSObject.Properties.Remove('attributes') }
+        [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 30), [Text.UTF8Encoding]::new($false))
+        $restored = Invoke-Prunlet @('restore', $deleted.Json.operationId)
+        Assert-True ($restored.ExitCode -eq 0 -and (File-Digest $file) -ceq $hash) 'Manifest without ordinary attributes no longer restores.'
+        if ($schema -eq 2) { Assert-TreeIntact $tree }
+        if ($schema -eq 3) { Assert-True ([IO.File]::ReadAllText($file + ':custom') -ceq 'legacy ADS') 'Legacy schema 3 stream changed.' }
+    }
+}
+Test-Case 'invalid ordinary attributes reject restore without creating source or modifying backup' {
+    foreach ($attributes in @(-1, 4294967296L, '1', 16, 1024, 129)) {
+        $file = New-File ('invalid-attributes-' + [guid]::NewGuid().ToString('N') + '.txt')
+        $deleted = Invoke-Prunlet @('delete', '--', $file)
+        Assert-True ($deleted.ExitCode -eq 0) 'Invalid attributes fixture deletion failed.'
+        $operationRoot = Join-Path $script:Recovery $deleted.Json.operationId
+        $manifestPath = Join-Path $operationRoot 'manifest.json'
+        $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -Depth 30
+        $copy = @(Get-ChildItem -LiteralPath $operationRoot -Filter '*.bak' -File)[0].FullName
+        $copyHash = File-Digest $copy
+        $manifest.items[0] | Add-Member -NotePropertyName attributes -NotePropertyValue $attributes -Force
+        [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 30), [Text.UTF8Encoding]::new($false))
+        Assert-Rejected @('restore', $deleted.Json.operationId) ''
+        Assert-True (![IO.File]::Exists($file) -and (File-Digest $copy) -ceq $copyHash) 'Invalid attribute metadata created source or changed backup.'
+    }
 }
 Test-Case 'manifest recovery-directory target rejected before restore' {
     $file = New-File 'manifest-tamper.txt'; $result = Invoke-Prunlet @('delete', '--', $file)
@@ -1513,15 +1643,19 @@ Test-Case 'MCP real stdio lifecycle/delete/restore/validation' {
         $file = New-File '日本語 MCP.txt' 'MCP content'
         $exactStream = '\\?\' + $file + ':trailing :$DATA'
         [IO.File]::WriteAllText($exactStream, 'MCP trailing stream')
+        $mcpAttributes = [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::Archive
+        [IO.File]::SetAttributes($file, $mcpAttributes)
         # 削除notificationは副作用を起こさず、次のpingだけに応答する。
         $process.StandardInput.WriteLine((@{jsonrpc='2.0';method='tools/call';params=@{name='delete_files';arguments=@{paths=@($file)}}} | ConvertTo-Json -Depth 10 -Compress))
         $null = Rpc @{jsonrpc='2.0';id=3;method='ping'}
         Assert-True ([IO.File]::Exists($file)) 'MCP notification caused deletion.'
+        Assert-True ([IO.File]::GetAttributes($file) -eq $mcpAttributes) 'MCP notification changed read-only attributes.'
         $deleted = Rpc @{jsonrpc='2.0';id=4;method='tools/call';params=@{name='delete_files';arguments=@{paths=@($file)}}}
         Assert-True (!$deleted.result.isError -and ![IO.File]::Exists($file)) 'MCP delete failed.'
         Assert-True (@($deleted.result.structuredContent.warnings | Where-Object { $_ -match 'maxRecoveryBytes' }).Count -gt 0) 'MCP oversized recovery warning missing.'
         $restored = Rpc @{jsonrpc='2.0';id=5;method='tools/call';params=@{name='restore_files';arguments=@{operationId=$deleted.result.structuredContent.operationId}}}
         Assert-True (!$restored.result.isError -and [IO.File]::ReadAllText($file) -eq 'MCP content') 'MCP restore failed.'
+        Assert-True ([IO.File]::GetAttributes($file) -eq $mcpAttributes) 'MCP restore changed read-only attributes.'
         Assert-True ([IO.File]::ReadAllText($exactStream) -ceq 'MCP trailing stream') 'MCP trailing stream changed.'
         $bad = Rpc @{jsonrpc='2.0';id=6;method='tools/call';params=@{name='delete_files';arguments=@{paths=@($file);dryRun='false'}}}
         Assert-True ($bad.error.code -eq -32602 -and [IO.File]::Exists($file)) 'Invalid arguments were not rejected.'

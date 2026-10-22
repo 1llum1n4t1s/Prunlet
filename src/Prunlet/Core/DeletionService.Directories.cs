@@ -166,6 +166,7 @@ public sealed partial class DeletionService
             NativeFiles.RejectCaseSensitive(node.Directory);
             NativeFiles.RejectNamedStreams(node.Entry.Path);
             node.Identity = NativeFiles.Identity(node.Directory);
+            node.Entry.Attributes = NativeFiles.RestorableAttributes(node.Directory);
             node.Entry.LastWriteUtc = Directory.GetLastWriteTimeUtc(node.Entry.Path);
             var children = new List<string>();
             foreach (var child in Directory.EnumerateFileSystemEntries(node.Entry.Path))
@@ -194,7 +195,7 @@ public sealed partial class DeletionService
                 NativeFiles.Verify(node.File!.Source.SafeFileHandle, node.Entry.Path);
                 NativeFiles.VerifySingleLink(node.File.Source.SafeFileHandle);
                 NativeFiles.RejectNamedStreams(node.Entry.Path);
-                NativeFiles.DeleteHandle(node.File.Source.SafeFileHandle);
+                NativeFiles.DeleteOriginalHandle(node.File.Source.SafeFileHandle);
                 node.File.Source.Dispose();
                 node.Item.Status = "deleted";
             }
@@ -223,7 +224,7 @@ public sealed partial class DeletionService
                 if (Directory.EnumerateFileSystemEntries(node.Entry.Path).Any())
                     throw new IOException("Directory is no longer empty; unprepared members were retained.");
                 // Windows自身も同じハンドルの空確認を行うため、確認後の追加も削除されない。
-                NativeFiles.DeleteHandle(handle);
+                NativeFiles.DeleteOriginalHandle(handle);
                 node.Item.Status = "deleted";
             }
             catch (Exception ex) when (IsOperational(ex)) { node.Item.Status = "failed"; node.Item.Error = ex.Message; }
@@ -290,6 +291,7 @@ public sealed partial class DeletionService
             var copies = new Dictionary<int, FileStream>();
             var directoryPins = new DirectoryLease();
             var pinnedDirectories = new Dictionary<string, SafeFileHandle>(StringComparer.Ordinal);
+            var restoredDirectories = new Dictionary<int, SafeFileHandle>();
             try
             {
                 // ツリーの全コピーを検証し固定してから復元先に変更を加える。
@@ -331,18 +333,19 @@ public sealed partial class DeletionService
                     if (!existed) NativeFiles.CreateDirectory(target);
                     PathPolicy.PinDirectories(target, directoryPins, pinnedDirectories);
                     NativeFiles.RejectNamedStreams(target);
+                    if (!existed) restoredDirectories.Add(index, pinnedDirectories[target]);
                     item.Status = existed ? "already_present" : "restored";
                 }
                 foreach (var index in indexes.AsEnumerable().Reverse())
                 {
                     var entry = manifest.Items[index];
-                    if (entry.Kind == "directory" && result.Items[index].Status == "restored" && entry.LastWriteUtc.HasValue)
+                    if (entry.Kind == "directory" && result.Items[index].Status == "restored")
                     {
-                        try { Directory.SetLastWriteTimeUtc(entry.Path, entry.LastWriteUtc.Value); }
+                        try { RestoreDirectoryMetadata(entry, restoredDirectories[index]); }
                         catch (Exception ex) when (IsOperational(ex))
                         {
                             result.Items[index].Status = "failed";
-                            result.Items[index].Error = $"Directory contents were restored, but its timestamp could not be restored: {ex.Message}";
+                            result.Items[index].Error = $"Directory contents were restored, but its metadata could not be restored: {ex.Message}";
                         }
                     }
                 }
@@ -363,6 +366,17 @@ public sealed partial class DeletionService
         }
         TryWriteResult(Path.Combine(directory, $"restore-result-{Guid.NewGuid():N}.json"), result, result.Warnings);
         return result;
+    }
+
+    private static void RestoreDirectoryMetadata(ManifestEntry entry, SafeFileHandle pinned)
+    {
+        if (entry.LastWriteUtc is null && (entry.Attributes is null || entry.Attributes == NativeFiles.RestorableAttributes(pinned))) return;
+        // 子の復元が完了してから、pinと同一実体のハンドルへ時刻・属性を適用する。
+        using var handle = NativeFiles.OpenRestoreMetadata(NativeFiles.FinalPath(pinned));
+        if (NativeFiles.Identity(handle) != NativeFiles.Identity(pinned) || NativeFiles.IsReparse(handle) || !NativeFiles.IsDirectory(handle))
+            throw new IOException("Restored directory identity changed before metadata restoration.");
+        if (entry.LastWriteUtc is DateTime timestamp) NativeFiles.RestoreLastWriteTime(handle, timestamp);
+        NativeFiles.RestoreAttributes(handle, entry.Attributes);
     }
 
     private sealed class TreeNode

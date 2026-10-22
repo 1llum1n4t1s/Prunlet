@@ -121,7 +121,7 @@ public sealed partial class DeletionService
                 try
                 {
                     NativeFiles.Verify(ready.Source.SafeFileHandle, ready.Entry.Path);
-                    NativeFiles.DeleteHandle(ready.Source.SafeFileHandle);
+                    NativeFiles.DeleteOriginalHandle(ready.Source.SafeFileHandle);
                     // DELETE_PENDING は最後のハンドルを閉じた時点で反映される。
                     ready.Source.Dispose();
                     ready.Item.Status = "deleted";
@@ -221,6 +221,7 @@ public sealed partial class DeletionService
             try { NativeFiles.Verify(backupHandle, backupPath); backup = new FileStream(backupHandle, FileAccess.ReadWrite); }
             catch { backupHandle.Dispose(); throw; }
             entry.Size = source.Length;
+            entry.Attributes = NativeFiles.RestorableAttributes(source.SafeFileHandle);
             entry.LastWriteUtc = File.GetLastWriteTimeUtc(path);
             using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             var buffer = ArrayPool<byte>.Shared.Rent(CopyBufferSize);
@@ -264,6 +265,9 @@ public sealed partial class DeletionService
                 || (entry.Kind == "directory" && (normalized.Length == 3 || PathPolicy.Within(config.BackupDirectory, normalized))))
                 throw new InvalidDataException("Manifest path is not canonical, duplicated, or inside the recovery directory.");
             if (entry.State is not ("backup_ready" or "already_absent" or "failed")) throw new InvalidDataException("Invalid manifest state.");
+            if (entry.Attributes is uint attributes && ((attributes & ~NativeFiles.RestorableAttributeMask) != 0
+                || ((attributes & (uint)FileAttributes.Normal) != 0 && attributes != (uint)FileAttributes.Normal)))
+                throw new InvalidDataException("Manifest attributes contain unsupported bits or combine Normal with other attributes.");
             if ((manifest.Schema == 3 ? entry.Kind is not ("file" or "directory" or "symlink" or "junction") : entry.Kind is not ("file" or "directory")) || (manifest.Schema == 1 && (entry.Kind != "file" || entry.TreeRoot is not null)))
                 throw new InvalidDataException("Invalid manifest entry kind or tree root.");
             if (manifest.Schema != 3 && (entry.Streams is not null || entry.ReparseTag is not null || entry.LinkDirectory || entry.CaseSensitive))
@@ -312,12 +316,13 @@ public sealed partial class DeletionService
                 destination.Position = 0;
                 if (!Convert.ToHexString(SHA256.HashData(destination)).Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
                     throw new IOException("Restored file hash verification failed.");
-                if (entry.LastWriteUtc.HasValue) File.SetLastWriteTimeUtc(target, entry.LastWriteUtc.Value);
+                if (entry.LastWriteUtc.HasValue) NativeFiles.RestoreLastWriteTime(destinationHandle, entry.LastWriteUtc.Value);
+                NativeFiles.RestoreAttributes(destinationHandle, entry.Attributes);
                 item.Status = "restored";
             }
             catch (Exception original) when (IsOperational(original))
             {
-                try { NativeFiles.DeleteHandle(destinationHandle); }
+                try { NativeFiles.DeleteOriginalHandle(destinationHandle); }
                 catch (Exception cleanup) when (IsOperational(cleanup))
                 { throw new IOException($"{original.Message} Partial restored file could not be removed: {cleanup.Message}", original); }
                 throw;

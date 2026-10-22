@@ -1,21 +1,25 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.Marshalling;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 namespace Prunlet.Core;
 
-internal static class NativeFiles
+internal static partial class NativeFiles
 {
     private const uint Read = 0x80000000, Write = 0x40000000, Delete = 0x00010000;
     private const uint OpenReparse = 0x00200000, BackupSemantics = 0x02000000;
     private const int FileCaseSensitiveInfo = 23;
     private const uint CaseSensitiveDirectory = 0x00000001;
+    // FileBasicInfoで復元できる通常属性。構造・圧縮・暗号化属性は含めない。
+    internal const uint RestorableAttributeMask = 0x31a7;
 
     internal static SafeFileHandle OpenDirectory(string path) => Open(path, 0x80, 3, 3, OpenReparse | BackupSemantics);
     internal static SafeFileHandle OpenInspect(string path) => Open(path, 0x80, 3, 3, OpenReparse);
     internal static SafeFileHandle OpenAny(string path) => Open(path, 0x80, 3, 3, OpenReparse | BackupSemantics);
+    internal static SafeFileHandle OpenRestoreMetadata(string path) => Open(path, 0x180, 3, 3, OpenReparse | BackupSemantics);
     internal static SafeFileHandle OpenSpecial(string path, bool deleting = false) => Open(path, Read | (deleting ? Delete : 0u), 1, 3, OpenReparse | BackupSemantics);
     internal static SafeFileHandle OpenDirectorySource(string path) => Open(path, 0x80 | Delete, 3, 3, OpenReparse | BackupSemantics);
     internal static SafeFileHandle OpenSource(string path) => Open(path, Read | Delete, 1, 3, OpenReparse);
@@ -295,16 +299,21 @@ internal static class NativeFiles
         return target.StartsWith(@"UNC\", StringComparison.OrdinalIgnoreCase) ? @"\\" + target[4..] : @"\\?\" + target;
     }
 
-    internal static void CreateSymbolicDestination(string path, byte[] bytes, bool directory)
+    internal static SafeFileHandle CreateSymbolicDestination(string path, byte[] bytes, bool directory)
     {
         var target = SymbolicTarget(bytes);
         // Developer Modeを利用できるOSの公開APIを使い、ホストの権限設定は変更しない。
         if (!CreateSymbolicLinkW(Win32Path(path), target, (directory ? 1u : 0u) | 2u)) ThrowLastError("Cannot exclusively restore symbolic link");
-        using var handle = OpenAny(path);
-        var restored = ReadReparse(handle);
-        if (!IsReparse(handle) || IsDirectory(handle) != directory || SymbolicTarget(restored) != target
-            || BitConverter.ToUInt32(restored, 16) != BitConverter.ToUInt32(bytes, 16))
-            throw new IOException("Restored symbolic link target or type differs; the created link was retained for inspection.");
+        var handle = Open(path, 0x180 | Delete, 3, 3, OpenReparse | BackupSemantics);
+        try
+        {
+            var restored = ReadReparse(handle);
+            if (!IsReparse(handle) || IsDirectory(handle) != directory || SymbolicTarget(restored) != target
+                || BitConverter.ToUInt32(restored, 16) != BitConverter.ToUInt32(bytes, 16))
+                throw new IOException("Restored symbolic link target or type differs; the created link was retained for inspection.");
+            return handle;
+        }
+        catch { handle.Dispose(); throw; }
     }
 
     internal static void VerifySingleLink(SafeFileHandle handle)
@@ -326,14 +335,18 @@ internal static class NativeFiles
         return $"{info.VolumeSerial:x8}:{info.FileIndexHigh:x8}{info.FileIndexLow:x8}";
     }
 
-    internal static void DeleteHandle(SafeFileHandle handle)
+    internal static void DeleteHandle(SafeFileHandle handle) => DeleteHandleCore(handle, original: false);
+
+    internal static void DeleteOriginalHandle(SafeFileHandle handle) => DeleteHandleCore(handle, original: true);
+
+    private static void DeleteHandleCore(SafeFileHandle handle, bool original)
     {
         var timeout = TimeSpan.FromSeconds(10);
         var timer = Stopwatch.StartNew();
         while (true)
         {
-            try { SetDeletePending(handle, true); return; }
-            catch (IOException ex) when (IsTransientDeletionFailure(handle, ex))
+            try { if (original) SetOriginalDeletePending(handle, true); else SetDeletePending(handle, true); return; }
+            catch (IOException ex) when (IsTransientDeletionFailure(handle, ex, original))
             {
                 // DLLのイメージ解放などを同じ検証済みハンドルで待つ。権限や削除方式は変えない。
                 var remaining = timeout - timer.Elapsed;
@@ -344,11 +357,11 @@ internal static class NativeFiles
         }
     }
 
-    private static bool IsTransientDeletionFailure(SafeFileHandle handle, IOException error)
+    private static bool IsTransientDeletionFailure(SafeFileHandle handle, IOException error, bool original)
     {
         if (error.InnerException is not Win32Exception { NativeErrorCode: 5 or 32 or 33 }) return false;
-        // 書込み共有のあるディレクトリ・リンクや、読み取り専用属性の拒否は待機しない。
-        const FileAttributes excluded = FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.ReadOnly;
+        // 元対象だけは属性を書き換えず読み取り専用を無視する。コピー整理には広げない。
+        var excluded = FileAttributes.Directory | FileAttributes.ReparsePoint | (original ? 0 : FileAttributes.ReadOnly);
         return GetFileInformationByHandle(handle, out var info) && (info.Attributes & (uint)excluded) == 0;
     }
 
@@ -357,6 +370,43 @@ internal static class NativeFiles
         var disposition = new FileDisposition { DeleteFile = pending };
         if (!SetFileInformationByHandle(handle, 4, ref disposition, (uint)Marshal.SizeOf<FileDisposition>()))
             ThrowLastError(pending ? "Cannot mark file for deletion" : "Cannot cancel pending deletion");
+    }
+
+    internal static void SetOriginalDeletePending(SafeFileHandle handle, bool pending)
+    {
+        if ((RestorableAttributes(handle) & (uint)FileAttributes.ReadOnly) == 0)
+        { SetDeletePending(handle, pending); return; }
+        // FILE_DISPOSITION_INFO_EX: DELETE | IGNORE_READONLY_ATTRIBUTE。
+        // 属性そのものを変更しないため、別hardlink名・拒否時の元属性も保つ。
+        var disposition = new FileDispositionEx { Flags = pending ? 0x11u : 0u };
+        if (!SetFileInformationByHandle(handle, 21, ref disposition, (uint)Marshal.SizeOf<FileDispositionEx>()))
+            ThrowLastError(pending ? "Cannot mark read-only original for deletion without changing its attributes" : "Cannot cancel pending deletion");
+    }
+
+    internal static uint RestorableAttributes(SafeFileHandle handle)
+    {
+        if (!GetFileInformationByHandle(handle, out var info)) ThrowLastError("Cannot inspect original attributes");
+        return info.Attributes & RestorableAttributeMask;
+    }
+
+    internal static void RestoreAttributes(SafeFileHandle handle, uint? attributes)
+    {
+        if (attributes is not uint value || EquivalentAttributes(RestorableAttributes(handle), value)) return;
+        var info = new BasicInformation { Attributes = value == 0 ? (uint)FileAttributes.Normal : value };
+        if (!SetFileInformationByHandle(handle, 0, ref info, (uint)Marshal.SizeOf<BasicInformation>()))
+            ThrowLastError("Cannot restore original attributes");
+        if (!EquivalentAttributes(RestorableAttributes(handle), value)) throw new IOException("Restored attributes differ from the manifest.");
+    }
+
+    // 通常属性なしは、圧縮などの構造属性の有無により0またはNormalで表現される。
+    private static bool EquivalentAttributes(uint left, uint right) =>
+        (left == (uint)FileAttributes.Normal ? 0u : left) == (right == (uint)FileAttributes.Normal ? 0u : right);
+
+    internal static void RestoreLastWriteTime(SafeFileHandle handle, DateTime timestamp)
+    {
+        var info = new BasicInformation { LastWriteTime = timestamp.ToFileTimeUtc() };
+        if (!SetFileInformationByHandle(handle, 0, ref info, (uint)Marshal.SizeOf<BasicInformation>()))
+            ThrowLastError("Cannot restore original last-write time");
     }
 
     internal static void RenameHandle(SafeFileHandle handle, string destination)
@@ -398,6 +448,16 @@ internal static class NativeFiles
     private struct FileDisposition { [MarshalAs(UnmanagedType.U1)] public bool DeleteFile; }
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct FileDispositionEx { public uint Flags; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BasicInformation
+    {
+        public long CreationTime, LastAccessTime, LastWriteTime, ChangeTime;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct CaseSensitiveInformation { public uint Flags; }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -423,21 +483,32 @@ internal static class NativeFiles
     [StructLayout(LayoutKind.Sequential)]
     private struct IoStatusBlock { public IntPtr Status; public UIntPtr Information; }
 
-    [DllImport("ntdll.dll")]
-    private static extern int NtCreateFile(out SafeFileHandle handle, uint access, ref ObjectAttributes attributes, out IoStatusBlock status,
+    [LibraryImport("ntdll.dll", EntryPoint = "NtCreateFile")]
+    private static partial int NtCreateFile(out SafeFileHandle handle, uint access, ref ObjectAttributes attributes, out IoStatusBlock status,
         IntPtr allocationSize, uint fileAttributes, uint share, uint disposition, uint options, IntPtr eaBuffer, uint eaLength);
-    [DllImport("ntdll.dll")]
-    private static extern uint RtlNtStatusToDosError(int status);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [LibraryImport("ntdll.dll", EntryPoint = "RtlNtStatusToDosError")]
+    private static partial uint RtlNtStatusToDosError(int status);
+    [LibraryImport("kernel32.dll", EntryPoint = "CreateSymbolicLinkW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.U1)]
-    private static extern bool CreateSymbolicLinkW(string path, string target, uint flags);
+    private static partial bool CreateSymbolicLinkW(string path, string target, uint flags);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass, ref CaseSensitiveInformation information, uint size);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int informationClass, IntPtr information, uint size);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool DeviceIoControl(SafeFileHandle handle, uint code, byte[]? input, int inputSize, byte[]? output, int outputSize, out int returned, IntPtr overlapped);
+    [LibraryImport("kernel32.dll", EntryPoint = "SetFileInformationByHandle", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass, ref CaseSensitiveInformation information, uint size);
+    [LibraryImport("kernel32.dll", EntryPoint = "SetFileInformationByHandle", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass, ref FileDispositionEx information, uint size);
+    [LibraryImport("kernel32.dll", EntryPoint = "SetFileInformationByHandle", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass, ref BasicInformation information, uint size);
+    [LibraryImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GetFileInformationByHandleEx(SafeFileHandle handle, int informationClass, IntPtr information, uint size);
+    [LibraryImport("kernel32.dll", EntryPoint = "DeviceIoControl", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool DeviceIoControl(SafeFileHandle handle, uint code,
+        [In, MarshalUsing(CountElementName = nameof(inputSize))] byte[]? input, int inputSize,
+        [Out, MarshalUsing(CountElementName = nameof(outputSize))] byte[]? output, int outputSize, out int returned, IntPtr overlapped);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct StreamInformation
@@ -446,41 +517,45 @@ internal static class NativeFiles
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 296)] public string Name;
     }
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [LibraryImport("kernel32.dll", EntryPoint = "CreateFileW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    private static partial SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [LibraryImport("kernel32.dll", EntryPoint = "CreateDirectoryW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool CreateDirectoryW(string path, IntPtr security);
+    private static partial bool CreateDirectoryW(string path, IntPtr security);
+    // ByValTStrを含む構造体はソース生成の対象外なので、既存のマーシャリングを維持する。
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr FindFirstStreamW(string path, int infoLevel, out StreamInformation data, uint flags);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool FindNextStreamW(IntPtr search, out StreamInformation data);
-    [DllImport("kernel32.dll", SetLastError = true)]
+    [LibraryImport("kernel32.dll", EntryPoint = "FindClose", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool FindClose(IntPtr search);
+    private static partial bool FindClose(IntPtr search);
+    // 外部型FILETIMEを含む構造体は、ランタイムマーシャリングを有効のまま維持する。
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInformation info);
-    [DllImport("kernel32.dll", SetLastError = true)]
+    [LibraryImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, out CaseSensitiveInformation info, uint size);
-    [DllImport("kernel32.dll", SetLastError = true)]
+    private static partial bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, out CaseSensitiveInformation info, uint size);
+    [LibraryImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, out CompressionInformation info, uint size);
-    [DllImport("kernel32.dll", SetLastError = true)]
+    private static partial bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, out CompressionInformation info, uint size);
+    [LibraryImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, out StandardInformation info, uint size);
+    private static partial bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, out StandardInformation info, uint size);
+    // StringBuilderはソース生成非対応のため、既存のバッファ契約を維持する。
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetVolumeInformationByHandleW(SafeFileHandle handle, StringBuilder? volumeName, uint volumeNameSize,
         out uint serial, out uint maximumComponentLength, out uint flags, StringBuilder fileSystem, uint fileSystemSize);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint size, uint flags);
+    // boolフィールドのU1変換はソース生成非対応のため、構造体と既存の変換を維持する。
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, ref FileDisposition info, uint size);
-    [DllImport("kernel32.dll", SetLastError = true)]
+    [LibraryImport("kernel32.dll", EntryPoint = "SetFileInformationByHandle", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, IntPtr info, uint size);
+    private static partial bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, IntPtr info, uint size);
 }

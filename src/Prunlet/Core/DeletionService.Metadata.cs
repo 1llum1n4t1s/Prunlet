@@ -214,7 +214,7 @@ public sealed partial class DeletionService
                 if (name == "treeroot") return MetadataText(MetadataPathCharacters, true);
                 if (name == "lastwriteutc") return MetadataText(128, true);
                 if (name is "casesensitive" or "linkdirectory") return MetadataBoolean();
-                if (name == "reparsetag") return MetadataNumber(true);
+                if (name is "reparsetag" or "attributes") return MetadataNumber(true);
                 if (name == "streams") return new(MetadataShape.Streams, Nullable: true);
             }
         }
@@ -229,23 +229,28 @@ public sealed partial class DeletionService
 
     private static void ValidateMetadataRequired(MetadataFrame frame)
     {
-        string[] fields = frame.Shape switch
+        var complete = frame.Shape switch
         {
-            MetadataShape.Manifest => ["schema", "operationId", "createdUtc", "items"],
-            MetadataShape.Intent => ["schema", "operationId", "manifestSha256", "createdUtc", "targets"],
-            MetadataShape.DeleteResult => ["operationId", "dryRun", "items", "warnings"],
-            MetadataShape.RestoreResult => ["operationId", "items", "warnings"],
-            MetadataShape.PurgeResult => ["operationId", "dryRun", "purgedBytes", "items", "warnings"],
-            MetadataShape.Entry => ["path", "state"],
-            MetadataShape.Target => ["index", "sha256", "size"],
-            MetadataShape.Stream => ["name", "offset", "size", "sha256"],
-            _ => []
+            MetadataShape.Manifest => HasMetadataFields(frame, ["schema", "operationId", "createdUtc", "items"]),
+            MetadataShape.Intent => HasMetadataFields(frame, ["schema", "operationId", "manifestSha256", "createdUtc", "targets"]),
+            MetadataShape.DeleteResult => HasMetadataFields(frame, ["operationId", "dryRun", "items", "warnings"]),
+            MetadataShape.RestoreResult => HasMetadataFields(frame, ["operationId", "items", "warnings"]),
+            MetadataShape.PurgeResult => HasMetadataFields(frame, ["operationId", "dryRun", "purgedBytes", "items", "warnings"]),
+            MetadataShape.Entry => HasMetadataFields(frame, ["path", "state"]),
+            MetadataShape.Target => HasMetadataFields(frame, ["index", "sha256", "size"]),
+            MetadataShape.Stream => HasMetadataFields(frame, ["name", "offset", "size", "sha256"]),
+            _ => true
         };
-        if (!HasMetadataFields(frame, fields)) throw new InvalidDataException("Operation metadata is missing required fields.");
+        if (!complete) throw new InvalidDataException("Operation metadata is missing required fields.");
     }
 
-    private static bool HasMetadataFields(MetadataFrame frame, string[] fields) =>
-        fields.All(field => frame.Properties.TryGetValue(field, out var actual) && actual.Equals(field, StringComparison.Ordinal));
+    private static bool HasMetadataFields(MetadataFrame frame, ReadOnlySpan<string> fields)
+    {
+        foreach (var field in fields)
+            if (!frame.Properties.TryGetValue(field, out var actual) || !actual.Equals(field, StringComparison.Ordinal))
+                return false;
+        return true;
+    }
 
     private static bool IsMetadataArray(MetadataShape shape) =>
         shape is MetadataShape.Entries or MetadataShape.Targets or MetadataShape.Streams or MetadataShape.Results or MetadataShape.Warnings;

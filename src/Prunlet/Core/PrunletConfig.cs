@@ -39,13 +39,16 @@ public sealed class PrunletConfig
         var resolver = new DefaultJsonTypeInfoResolver();
         resolver.Modifiers.Add(info =>
         {
-            // schema 1 は旧exeの厳密JSON読込でも扱える保存形式を維持する。
+            // 通常属性が既定のschema 1は旧exeの厳密JSON読込との互換性を維持する。
             if (info.Type == typeof(ManifestEntry))
             {
                 foreach (var property in info.Properties.Where(property => property.Name is "kind" or "treeRoot"))
                     property.ShouldSerialize = (value, _) => ((ManifestEntry)value).Schema2Wire;
                 foreach (var property in info.Properties.Where(property => property.Name is "streams" or "reparseTag" or "linkDirectory" or "caseSensitive"))
                     property.ShouldSerialize = (value, _) => ((ManifestEntry)value).Schema3Wire;
+                foreach (var property in info.Properties.Where(property => property.Name == "attributes"))
+                    property.ShouldSerialize = (value, _) => ((ManifestEntry)value).Attributes is uint attributes
+                        && (((ManifestEntry)value).Schema2Wire || attributes != (uint)FileAttributes.Archive);
             }
             if (info.Type == typeof(FileOperationResult))
                 foreach (var property in info.Properties.Where(property => property.Name == "kind"))
@@ -110,6 +113,7 @@ internal sealed class ManifestEntry
     public string? Sha256 { get; set; }
     public long? Size { get; set; }
     public DateTime? LastWriteUtc { get; set; }
+    public uint? Attributes { get; set; }
 }
 
 internal sealed class ManifestStream

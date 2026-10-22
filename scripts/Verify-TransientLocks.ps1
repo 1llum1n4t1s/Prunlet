@@ -31,7 +31,7 @@ $commands = [Collections.Generic.List[object]]::new()
 $binaryHash = (Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash.ToLowerInvariant()
 
 # 想定する失敗: 短期競合の即失敗、60秒を超える調停待機の打ち切り、ロード中DLLの即失敗、
-# 失敗後の元対象・検証済みコピーの欠損、読み取り専用属性の無断解除。
+# 失敗後の元対象・検証済みコピーの欠損や元属性の変更、読み取り専用削除・復元の失敗。
 # 待機進捗の終了時までのバッファリング、繰返し・取得通知の欠落、無競合時の不要な出力、
 # MCPのtokenなし通知・token型変更・進捗逆行・stdout結果JSONへの診断混入。
 # バックアップ・identity検証エラーの非再試行は、Core担当の確認範囲とする。
@@ -289,6 +289,8 @@ foreach ($persistent in @($false, $true)) {
         $null = [IO.Directory]::CreateDirectory($parent)
         $source = Join-Path $parent 'fixture.dll'
         [IO.File]::Copy((Join-Path $env:WINDIR 'System32\version.dll'), $source)
+        $sourceAttributes = [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Archive
+        [IO.File]::SetAttributes($source, $sourceAttributes)
         $hash = Digest $source; $script:Evidence.sourceSha256 = $hash
         $script:Module = [PrunletTransientLockFixture]::LoadLibraryExW($source, [IntPtr]::Zero, 1)
         Assert-True ($script:Module -ne [IntPtr]::Zero) "LoadLibraryExW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
@@ -308,6 +310,7 @@ foreach ($persistent in @($false, $true)) {
             if ($persistent) {
                 Assert-True ($result.ExitCode -ne 0 -and $null -ne $script:ManifestSeenAt -and ($result.Milliseconds - $script:ManifestSeenAt) -ge 9500 -and $result.Milliseconds -lt 25000) 'Loaded DLL did not fail within the deletion retry bound.'
                 Assert-True ([IO.Directory]::Exists($tree) -and [IO.Directory]::Exists($parent) -and [IO.File]::Exists($source) -and (Digest $source) -ceq $hash) 'Held DLL or its parent directories were lost.'
+                Assert-True ([IO.File]::GetAttributes($source) -eq $sourceAttributes) 'Failed loaded DLL deletion changed original attributes.'
             } else {
                 Assert-True ($script:Evidence.releaseMilliseconds -ge $script:ManifestSeenAt + 1000) 'DLL was not held through deletion contention.'
                 Assert-True ($result.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree)) 'Released DLL did not allow recursive deletion.'
@@ -320,26 +323,27 @@ foreach ($persistent in @($false, $true)) {
         }
     }
 }
-Test-Case 'readonly-remains-readonly' {
+Test-Case 'readonly-deletes-and-restores-with-original-attributes' {
     $source = Join-Path $script:CaseRoot 'readonly.txt'; [IO.File]::WriteAllText($source, 'readonly fixture')
     [IO.File]::SetAttributes($source, [IO.FileAttributes]::ReadOnly)
     $hash = Digest $source; $script:Evidence.sourceSha256 = $hash
     $result = Invoke-Cli @('delete', '--', $source) {} 15
     $script:Evidence.cliMilliseconds = $result.Milliseconds
-    Assert-True ($result.ExitCode -ne 0 -and @($result.Json.items).Count -eq 1 -and $result.Json.items[0].status -eq 'failed' -and $result.Json.items[0].path -ceq $source) 'Read-only deletion did not report the expected failed item.'
-    Assert-True ([IO.File]::Exists($source) -and (Digest $source) -ceq $hash -and ([IO.File]::GetAttributes($source) -band [IO.FileAttributes]::ReadOnly) -ne 0) 'Read-only source content or attribute changed.'
+    Assert-True ($result.ExitCode -eq 0 -and @($result.Json.items).Count -eq 1 -and $result.Json.items[0].status -eq 'deleted' -and $result.Json.items[0].path -ceq $source -and ![IO.File]::Exists($source)) 'Read-only deletion did not report the expected deleted item.'
     Assert-Backup $hash
     $manifests = @(Manifests)
     $deleteResults = @(Get-ChildItem -LiteralPath $script:Recovery -Filter delete-result.json -Recurse -File)
     Assert-True ($manifests.Count -eq 1 -and $deleteResults.Count -eq 1 -and $manifests[0].DirectoryName -ceq $deleteResults[0].DirectoryName) 'Expected one manifest and one result in the same operation directory.'
     $persistedResult = [IO.File]::ReadAllText($deleteResults[0].FullName) | ConvertFrom-Json
-    Assert-True (@($persistedResult.items).Count -eq 1 -and $persistedResult.items[0].status -eq 'failed' -and $persistedResult.items[0].path -ceq $source) 'Persisted read-only result does not contain the expected failed item.'
-    # CLI起動時間を除く。25ms間隔の観測では即時失敗を取り逃がすため、永続化した両記録の時刻を使う。
+    Assert-True (@($persistedResult.items).Count -eq 1 -and $persistedResult.items[0].status -eq 'deleted' -and $persistedResult.items[0].path -ceq $source) 'Persisted read-only result does not contain the expected deleted item.'
+    # CLI起動時間を除く。25ms間隔の観測では即時完了を取り逃がすため、永続化した両記録の時刻を使う。
     $manifestWrittenUtc = $manifests[0].LastWriteTimeUtc
     $resultWrittenUtc = $deleteResults[0].LastWriteTimeUtc
     $phaseMilliseconds = ($resultWrittenUtc - $manifestWrittenUtc).TotalMilliseconds
     $script:Evidence.deletionPhaseTiming = @{ source = 'persisted-metadata-last-write-utc'; manifestWrittenUtc = $manifestWrittenUtc.ToString('O'); resultWrittenUtc = $resultWrittenUtc.ToString('O'); milliseconds = $phaseMilliseconds }
-    Assert-True ($phaseMilliseconds -ge 0 -and $phaseMilliseconds -lt 5000) 'Read-only deletion phase should fail without transient retries; metadata interval must be nonnegative and below 5000ms.'
+    Assert-True ($phaseMilliseconds -ge 0 -and $phaseMilliseconds -lt 5000) 'Read-only deletion should complete without transient retries; metadata interval must be nonnegative and below 5000ms.'
+    $restored = Invoke-Cli @('restore', $result.Json.operationId) {} 15
+    Assert-True ($restored.ExitCode -eq 0 -and [IO.File]::Exists($source) -and (Digest $source) -ceq $hash -and [IO.File]::GetAttributes($source) -eq [IO.FileAttributes]::ReadOnly) 'Read-only restore changed source content or attributes.'
 }
 $passed = @($results | Where-Object passed).Count; $failed = $results.Count - $passed
 Save-Json $report @{ purpose = 'post-fix-transient-lock-e2e'; executable = $ExecutablePath; executableSha256 = $binaryHash; outputDirectory = $outputRoot; passed = $passed; failed = $failed; cases = @($results); commands = @($commands) }
