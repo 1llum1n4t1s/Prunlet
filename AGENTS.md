@@ -29,6 +29,8 @@ case-sensitive属性の復元を変更した場合は、通常E2Eの権限別ケ
 
 大量操作に関係する変更では、通常E2Eに加えて`scripts/Verify-LargeOperations.ps1`へ今回のexeを渡す。[大量操作と途中バックアップの検証手順](docs/verification.md#大量操作と途中バックアップ)に従い、件数・記録サイズが旧上限を超えるschema 2/3の削除・復元・整理を確認する。
 
+削除速度を変更した場合は、通常E2Eに加えて`scripts/Verify-DeletionPerformance.ps1`へ今回のexeを渡す。[削除性能の比較](docs/verification.md#削除性能の比較)に従い、変更前のexeを`-BaselineExecutablePath`で指定して同条件で複数回比較し、削除・復元内容・衝突時の非上書きと、JSONレポートの各試行・中央値を確認する。性能値だけで安全性の検証を代替しない。
+
 保持期限・容量制限を変更した場合は、通常E2Eに加えて`scripts/Verify-Retention.ps1`へ今回のexeを渡す。[自動整理の検証手順](docs/verification.md#復元データの自動整理)に従い、旧設定の互換性、整理できないコピーの保全、並行削除時の容量制御を確認する。上限を超える単一操作については、複数入力の合計とschema 2/3を含むバックアップ・復元、dry-runの不変更、次回削除・maintainでの通常上限の再適用、整理できない既存コピーがある場合の元対象とコピーの保全も確認する。定期タスクの登録・解除を変更した場合は`scripts/Verify-LatestInstall.ps1`で所有者検証、既存タスクの保持、登録失敗時の復旧も確認する。
 
 リポジトリおよびCodex homeへ`bin`・`obj`・一時物・検証出力・バックアップを作らない。検証用出力とレポートには新しい外部絶対パスを渡し、レポートの親を事前に作る。検証後の保持と清掃は[検証手順](docs/verification.md)に従う。
