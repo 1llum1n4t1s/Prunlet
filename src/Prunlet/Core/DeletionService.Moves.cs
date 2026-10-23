@@ -134,6 +134,7 @@ public sealed partial class DeletionService
         item.BackupPath = payload;
         var moved = false;
         var verified = false;
+        var renamePath = entry.Path;
         SafeFileHandle? target = null;
         MoveEntryIdentity? renameIdentity = null;
         try
@@ -151,8 +152,9 @@ public sealed partial class DeletionService
             VerifyMoveHandle(target, entry.Path, entry.Identity!);
             VerifyMoveHandle(store.ParentHandle, store.OperationPath, entry.PayloadParent!);
             NativeFiles.MoveNoReplace(target, store.ParentHandle, entry.PayloadName);
+            renamePath = payload;
             moved = true;
-            VerifyMoveHandle(target, payload, entry.Identity!);
+            VerifyRenamedMoveHandle(target, payload, entry.Identity!);
             var size = MeasureMovePayload(payload, guards);
             if (size > entry.Size!.Value)
                 throw new IOException("Target grew beyond its reserved recovery capacity during the move.");
@@ -173,27 +175,27 @@ public sealed partial class DeletionService
                 try
                 {
                     target ??= NativeFiles.OpenMoveEntry(payload);
-                    VerifyMoveHandle(target, payload, entry.Identity!);
-                    attributeGuard.Prepare(payload, renameIdentity!);
+                    VerifyRenamedMoveHandle(target, payload, entry.Identity!);
+                    attributeGuard.Prepare(payload, renameIdentity!, renamed: true);
                     using var originalParent = NativeFiles.OpenMoveParent(Path.GetDirectoryName(entry.Path)!, entry.Identity!.IsDirectory);
                     VerifyMoveHandle(originalParent, Path.GetDirectoryName(entry.Path)!, entry.OriginalParent!);
                     NativeFiles.MoveNoReplace(target, originalParent, Path.GetFileName(entry.Path));
-                    VerifyMoveHandle(target, entry.Path, entry.Identity!);
+                    renamePath = entry.Path;
+                    VerifyRenamedMoveHandle(target, entry.Path, entry.Identity!);
                     using var rollbackPin = FinishMoveRename(ref target, entry.Path, renameIdentity!, attributeGuard);
                     item.BackupPath = null;
                     cancelled = true;
                 }
                 catch (Exception rollback) when (IsMoveFailure(rollback))
                 {
-                    warnings.Add($"Rollback failed for '{entry.Path}'; the moved object was retained at '{payload}': {rollback.Message}");
+                    warnings.Add($"Rollback failed for '{entry.Path}'; the moved object was retained at '{renamePath}': {rollback.Message}");
                     if (target is not null && renameIdentity is not null)
                     {
                         try
                         {
-                            var retainedPath = NativeFiles.FinalPath(target);
-                            if (retainedPath != payload && retainedPath != entry.Path)
-                                throw new IOException("The retained object moved outside its recorded locations.");
-                            using var retainedPin = FinishMoveRename(ref target, retainedPath, renameIdentity, attributeGuard);
+                            // 成功したrenameの移動先だけを使い、同じFile IDの別名を探索しない。
+                            VerifyRenamedMoveHandle(target, renamePath, renameIdentity);
+                            using var retainedPin = FinishMoveRename(ref target, renamePath, renameIdentity, attributeGuard);
                         }
                         catch (Exception attributes) when (IsMoveFailure(attributes))
                         {
@@ -289,7 +291,7 @@ public sealed partial class DeletionService
                         var expected = RecoverMoveAttributeSnapshot(current, snapshot);
                         using var attributes = new MoveAttributeGuard();
                         attributes.Prepare(entry.Path, expected);
-                        attributes.RestoreAndClose(entry.Path, expected);
+                        attributes.RestoreAndClose(originalHandle, entry.Path, expected);
                         VerifyMoveAttributes(originalHandle, entry.Path, expected);
                     }
                     else if (NeedsMoveAttributeGuard(current) || NeedsMoveAttributeGuard(entry.Identity!))
@@ -346,7 +348,7 @@ public sealed partial class DeletionService
                     renameIdentity.Attributes & NativeFiles.RestorableAttributeMask);
             NativeFiles.MoveNoReplace(target, parent, Path.GetFileName(entry.Path));
             renamed = true;
-            VerifyMoveHandle(target, entry.Path, entry.Identity!);
+            VerifyRenamedMoveHandle(target, entry.Path, entry.Identity!);
             using var finalPin = FinishMoveRename(ref target, entry.Path, renameIdentity, attributeGuard);
             WriteMoveReceipt(operation.Directory, operation.Manifest, operation.ManifestHash, entry, "restore", "complete");
             item.Status = "restored";
@@ -379,7 +381,7 @@ public sealed partial class DeletionService
         try
         {
             VerifyMoveHandle(pin, path, expected);
-            attributes.RestoreAndClose(path, expected);
+            attributes.RestoreAndClose(pin, path, expected);
             if (!expected.IsDirectory && expected.ReparseTag == 0 && sizingGuards is not null)
                 ReleaseMoveMeasurementGuards(sizingGuards);
             VerifyMoveAttributes(pin, path, expected);
@@ -426,18 +428,25 @@ public sealed partial class DeletionService
     {
         private SafeFileHandle? writer;
 
-        internal void Prepare(string path, MoveEntryIdentity expected)
+        internal void Prepare(string path, MoveEntryIdentity expected, bool renamed = false)
         {
             if (NeedsMoveAttributeGuard(expected)) writer ??= NativeFiles.OpenMoveAttributeGuard(path);
-            if (writer is not null) VerifyMoveHandle(writer, path, expected);
+            if (writer is not null)
+            {
+                if (renamed) VerifyRenamedMoveHandle(writer, path, expected);
+                else VerifyMoveHandle(writer, path, expected);
+            }
         }
 
-        internal void RestoreAndClose(string path, MoveEntryIdentity expected)
+        internal void RestoreAndClose(SafeFileHandle pin, string path, MoveEntryIdentity expected)
         {
             if (NeedsMoveAttributeGuard(expected))
             {
                 if (writer is null) throw new IOException("Attribute preservation was not authorized before the rename.");
-                VerifyMoveHandle(writer, path, expected);
+                // 移動後に開き直したpinが正規パスを固定し、writerは同じ実体への属性操作だけに使う。
+                VerifyMoveHandle(pin, path, expected);
+                if (!SameMoveObject(expected, NativeFiles.MoveIdentity(writer)))
+                    throw new IOException("The attribute preservation object's identity changed.");
                 NativeFiles.RestoreAttributes(writer, expected.Attributes & NativeFiles.RestorableAttributeMask);
             }
             Dispose();
@@ -451,6 +460,17 @@ public sealed partial class DeletionService
         if (!NativeFiles.FinalPath(handle).Equals(path, StringComparison.Ordinal)
             || !SameMoveObject(identity, NativeFiles.MoveIdentity(handle)))
             throw new IOException("The move object's identity or canonical path changed.");
+    }
+
+    private static void VerifyRenamedMoveHandle(SafeFileHandle handle, string path, MoveEntryIdentity identity)
+    {
+        // 成功した非上書きrenameの直後だけ、移動先を開き直して名前と同一性を確認する。
+        // 元のDELETEハンドルは保持し、移動前の名前情報が残る環境でも名前の差し替えを許さない。
+        // 事前検証はVerifyMoveHandleのままとし、同じFile IDの別ハードリンク名を許容しない。
+        if (!SameMoveObject(identity, NativeFiles.MoveIdentity(handle)))
+            throw new IOException("The renamed move object's identity changed.");
+        using var renamed = NativeFiles.OpenMoveMeasurement(path);
+        VerifyMoveHandle(renamed, path, identity);
     }
 
     private static bool IsMoveFailure(Exception exception) =>

@@ -4,7 +4,13 @@ namespace Prunlet.Core;
 
 internal static class PathPolicy
 {
-    internal static string Absolute(string? value)
+    internal static string Absolute(string? value) => AbsoluteCore(value, allowReservedNames: false);
+
+    // 列挙・ハンドル由来の実ファイル名を、必ず拡張長形式で開く内部経路に限り使う。
+    // 外部入力の予約名拒否とは分離し、名前空間・ADS・走査などの構文制約は共通に保つ。
+    internal static string FileSystemAbsolute(string? value) => AbsoluteCore(value, allowReservedNames: true);
+
+    private static string AbsoluteCore(string? value, bool allowReservedNames)
     {
         // 拡張長形式も通常のローカルドライブに限り、同じ構文検査へ通す。
         if (value?.StartsWith(@"\\?\", StringComparison.Ordinal) == true) value = value[4..];
@@ -22,9 +28,9 @@ internal static class PathPolicy
                 || component.IndexOfAny(['<', '>', '"', '|']) >= 0 || component.Any(char.IsControl))
                 throw new ArgumentException("Path components cannot contain traversal, empty components, invalid characters, or trailing dots/spaces.");
             var stem = component.Split('.')[0].ToUpperInvariant();
-            if (stem is "CON" or "PRN" or "AUX" or "NUL" or "CONIN$" or "CONOUT$"
+            if (!allowReservedNames && (stem is "CON" or "PRN" or "AUX" or "NUL" or "CONIN$" or "CONOUT$"
                 || (stem.Length == 4 && (stem.StartsWith("COM", StringComparison.Ordinal) || stem.StartsWith("LPT", StringComparison.Ordinal))
-                    && "123456789¹²³".Contains(stem[3])))
+                    && "123456789¹²³".Contains(stem[3]))))
                 throw new ArgumentException("Device names are not allowed.");
         }
         return Path.GetFullPath(path);

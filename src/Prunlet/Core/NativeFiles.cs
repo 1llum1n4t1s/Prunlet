@@ -124,7 +124,7 @@ internal static partial class NativeFiles
     }
 
     // 入力の許可条件を保ち、Win32 呼び出しの直前だけ長いパス形式へ変換する。
-    private static string Win32Path(string path) => @"\\?\" + PathPolicy.Absolute(path);
+    private static string Win32Path(string path) => @"\\?\" + PathPolicy.FileSystemAbsolute(path);
 
     internal static void Verify(SafeFileHandle handle, string expected, bool directory = false)
     {
@@ -155,7 +155,7 @@ internal static partial class NativeFiles
         }
         if (length == 0 || length >= buffer.Capacity) ThrowLastError("Cannot resolve file handle path");
         var actual = buffer.ToString();
-        return PathPolicy.Absolute(actual);
+        return PathPolicy.FileSystemAbsolute(actual);
     }
 
     internal static bool IsReparse(SafeFileHandle handle)
