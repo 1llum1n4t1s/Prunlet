@@ -49,7 +49,8 @@ $guidePath = Assert-AgentFilePath (Join-Path $CodexHome 'PRUNLET.md')
 $document = Read-AgentDocument $agentPath
 $begin = '<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->'
 $end = '<!-- END PRUNLET AGENT-INSTRUCTIONS -->'
-$instruction = 'Windowsのファイル・フォルダー削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。'
+$instruction = 'Windowsのファイル・フォルダー・レジストリ削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。'
+$legacyFileFolderCliInstruction = 'Windowsのファイル・フォルダー削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。'
 $legacyCliInstruction = 'Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。'
 $legacyInstruction = 'Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet MCPの`delete_files`を最初から使う。'
 $ExecutablePath = Resolve-Absolute $ExecutablePath 'ExecutablePath'
@@ -68,6 +69,11 @@ if ($owned) {
     if ($begins.Count -ne 1 -or $ends.Count -ne 1) { throw 'Duplicate or incomplete Prunlet agent instruction markers; existing instructions were preserved.' }
     $pattern = [regex]::Escape($begin) + '(?<newline>\r\n|\n|\r)' + [regex]::Escape($instruction) + '\k<newline>' + [regex]::Escape($bindingLine) + '\k<newline>' + [regex]::Escape($end) + '\k<newline>'
     $blockMatch = [regex]::Match($document.text, $pattern)
+    if (!$blockMatch.Success) {
+        # 出荷済みのファイル・フォルダー用CLI管理blockはbindingを照合して移行する。
+        $legacyFileFolderCliPattern = [regex]::Escape($begin) + '(?<newline>\r\n|\n|\r)' + [regex]::Escape($legacyFileFolderCliInstruction) + '\k<newline>' + [regex]::Escape($bindingLine) + '\k<newline>' + [regex]::Escape($end) + '\k<newline>'
+        $blockMatch = [regex]::Match($document.text, $legacyFileFolderCliPattern)
+    }
     if (!$blockMatch.Success) {
         # 出荷済みのfile-only CLI管理blockはbindingを照合して移行する。
         $legacyCliPattern = [regex]::Escape($begin) + '(?<newline>\r\n|\n|\r)' + [regex]::Escape($legacyCliInstruction) + '\k<newline>' + [regex]::Escape($bindingLine) + '\k<newline>' + [regex]::Escape($end) + '\k<newline>'

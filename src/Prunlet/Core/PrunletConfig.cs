@@ -14,6 +14,8 @@ public sealed class PrunletConfig
     public long MaxRecoveryBytes { get; set; } = 10L * 1024 * 1024 * 1024;
     // 省略時は各ボリュームのユーザー専用領域を使う。検証・管理用の同一ボリューム内配置指定。
     public Dictionary<string, string> VolumeRecoveryDirectories { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public string RegistryScope { get; set; } = "current";
+    public string? RegistrySessionFile { get; set; }
 
     public static PrunletConfig Load(string path)
     {
@@ -31,6 +33,11 @@ public sealed class PrunletConfig
         if (RetentionDays is < 1 or > 36500) throw new InvalidDataException("retentionDays must be between 1 and 36500.");
         if (MaxRecoveryBytes <= 0) throw new InvalidDataException("maxRecoveryBytes must be positive.");
         if (VolumeRecoveryDirectories is null) throw new InvalidDataException("volumeRecoveryDirectories cannot be null.");
+        if (RegistryScope is not ("current" or "nativeWindows")) throw new InvalidDataException("registryScope must be current or nativeWindows.");
+        if (RegistryScope == "nativeWindows" && RegistrySessionFile is null)
+            throw new InvalidDataException("nativeWindows requires an absolute registrySessionFile.");
+        if (RegistrySessionFile is not null && PathPolicy.Absolute(RegistrySessionFile) != RegistrySessionFile)
+            throw new InvalidDataException("registrySessionFile must be a canonical absolute path.");
         var volumes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in VolumeRecoveryDirectories)
         {
@@ -50,8 +57,14 @@ public sealed class PrunletConfig
         resolver.Modifiers.Add(info =>
         {
             if (info.Type == typeof(PrunletConfig))
+            {
                 foreach (var property in info.Properties.Where(property => property.Name == "volumeRecoveryDirectories"))
                     property.ShouldSerialize = (value, _) => ((PrunletConfig)value).VolumeRecoveryDirectories.Count != 0;
+                foreach (var property in info.Properties.Where(property => property.Name == "registryScope"))
+                    property.ShouldSerialize = (value, _) => ((PrunletConfig)value).RegistryScope != "current";
+                foreach (var property in info.Properties.Where(property => property.Name == "registrySessionFile"))
+                    property.ShouldSerialize = (value, _) => ((PrunletConfig)value).RegistrySessionFile is not null;
+            }
             // 通常属性が既定のschema 1は旧exeの厳密JSON読込との互換性を維持する。
             if (info.Type == typeof(ManifestEntry))
             {
@@ -65,7 +78,8 @@ public sealed class PrunletConfig
             }
             if (info.Type == typeof(FileOperationResult))
                 foreach (var property in info.Properties.Where(property => property.Name == "kind"))
-                    property.ShouldSerialize = (value, _) => ((FileOperationResult)value).Schema2Wire;
+                    property.ShouldSerialize = (value, _) => ((FileOperationResult)value).Schema2Wire
+                        || ((FileOperationResult)value).Kind is "registry-key" or "registry-value";
         });
         return new JsonSerializerOptions(JsonSerializerDefaults.Web)
         {

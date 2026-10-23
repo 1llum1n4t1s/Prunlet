@@ -532,7 +532,7 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         $fileCliOldHash = (Get-FileHash -LiteralPath $fileCliGuide -Algorithm SHA256).Hash
         & (Join-Path $repoRoot 'integration\install-agent-instructions.ps1') -SourceGuidePath (Join-Path $instructionInstall 'bin\PRUNLET.md') -PreviousGuideSha256 $fileCliOldHash -ExecutablePath (Join-Path $instructionInstall 'bin\prunlet.exe') -ConfigPath (Join-Path $instructionInstall 'config.json') -CodexHome $fileCliHome -BackupDirectory (Join-Path $OutputDirectory 'file-cli-migration-backup') | Out-Null
         $updated = [IO.File]::ReadAllText($fileCliAgents)
-        Assert-True ($updated.Contains('Windowsのファイル・フォルダー削除では')) 'File-only CLI block did not migrate.'
+        Assert-True ($updated.Contains('Windowsのファイル・フォルダー・レジストリ削除では')) 'File-only CLI block did not migrate.'
         $afterBody = [regex]::Replace($updated, '<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->[\s\S]*?<!-- END PRUNLET AGENT-INSTRUCTIONS -->\r?\n', '')
         Assert-True ($fileCliBody -ceq $afterBody) 'CLI migration changed the existing body.'
         Assert-True ($updated.Contains($fileCliBinding)) 'CLI migration changed the executable/config binding.'
@@ -781,9 +781,9 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
             Assert-True ($registered.StartsWith('<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->', [StringComparison]::Ordinal)) 'Owned block was inserted inside existing Markdown.'
             $html = (ConvertFrom-Markdown -InputObject $registered).Html
             $codeBlocks = [regex]::Matches($html, '(?s)<pre><code.*?</code></pre>')
-            foreach ($codeBlock in $codeBlocks) { Assert-True (!$codeBlock.Value.Contains('Windowsのファイル・フォルダー削除では')) 'Agent instruction is inside a Markdown code block.' }
+            foreach ($codeBlock in $codeBlocks) { Assert-True (!$codeBlock.Value.Contains('Windowsのファイル・フォルダー・レジストリ削除では')) 'Agent instruction is inside a Markdown code block.' }
             $outsideCode = [regex]::Replace($html, '(?s)<pre><code.*?</code></pre>', '')
-            Assert-True ($outsideCode.Contains('Windowsのファイル・フォルダー削除では')) 'Agent instruction is not rendered outside code examples.'
+            Assert-True ($outsideCode.Contains('Windowsのファイル・フォルダー・レジストリ削除では')) 'Agent instruction is not rendered outside code examples.'
             Assert-True ($registered.EndsWith($text, [StringComparison]::Ordinal)) 'Registering instructions changed existing body or EOF bytes.'
             & (Join-Path $instructionInstall 'bin\install-agent-instructions.ps1') @helperParameters -Uninstall | Out-Null
             Assert-True ($originalHash -eq (Get-FileHash -LiteralPath $agentPath).Hash) 'Fenced document registration/removal did not restore original bytes.'

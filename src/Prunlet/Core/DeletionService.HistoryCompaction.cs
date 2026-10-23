@@ -43,6 +43,12 @@ public sealed partial class DeletionService
             NativeFiles.RejectNamedStreams(lockPath);
             if (RandomAccess.GetLength(operationLock) != 0) throw new InvalidDataException("Operation lock is not empty.");
             var members = Directory.EnumerateFileSystemEntries(directory).Select(Path.GetFileName).ToHashSet(StringComparer.Ordinal);
+            if (members.Contains(RegistryManifestName))
+            {
+                result.Status = "retained";
+                warnings.Add($"Registry history operation {id} was retained; schema 5 snapshot and transaction receipts are not physically compacted.");
+                return;
+            }
             if (members.Contains(MoveManifestName))
                 throw new InvalidDataException("Schema 4 move history is retained; physical compression requires dedicated completion validation.");
             if (!members.Contains("manifest.json") || !members.Contains("purge-intent.json"))

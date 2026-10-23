@@ -25,6 +25,9 @@ internal static class Program
                     prunlet --config <absolute-json-path> init --backup-directory <directory>
                     prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]
                     prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>
+                    prunlet --config <absolute-json-path> registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <registry-key-path>
+                    prunlet --config <absolute-json-path> registry-session --minutes <1..60> --assert-native-windows
+                    prunlet --config <absolute-json-path> registry-reconcile <operation-id>
                     prunlet --config <absolute-json-path> restore <operation-id>
                     prunlet --config <absolute-json-path> purge <operation-id> [--dry-run | --apply]
                     prunlet --config <absolute-json-path> maintain [--dry-run | --apply]
@@ -41,6 +44,8 @@ internal static class Program
                     Moved hard links share content with surviving aliases; legacy copies restore as independent snapshots.
                     Empty directories are supported; deleting directory contents requires --recursive.
                     Wildcard expansion is unsupported. Links are deleted without following their targets.
+                    Registry view is required. Omit value-name for a key; an empty value-name selects the default value.
+                    Registry key snapshots require full Owner/Group/DACL/SACL access and SeSecurityPrivilege; no automatic elevation or fallback.
                     """);
                 return 0;
             }
@@ -60,6 +65,14 @@ internal static class Program
                 return await HookRouter.RunAsync(configPath, commandArgs.Length == 2 ? commandArgs[1] : null);
             }
             var config = PrunletConfig.Load(configPath);
+            if (command == "registry-session")
+            {
+                if (commandArgs.Length != 3 || commandArgs[0] != "--minutes" || !int.TryParse(commandArgs[1], out var minutes)
+                    || commandArgs[2] != "--assert-native-windows")
+                    throw new ArgumentException("Use registry-session --minutes <1..60> --assert-native-windows from a normal Windows desktop.");
+                await RegistrySessionServer.RunAsync(config, minutes, assertNativeWindows: true);
+                return 0;
+            }
             var service = new DeletionService(config);
             service.RecoveryLockProgress += (elapsed, acquired) =>
             {
@@ -88,6 +101,14 @@ internal static class Program
                     else
                         throw new ArgumentException("Use delete [--dry-run] [--recursive] -- <absolute-path> [...] or delete [--dry-run] [--recursive] --paths-file <absolute-json-file>.");
                     result = service.Delete(paths, dryRun, recursive);
+                    break;
+                case "registry-delete":
+                    var registryOptions = ParseRegistryDelete(commandArgs);
+                    result = service.DeleteRegistry(registryOptions.Request, registryOptions.DryRun);
+                    break;
+                case "registry-reconcile":
+                    if (commandArgs.Length != 1) throw new ArgumentException("Registry reconciliation requires exactly one operation id.");
+                    result = service.ReconcileRegistry(commandArgs[0]);
                     break;
                 case "restore":
                     if (commandArgs.Length != 1) throw new ArgumentException("Restore requires exactly one operation id.");
@@ -130,6 +151,39 @@ internal static class Program
             else Write(new { error = ex.Message, type = ex.GetType().Name });
             return 1;
         }
+    }
+
+    private static (RegistryDeleteRequest Request, bool DryRun) ParseRegistryDelete(string[] args)
+    {
+        string? view = null;
+        string? valueName = null;
+        var hasValueName = false;
+        var recursive = false;
+        var dryRun = false;
+        var index = 0;
+        while (index < args.Length && args[index] != "--")
+        {
+            var option = args[index++];
+            if (option == "--view" && view is null && index < args.Length && args[index] is "32" or "64")
+                view = args[index++];
+            else if (option == "--value-name" && !hasValueName && index < args.Length && args[index] != "--")
+            {
+                valueName = args[index++];
+                hasValueName = true;
+            }
+            else if (option.StartsWith("--value-name=", StringComparison.Ordinal) && !hasValueName)
+            {
+                valueName = option["--value-name=".Length..];
+                hasValueName = true;
+            }
+            else if (option == "--recursive" && !recursive) recursive = true;
+            else if (option == "--dry-run" && !dryRun) dryRun = true;
+            else throw new ArgumentException("Unknown, duplicate, missing or invalid registry-delete option: " + option);
+        }
+        if (view is null || index >= args.Length || args[index] != "--" || args.Length - index != 2)
+            throw new ArgumentException("Use registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <single registry-key-path>.");
+        if (hasValueName && recursive) throw new ArgumentException("Recursive cannot be combined with value-name.");
+        return (new RegistryDeleteRequest { Path = args[index + 1], View = view, ValueName = valueName, Recursive = recursive }, dryRun);
     }
 
     private static string[] ReadDeletePathsFile(string path)

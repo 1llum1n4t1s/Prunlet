@@ -20,6 +20,8 @@ pwsh -NoProfile -File .\scripts\Verify-VolumeMoves.ps1 -ExecutablePath <今回�
 - 通常ファイルと再帰フォルダーを同じFile IDのまま退避・復元し、空階層・内容・ACL・ADS・通常属性・case-sensitive属性を保持する。フォルダーの全子をコピーした形式を新規作成しない。
 - dry-runで元対象、属性、中央記録、専用領域を変更しない。非再帰の非空フォルダー、重複・包含、専用領域とその祖先、不正パスを拒否する。
 - ハードリンクの外部別名とリンク先を削除しない。別名からの書込みが保管実体へ反映される共有関係を確認する。リンクはリンク自体を移動する。
+- フォルダー内に実在する`Aux.csproj`・`NUL.txt`・`COM1.txt`・`CON`等は、列挙した名前のまま退避・復元できることを確認する。これらを公開CLI・MCPへ直接指定する入力は従来どおり拒否し、device namespace・ADS・UNC・相対パスの拒否も維持する。
+- MSIX由来のCドライブAppDataから同一Cドライブ直下の隔離した専用領域へのrenameを確認する。移動前から保持するハンドルの名前取得が1168になる条件で、移動先を開き直した厳密な正規パスと両ハンドルのFile IDを照合する。Archive属性のある対象とない対象を分け、ADS・完全SDDL・属性・File ID・内容の往復、旧exeの失敗記録からの非上書き復元も確認する。
 - 復元先の既存ファイル・フォルダーを上書き・マージしない。復元成功後はpayloadを消費し、整合する再実行は`already_restored`とする。元親・payload・領域のID、marker、ACL、volume、manifest・receiptの不一致を保全する。
 - 容量の事前走査、整理前後の再走査、期限・容量順序、複数入力の合計、単一超過時の例外予算と次回の通常予算、計数不能・整理不能時の元対象の保全を確認する。
 - 移動完了receipt不在、復元intent後などの中断形状から状態を照合し、矛盾・曖昧な欠損を成功扱いしない。
@@ -35,6 +37,28 @@ pwsh -NoProfile -File .\scripts\Verify-VolumeMoves.ps1 -ExecutablePath <今回�
 検証完了後はJSONレポートと再現に必要な最小データを保持し、プロセスの終了・リンク・他作業との混在を確認して今回の作業領域だけを清掃します。配置済みexe、既存共有キャッシュ、利用者の設定・復元データは対象にしません。
 
 このE2EはCodex自身のフック読込・承認や共通指示の読込みを検証しません。登録変更後は、新しいチャットで配置済みguide・管理マーカー・exe/config binding、最初からCMD CLIが選ばれること、直接削除が拒否されることを実ホストで確認し、スクリプト結果と分けて報告してください。MSIX転送も実パッケージの新規fixtureで実体と往復結果を確認し、既存の拒否対象を別経路で再試行しません。
+
+## レジストリの削除と復元
+
+新しいexeのCLI・stdio MCP・hookを実プロセスで検証する。fixtureは利用可能なhiveの専用キー配下へ隔離して作成し、hive・view・実行権限をレポートへ記録する。HKCUでKTMを利用できない環境では、許可されたHKLMの専用fixtureで正系を検証し、HKCUの拒否・原データ保全と区別する。レポートと一時物は外部作業領域へ置き、親を事前作成する。終了コード・stdout JSON・`passed`/`failed`を読み、未実行の権限・view・KTMケースを合格扱いしない。
+
+- CLIのview欠落・重複・不正・未知引数・複数キー、MCPの余剰property・型不正を拒否する。値名はliteralで、空の既定値名（CLIの`--value-name=`を含む）と値+再帰拒否を確認する。
+- キー・値・既定値・未知の型を含むuint型番号と生バイト列・Unicode名を往復し、キーごとのOwner/Group/DACL/SACLとMandatory Labelを含む生のセキュリティ記述子を完全一致で比較する。値復元で親ACLが変わらないことを確認する。
+- SACL実体がない子キーにも`SE_SACL_AUTO_INHERITED`だけがある階層を含め、ACLの不在・null・空を区別して制御フラグを完全一致で比較する。フラグ欠落を比較除外で回避しない。
+- schema 5のpending・snapshot・metadata・ロックと操作ディレクトリが作成時から現在のユーザーSIDとSYSTEMだけのprotected DACL・現在ユーザーOwnerを持つこと、ACL改変時は読取り・復元・整理を拒否してデータを保持することを確認する。未知schemaとファイル・レジストリ混在の保持制御も検証する。
+- `SeSecurityPrivilege`不足・KTM非対応・レジストリリンク等はcommit前に停止する。未知のschema・metadataや検証できない復元記録は復元・整理を拒否して保全する。完全ACLを取得できる実行環境と、権限不足を期待する環境を分ける。自動昇格はしない。
+- 既存キー・値・空の既定値への復元は競合となり、データを上書きしない。Owner/SACL・Mandatory Labelの適用失敗はrollbackして退避を保持する。commit後receipt未確定の不明状態は自動整理・復元を拒否してpayloadを保全する。
+- 削除stage後に別の非トランザクションwriterが値やACLを更新する競合を確認し、受理された外部データがcommit失敗後も残ることを照合する。値復元もstage後の既存値検出・外部writer競合で上書きせず、snapshotを保全する。
+- `restore`は共通、`restore_files`と`restore_registry`は型限定であること、既存ファイル・旧schema 1/2/3の互換、7日・10 GiBの合算予算と整理前後走査を確認する。
+- hookはレジストリ対象の`Remove-Item`・alias、`Remove-ItemProperty`・`rp`、`reg[.exe] delete`とwrapper・escapeを拒否する。`reg query`とechoの無関係な文字列は通過し、拒否応答に配置済みCLI/config・view・共通restore・operationId保持があることを確認する。
+
+最終書込み時刻・volatile寿命等の全状態保持を検証済みと扱わない。Codex実ホストでのフック読込み・共通guide選択・承認は、プロセスE2Eと分けて確認する。
+
+明示native sessionでは、Codex側の通常CLI・MCPを実際に起動して同じnative scopeの値を削除・復元する。通常セッションと通常client、管理者セッションと利用者が明示起動した管理者clientを分け、同じSIDでも別ログオン識別子からの接続は拒否する。通常clientの完全ACL権限不足は正常往復の成功に数えない。RPC後の`kind`、`allowedRoots:null`とvolumeパスのslash・末尾区切りを含む設定照合、期限切れ・未接続・capability/peer/scope/config改変、scope欠落の旧記録、接続断後のoperationId照合、60秒超の共通ロック待機とMCP進捗を確認する。元のMSIX仮想viewをnativeの同名キーと同一視せず、清掃不能なprivate fixtureを新規作成しない。
+
+2026-10-24の同じSIDでの比較では、MSIX由来でないnative起動のHKCU専用fixtureはE2E 25成功・0失敗となった。一方、MSIX由来の起動コンテキストでは通常・管理者ともHKCU/Softwareのtransacted openが6801（`ERROR_RM_NOT_ACTIVE`）となり、そのコンテキストで見える既存の正確な8対象名はnative viewで全て不存在だった。この別viewでの不存在は清掃の証拠にしない。8対象はその後、利用者が明示承認した一回限りの例外清掃で、保護付きhive保存・独立再読・直前照合を経て削除し、元の仮想viewで残存0とバックアップ不変を確認した。この例外はCLI/MCPの通常削除の成功に数えず、製品への非transaction fallbackは追加していない。`PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY`の既定0と`ENABLE_PROCESS_TREE=1`は直接起動・brokerの子としての起動とも読取りprobeの84行が同一で、6801は解消しなかった。この仮想view内でtransactionが使えない制約は引き続き拒否し、通常Windowsの操作は利用者が明示選択したnative sessionへ分ける。識別・読取り比較・停止条件は[6801の切分け手順](integration.md#レジストリの6801と起動コンテキスト)に従い、起動コンテキストを混ぜて合格や清掃成功を判定しない。
+
+2026-10-24の明示native session追加後は、Codex通常CLI・MCPの値往復、明示した管理者CLI・MCPのキー往復、class・raw bytes・全階層の完全security bytes一致、権限不足・復元競合・新旧scope不一致・payload改変の拒否、各65秒超のロック待機とMCP進捗を含む27件が成功した。client切断後もserverが1操作だけ安全に完了し、再削除せず記録を照合して復元できた。通常native起動の既存レジストリE2Eは25成功、ファイルE2Eは64成功・3skipとなった。正規長の誤nonceによるHMAC拒否の単独注入とprivate/native同名異値の厳密比較、実タイミングのserver強制終了・電源断、distinct WOW64 viewの分離は未検証であり、これらの成功を主張しない。
 
 ## 一時的なロックとロード中DLL
 

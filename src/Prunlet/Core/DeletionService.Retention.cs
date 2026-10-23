@@ -58,9 +58,20 @@ public sealed partial class DeletionService
             try
             {
                 // 移動記録の別volumeにある実体は専用の走査で数える。不正記録も旧形式へ戻さない。
+                if (operation && IsRegistryOperation(name))
+                {
+                    ScanRegistryRecovery(scan, name, warnings, collectCandidates);
+                    continue;
+                }
                 if (operation && IsMoveOperation(name)) continue;
                 bytes = CountRecoveryPayload(member, operation, members);
                 scan.Bytes = checked(scan.Bytes + bytes);
+                if (name.StartsWith("registry-pending-", StringComparison.Ordinal)
+                    || (operation && Directory.EnumerateFileSystemEntries(path).Any(child => Path.GetFileName(child).StartsWith("registry-", StringComparison.OrdinalIgnoreCase))))
+                {
+                    scan.Known = false;
+                    warnings.Add($"Unpublished registry recovery data {name} was retained; capacity is not considered safe for new deletion.");
+                }
             }
             catch (Exception ex) when (IsOperational(ex) || ex is OverflowException)
             {

@@ -6,19 +6,25 @@ namespace Prunlet.Core;
 public sealed partial class DeletionService
 {
     private readonly PrunletConfig config;
+    private readonly RegistrySessionContext? registrySession;
     private const int CopyBufferSize = 128 * 1024;
     internal event Action<TimeSpan, bool>? RecoveryLockProgress;
 
-    public DeletionService(PrunletConfig config)
+    public DeletionService(PrunletConfig config) : this(config, null) { }
+
+    internal DeletionService(PrunletConfig config, RegistrySessionContext? registrySession)
     {
         ArgumentNullException.ThrowIfNull(config);
         config.Validate();
+        this.registrySession = registrySession;
         this.config = new PrunletConfig
         {
             Schema = config.Schema,
             AllowedRoots = config.AllowedRoots?.ToArray() ?? [],
             RetentionDays = config.RetentionDays,
             MaxRecoveryBytes = config.MaxRecoveryBytes,
+            RegistryScope = config.RegistryScope,
+            RegistrySessionFile = config.RegistrySessionFile,
             VolumeRecoveryDirectories = config.VolumeRecoveryDirectories.ToDictionary(pair => PathPolicy.Absolute(pair.Key),
                 pair => PathPolicy.Absolute(pair.Value), StringComparer.OrdinalIgnoreCase),
             BackupDirectory = PathPolicy.Resolve(config.BackupDirectory, finalDirectory: true, allowMissing: false)
@@ -31,11 +37,23 @@ public sealed partial class DeletionService
     }
 
     public RestoreResult Restore(string operationId)
+        => RestoreOperation(operationId, expectedRegistry: null);
+
+    private RestoreResult RestoreOperation(string operationId, bool? expectedRegistry)
     {
         config.Validate();
-        using var coordination = AcquireRecoveryCoordination(create: true);
         if (!Guid.TryParseExact(operationId, "N", out var id) || id.ToString("N") != operationId)
             throw new ArgumentException("Operation ID must be a lowercase 32-character GUID.");
+        if (expectedRegistry is bool preflight && preflight != IsRegistryOperation(operationId))
+            throw new ArgumentException(preflight ? "Operation is not a registry recovery operation." : "Registry operations cannot be restored through the file-only entry point.");
+        // 委任先が同じ共通lockを取るので、RPCは必ず取得より前に行う。
+        if (registrySession is null && config.RegistryScope == "nativeWindows" && IsRegistryOperation(operationId))
+            return RegistrySessionClient.Restore(config, operationId, RecoveryLockProgress);
+        using var coordination = AcquireRecoveryCoordination(create: true);
+        var registry = IsRegistryOperation(operationId);
+        if (expectedRegistry is bool expected && expected != registry)
+            throw new ArgumentException(expected ? "Operation is not a registry recovery operation." : "Registry operations cannot be restored through the file-only entry point.");
+        if (registry) return RestoreRegistryCore(operationId);
         if (IsMoveOperation(operationId)) return RestoreMoves(operationId);
         var directory = Path.Combine(config.BackupDirectory, operationId);
         using var directories = PathPolicy.PinRecoveryDirectories(directory);

@@ -1,12 +1,12 @@
 # Prunletの設計
 
-PrunletはWindowsのファイル・フォルダーとシンボリックリンク・ジャンクションを、同一ボリュームの専用領域へrenameして退避するツールである。新規削除ではコピー後の削除を行わない。CLIとローカルstdio MCPを単一exeで提供し、Codexのフックは直接削除を検査・拒否してCLI手順を案内する。利用手順は[README](README.md)、開発・検証の規約は[AGENTS.md](AGENTS.md)を参照する。
+PrunletはWindowsのファイル・フォルダーとシンボリックリンク・ジャンクションを、同一ボリュームの専用領域へrenameして退避するツールである。新規ファイル削除ではコピー後の削除を行わない。レジストリのキー・値はsnapshotとKTMトランザクションで保全して削除する。CLIとローカルstdio MCPを単一exeで提供し、Codexのフックは直接削除を検査・拒否してCLI手順を案内する。利用手順は[README](README.md)、開発・検証の規約は[AGENTS.md](AGENTS.md)を参照する。
 
 ## 構成と責務
 
 | 実装 | 責務と境界 |
 | --- | --- |
-| `Program.cs` / `Protocol/McpServer.cs` | CLI・JSON出力、stdio JSON-RPCと3つのMCPツール |
+| `Program.cs` / `Protocol/McpServer.cs` | CLI・JSON出力、stdio JSON-RPCと5つのMCPツール |
 | `Core/DeletionService.Moves.cs` / `Core/NativeFiles.Moves.cs` | 新規削除と復元、ハンドルによる同一ボリューム・非上書きrename、容量の事前走査 |
 | `Core/MoveOperation.cs` / `Core/DeletionService.MoveRecords.cs` | schema 4の中央manifest、追記するreceiptの永続化と照合、中断状態の検証 |
 | `Core/VolumeRecoveryStore.cs` | ボリューム別専用領域、所有者ACL・marker・ボリュームとFile IDの照合 |
@@ -29,6 +29,26 @@ PrunletはWindowsのファイル・フォルダーとシンボリックリンク
 復元は記録・receipt・元親・退避先・実体のIDを照合し、復元intentを永続化してから同一オブジェクトを元パスへ非上書きrenameする。既存ファイル・フォルダーへはマージせず`conflict`とし、退避実体を保持する。成功時は`restored`、整合する復元済み記録の再実行は`already_restored`となる。復元は消費型であり、成功後に退避実体は残らない。元親がなくなった場合やIDが変わった場合は停止する。
 
 中断時はmanifestのintent、immutable receipt、元パスと退避先のFile IDから状態を判定する。移動済みだが完了receiptがない場合も実体を照合して扱う。欠損・両方の存在・ID不一致・記録の矛盾など状態が確定できない場合は保全して停止し、存在しないことだけを理由に成功へ変更しない。操作一覧は中央操作IDの列挙であり、復元可能性を保証しない。
+
+## レジストリの削除と復元
+
+レジストリ操作も`Core`へ集約する。CLIは`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <single-key-path>`、MCPは`delete_registry`と`restore_registry`を提供する。共通CLIの`restore`はファイルとレジストリを振り分け、MCPの`restore_files`はファイル操作に限定する。削除要求はview必須、値名省略はキー、空文字は既定値であり、値削除の再帰指定を拒否する。
+
+schema 5の`registry-manifest`・snapshot・intent・receiptで、未知の値型も含め型のuint値と生バイト列、キーごとのOwner・Group・DACL・SACL（Mandatory Labelを含む）を保持する。実削除は非トランザクションの対象または親HKEYを保持し、その同じオブジェクトをRootDirectory・空の相対名で`NtOpenKeyTransactedEx`に渡す。まず削除をトランザクション内へstageし、外部には元データが見える状態で、保持した非トランザクションHKEYからsnapshotを取得する。snapshot・manifest・intentのflushとハッシュ検証を済ませてからcommitし、完了receiptを永続化する。したがって外部に削除が確定する前に保全データが永続化される。dry-runは削除をstageしない読取り検査である。
+
+snapshotを先に読んでから削除をstageすると、その間の外部書込みが成功したまま失われるおそれがあるため、この順序へ戻さない。先行stage後も非トランザクションの外部書込みが受理される場合はあるが、競合したcommitは失敗し、外部の新データを含む元対象を保全する。KTM非対応時の非トランザクション削除は行わない。完全なキーACL取得には`SeSecurityPrivilege`が必要であり、現在のトークンに存在する場合のみ一時有効化し、自動昇格しない。権限不足やsnapshot失敗ではcommitせずロールバックする。値には独立ACLがなく、親ACLを変更しない。
+
+schema 5の原文bytesはpendingファイルの最初の書込み時点から、Ownerを現在のユーザーSID、アクセス主体を現在のユーザーSIDとSYSTEMだけとするprotected DACLを指定してatomicに作成する。操作ディレクトリ・metadata・ロックも同じ非公開ACLで作成し、後からACLを締める公開期間を設けない。読取り・復元・整理でもACLを検証し、改変を検出した記録は処理せず保持する。
+
+キーの生セキュリティ記述子は`BACKUP_SECURITY_INFORMATION`（0x10000）で取得し、Owner・Group・DACL・SACLとMandatory Labelを含めて保持する。Owner/Group/DACL/SACLだけの取得フラグ（0xF）ではMandatory Label ACEが欠落するため使用しない。復元時は完全な記述子を指定して全キーを作成してから、必要なauto-inherited bitだけを要求するsetterを適用し、同じ完全取得方法で再読して生bytesを完全一致で比較する。親のsetterを子の作成前に適用すると、SACL実体がない子のauto-inherited bitが失われるため、この順序を維持する。比較を緩和せず、保持できない場合はロールバックしてsnapshotを保全する。
+
+復元はトランザクション内で新規作成だけを許し、既存キー・値・空の既定値を上書きもマージもしない。値復元は先に書込みをstageしてから、保持した非トランザクション親HKEYで同名値の不存在を確認する。既存値ならロールバックし、競合する外部書込みがあればcommitを失敗させて外部値を保全する。Owner/SACLの適用権限不足もロールバックしsnapshotを保全する。commitとreceipt永続化の間の中断は`ambiguous`としてpayloadを保持し、推測した復元・自動整理を拒否する。キーのclassも保存するが、最終書込み時刻は復元せず、volatileキーも非volatileキーとして復元する。
+
+対象はローカルHKCU/HKLM/HKUの絶対キーで、`Registry::`およびmodule prefixを許容する。ルート自体、mergedなHKCR/HKCC、remote、relative、レジストリリンク、未知のschema・metadataや検証できない復元記録は拒否する。保持期間7日・容量10 GiBの既定値はschema 4および旧schema 1/2/3と合算し、共通ロック・事前走査・整理前後の再走査・単一超過時だけの例外予算を共有する。明示整理は既存CLIの`purge`・`maintain`を使い、MCPにpurgeは追加しない。
+
+MSIX由来の仮想viewでtransactionが利用できない場合も、非transaction操作へ切り替えない。通常Windows側の操作には、利用者が通常デスクトップで明示起動する期限付きnative sessionを用意し、`registryScope=nativeWindows`と専用接続情報を選んだCLI・MCPから同じCoreへ委任する。job・silo制約をsessionへ転送する方式ではなく、利用者が通常Windows scopeへの委任を明示する方式である。自動起動・昇格・タスク登録・仮想viewからのfallbackは行わない。要求ごとのeffective tokenを使用し、session固有の権限を呼出元へ貸さない。sessionはlocal・同じログオン・同じexeに限定し、期限後は新規受付を停止するが進行中のCoreを強制終了しない。
+
+native scopeの識別はmanifestとsnapshotのhash内に保存し、machine・SID・viewの一致を復元前に確認する。scope欠落の旧記録をnativeと推定せず、異なるscopeからの復元を拒否する。restoreのIPC分岐は共通ロックの取得前に行い、server側だけでCoreの共通ロックを取得する。deleteのoperationIdはclientで先に決め、応答喪失時は同じ削除を再送せず、read-onlyの`registry-reconcile`で記録を確認する。接続・scope・認証の不一致は元対象と復元データを保持して停止する。起動・設定の手順は[連携手順](docs/integration.md#通常windowsのレジストリを明示して操作する)を参照する。
 
 ## ボリューム別の復元領域
 

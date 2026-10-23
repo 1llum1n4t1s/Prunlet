@@ -16,6 +16,7 @@ public sealed partial class DeletionService
         config.Validate();
         if (!Guid.TryParseExact(operationId, "N", out var id) || id.ToString("N") != operationId)
             throw new ArgumentException("Operation ID must be a lowercase 32-character GUID.");
+        if (IsRegistryOperation(operationId)) return PurgeRegistryCore(operationId, apply);
         if (IsMoveOperation(operationId)) return PurgeMoveCore(operationId, apply);
         var directory = Path.Combine(config.BackupDirectory, operationId);
         using var directories = PathPolicy.PinRecoveryDirectories(directory);

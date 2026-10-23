@@ -2,7 +2,7 @@
 
 Prunletは、`blocked by policy`による清掃の停止を減らすために、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約するWindows用ツールです。許可された削除を最初からPrunletへ任せる使い方に揃えます。
 
-指定した対象を、同じボリュームのPrunlet専用領域へrenameして退避し、操作IDを使って元へ戻せます。新規削除ではファイル内容をコピーしません。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
+指定したファイル・フォルダーを、同じボリュームのPrunlet専用領域へrenameして退避し、操作IDを使って元へ戻せます。新規ファイル削除では内容をコピーしません。レジストリのキー・値は専用snapshotとトランザクションで保全して削除します。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
 
 並行操作でロックを待つ間は、経過時間とロック取得を通知します。CLI・MCPでの確認方法は[使用中のファイルと同時実行](docs/integration.md#使用中のファイルと同時実行)を参照してください。
 
@@ -112,6 +112,23 @@ C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet
 
 既存schema 1/2/3のコピー形式も復元・整理できます。旧形式はACL等の再現や復元後のコピー保持など新方式と挙動が異なります。[互換経路の設計](DESIGN.md#旧コピー形式の互換性)を参照し、旧版でschema 4を操作しないでください。復元できるのは退避実体または旧コピーが保持されている間だけです。
 
+## レジストリの削除・復元
+
+許可されたローカルのHKCU・HKLM・HKUのキーまたは値を、明示した32/64ビットviewで退避して削除できます。キーのパスは絶対指定し、`--`の後へ1件だけ渡します。`--value-name`を省略するとキー、指定すると文字通りの値名を対象にします。既定値は空の名前なので、PowerShellから空引数が失われない`--value-name=`を使えます。値削除と`--recursive`は併用できません。子キーを含む削除には`--recursive`が必要です。
+
+```text
+prunlet --config <絶対パス> registry-delete --view 64 --dry-run -- HKCU:\Software\Example
+prunlet --config <絶対パス> registry-delete --view 64 --recursive -- HKCU:\Software\Example
+prunlet --config <絶対パス> registry-delete --view 32 --value-name= -- HKCU:\Software\Example
+prunlet --config <絶対パス> restore <operation-id>
+```
+
+schema 5の退避データ・記録・ロックは最初の書込みから現在のユーザーとSYSTEMだけがアクセスできるACLで作成し、ACL改変を検出した記録は復元・整理せず保全します。キーは未知の値型も含め型のuint値・生バイト列とOwner・Group・DACL・SACL（Mandatory Labelを含む）を保存します。完全なACL取得には`SeSecurityPrivilege`が必要で、トークンにある場合だけ一時有効化します。不足時は削除前に停止し、自動昇格しません。KTMトランザクションに対応しない環境へのfallbackはありません。値には独立したACLがなく、値の復元では親キーのACLを変更しません。
+
+復元は元のviewへ行い、既存キー・値（空の既定値も含む）を上書き・マージしません。Owner/SACLの復元権限が不足した場合もロールバックして退避を保全します。ルート自体・HKCR/HKCC・リモート・相対指定・レジストリリンク・未知のschema・metadataや検証できない復元記録は拒否します。キーのclassも保存しますが、最終書込み時刻は復元せず、volatileキーも非volatileキーとして復元します。commit後の記録確定前に中断した操作は不明状態として保全し、自動整理・復元を拒否します。
+
+MSIX由来の仮想viewで6801になる場合は、[通常Windowsの明示セッション](docs/integration.md#通常windowsのレジストリを明示して操作する)を利用できます。利用者が通常デスクトップで期限付きセッションを起動し、専用設定を選んだCLI・MCPから接続します。仮想viewからの自動切替や自動昇格は行わず、仮想view内のキーを通常Windows側の同名キーとして扱いません。
+
 ## 復元データの保持と自動整理
 
 既定の保存期間は操作の作成から7日、新しい退避実体と旧コピーの合計の容量上限は10 GiBです。新しい削除の前に期限切れの復元データを整理し、必要な容量が不足するときは7日以内でも古い操作から整理します。1操作内の復元データはまとめて整理するため、上限より少ない容量になる場合があります。旧設定で項目が省略されている場合も、この既定値が適用されます。
@@ -158,6 +175,9 @@ prunlet --config <絶対パス> compact-history --apply
 | --- | --- | --- |
 | `delete_files` | `paths`、任意の`dryRun`・`recursive` | ファイル・空フォルダー、明示再帰で内容も削除 |
 | `restore_files` | `operationId` | 上書きしない復元 |
+| `delete_registry` | `path`・`view`（`"32"`/`"64"`）、任意の`valueName`・`recursive`・`dryRun` | キーまたは値を保全して削除。空の`valueName`は既定値 |
+| `restore_registry` | `operationId` | レジストリ操作を非上書きで復元 |
+| `reconcile_registry` | `operationId` | 切断後に保存済みの結果を読取り確認。削除・復元を再送しない |
 | `list_operations` | なし | 保存された操作IDの一覧（復元可否は復元時に検証） |
 
 サーバーは削除ツールの用途を`instructions`で通知します。通常入口はCLIで、MCPは配置済みexe・設定をCMDで安全に表現できない場合などの代替入口です。purgeは明示CLI操作です。
@@ -169,6 +189,10 @@ prunlet --config <絶対パス> compact-history --apply
 ## 保存先の実体検証で停止する場合
 
 MSIX版のアプリでは、AppDataの新しいフォルダーがパッケージ専用のLocalCacheへ転送される場合があります。通常ディレクトリの転送は実体へ解決して扱いますが、祖先のリンクや実体・属性を検証できない場合は停止します。エラーに示されたパスと属性を確認し、検証を無効化せず、必要ならexe・設定・復元データを`%USERPROFILE%\.local\Prunlet`などの専用ディレクトリへ配置してください。CodexパッケージのLocalCacheを復元データの恒久保存先にすることは推奨しません。
+
+## レジストリのトランザクションが利用できない場合
+
+`ERROR_RM_NOT_ACTIVE`（6801）などで対象hiveのトランザクションが利用できない場合は、削除をcommitせず元データを保全して停止します。同じPCでもhiveごとに利用可否が異なる場合があります。非トランザクション削除への切替や、原因未確認のOS修復は行わず、エラーと対象hive・viewを確認してください。
 
 ## 開発資料
 

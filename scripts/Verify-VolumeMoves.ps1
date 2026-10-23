@@ -26,6 +26,10 @@ $ErrorActionPreference = 'Stop'
 # ・WriteAttributes拒否時に先に移動してしまい、元対象/属性/別名を失う。
 # ・複数volumeを一方のstoreへ集約し、ID・属性・非上書き・消費型復元を壊す。
 # ・schema 4の履歴を未対応の圧縮経路へ通し、manifestやpayloadを変更する。
+# ・registry削除やfile削除、registry/file混在を誤通過する。
+# ・変数/補間/式/配列/不明オプションを静的な単一registryパスと誤解析する。
+# ・shell/alias/wrapper文脈、Bash.commandとexec_command.cmdの違いを取り違える。
+# ・module修飾/escape/Unicode/不正JSONの検出を退行させ、hookが入力や元fileを変更する。
 # 中断fixtureは有効な記録と移動済みの位置を再現する。原子APIの時刻kill試験ではない。
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
@@ -732,6 +736,143 @@ Test-Case 'hook-rejects-native-delete-with-cli-guidance' {
     $file = New-File 'hook-target'; $event = @{ hook_event_name = 'PreToolUse'; tool_name = 'Bash'; tool_input = @{ command = "Remove-Item -LiteralPath '$file'"; cwd = $script:Scope } }
     $result = Invoke-Child $ExecutablePath @('--config', $script:Config, 'hook') ($event | ConvertTo-Json -Depth 8 -Compress)
     Assert-True ($result.ExitCode -eq 0 -and $result.Stdout -match '(?i)deny' -and $result.Stdout -match '(?i)prunlet' -and [IO.File]::Exists($file)) 'Hook did not refuse and guide to Prunlet.'
+}
+# commandはhookのstdinにだけ渡す。PowerShell/CMD/レジストリ操作として実行しない。
+function Assert-HookCommand([string]$Command, [bool]$Pass, [string]$Shell = '', [switch]$EscapeUnicode) {
+    $file = New-File 'hook-保全😀.txt'
+    $before = Digest $file
+    $Command = $Command.Replace('<FILE>', $file)
+    foreach ($tool in @('Bash', 'exec_command', 'functions.exec_command')) {
+        $inputObject = @{ cwd = $script:Scope }
+        $inputObject[$(if ($tool -eq 'Bash') { 'command' } else { 'cmd' })] = $Command
+        if ($Shell) { $inputObject.shell = $Shell }
+        $event = @{ hook_event_name = 'PreToolUse'; tool_name = $tool; tool_input = $inputObject }
+        $json = if ($EscapeUnicode) { $event | ConvertTo-Json -Depth 8 -Compress -EscapeHandling EscapeNonAscii } else { $event | ConvertTo-Json -Depth 8 -Compress }
+        $result = Invoke-Child $ExecutablePath @('--config', $script:Config, 'hook') $json
+        $label = "$tool shell=$Shell command=$Command"
+        Assert-True ($result.ExitCode -eq 0) "Hook failed: $label : $($result.Stderr)"
+        if ($Pass) {
+            Assert-True ($result.Stdout.Trim() -ceq '{}') "Expected exact empty hook response: $label : $($result.Stdout)"
+        } else {
+            Assert-True ($result.Json.hookSpecificOutput.permissionDecision -ceq 'deny' -and $result.Json.hookSpecificOutput.permissionDecisionReason -match '(?i)prunlet' -and !$result.Json.hookSpecificOutput.updatedInput) "Expected refusal with CLI guidance and no rewrite: $label"
+        }
+        Assert-True ([IO.File]::Exists($file) -and (Digest $file) -ceq $before) "Hook modified source: $label"
+    }
+}
+Test-Case 'hook-rejects-static-registry-paths' {
+    foreach ($command in @(
+        'Remove-Item HKCU:\Software\PrunletHookProbe',
+        'Remove-Item -Path HKLM:\Software\PrunletHookProbe',
+        "Remove-Item -LiteralPath 'Registry::HKEY_CURRENT_USER\Software\PrunletHookProbe'",
+        'Remove-Item -LiteralPath "Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\Software\PrunletHookProbe"',
+        'rEmOvE-iTeM -lItErAlPaTh hKcU:\Software\PrunletHookProbe',
+        'Microsoft.PowerShell.Management\Remove-Item -LiteralPath HKCU:\Software\PrunletHookProbe',
+        "Remove-Item -Recurse -Force -WhatIf -Confirm:`$false -LiteralPath 'HKCU:\Software\Prunlet Hook 日本語' -ErrorAction SilentlyContinue",
+        'Remove-Item -Confirm -Path HKLM:\Software\PrunletHookProbe -ErrorAction Stop',
+        'Remove-Item Microsoft.PowerShell.Core\Registry::HKEY_CURRENT_USER\Software\Probe',
+        'Remove-Item -LiteralPath:HKCU:\Software\Probe -ErrorAction:SilentlyContinue',
+        'Remove-Item HKCU:\Software\PrunletHookProbe; Write-Output done'
+    )) { Assert-HookCommand $command $false }
+}
+Test-Case 'hook-rejects-registry-aliases-in-all-shell-contexts' {
+    Assert-HookCommand 'ri -LiteralPath HKCU:\Software\Probe' $false 'C:\Program Files\PowerShell\7\pwsh.exe'
+    foreach ($alias in @('ri', 'rm', 'rd', 'rmdir', 'del', 'erase')) {
+        $command = "$alias -LiteralPath HKCU:\Software\PrunletHookProbe -Recurse -Force"
+        Assert-HookCommand $command $false 'pwsh'
+        Assert-HookCommand $command $false
+        foreach ($shell in @('cmd.exe', 'bash')) { Assert-HookCommand $command $false $shell }
+    }
+}
+Test-Case 'hook-respects-registry-wrapper-shell-context' {
+    foreach ($command in @(
+        'pwsh -NoProfile -Command "ri -LiteralPath HKCU:\Software\PrunletHookProbe"',
+        'powershell -Command "Remove-Item -Path Registry::HKEY_CURRENT_USER\Software\PrunletHookProbe"',
+        'cmd.exe /d /c pwsh -Command "rm -LiteralPath HKCU:\Software\PrunletHookProbe"',
+        'bash -c ''pwsh -Command "ri -LiteralPath HKCU:\Software\PrunletHookProbe"'''
+    )) { Assert-HookCommand $command $false }
+    foreach ($command in @(
+        'cmd.exe /d /c del HKCU:\Software\PrunletHookProbe',
+        'bash -c ''rm HKCU:\Software\PrunletHookProbe''',
+        'pwsh -Command ''bash -c "rm HKCU:\Software\PrunletHookProbe"''',
+        'pwsh -Command "Remove-Item HKCU:\Software\PrunletHookProbe; Remove-Item -LiteralPath ''<FILE>''"'
+    )) { Assert-HookCommand $command $false 'pwsh' }
+}
+Test-Case 'hook-rejects-registry-file-mixtures' {
+    foreach ($command in @(
+        "Remove-Item -LiteralPath 'HKCU:\Software\PrunletHookProbe','<FILE>'",
+        "Remove-Item -LiteralPath HKCU:\Software\PrunletHookProbe '<FILE>'",
+        "Remove-Item HKCU:\Software\PrunletHookProbe; Remove-Item -LiteralPath '<FILE>'",
+        "Remove-Item -LiteralPath '<FILE>'; Remove-Item HKCU:\Software\PrunletHookProbe",
+        "Remove-Item HKCU:\Software\PrunletHookProbe | Remove-Item -LiteralPath '<FILE>'",
+        "Remove-Item HKCU:\Software\PrunletHookProbe && Remove-Item -LiteralPath '<FILE>'"
+    )) { Assert-HookCommand $command $false 'pwsh' }
+}
+Test-Case 'hook-rejects-dynamic-or-incomplete-registry-targets' {
+    foreach ($command in @(
+        'Remove-Item -LiteralPath $target',
+        'Remove-Item -LiteralPath "HKCU:\Software\$name"',
+        'Remove-Item -LiteralPath ''HKCU:\Software\$name''',
+        'Remove-Item -LiteralPath HKCU:\Software\Prunlet`HookProbe',
+        'Remove-Item -LiteralPath (Join-Path HKCU:\Software PrunletHookProbe)',
+        'Remove-Item -LiteralPath @(HKCU:\Software\First,HKCU:\Software\Second)',
+        'Remove-Item -LiteralPath HKCU:\Software\First,HKCU:\Software\Second',
+        'Remove-Item @parameters',
+        '''HKCU:\Software\PrunletHookProbe'' | Remove-Item',
+        'Remove-Item .\PrunletHookProbe',
+        'Remove-Item -LiteralPath HKCU:\Software\PrunletHookProbe -Unknown',
+        'Remove-Item -LiteralPath HKCU:\Software\PrunletHookProbe -ErrorAction',
+        'Remove-Item -LiteralPath',
+        'Remove-Item -LiteralPath HKCU:\Software\PrunletHookProbe -Path',
+        'Remove-Item HKCU:\Software\Probe -ErrorAction -Force',
+        'Remove-Item HKCU:\Software\Probe HKLM:\Software\Probe',
+        'Remove-Item -LiteralPath HKCU:\Software\Probe -LiteralPath HKLM:\Software\Probe',
+        'Remove-Item HKCU:Software\Probe',
+        'Remove-Item -LiteralPath Registry::Software\Probe',
+        'Remove-Item -LiteralPath HKCU:\Software\PrunletHookProbe -Recurse:$value'
+    )) { Assert-HookCommand $command $false 'pwsh' }
+}
+Test-Case 'hook-retains-file-module-escape-unicode-detection' {
+    foreach ($command in @(
+        "Remove-Item -LiteralPath '<FILE>'",
+        "Microsoft.PowerShell.Management\Remove-Item -LiteralPath '<FILE>'",
+        "Remove``-Item -LiteralPath '<FILE>'",
+        "r``m -LiteralPath '<FILE>'",
+        'Remove-Item.exe HKCU:\Software\PrunletHookProbe',
+        '& "C:\tools\Remove-Item.exe" HKCU:\Software\PrunletHookProbe',
+        'Set-Location "C:\work\"; Remove-Item -LiteralPath "<FILE>"',
+        'cmd.exe /d /c @del "<FILE>"',
+        'bash -c ''printf "abc\""; rm -- "<FILE>"'''
+    )) { Assert-HookCommand $command $false -EscapeUnicode }
+}
+Test-Case 'hook-passes-registry-text-without-deletion' {
+    foreach ($command in @(
+        'Write-Output ''Remove-Item HKCU:\Software\PrunletHookProbe''',
+        'echo "Remove-Item -LiteralPath Registry::HKEY_CURRENT_USER\Software\PrunletHookProbe"',
+        'echo rm HKCU:\Software\PrunletHookProbe',
+        'rg --files',
+        'reg.exe query HKCU\Software\PrunletHookProbe',
+        'reg.exe add HKCU\Software\PrunletHookProbe /v name /d value',
+        'prunlet registry-delete --view 64 -- HKCU\Software\PrunletHookProbe'
+    )) { Assert-HookCommand $command $true }
+}
+Test-Case 'hook-rejects-registry-values-and-reg-exe-with-guidance' {
+    foreach ($command in @(
+        'Remove-ItemProperty -LiteralPath HKCU:\Software\PrunletHookProbe -Name name',
+        'Microsoft.PowerShell.Management\Remove-ItemProperty -Path HKCU:\Software\PrunletHookProbe -Name name',
+        'rp HKCU:\Software\PrunletHookProbe name',
+        'reg.exe delete HKCU\Software\PrunletHookProbe /f',
+        'reg delete HKCU\Software\PrunletHookProbe /v name /f',
+        'cmd.exe /c reg.exe delete HKCU\Software\PrunletHookProbe /ve /f'
+    )) { Assert-HookCommand $command $false }
+    $event = @{ hook_event_name = 'PreToolUse'; tool_name = 'exec_command'; tool_input = @{ cmd = 'Remove-ItemProperty HKCU:\Software\Probe name' } }
+    $result = Invoke-Child $ExecutablePath @('--config', $script:Config, 'hook') ($event | ConvertTo-Json -Depth 8 -Compress)
+    Assert-True ($result.Json.hookSpecificOutput.permissionDecisionReason -match 'registry-delete' -and $result.Json.hookSpecificOutput.permissionDecisionReason -match 'delete') 'Hook omitted file/registry CLI guidance.'
+}
+Test-Case 'hook-rejects-invalid-json-without-mutation' {
+    $file = New-File 'hook-invalid-json-保全.txt'; $before = Digest $file
+    $result = Invoke-Child $ExecutablePath @('--config', $script:Config, 'hook') '{invalid'
+    Assert-True ($result.ExitCode -eq 0 -and $result.Json.hookSpecificOutput.permissionDecision -ceq 'deny' -and !$result.Json.hookSpecificOutput.updatedInput) 'Invalid hook JSON passed or changed input.'
+    Assert-True ([IO.File]::Exists($file) -and (Digest $file) -ceq $before) 'Invalid hook input changed source.'
 }
 Test-Case 'mcp-initialize-delete-restore' {
     $help = Invoke-Child $ExecutablePath @('--help') -Raw

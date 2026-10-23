@@ -7,7 +7,7 @@ internal static class HookRouter
 {
     private static readonly HashSet<string> DeleteCommands = new(StringComparer.OrdinalIgnoreCase)
     {
-        "Remove-Item", "ri", "rm", "rmdir", "rd", "del", "erase"
+        "Remove-Item", "ri", "rm", "rmdir", "rd", "del", "erase", "Remove-ItemProperty", "rp"
     };
 
     // 旧登録の --hook-script は受理するが、外部コードとして読み取ったり実行したりしない。
@@ -32,7 +32,7 @@ internal static class HookRouter
             if (!ContainsDirectDeletion(command.GetString()!)) return Pass();
 
             var executable = Environment.ProcessPath ?? "prunlet.exe";
-            return Deny($"Direct shell deletion is blocked. For an authorized target, use the installed Prunlet CLI from the start with shell=cmd.exe and login=false: {CmdPath(executable)} --config {CmdPath(configPath)} delete --paths-file <absolute-json-file>. Keep its operationId for restore. Do not retry a policy-rejected target through another route.");
+            return Deny($"Direct shell deletion is blocked. For explicitly authorized targets, use the installed Prunlet CLI from the start with shell=cmd.exe and login=false: {CmdPath(executable)} --config {CmdPath(configPath)} delete --paths-file <absolute-json-file>; for registry keys/values use {CmdPath(executable)} --config {CmdPath(configPath)} registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <registry-key-path>. Keep operationId and use {CmdPath(executable)} --config {CmdPath(configPath)} restore <operationId>. Existing host approvals and policies still apply. Do not retry a policy-rejected target through another route.");
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
@@ -93,6 +93,8 @@ internal static class HookRouter
             return IsDeletionCommand(words.GetRange(condition + 2, words.Count - condition - 2), depth + 1);
         }
         if (DeleteCommands.Contains(name)) return true;
+        if (name.Equals("reg", StringComparison.OrdinalIgnoreCase))
+            return index + 1 < words.Count && words[index + 1].Text.Equals("delete", StringComparison.OrdinalIgnoreCase);
         if (!IsShellWrapper(name)) return false;
         for (var i = index + 1; i + 1 < words.Count; i++)
         {

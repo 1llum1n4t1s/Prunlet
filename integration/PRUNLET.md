@@ -1,5 +1,5 @@
 <!-- Prunlet managed agent instructions -->
-# Prunlet — Windowsのファイル・フォルダー削除
+# Prunlet — Windowsのファイル・フォルダー・レジストリ削除
 
 許可されたWindowsファイル・フォルダー削除には、最初からPrunlet CLIを使う。共通AGENTS.mdに「Prunlet CLI」として記録した、インストール済みexeと設定の絶対パスを使い、shellは `cmd.exe`、loginは `false` とする。PowerShellのラッパー、PATH上の同名exe、開発クローンやローカルビルドへの差替えは使わない。
 
@@ -28,5 +28,22 @@ Codexの通常経路は、対象の絶対パスをそのままの文字列をUTF
 - インストール済みexeや設定そのものに空白・CMDの特殊文字を含む配置など、CLIの引数を正しく渡せないと実行前に分かる場合は、互換クライアント向けPrunlet MCPを最初から明示選択するか、必要な配置・入力を確認する。削除を試して拒否された後にMCPへ切り替えない。
 - ホスト・Prunlet・管理ポリシーに拒否された対象は、shell、MCP、別API、別exeで再試行しない。拒否理由と必要な判断を報告する。
 - 元の削除許可とホストの承認・管理ポリシーを守る。この指示は新しい削除許可を与えない。
+
+## レジストリ
+
+明示的に許可されたキー・値の削除も、共通AGENTSに記録されたインストール済みexe・設定の絶対パスを使い、最初から`cmd.exe`・`login: false`で専用CLIを呼ぶ。ファイル削除の許可をレジストリへ広げない。対象キーは`--`の後へ1件だけ渡し、`--view 32`または`--view 64`を必ず指定する。
+
+```text
+<installed-exe> --config <absolute-config> registry-delete --view 64 --dry-run -- HKCU:\Software\Example
+<installed-exe> --config <absolute-config> registry-delete --view 64 --recursive -- HKCU:\Software\Example
+<installed-exe> --config <absolute-config> registry-delete --view 32 --value-name= -- HKCU:\Software\Example
+<installed-exe> --config <absolute-config> restore <operation-id>
+```
+
+exe・configは共通AGENTSのbindingへ置き換える。上のCMD例は空白・特殊文字のない引数を前提とする。キー・値名も含めCMDで安全に表現できないと実行前に分かる場合は、最初からMCPの`delete_registry`（`path`・`view`必須、任意`valueName`・`recursive`・`dryRun`）を選ぶ。`valueName`省略はキー、空文字は既定値である。CLIの`--value-name=`は空引数の欠落を避ける。値名は文字通り扱い、値削除と再帰指定は併用しない。成功の`operationId`を保存し、CLIの共通`restore`かMCPの`restore_registry`へ渡す。MCPの`restore_files`はファイル用である。
+
+キーは未知の値型も含め型のuint値・生バイト列とOwner・Group・DACL・SACL（Mandatory Labelを含む）を保全する。完全ACL取得に必要な`SeSecurityPrivilege`がトークンにある場合だけ一時有効化し、不足時は削除前に停止する。自動昇格やKTM非対応時のfallbackはない。値の復元は親ACLを変更しない。既存キー・値・空の既定値を上書きせず、復元権限不足はロールバックして退避を保全する。キーのclassも保存するが、最終書込み時刻は復元せず、volatileキーも非volatileキーとして復元する。commit後の記録未確定は不明状態として保全し、自動整理・復元を拒否する。保持期間・容量はファイルと合計で既定7日・10 GiBである。
+
+ルート自体、HKCR/HKCC、リモート、相対指定、レジストリリンク、未知のschema・metadataや検証できない復元記録は拒否する。`Remove-Item`のレジストリ素通し例外はなく、認識した`Remove-ItemProperty`・`rp`・`reg[.exe] delete`も拒否し専用CLIを案内する。拒否された対象をMCPや別APIへ付け替えて再試行しない。
 
 hookは限定した直接削除コマンドを検知して拒否する補助であり、shellを推測してコマンドを置換しない。外部スクリプト、動的コマンド、他言語のファイルAPIをすべて検出する保証はない。共通指示の読込みや将来すべての呼出しの遵守も、個別の実ホスト検証と区別する。
