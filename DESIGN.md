@@ -6,10 +6,12 @@ PrunletはWindowsのファイル・フォルダーとシンボリックリンク
 
 | 実装 | 責務と境界 |
 | --- | --- |
-| `Program.cs` / `Protocol/McpServer.cs` | CLI・JSON出力、stdio JSON-RPCと5つのMCPツール |
+| `Program.cs` / `Protocol/McpServer.cs` | CLI・JSON出力、stdio JSON-RPCと6つのMCPツール |
 | `Core/DeletionService.Moves.cs` / `Core/NativeFiles.Moves.cs` | 新規削除と復元、ハンドルによる同一ボリューム・非上書きrename、容量の事前走査 |
 | `Core/MoveOperation.cs` / `Core/DeletionService.MoveRecords.cs` | schema 4の中央manifest、追記するreceiptの永続化と照合、中断状態の検証 |
 | `Core/VolumeRecoveryStore.cs` | ボリューム別専用領域、所有者ACL・marker・ボリュームとFile IDの照合 |
+| `Core/DeletionService.Registry*.cs` / `Core/RegistryOperation.cs` / `Core/NativeRegistry.cs` / `Core/NativeFiles.RegistrySecurity.cs` | schema 5のsnapshot・receipt、KTMによる削除と復元、完全ACLと非公開保存の検証、snapshotの消費・整理 |
+| `Core/RegistrySession*.cs` | 明示native sessionの接続・認証・scope識別と要求委任 |
 | `Core/DeletionService.MoveMaintenance.cs` | schema 4と旧コピーの容量集計・保持制御・明示purgeの統合 |
 | `Core/DeletionService.Metadata.cs` / `Core/DeletionService.Retention.cs` / `Core/DeletionService.Purge.cs` | schema 1/2/3の読込み・コピー検証・復元・整理の互換経路 |
 | `Core/DeletionService.HistoryCompaction.cs` / `Core/HistoryCompactionResult.cs` | 旧コピー形式の整理済み履歴のNTFS圧縮 |
@@ -60,7 +62,7 @@ StoreRootは本人・SYSTEM・Administratorsだけに許可するACLを検証し
 
 ## フォルダーの削除と復元
 
-新規操作はファイル・フォルダー・特殊対象ともschema 4で記録する。ツリー全体を事前走査するため、件数に応じた走査時間と保持ハンドルが必要だが、データの複製は行わない。rootのrenameにより、空フォルダー・階層・正確な名前を同じオブジェクトのまま保持する。復元先の既存フォルダーへはマージしない。
+新規ファイル操作はファイル・フォルダー・リンクともschema 4で記録する。ツリー全体を事前走査するため、件数に応じた走査時間と保持ハンドルが必要だが、データの複製は行わない。rootのrenameにより、空フォルダー・階層・正確な名前を同じオブジェクトのまま保持する。復元先の既存フォルダーへはマージしない。
 
 ## 通常属性の保存と復元
 
@@ -82,7 +84,7 @@ ADSは元オブジェクトに付随して移動し、`Zone.Identifier`や正確
 
 ## 復元データの自動整理
 
-既定は操作作成から7日・合計10 GiBで、項目を省略した旧設定にも適用する。新しい退避実体と旧コピーを合計し、期限切れ、次いで容量確保に必要な古い操作を整理する。実削除前と`maintain --apply`が同じ経路を使い、インストーラーの定期タスクは毎日03:00とログオン時に同じCLIを実行する。dry-run・復元・一覧・hook検査では自動整理しない。
+既定は操作作成から7日・合計10 GiBで、項目を省略した旧設定にも適用する。schema 4の退避実体、schema 5のレジストリsnapshot、旧コピーを合計し、期限切れ、次いで容量確保に必要な古い操作を整理する。実削除前と`maintain --apply`が同じ経路を使い、インストーラーの定期タスクは毎日03:00とログオン時に同じCLIを実行する。dry-run・復元・一覧・hook検査では自動整理しない。
 
 共通`maintenance.lock`で実削除・復元・purge・maintainを直列化する。元対象の容量走査、整理前後の既存全体走査、移動直前・直後の照合で予算を検証する。通常の有効予算は`maxRecoveryBytes`。1回の入力合計がそれを超える場合だけ`max(maxRecoveryBytes, incomingBytes)`を有効予算とし、既存データを0バイトまで安全に整理できることを必要とする。設定は変更せず、次回の削除・maintainは通常予算を再適用する。
 
@@ -96,7 +98,7 @@ ADSは元オブジェクトに付随して移動し、`Zone.Identifier`や正確
 
 `compact-history [--dry-run | --apply]`は既定検査のみで、旧schema 1/2/3の正常なpurge済み履歴JSONをNTFS圧縮する。JSONの内容・名前・ロック・操作IDを保持し、圧縮前後のSHA-256と長さを照合する。コピーが残る操作、未知項目、不正記録、使用中などは理由付きで保持する。
 
-schema 4の移動記録とreceiptは当面この圧縮対象から外し、理由付き`retained`として保持する。`maintain`と実削除前の自動経路も同じ境界を守る。履歴metadataの物理容量と復元payloadの容量予算は分離する。[検証手順](docs/verification.md#操作履歴の圧縮)を参照する。
+schema 4の移動記録とreceipt、およびschema 5のレジストリ記録は当面この圧縮対象から外し、理由付き`retained`として保持する。`maintain`と実削除前の自動経路も同じ境界を守る。履歴metadataの物理容量と復元payloadの容量予算は分離する。[検証手順](docs/verification.md#操作履歴の圧縮)を参照する。
 
 ## 復元データの明示整理
 

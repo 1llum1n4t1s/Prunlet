@@ -2,11 +2,13 @@
 
 現在の構造と設計判断は[DESIGN.md](DESIGN.md)を参照する。削除処理は`src/Prunlet/Core`に集約し、CLI・MCP・フックで別の削除方式を実装しない。
 
-Windowsのファイル削除は、配置済み共通指示のexe・設定の絶対パスを使い、最初から`cmd.exe`・`login: false`でPrunlet CLIを呼ぶ。空白・Unicode・多数・長い対象は絶対パスのUTF-8 JSON一覧を`delete [--dry-run] --paths-file <絶対パス>`で渡す。exe・設定自体をCMDで安全に表現できない場合は実行前に同じCoreのMCPを選ぶ。拒否された削除を別shell・Prunletへ付け替えて再試行しない。詳細は[連携手順](docs/integration.md)を参照する。
+Windowsのファイル・フォルダー・レジストリ削除は、配置済み共通指示のexe・設定の絶対パスを使い、最初から`cmd.exe`・`login: false`でPrunlet CLIを呼ぶ。空白・Unicode・多数・長いファイル対象は絶対パスのUTF-8 JSON一覧を`delete [--dry-run] --paths-file <絶対パス>`で渡す。レジストリは`registry-delete --view <32|64> ... -- <single-key-path>`を使う。exe・設定自体をCMDで安全に表現できない場合は実行前に同じCoreのMCPを選ぶ。拒否された削除を別shell・Prunletへ付け替えて再試行しない。詳細は[連携手順](docs/integration.md)を参照する。
 
 削除対象フォルダーの許可リストは設けず、既存の`allowedRoots`は互換入力として扱う。中央metadataとボリューム別専用領域の保護、リンク先を辿らない処理、File IDと移動intentを永続化してから同一ボリューム内でrenameする順序、既存ファイル・フォルダーを上書き・マージしない消費型復元を維持する。新規削除のコピー経路と異ボリュームへのfallbackは設けず、schema 1/2/3のコピー処理は既存記録の復元・整理の互換経路に限定する。フックはネイティブexeによる入力検査・拒否とCLI案内を担当し、削除・自動置換・PowerShell backend起動を行わない。ホストの承認・管理ポリシーを無効化しない。
 
-復元データの整理を変更する場合は、[整理の設計](DESIGN.md#復元データの自動整理)に従う。既定は7日・合計10 GiBとし、期限切れと容量超過時の古い復元データを自動整理する。元対象の事前容量走査、新旧合計の整理前後の再走査、共通ロック、単一超過時だけの有効予算を維持する。新方式のFile ID・marker・receiptと旧コピーのサイズ・hashを検証し、intentの先行永続化、記録とロックの保持を維持する。手動整理はCLIの明示適用とし、MCPへのpurge追加は行わない。
+レジストリ変更では[レジストリの設計](DESIGN.md#レジストリの削除と復元)のstage・snapshot・永続化・commitの順序、完全なsecurity bytesの照合、schema 5の作成時からの非公開ACL、曖昧な状態の保全を維持する。非トランザクション削除へのfallbackや自動昇格は追加しない。native sessionは利用者の明示起動・scope選択を必要とし、切断時は同じ削除を再送せず`registry-reconcile <operation-id>`で照合する。
+
+復元データの整理を変更する場合は、[整理の設計](DESIGN.md#復元データの自動整理)に従う。既定は7日・合計10 GiBとし、期限切れと容量超過時の古い復元データを自動整理する。元対象の事前容量走査、schema 5のsnapshotを含む新旧合計の整理前後の再走査、共通ロック、単一超過時だけの有効予算を維持する。新方式のFile ID・marker・receiptと旧コピーのサイズ・hashを検証し、intentの先行永続化、記録とロックの保持を維持する。手動整理はCLIの明示適用とし、MCPへのpurge追加は行わない。
 
 ## ビルドと検証
 
@@ -30,7 +32,8 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 - 大量操作: 新方式は`Verify-VolumeMoves.ps1 -Large`でroot単位の記録と容量走査、往復・消費型復元を確認する。旧32,768件・8 MiB超のschema 2/3は既存記録の互換検証として分離する。
 - 削除速度: 変更前exeと同条件で複数回比較し、安全性と内容・IDの保持、衝突時の非上書き、各試行・中央値を確認する。旧コピー方式の性能値を新方式へ流用しない。
 - 保持制御: 新旧合計の容量、事前走査と整理前後再走査、通常予算、複数入力合計が上限を超える操作の例外予算、次回の通常上限、整理不能時の元対象と復元データ保全、並行操作を確認する。定期タスク変更時は所有者検証、既存タスクの保持、登録失敗時の復旧も確認する。
-- 履歴圧縮: schema 4は理由付きretained、旧1/2/3は従来のNTFS圧縮、JSON内容一致・冪等性・ロック保全・容量集計分離を確認する。自動経路と隔離した一回限りの時刻トリガーも対象とする。
+- 履歴圧縮: schema 4/5は理由付きretained、旧1/2/3は従来のNTFS圧縮、JSON内容一致・冪等性・ロック保全・容量集計分離を確認する。自動経路と隔離した一回限りの時刻トリガーも対象とする。
+- レジストリ: `scripts/Verify-RegistryRecovery.ps1 -ExecutablePath <今回のexe> -OutputDirectory <外部絶対パス> -ReportPath <外部JSONパス>`を実行し、[専用検証手順](docs/verification.md#レジストリの削除と復元)に従って完全ACL・raw bytes・競合・曖昧な記録・混在予算・CLI/MCP/hookを確認する。native sessionの往復と切断後照合は別途実プロセスで確認し、MSIX仮想viewと通常Windowsの同名キーを同一視しない。権限・KTM・viewの未検証範囲を成功に数えない。
 
 リポジトリおよびCodex homeへ`bin`・`obj`・一時物・検証出力・バックアップを作らない。TEMP/TMP・ビルド・fixture・レポートには外部絶対パスを渡し、レポートの親を事前に作る。検証後の保持と清掃は[検証手順](docs/verification.md)に従う。移行前提が合わないスクリプトの失敗・未実行は合格扱いせず、未検証範囲を報告する。
 
