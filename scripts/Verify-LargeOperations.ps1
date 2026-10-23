@@ -3,17 +3,23 @@ param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
+    [string]$LegacyExecutablePath,
     [string]$BaselineExecutablePath,
     [ValidateRange(32769, 1000000)][int]$FileCount = 32769,
     [ValidateRange(60, 86400)][int]$ProcessTimeoutSeconds = 1800
 )
 $ErrorActionPreference = 'Stop'
+if (!$LegacyExecutablePath) {
+    & (Join-Path $PSScriptRoot 'Verify-VolumeMoves.ps1') -ExecutablePath $ExecutablePath -OutputDirectory $OutputDirectory -ReportPath $ReportPath -Large -CaseFilter '*large-*' -ProcessTimeoutSeconds ([Math]::Min($ProcessTimeoutSeconds, 3600))
+    exit $LASTEXITCODE
+}
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
 foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'ExecutablePath, OutputDirectory and ReportPath must be absolute.' }
 }
 if ($BaselineExecutablePath -and ![IO.Path]::IsPathFullyQualified($BaselineExecutablePath)) { throw 'BaselineExecutablePath must be absolute.' }
+if (![IO.Path]::IsPathFullyQualified($LegacyExecutablePath)) { throw 'LegacyExecutablePath must be absolute.' }
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $report = [IO.Path]::GetFullPath($ReportPath)
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
@@ -23,12 +29,13 @@ foreach ($destination in @($outputRoot, $report)) {
 if (Test-Path -LiteralPath $outputRoot) { throw 'OutputDirectory must be new.' }
 if (Test-Path -LiteralPath $report) { throw 'ReportPath must be new.' }
 if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($report))) { throw 'Create the external ReportPath parent first.' }
-foreach ($exe in @($ExecutablePath, $BaselineExecutablePath) | Where-Object { $_ }) {
+foreach ($exe in @($ExecutablePath, $LegacyExecutablePath, $BaselineExecutablePath) | Where-Object { $_ }) {
     if (![IO.File]::Exists($exe)) { throw "Executable not found: $exe" }
 }
 $null = [IO.Directory]::CreateDirectory($outputRoot)
 $recovery = Join-Path $outputRoot 'recovery'
 $config = Join-Path $outputRoot 'config.json'
+$legacyConfig = Join-Path $outputRoot 'legacy-config.json'
 $tree = Join-Path $outputRoot 'large-tree'
 $alias = Join-Path $outputRoot 'special-hardlink.txt'
 $metrics = [Collections.Generic.List[object]]::new()
@@ -39,7 +46,8 @@ function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { th
 function File-Digest([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 function Invoke-Cli([string[]]$Arguments, [string]$Executable = $ExecutablePath) {
     # 削除を含む全操作は最初からCMDでCLIへ直接渡す。展開文字を含む経路は実行前に拒否する。
-    $argumentsWithConfig = @('--config', $config) + $Arguments
+    $selectedConfig = if ($Executable.Equals($ExecutablePath, [StringComparison]::OrdinalIgnoreCase)) { $config } else { $legacyConfig }
+    $argumentsWithConfig = @('--config', $selectedConfig) + $Arguments
     foreach ($value in @($Executable) + $argumentsWithConfig) {
         if ($value -match '["%&|<>^!\r\n]') { throw 'CLI argument cannot be represented safely in CMD.' }
     }
@@ -50,6 +58,8 @@ function Invoke-Cli([string[]]$Arguments, [string]$Executable = $ExecutablePath)
     $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false); $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     $info.Arguments = '/d /s /c ' + $command
     $info.Environment['DOTNET_BUNDLE_EXTRACT_BASE_DIR'] = Join-Path $outputRoot 'runtime-cache'
+    $info.Environment['TEMP'] = Join-Path $outputRoot 'temp'
+    $info.Environment['TMP'] = Join-Path $outputRoot 'temp'
     # CMDの子CLIの計測はPowerShellのProcess APIでPIDを追跡する。
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
     $timer = [Diagnostics.Stopwatch]::StartNew(); $peakHandles = 0; $peakWorkingSet = 0L; $peakPrivateBytes = 0L
@@ -116,10 +126,24 @@ function Assert-BaselineRejects([string[]]$Arguments) {
     Assert-FixtureIntact
 }
 
-Test-Case 'create one reusable large fixture and initialize isolated recovery' {
+# 想定する失敗: 新方式が木をコピーへ戻す、旧schema 2/3の大きな記録を読めない、
+# 競合復元で上書きする、整理が記録を壊す。旧記録の生成は指定した旧exeだけが行う。
+Test-Case 'schema 4 large folder moves and restores with persistent identities' {
+    $moveReport = $report + '.moves.json'
+    $global:LASTEXITCODE = 0
+    & (Join-Path $PSScriptRoot 'Verify-VolumeMoves.ps1') -ExecutablePath $ExecutablePath -OutputDirectory (Join-Path $outputRoot 'move-validation') -ReportPath $moveReport -Large -CaseFilter '*large-*' -ProcessTimeoutSeconds ([Math]::Min($ProcessTimeoutSeconds, 3600))
+    $moveResult = [IO.File]::ReadAllText($moveReport) | ConvertFrom-Json
+    Assert-True ($LASTEXITCODE -eq 0 -and $moveResult.failed -eq 0 -and $moveResult.passed -eq 1) 'Large move verification failed.'
+}
+Test-Case 'create one reusable legacy fixture and initialize isolated recovery' {
     $null = [IO.Directory]::CreateDirectory($recovery)
     $init = Invoke-Cli @('init', '--backup-directory', $recovery)
     Assert-True ($init.ExitCode -eq 0) 'Initialization failed.'
+    [IO.File]::Copy($config, $legacyConfig)
+    $candidateConfig = [IO.File]::ReadAllText($config) | ConvertFrom-Json -AsHashtable
+    $candidateConfig.volumeRecoveryDirectories = @{ 'D:\' = (Join-Path $outputRoot 'volume-store') }
+    [IO.File]::WriteAllText($config, ($candidateConfig | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+    $null = [IO.Directory]::CreateDirectory((Join-Path $outputRoot 'temp'))
     $null = [IO.Directory]::CreateDirectory($tree)
     for ($index = 0; $index -lt $FileCount; $index++) { [IO.File]::WriteAllText((Fixture-Path $index), "content $index", [Text.UTF8Encoding]::new($false)) }
     $null = New-Item -ItemType HardLink -Path $alias -Target (Fixture-Path 0)
@@ -127,7 +151,7 @@ Test-Case 'create one reusable large fixture and initialize isolated recovery' {
 }
 
 foreach ($schema in @(3, 2)) {
-    Test-Case "schema $schema recursive delete restore conflict purge repeat exceeds 32768 entries and 8 MiB metadata" {
+    Test-Case "legacy schema $schema restore conflict purge repeat exceeds 32768 entries and 8 MiB metadata" {
         Assert-True ($results.Count -gt 0 -and @($results | Where-Object { !$_.passed }).Count -eq 0) 'Earlier phase failed; fixture retained without further mutation.'
         if ($schema -eq 2) {
             # 外部名だけを同じCoreで削除し、元の32Kファイルはそのまま再利用する。
@@ -141,10 +165,10 @@ foreach ($schema in @(3, 2)) {
         }
         Assert-BaselineRejects @('delete', '--dry-run', '--recursive', '--', $tree)
         $response = Invoke-Cli @('delete', '--dry-run', '--recursive', '--', $tree)
-        Assert-True ($response.ExitCode -eq 0 -and $response.Json.items.Count -eq ($FileCount + 1)) 'Large candidate dry run failed.'
+        Assert-True ($response.ExitCode -eq 0 -and $response.Json.items.Count -eq 1) 'Large candidate dry run failed.'
         $response = $null
         Assert-FixtureIntact
-        $response = Invoke-Cli @('delete', '--recursive', '--', $tree)
+        $response = Invoke-Cli @('delete', '--recursive', '--', $tree) $LegacyExecutablePath
         Assert-True ($response.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree) -and $response.Json.items.Count -eq ($FileCount + 1)) 'Large recursive deletion failed.'
         $id = $response.Json.operationId; $operationRoot = Join-Path $recovery $id
         $response = $null
@@ -209,6 +233,7 @@ $failed = @($results | Where-Object { !$_.passed })
 $reportObject = [ordered]@{
     timestampUtc = [DateTimeOffset]::UtcNow.ToString('O'); executable = $ExecutablePath; executableSha256 = File-Digest $ExecutablePath
     baselineExecutable = $BaselineExecutablePath; baselineExecutableSha256 = $(if ($BaselineExecutablePath) { File-Digest $BaselineExecutablePath } else { $null })
+    legacyExecutable = $LegacyExecutablePath; legacyExecutableSha256 = File-Digest $LegacyExecutablePath
     outputDirectory = $outputRoot; fileCount = $FileCount; passed = $results.Count - $failed.Count; failed = $failed.Count
     results = @($results); operations = @($operations); processMetrics = @($metrics)
     metricNotes = 'CLI child sampled through CMD every 100 ms; handles/private bytes are sampled maxima. Short processes may not be sampled. No performance threshold is asserted.'

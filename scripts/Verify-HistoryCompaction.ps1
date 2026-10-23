@@ -1,13 +1,14 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
+    [Parameter(Mandatory)][string]$LegacyExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
-foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
+foreach ($path in @($ExecutablePath, $LegacyExecutablePath, $OutputDirectory, $ReportPath)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'All paths must be absolute.' }
 }
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
@@ -17,9 +18,11 @@ foreach ($destination in @($outputRoot, $report)) {
     Assert-VerificationDestination $destination @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))
 }
 if (![IO.File]::Exists($ExecutablePath)) { throw 'Executable not found.' }
+if (![IO.File]::Exists($LegacyExecutablePath)) { throw 'Legacy fixture producer not found.' }
 if ((Test-Path -LiteralPath $outputRoot) -or (Test-Path -LiteralPath $report)) { throw 'OutputDirectory and ReportPath must be new.' }
 if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($report))) { throw 'Create the report parent first.' }
 $null = [IO.Directory]::CreateDirectory($outputRoot)
+$null = [IO.Directory]::CreateDirectory((Join-Path $outputRoot 'temp'))
 $results = [Collections.Generic.List[object]]::new()
 $commands = [Collections.Generic.List[object]]::new()
 $script:CaseRoot = $null; $script:Config = $null; $script:Recovery = $null
@@ -29,6 +32,8 @@ $script:CaseRoot = $null; $script:Config = $null; $script:Recovery = $null
 # 不正intent/outcome、未知member・payload・未完履歴、lock競合・処理中の名前差替え、FSCTL失敗。
 # このE2EはNTFS上で実行する。非NTFS/EFS/FSCTL失敗の注入は行わない。
 $script:CliEnvironment = @{
+    TEMP = Join-Path $outputRoot 'temp'
+    TMP = Join-Path $outputRoot 'temp'
     DOTNET_BUNDLE_EXTRACT_BASE_DIR = Join-Path $outputRoot 'runtime-cache'
 }
 . (Join-Path $PSScriptRoot 'HistoryVerification-Common.ps1')
@@ -268,7 +273,7 @@ Test-Case 'invalid-cli-options-rejected' {
 }
 
 $passed = @($results | Where-Object passed).Count; $failed = $results.Count - $passed
-Save-Json $report @{ executable = $ExecutablePath; executableSha256 = (Digest $ExecutablePath); outputDirectory = $outputRoot; passed = $passed; failed = $failed; cases = @($results); commands = @($commands) }
+Save-Json $report @{ executable = $ExecutablePath; executableSha256 = (Digest $ExecutablePath); legacyExecutable = $LegacyExecutablePath; legacyExecutableSha256 = (Digest $LegacyExecutablePath); outputDirectory = $outputRoot; passed = $passed; failed = $failed; cases = @($results); commands = @($commands) }
 Write-Output $report
 Write-Output "passed=$passed failed=$failed"
 if ($failed) { exit 1 }

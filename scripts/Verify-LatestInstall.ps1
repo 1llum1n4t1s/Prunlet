@@ -26,7 +26,32 @@ foreach ($path in @($OutputDirectory, $ReportPath)) {
 }
 New-Item -ItemType Directory -Path $OutputDirectory, (Split-Path -Parent $ReportPath) -Force | Out-Null
 $fixtureUpdateBackupRoot = Join-Path $OutputDirectory 'update-backups'
+$fixtureVolumeStore = Join-Path $OutputDirectory 'volume-stores'
 $results = [Collections.Generic.List[object]]::new()
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class PrunletLatestMoveIdentity {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int kind, byte[] data, uint size);
+    public static string Read(string path) {
+        using (var handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+            if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            byte[] data = new byte[24];
+            if (!GetFileInformationByHandleEx(handle, 18, data, 24)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            return BitConverter.ToString(data).Replace("-", "");
+        }
+    }
+}
+'@
+function Set-FixtureVolumeMap([string]$ConfigPath) {
+    $settings = [IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json -AsHashtable
+    $settings.volumeRecoveryDirectories = @{ 'D:\' = $fixtureVolumeStore }
+    [IO.File]::WriteAllText($ConfigPath, ($settings | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+}
 # 実ホストのタスクは一切登録せず、Task Scheduler境界だけをメモリー上で代替する。
 $global:PrunletMaintenanceFixture = @{ tasks = @{}; failAfterWrite = $false }
 function Get-ScheduledTask {
@@ -72,7 +97,7 @@ $isolatedCodex = Join-Path $OutputDirectory 'isolated-codex'
 $settingsBackup = Join-Path $OutputDirectory 'settings-backup'
 
 # 起こり得る失敗を列挙してから実システムの検証を組み立てる。
-$failureConditions = @('フォルダー未登録の初回導入が拒否される', '旧rootsが削除範囲へ再適用される', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '公開HEADに必要ソース欠落', 'ZIP traversal/重複/リンク', 'ビルド失敗', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '旧roots内外の作業場所と復元先の検証', '指示登録オプションの組合せ不備', '指示marker重複・不完全・利用者編集', 'guide既存未所有・利用者編集', '指示登録途中での書込み失敗')
+$failureConditions = @('退役用設定が利用者のvolume mapを無視する', '退役が元設定や他の設定を変更する', 'schema 4退役payloadのID/hash不一致', 'fixtureが本番専用領域へ書き込む', '未追跡C#がfixture archiveから欠落する', 'フォルダー未登録の初回導入が拒否される', '旧rootsが削除範囲へ再適用される', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '公開HEADに必要ソース欠落', 'ZIP traversal/重複/リンク', 'ビルド失敗', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '旧roots内外の作業場所と復元先の検証', '指示登録オプションの組合せ不備', '指示marker重複・不完全・利用者編集', 'guide既存未所有・利用者編集', '指示登録途中での書込み失敗')
 Test-Case 'Agent instructions require explicit Codex registration' {
     Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -RegisterAgentInstructions } 'requires explicit -RegisterCodex'
 }
@@ -111,6 +136,15 @@ $source = Join-Path $fixtureRoot 'Prunlet-fixture'
 New-Item -ItemType Directory -Path $source, (Join-Path $source 'scripts') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'src'), (Join-Path $repoRoot 'integration') -Destination $source -Recurse
 Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1') -Destination (Join-Path $source 'scripts')
+$fixtureGuideSha256 = (Get-FileHash -LiteralPath (Join-Path $source 'integration\PRUNLET.md') -Algorithm SHA256).Hash
+Assert-True ($fixtureGuideSha256 -ceq (Get-FileHash -LiteralPath (Join-Path $repoRoot 'integration\PRUNLET.md') -Algorithm SHA256).Hash) 'Fixture guide differs from the current working tree.'
+$fixtureSourceFiles = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'src') -Filter '*.cs' -File -Recurse | ForEach-Object {
+    $relative = [IO.Path]::GetRelativePath($repoRoot, $_.FullName)
+    $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+    Assert-True ((Get-FileHash -LiteralPath (Join-Path $source $relative) -Algorithm SHA256).Hash -ceq $hash) "Fixture source differs: $relative"
+    @{ path = $relative; sha256 = $hash }
+})
+Assert-True (@($fixtureSourceFiles | Where-Object path -eq 'src\Prunlet\Core\NativeFiles.Moves.cs').Count -eq 1) 'Fixture archive omitted the new native move source.'
 $zipPath = Join-Path $OutputDirectory 'fixture.zip'
 [IO.Compression.ZipFile]::CreateFromDirectory($fixtureRoot, $zipPath)
 $global:PrunletLatestFixture = @{ sha = ('a' * 40); zip = $zipPath; requests = [Collections.Generic.List[string]]::new(); failDownload = $false; failCopy = $false }
@@ -280,6 +314,9 @@ try {
         Assert-True (!(Test-Path -LiteralPath (Join-Path $isolatedCodex 'AGENTS.md')) -and !(Test-Path -LiteralPath (Join-Path $isolatedCodex 'PRUNLET.md'))) 'Without the flag agent instructions were written.'
         $installedExe = Join-Path $install 'bin\prunlet.exe'
         $installedConfig = Join-Path $install 'config.json'
+        $initialSettings = Get-Content -LiteralPath $installedConfig -Raw | ConvertFrom-Json -AsHashtable
+        Assert-True (!$initialSettings.ContainsKey('volumeRecoveryDirectories') -or $initialSettings.volumeRecoveryDirectories.Count -eq 0) 'Fresh installation changed default volume placement.'
+        Set-FixtureVolumeMap $installedConfig
         $target = Join-Path $OutputDirectory 'unregistered-install-target.txt'
         [IO.File]::WriteAllText($target, 'unregistered install target')
         $deleted = (& $installedExe --config $installedConfig delete -- $target | ConvertFrom-Json)
@@ -390,6 +427,7 @@ try {
         $bytes = [IO.File]::ReadAllBytes($instructionAgents)
         Assert-True ($bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf) 'UTF8 BOM was removed.'
         Assert-True ((Get-FileHash -LiteralPath $instructionGuide).Hash -eq (Get-FileHash -LiteralPath (Join-Path $instructionInstall 'bin\PRUNLET.md')).Hash) 'Registered guide differs from installed guide.'
+        Assert-True ((Get-FileHash -LiteralPath $instructionGuide).Hash -ceq $fixtureGuideSha256) 'Registered guide differs from the source guide snapshot.'
         Assert-True ((Get-FileHash -LiteralPath $trustPath).Hash -eq $trustHash) 'Unrelated host trust data changed.'
     }
 
@@ -428,6 +466,19 @@ try {
         $obsoleteBackend = Join-Path $legacyInstall 'bin\codex-pretooluse.ps1'
         [IO.File]::WriteAllText($obsoleteBackend, '# Previous installed PowerShell backend fixture', [Text.UTF8Encoding]::new($false))
         $obsoleteHash = (Get-FileHash -LiteralPath $obsoleteBackend -Algorithm SHA256).Hash
+        $obsoleteId = [PrunletLatestMoveIdentity]::Read($obsoleteBackend)
+        $legacyConfigPath = Join-Path $legacyInstall 'config.json'
+        Set-FixtureVolumeMap $legacyConfigPath
+        $mainSettings = Get-Content -LiteralPath $legacyConfigPath -Raw | ConvertFrom-Json -AsHashtable
+        $configuredVolumeMap = $mainSettings['volumeRecoveryDirectories']
+        $mainSettings.Remove('volumeRecoveryDirectories')
+        $mainSettings['VolumeRecoveryDirectories'] = $configuredVolumeMap
+        $mainSettings.retentionDays = 13
+        $mainSettings.maxRecoveryBytes = 4GB
+        [IO.File]::WriteAllText($legacyConfigPath, ($mainSettings | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+        & (Join-Path $legacyInstall 'bin\prunlet.exe') --config $legacyConfigPath operations | Out-Null
+        Assert-True ($LASTEXITCODE -eq 0 -and !$mainSettings.ContainsKey('volumeRecoveryDirectories') -and $mainSettings.ContainsKey('VolumeRecoveryDirectories')) 'CLI rejected the case-variant volume configuration fixture.'
+        $legacyConfigHash = (Get-FileHash -LiteralPath $legacyConfigPath -Algorithm SHA256).Hash
         $legacyGuide = "<!-- Prunlet managed agent instructions -->`n# Previous guide`nUse Prunlet MCP first.`n"
         $legacyBytes = [Text.UTF8Encoding]::new($false).GetBytes($legacyGuide)
         [IO.File]::WriteAllBytes((Join-Path $legacyInstall 'bin\PRUNLET.md'), $legacyBytes)
@@ -438,12 +489,18 @@ try {
         $legacyResult = & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $legacyInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $legacyCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'legacy-instruction-upgrade-work') | ConvertFrom-Json
         Assert-True (@($legacyResult).Count -eq 1 -and $legacyResult.requiresHookTrust) 'Installer must emit one result including the hook trust requirement.'
         Assert-True (!(Test-Path -LiteralPath $obsoleteBackend)) 'Upgrade retained the obsolete backend.'
-        $retiredManifests = @(Get-ChildItem -LiteralPath (Join-Path $legacyResult.updateBackupDirectory 'retired-recovery') -Filter 'manifest.json' -File -Recurse)
+        Assert-True ((Get-FileHash -LiteralPath $legacyConfigPath -Algorithm SHA256).Hash -ceq $legacyConfigHash) 'Retirement changed the main configuration.'
+        $retirementConfig = Get-Content -LiteralPath (Join-Path $legacyResult.updateBackupDirectory 'retirement-config.json') -Raw | ConvertFrom-Json
+        Assert-True ($retirementConfig.volumeRecoveryDirectories.'D:\' -ceq $fixtureVolumeStore -and $retirementConfig.backupDirectory -ceq (Join-Path $legacyResult.updateBackupDirectory 'retired-recovery')) 'Retirement lost the user volume map or dedicated metadata directory.'
+        Assert-True ($retirementConfig.retentionDays -eq 7 -and $retirementConfig.maxRecoveryBytes -eq 10GB) 'Retirement inherited unrelated main configuration settings.'
+        $retiredManifests = @(Get-ChildItem -LiteralPath (Join-Path $legacyResult.updateBackupDirectory 'retired-recovery') -Filter 'move-manifest.json' -File -Recurse)
         Assert-True ($retiredManifests.Count -eq 1) 'Retirement has no unique recovery operation.'
         $retired = [IO.File]::ReadAllText($retiredManifests[0].FullName) | ConvertFrom-Json
-        Assert-True ($retired.items[0].path -ieq $obsoleteBackend -and $retired.items[0].sha256 -ieq $obsoleteHash) 'Retirement manifest does not match the old backend.'
-        $retiredCopy = Join-Path $retiredManifests[0].DirectoryName '0000.bak'
-        Assert-True ((Get-FileHash -LiteralPath $retiredCopy -Algorithm SHA256).Hash -eq $obsoleteHash) 'Obsolete backend recovery copy is not verified.'
+        Assert-True ($retired.schema -eq 4 -and @($retired.entries).Count -eq 1 -and $retired.entries[0].path -ieq $obsoleteBackend -and $retired.entries[0].identity.fileId -ceq $obsoleteId.Substring(16)) 'Retirement manifest does not match the old backend identity.'
+        $retiredEntry = $retired.entries[0]
+        $retiredPayload = Join-Path (Join-Path $retiredEntry.storeRoot $retired.operationId) $retiredEntry.payloadName
+        Assert-True ($retiredPayload.StartsWith($fixtureVolumeStore + '\', [StringComparison]::OrdinalIgnoreCase)) 'Retirement escaped the isolated volume store.'
+        Assert-True ((Get-FileHash -LiteralPath $retiredPayload -Algorithm SHA256).Hash -ceq $obsoleteHash -and [PrunletLatestMoveIdentity]::Read($retiredPayload) -ceq $obsoleteId) 'Retired backend was copied or its bytes changed.'
         $updated = [IO.File]::ReadAllText($legacyAgents)
         Assert-True ($updated.Contains('Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。')) 'Legacy instructions did not migrate.'
         Assert-True (!$updated.Contains('Prunlet MCPの`delete_files`を最初から使う。')) 'Legacy normal route survived migration.'
@@ -739,7 +796,7 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
     Remove-Item Function:\Get-ScheduledTask, Function:\Export-ScheduledTask, Function:\Register-ScheduledTask, Function:\Unregister-ScheduledTask
     Remove-Variable PrunletMaintenanceFixture -Scope Global
     # junctionと更新バックアップも隔離出力内に残し、結果確認後にPrunletで一括清掃する。
-    [ordered]@{ verifiedUtc = [DateTimeOffset]::UtcNow.ToString('o'); failureConditions = $failureConditions; results = @($results.ToArray()); passed = !@($results | Where-Object { !$_.passed }).Count; retention = 'Keep this report as reproducible installer verification evidence; delete when superseded.'; reproduce = 'Run scripts/Verify-LatestInstall.ps1 with new external OutputDirectory and ReportPath.' } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ReportPath -Encoding utf8NoBOM
+    [ordered]@{ verifiedUtc = [DateTimeOffset]::UtcNow.ToString('o'); fixtureSource = 'current working tree including untracked C# files'; fixtureSourceFiles = $fixtureSourceFiles; fixtureGuideSha256 = $fixtureGuideSha256; publicHeadChecked = [bool]$CheckPublicHead; failureConditions = $failureConditions; results = @($results.ToArray()); passed = !@($results | Where-Object { !$_.passed }).Count; retention = 'Keep this report as reproducible installer verification evidence; delete when superseded.'; reproduce = 'Run scripts/Verify-LatestInstall.ps1 with new external OutputDirectory and ReportPath.' } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ReportPath -Encoding utf8NoBOM
 }
 Get-Content -LiteralPath $ReportPath -Raw
 if (@($results | Where-Object { !$_.passed }).Count) { throw 'Latest installer verification failed; read the JSON report.' }

@@ -2,9 +2,15 @@
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
-    [Parameter(Mandatory)][string]$ReportPath
+    [Parameter(Mandatory)][string]$ReportPath,
+    [switch]$LegacyCopyVerification
 )
 $ErrorActionPreference = 'Stop'
+# 期限・容量・旧記録混在・hardlink更新を移動方式で検証する。
+if (!$LegacyCopyVerification) {
+    & (Join-Path $PSScriptRoot 'Verify-VolumeMoves.ps1') -ExecutablePath $ExecutablePath -OutputDirectory $OutputDirectory -ReportPath $ReportPath -CaseFilter '*retention*', '*oversized*', '*capacity*', '*mutable-hardlink*'
+    exit $LASTEXITCODE
+}
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
 foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
@@ -27,6 +33,8 @@ $script:CaseRoot = $null; $script:Config = $null; $script:Recovery = $null
 # 想定する失敗: 旧設定の既定値欠落、期限の誤判定、容量整理の順序違反、dry-runの変更、
 # 上限超過入力の拒否・バックアップ欠落・部分削除、次回操作での上限復帰漏れ、
 # 破損・稼働中コピーの削除、ADS・複数対象の過少計上、未知項目の追跡、
+# 多数ADSでの容量情報バッファ拡張漏れ、ストリーム長の取り違え、
+# 大きい操作の並列走査での検査漏れ・途中失敗の過少集計、
 # 整理後の誤った復元成功、並行超過入力の容量累積、繰り返し実行時の記録増殖。
 # 各ケースを独立した復元先で検証する。
 function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { throw $Message } }
@@ -329,6 +337,32 @@ Test-Case 'recovery-root-ads-counts-against-budget' {
     $delete = Invoke-Cli @('delete', '--', $source)
     Assert-True ($delete.ExitCode -ne 0 -and [IO.File]::Exists($source) -and (Digest $source) -ceq $sourceHash -and (Digest $payload) -ceq $hash) 'Root ADS permitted a new copy or was removed.'
 }
+foreach ($kind in @('root', 'file', 'directory')) {
+    Test-Case "many-recovery-streams-$kind-counted-and-preserved" {
+        $target = $script:Recovery
+        $expected = 0L
+        if ($kind -eq 'file') {
+            $target = Join-Path $script:Recovery 'unknown.bin'
+            [IO.File]::WriteAllBytes($target, [byte[]](1, 2, 3)); $expected = 3
+        } elseif ($kind -eq 'directory') {
+            $target = Join-Path $script:Recovery 'unknown-directory'
+            $null = [IO.Directory]::CreateDirectory($target)
+        }
+        $hashes = @{}
+        for ($index = 1; $index -le 64; $index++) {
+            $stream = $target + (':capacity-stream-{0:D3}' -f $index)
+            [IO.File]::WriteAllBytes($stream, [byte[]](1..$index))
+            $expected += $index; $hashes[$stream] = Digest $stream
+        }
+        Set-Policy ($expected - 1)
+        $preview = Invoke-Cli @('maintain')
+        Assert-True ($preview.Json.dryRun -and $preview.Json.capacityKnown -and $preview.Json.retainedBytesBefore -eq $expected -and !$preview.Json.budgetSatisfied) 'Many-stream capacity was not measured exactly.'
+        $source = New-Source 'incoming.txt' 1; $hash = Digest $source
+        $delete = Invoke-Cli @('delete', '--', $source)
+        Assert-True ($delete.ExitCode -ne 0 -and [IO.File]::Exists($source) -and (Digest $source) -ceq $hash) 'Many-stream capacity permitted an over-budget copy.'
+        foreach ($stream in $hashes.Keys) { Assert-True ((Digest $stream) -ceq $hashes[$stream]) 'Recovery stream changed during capacity inspection.' }
+    }
+}
 Test-Case 'reparse-root-does-not-follow-target' {
     $outside = Join-Path $script:CaseRoot 'outside'; $null = [IO.Directory]::CreateDirectory($outside)
     $payload = Join-Path $outside 'payload'; [IO.File]::WriteAllBytes($payload, [byte[]](1..64)); $hash = Digest $payload
@@ -337,6 +371,20 @@ Test-Case 'reparse-root-does-not-follow-target' {
     $result = Invoke-Cli @('maintain', '--apply')
     Assert-True ([IO.Directory]::Exists($junction) -and [IO.File]::Exists($payload) -and (Digest $payload) -ceq $hash) 'Maintenance followed or removed a recovery reparse point.'
     Assert-True (!$result.Json.capacityKnown -and @($result.Json.warnings).Count -gt 0) 'Reparse recovery root was silently trusted.'
+}
+Test-Case 'parallel-recovery-scan-failure-retains-originals-and-copies' {
+    $root = Delete-Source (New-Source 'retained.txt')
+    $backup = (Backups $root)[0]; $backupHash = Digest $backup
+    $outside = Join-Path $script:CaseRoot 'outside'; $null = [IO.Directory]::CreateDirectory($outside)
+    $payload = Join-Path $outside 'payload.bin'; [IO.File]::WriteAllBytes($payload, [byte[]](1..64)); $payloadHash = Digest $payload
+    $null = New-Item -ItemType Junction -Path (Join-Path $root 'unsafe-link') -Target $outside
+    for ($index = 1; $index -le 64; $index++) { [IO.File]::WriteAllBytes((Join-Path $root ('unpublished-{0:D4}.bak' -f $index)), [byte[]]@(42)) }
+    $result = Invoke-Cli @('maintain', '--apply')
+    Assert-True ($result.ExitCode -ne 0 -and !$result.Json.capacityKnown -and @($result.Json.warnings).Count -gt 0) 'Parallel scan failure was accepted as a complete capacity count.'
+    $source = New-Source 'incoming.txt'; $hash = Digest $source
+    $delete = Invoke-Cli @('delete', '--', $source)
+    Assert-True ($delete.ExitCode -ne 0 -and [IO.File]::Exists($source) -and (Digest $source) -ceq $hash) 'Failed parallel inspection allowed a new deletion.'
+    Assert-True ((Digest $backup) -ceq $backupHash -and (Digest $payload) -ceq $payloadHash -and (Backups $root).Count -eq 65) 'Failed parallel inspection changed recovery data or followed a link.'
 }
 Test-Case 'resume-partially-applied-purge-intent' {
     $first = New-Source 'first.txt'; $second = New-Source 'second.txt'

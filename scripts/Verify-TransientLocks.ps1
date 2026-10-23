@@ -2,13 +2,15 @@
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
-    [Parameter(Mandatory)][string]$ReportPath
+    [Parameter(Mandatory)][string]$ReportPath,
+    [string]$TemporaryDirectory
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
-foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
+if (!$TemporaryDirectory) { $TemporaryDirectory = Join-Path $OutputDirectory 'temp' }
+foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath, $TemporaryDirectory)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'All paths must be absolute.' }
     Assert-VerificationDestination ([IO.Path]::GetFullPath($path)) @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))
     if ($path -match '["%&|<>^!\r\n]') { throw 'Unsafe CMD path.' }
@@ -16,29 +18,42 @@ foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
 $ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath)
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $report = [IO.Path]::GetFullPath($ReportPath)
-foreach ($destination in @($outputRoot, $report)) {
+foreach ($destination in @($outputRoot, $report, $TemporaryDirectory)) {
     if (![IO.Path]::GetPathRoot($destination).Equals('D:\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Verification output must be on D:.' }
 }
 if (![IO.File]::Exists($ExecutablePath)) { throw 'Executable not found.' }
 if ((Test-Path -LiteralPath $outputRoot) -or (Test-Path -LiteralPath $report)) { throw 'OutputDirectory and ReportPath must be new.' }
 if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($report))) { throw 'Create the report parent first.' }
 $null = [IO.Directory]::CreateDirectory($outputRoot)
-$env:TEMP = Join-Path $outputRoot 'temp'; $env:TMP = $env:TEMP
+$env:TEMP = [IO.Path]::GetFullPath($TemporaryDirectory); $env:TMP = $env:TEMP
 $env:DOTNET_BUNDLE_EXTRACT_BASE_DIR = Join-Path $outputRoot 'runtime-cache'
 $null = [IO.Directory]::CreateDirectory($env:TEMP)
 $results = [Collections.Generic.List[object]]::new()
 $commands = [Collections.Generic.List[object]]::new()
 $binaryHash = (Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash.ToLowerInvariant()
 
-# 想定する失敗: 短期競合の即失敗、60秒を超える調停待機の打ち切り、ロード中DLLの即失敗、
-# 失敗後の元対象・検証済みコピーの欠損や元属性の変更、読み取り専用削除・復元の失敗。
+# 想定する失敗: 60秒を超える調停待機の打ち切り、fixtureによる本番専用領域への書込み、
+# rename拒否後の元tree・ID・hash・属性の変更、成功後のpayload/復元の別ID化・非消費、
+# schema 4 intent/payloadの欠落、読み取り専用移動の属性変更・不要な再試行。
 # 待機進捗の終了時までのバッファリング、繰返し・取得通知の欠落、無競合時の不要な出力、
 # MCPのtokenなし通知・token型変更・進捗逆行・stdout結果JSONへの診断混入。
-# バックアップ・identity検証エラーの非再試行は、Core担当の確認範囲とする。
+# 新規renameはone-shotであり、旧コピー経路のdelete-pending再試行とは区別する。
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 public static class PrunletTransientLockFixture {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetFileInformationByHandleEx(Microsoft.Win32.SafeHandles.SafeFileHandle file, int kind, byte[] data, uint size);
+    public static string Identity(string path) {
+        using (var handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+            if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            byte[] data = new byte[24];
+            if (!GetFileInformationByHandleEx(handle, 18, data, 24)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            return BitConverter.ToString(data).Replace("-", "");
+        }
+    }
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr LoadLibraryExW(string path, IntPtr file, uint flags);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -49,7 +64,9 @@ public static class PrunletTransientLockFixture {
 function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { throw $Message } }
 function Digest([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 function Save-Json([string]$Path, [object]$Value) { [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false)) }
-function Manifests { @(Get-ChildItem -LiteralPath $script:Recovery -Filter manifest.json -Recurse -File) }
+function File-Id([string]$Path) { [PrunletTransientLockFixture]::Identity($Path) }
+function Manifests { @(Get-ChildItem -LiteralPath $script:Recovery -Filter move-manifest.json -Recurse -File) }
+function Payloads { if ([IO.Directory]::Exists($script:Store)) { @(Get-ChildItem -LiteralPath $script:Store -Filter '*.entry' -Recurse -Force) } }
 function Receive-Lines($Reader, [ref]$Pending, $Lines, $Timer) {
     while ($null -ne $Pending.Value -and $Pending.Value.IsCompleted) {
         $line = $Pending.Value.GetAwaiter().GetResult()
@@ -119,11 +136,15 @@ function Test-Case([string]$Name, [scriptblock]$Body) {
         $script:CaseRoot = Join-Path $outputRoot $Name
         $script:Recovery = Join-Path $script:CaseRoot 'recovery'
         $script:Config = Join-Path $script:CaseRoot 'config.json'
+        $script:Store = Join-Path $script:CaseRoot 'volume-store'
         Assert-VerificationDestination $script:CaseRoot @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))
         $null = [IO.Directory]::CreateDirectory($script:Recovery)
         $init = Invoke-Cli @('init', '--backup-directory', $script:Recovery)
         $script:Evidence.initMilliseconds = $init.Milliseconds
         Assert-True ($init.ExitCode -eq 0) 'Fixture initialization failed.'
+        $configuration = [IO.File]::ReadAllText($script:Config) | ConvertFrom-Json -AsHashtable
+        $configuration.volumeRecoveryDirectories = @{ 'D:\' = $script:Store }
+        Save-Json $script:Config $configuration
         & $Body
         $results.Add(@{ name = $Name; passed = $true; milliseconds = $timer.Elapsed.TotalMilliseconds; evidence = $script:Evidence })
     } catch {
@@ -131,22 +152,25 @@ function Test-Case([string]$Name, [scriptblock]$Body) {
         Write-Warning "$Name : $($_.Exception.Message)"
     }
 }
-function Assert-Backup([string]$SourceHash) {
+function Assert-MovePayload([string]$SourceHash, [string]$RootId = $script:Evidence.sourceId, [string]$Relative = '') {
     $manifests = @(Manifests)
     Assert-True ($manifests.Count -eq 1) 'Expected exactly one operation manifest.'
     $manifest = [IO.File]::ReadAllText($manifests[0].FullName) | ConvertFrom-Json
-    $entry = @($manifest.items | Where-Object { $_.sha256 -eq $SourceHash })
-    Assert-True ($entry.Count -eq 1 -and $entry[0].state -eq 'backup_ready') 'Verified backup metadata is missing.'
-    $copies = @(Get-ChildItem -LiteralPath $manifests[0].DirectoryName -Filter '*.bak' -File)
-    $matching = @($copies | Where-Object { (Digest $_.FullName) -ceq $SourceHash })
-    Assert-True ($matching.Count -eq 1) 'Verified backup bytes differ.'
-    $script:Evidence.backup = @{ path = $matching[0].FullName; sha256 = Digest $matching[0].FullName; manifest = $manifests[0].FullName; state = $entry[0].state }
+    Assert-True ($manifest.schema -eq 4 -and @($manifest.entries).Count -eq 1) 'Expected one schema 4 root entry.'
+    $entry = $manifest.entries[0]
+    $payload = Join-Path (Join-Path $entry.storeRoot $manifest.operationId) $entry.payloadName
+    Assert-True ($payload.StartsWith($script:Store + '\', [StringComparison]::OrdinalIgnoreCase)) 'Payload escaped isolated volume store.'
+    Assert-True ($entry.identity.fileId -ceq $RootId.Substring(16) -and $entry.identity.volumeSerialNumber -eq [BitConverter]::ToUInt64([Convert]::FromHexString($RootId), 0) -and (File-Id $payload) -ceq $RootId) 'Root file identity changed during move.'
+    $bytes = if ($Relative) { Join-Path $payload $Relative } else { $payload }
+    Assert-True ((Digest $bytes) -ceq $SourceHash -and (File-Id $bytes) -ceq $script:Evidence.sourceId) 'Moved bytes or file identity differ.'
+    Assert-True (@(Get-ChildItem -LiteralPath $script:Recovery -Filter manifest.json -Recurse -File).Count -eq 0) 'New deletion generated a legacy copy manifest.'
+    $script:Evidence.move = @{ path = $payload; sha256 = Digest $bytes; rootId = File-Id $payload; manifest = $manifests[0].FullName }
 }
 foreach ($longWait in @($false, $true)) {
     $name = if ($longWait) { 'maintenance-lock-long-wait-released' } else { 'maintenance-lock-released' }
     Test-Case $name {
         $source = Join-Path $script:CaseRoot 'source.txt'; [IO.File]::WriteAllText($source, 'maintenance contention fixture')
-        $hash = Digest $source; $script:Evidence.sourceSha256 = $hash
+        $hash = Digest $source; $script:Evidence.sourceId = File-Id $source; $script:Evidence.sourceSha256 = $hash
         $script:Evidence.plannedHoldMilliseconds = if ($longWait) {
             # 起動時間を見込んでも旧60秒上限を超えるまで保持する。
             [Math]::Max(65000, $script:Evidence.initMilliseconds * 2 + 62000)
@@ -159,8 +183,8 @@ foreach ($longWait in @($false, $true)) {
                 if ($longWait -and $script:HeldLock -and $milliseconds -ge 61000 -and !$script:Evidence.checkedBeyondSixtySeconds) {
                     $script:Evidence.checkedBeyondSixtySeconds = $milliseconds
                     Assert-True (!$process.HasExited) 'CLI exited while the coordination lock was still held beyond 60 seconds.'
-                    Assert-True ([IO.File]::Exists($source) -and (Digest $source) -ceq $hash) 'Coordination wait changed the source beyond 60 seconds.'
-                    Assert-True (@(Manifests).Count -eq 0 -and @(Get-ChildItem -LiteralPath $script:Recovery -Filter '*.bak' -Recurse -File).Count -eq 0) 'Coordination wait changed backup state beyond 60 seconds.'
+                    Assert-True ([IO.File]::Exists($source) -and (Digest $source) -ceq $hash -and (File-Id $source) -ceq $script:Evidence.sourceId) 'Coordination wait changed the source beyond 60 seconds.'
+                    Assert-True (@(Manifests).Count -eq 0 -and @(Payloads).Count -eq 0) 'Coordination wait changed move state beyond 60 seconds.'
                 }
                 if ($script:HeldLock -and $milliseconds -ge $script:Evidence.plannedHoldMilliseconds) {
                     Assert-True ($stderrLines.Count -ge 2) 'Repeated CLI wait messages must arrive while the lock is still held.'
@@ -168,9 +192,9 @@ foreach ($longWait in @($false, $true)) {
                     $script:Evidence.cliAliveBeforeRelease = !$process.HasExited
                     $script:Evidence.manifestCountBeforeRelease = @(Manifests).Count
                     Assert-True ($script:Evidence.cliAliveBeforeRelease -and $script:Evidence.manifestCountBeforeRelease -eq 0) 'CLI must still be alive without a manifest before lock release.'
-                    Assert-True ([IO.File]::Exists($source) -and (Digest $source) -ceq $hash) 'Coordination wait changed the source before release.'
-                    $script:Evidence.backupCountBeforeRelease = @(Get-ChildItem -LiteralPath $script:Recovery -Filter '*.bak' -Recurse -File).Count
-                    Assert-True ($script:Evidence.backupCountBeforeRelease -eq 0) 'Coordination wait created backup bytes before lock release.'
+                    Assert-True ([IO.File]::Exists($source) -and (Digest $source) -ceq $hash -and (File-Id $source) -ceq $script:Evidence.sourceId) 'Coordination wait changed the source before release.'
+                    $script:Evidence.payloadCountBeforeRelease = @(Payloads).Count
+                    Assert-True ($script:Evidence.payloadCountBeforeRelease -eq 0) 'Coordination wait created move payload before lock release.'
                     $script:HeldLock.Dispose(); $script:HeldLock = $null
                 }
             } $timeoutSeconds
@@ -180,21 +204,21 @@ foreach ($longWait in @($false, $true)) {
             Assert-True ($result.ExitCode -eq 0 -and ![IO.File]::Exists($source)) 'Released coordination lock did not allow deletion.'
             $script:Evidence.stderrLines = $result.StderrLines
             Assert-LockMessages $result.StderrLines
-            Assert-Backup $hash
+            Assert-MovePayload $hash
         } finally { if ($script:HeldLock) { $script:HeldLock.Dispose(); $script:HeldLock = $null } }
     }
 }
 Test-Case 'maintenance-lock-uncontended-quiet' {
     $source = Join-Path $script:CaseRoot 'source.txt'; [IO.File]::WriteAllText($source, 'uncontended fixture')
-    $hash = Digest $source
+    $hash = Digest $source; $script:Evidence.sourceId = File-Id $source
     $result = Invoke-Cli @('delete', '--', $source)
     Assert-True ($result.ExitCode -eq 0 -and ![IO.File]::Exists($source) -and $result.StderrLines.Count -eq 0) 'Uncontended CLI deletion should succeed without stderr diagnostics.'
-    Assert-Backup $hash
+    Assert-MovePayload $hash
 }
 foreach ($tokenCase in @('string', 'number', 'absent')) {
     Test-Case "mcp-maintenance-lock-$tokenCase" {
         $source = Join-Path $script:CaseRoot 'source.txt'; [IO.File]::WriteAllText($source, 'MCP coordination fixture')
-        $hash = Digest $source
+        $hash = Digest $source; $script:Evidence.sourceId = File-Id $source
         $token = if ($tokenCase -eq 'string') { 'lock-progress-token' } else { [long]123 }
         $stdoutLines = [Collections.Generic.List[object]]::new()
         $stderrLines = [Collections.Generic.List[object]]::new()
@@ -237,7 +261,7 @@ foreach ($tokenCase in @('string', 'number', 'absent')) {
                     $beforeRelease = @($stdoutLines | ForEach-Object { $_.text | ConvertFrom-Json -Depth 40 } | Where-Object { $_.method -eq 'notifications/progress' })
                     if ($tokenCase -eq 'absent') { Assert-True ($beforeRelease.Count -eq 0) 'MCP sent progress without a token.' }
                     else { Assert-True ($beforeRelease.Count -ge 2) 'MCP progress notifications must arrive before lock release.' }
-                    Assert-True ([IO.File]::Exists($source) -and (Digest $source) -ceq $hash -and @(Manifests).Count -eq 0 -and @(Get-ChildItem -LiteralPath $script:Recovery -Filter '*.bak' -Recurse -File).Count -eq 0) 'MCP lock wait changed source or backup state.'
+                    Assert-True ([IO.File]::Exists($source) -and (Digest $source) -ceq $hash -and (File-Id $source) -ceq $script:Evidence.sourceId -and @(Manifests).Count -eq 0 -and @(Payloads).Count -eq 0) 'MCP lock wait changed source or move state.'
                     $script:Evidence.releaseMilliseconds = $timer.Elapsed.TotalMilliseconds
                     $script:HeldLock.Dispose(); $script:HeldLock = $null
                 }
@@ -267,7 +291,7 @@ foreach ($tokenCase in @('string', 'number', 'absent')) {
             $script:Evidence.stderrLines = @($stderrLines)
             $script:Evidence.progressNotifications = $notifications
             $script:Evidence.result = $response
-            Assert-Backup $hash
+            Assert-MovePayload $hash
         } finally {
             if ($script:HeldLock) { $script:HeldLock.Dispose(); $script:HeldLock = $null }
             if ($started) {
@@ -283,7 +307,7 @@ foreach ($tokenCase in @('string', 'number', 'absent')) {
     }
 }
 foreach ($persistent in @($false, $true)) {
-    $name = if ($persistent) { 'loaded-dll-timeout' } else { 'loaded-dll-released' }
+    $name = if ($persistent) { 'loaded-dll-held-through-rename' } else { 'loaded-dll-released-before-rename' }
     Test-Case $name {
         $tree = Join-Path $script:CaseRoot 'tree'; $parent = Join-Path $tree 'nested'
         $null = [IO.Directory]::CreateDirectory($parent)
@@ -291,29 +315,38 @@ foreach ($persistent in @($false, $true)) {
         [IO.File]::Copy((Join-Path $env:WINDIR 'System32\version.dll'), $source)
         $sourceAttributes = [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Archive
         [IO.File]::SetAttributes($source, $sourceAttributes)
-        $hash = Digest $source; $script:Evidence.sourceSha256 = $hash
+        $hash = Digest $source; $script:Evidence.sourceId = File-Id $source; $script:Evidence.sourceSha256 = $hash
+        $treeId = File-Id $tree; $parentId = File-Id $parent
         $script:Module = [PrunletTransientLockFixture]::LoadLibraryExW($source, [IntPtr]::Zero, 1)
         Assert-True ($script:Module -ne [IntPtr]::Zero) "LoadLibraryExW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-        $script:ManifestSeenAt = $null
         try {
-            $result = Invoke-Cli @('delete', '--recursive', '--', $tree) {
-                param($milliseconds)
-                if ($null -eq $script:ManifestSeenAt -and @(Manifests).Count -gt 0) { $script:ManifestSeenAt = $milliseconds; $script:Evidence.manifestSeenMilliseconds = $milliseconds }
-                if (!$persistent -and $null -ne $script:ManifestSeenAt -and $milliseconds -ge $script:ManifestSeenAt + 1000 -and $script:Module -ne [IntPtr]::Zero) {
-                    Assert-True ([IO.Directory]::Exists($parent) -and [IO.File]::Exists($source)) 'Loaded DLL or its parent disappeared before release.'
-                    Assert-True ([PrunletTransientLockFixture]::FreeLibrary($script:Module)) 'FreeLibrary failed.'
-                    $script:Module = [IntPtr]::Zero; $script:Evidence.releaseMilliseconds = $milliseconds
-                }
-            } 25
+            if (!$persistent) {
+                Assert-True ([PrunletTransientLockFixture]::FreeLibrary($script:Module)) 'FreeLibrary failed.'
+                $script:Module = [IntPtr]::Zero
+            }
+            $script:Evidence.loadedDuringRequest = $persistent
+            $result = Invoke-Cli @('delete', '--recursive', '--', $tree) {} 25
             $script:Evidence.cliMilliseconds = $result.Milliseconds
-            Assert-Backup $hash
-            if ($persistent) {
-                Assert-True ($result.ExitCode -ne 0 -and $null -ne $script:ManifestSeenAt -and ($result.Milliseconds - $script:ManifestSeenAt) -ge 9500 -and $result.Milliseconds -lt 25000) 'Loaded DLL did not fail within the deletion retry bound.'
-                Assert-True ([IO.Directory]::Exists($tree) -and [IO.Directory]::Exists($parent) -and [IO.File]::Exists($source) -and (Digest $source) -ceq $hash) 'Held DLL or its parent directories were lost.'
-                Assert-True ([IO.File]::GetAttributes($source) -eq $sourceAttributes) 'Failed loaded DLL deletion changed original attributes.'
+            if ($result.ExitCode -ne 0) {
+                Assert-True $persistent 'Released DLL still prevented rename.'
+                $script:Evidence.renameOutcome = 'rejected-with-source-preserved'
+                Assert-True ([IO.Directory]::Exists($tree) -and [IO.Directory]::Exists($parent) -and [IO.File]::Exists($source) -and (Digest $source) -ceq $hash -and (File-Id $source) -ceq $script:Evidence.sourceId) 'Held DLL or its parent directories were lost.'
+                Assert-True ((File-Id $tree) -ceq $treeId -and (File-Id $parent) -ceq $parentId -and (File-Id $source) -ceq $script:Evidence.sourceId) 'Rejected rename changed original identities.'
+                Assert-True ([IO.File]::GetAttributes($source) -eq $sourceAttributes -and @(Payloads).Count -eq 0) 'Rejected rename changed attributes or left a payload.'
+                $manifests = @(Manifests)
+                Assert-True ($manifests.Count -eq 1) 'Rejected rename must preserve its persisted move intent.'
+                $intent = [IO.File]::ReadAllText($manifests[0].FullName) | ConvertFrom-Json
+                Assert-True ($intent.schema -eq 4 -and $intent.entries[0].identity.fileId -ceq $treeId.Substring(16)) 'Rejected rename intent identity differs.'
             } else {
-                Assert-True ($script:Evidence.releaseMilliseconds -ge $script:ManifestSeenAt + 1000) 'DLL was not held through deletion contention.'
-                Assert-True ($result.ExitCode -eq 0 -and ![IO.Directory]::Exists($tree)) 'Released DLL did not allow recursive deletion.'
+                $script:Evidence.renameOutcome = 'moved'
+                Assert-True (![IO.Directory]::Exists($tree)) 'Successful rename retained original tree.'
+                Assert-MovePayload $hash $treeId 'nested\fixture.dll'
+                $payload = $script:Evidence.move.path
+                Assert-True ((File-Id (Join-Path $payload 'nested')) -ceq $parentId -and [IO.File]::GetAttributes((Join-Path $payload 'nested\fixture.dll')) -eq $sourceAttributes) 'Moved DLL parent identity or attributes changed.'
+                # 復元もフォルダーrename。ロード状態を維持したまま同一実体で往復する。
+                $restored = Invoke-Cli @('restore', $result.Json.operationId) {} 25
+                Assert-True ($restored.ExitCode -eq 0 -and ![IO.Directory]::Exists($payload)) 'Restore failed or did not consume payload.'
+                Assert-True ((File-Id $tree) -ceq $treeId -and (File-Id $parent) -ceq $parentId -and (File-Id $source) -ceq $script:Evidence.sourceId -and (Digest $source) -ceq $hash -and [IO.File]::GetAttributes($source) -eq $sourceAttributes) 'DLL restore changed identity, bytes or attributes.'
             }
         } finally {
             if ($script:Module -ne [IntPtr]::Zero) {
@@ -326,11 +359,14 @@ foreach ($persistent in @($false, $true)) {
 Test-Case 'readonly-deletes-and-restores-with-original-attributes' {
     $source = Join-Path $script:CaseRoot 'readonly.txt'; [IO.File]::WriteAllText($source, 'readonly fixture')
     [IO.File]::SetAttributes($source, [IO.FileAttributes]::ReadOnly)
-    $hash = Digest $source; $script:Evidence.sourceSha256 = $hash
+    $hash = Digest $source; $script:Evidence.sourceId = File-Id $source; $script:Evidence.sourceSha256 = $hash
+    $script:Evidence.sourceAttributes = [int][IO.File]::GetAttributes($source)
     $result = Invoke-Cli @('delete', '--', $source) {} 15
     $script:Evidence.cliMilliseconds = $result.Milliseconds
     Assert-True ($result.ExitCode -eq 0 -and @($result.Json.items).Count -eq 1 -and $result.Json.items[0].status -eq 'deleted' -and $result.Json.items[0].path -ceq $source -and ![IO.File]::Exists($source)) 'Read-only deletion did not report the expected deleted item.'
-    Assert-Backup $hash
+    Assert-MovePayload $hash
+    $script:Evidence.payloadAttributes = [int][IO.File]::GetAttributes($script:Evidence.move.path)
+    Assert-True ($script:Evidence.payloadAttributes -eq $script:Evidence.sourceAttributes) 'Read-only move changed original attributes.'
     $manifests = @(Manifests)
     $deleteResults = @(Get-ChildItem -LiteralPath $script:Recovery -Filter delete-result.json -Recurse -File)
     Assert-True ($manifests.Count -eq 1 -and $deleteResults.Count -eq 1 -and $manifests[0].DirectoryName -ceq $deleteResults[0].DirectoryName) 'Expected one manifest and one result in the same operation directory.'
@@ -343,7 +379,10 @@ Test-Case 'readonly-deletes-and-restores-with-original-attributes' {
     $script:Evidence.deletionPhaseTiming = @{ source = 'persisted-metadata-last-write-utc'; manifestWrittenUtc = $manifestWrittenUtc.ToString('O'); resultWrittenUtc = $resultWrittenUtc.ToString('O'); milliseconds = $phaseMilliseconds }
     Assert-True ($phaseMilliseconds -ge 0 -and $phaseMilliseconds -lt 5000) 'Read-only deletion should complete without transient retries; metadata interval must be nonnegative and below 5000ms.'
     $restored = Invoke-Cli @('restore', $result.Json.operationId) {} 15
-    Assert-True ($restored.ExitCode -eq 0 -and [IO.File]::Exists($source) -and (Digest $source) -ceq $hash -and [IO.File]::GetAttributes($source) -eq [IO.FileAttributes]::ReadOnly) 'Read-only restore changed source content or attributes.'
+    $script:Evidence.restoredAttributes = [int][IO.File]::GetAttributes($source)
+    $script:Evidence.restoredId = File-Id $source
+    $script:Evidence.payloadExistsAfterRestore = Test-Path -LiteralPath $script:Evidence.move.path
+    Assert-True ($restored.ExitCode -eq 0 -and [IO.File]::Exists($source) -and (File-Id $source) -ceq $script:Evidence.sourceId -and (Digest $source) -ceq $hash -and [IO.File]::GetAttributes($source) -eq [IO.FileAttributes]::ReadOnly -and !(Test-Path -LiteralPath $script:Evidence.move.path)) 'Read-only restore changed identity, content or attributes, or retained payload.'
 }
 $passed = @($results | Where-Object passed).Count; $failed = $results.Count - $passed
 Save-Json $report @{ purpose = 'post-fix-transient-lock-e2e'; executable = $ExecutablePath; executableSha256 = $binaryHash; outputDirectory = $outputRoot; passed = $passed; failed = $failed; cases = @($results); commands = @($commands) }

@@ -1,19 +1,20 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
+    [Parameter(Mandatory)][string]$LegacyExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
-foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
+foreach ($path in @($ExecutablePath, $LegacyExecutablePath, $OutputDirectory, $ReportPath)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'All paths must be absolute.' }
 }
 function Assert-CmdPath([string]$Path) {
     if ($Path -cnotmatch '^[A-Za-z]:\\[A-Za-z0-9 _.:\\-]+$') { throw "Scheduled verification requires an ASCII CMD-safe absolute path: $Path" }
 }
-foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) { Assert-CmdPath $path }
+foreach ($path in @($ExecutablePath, $LegacyExecutablePath, $OutputDirectory, $ReportPath)) { Assert-CmdPath $path }
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $report = [IO.Path]::GetFullPath($ReportPath)
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
@@ -22,6 +23,7 @@ foreach ($destination in @($outputRoot, $report)) {
 }
 foreach ($destination in @($outputRoot, $report)) { if ([IO.Path]::GetPathRoot($destination) -ine 'D:\') { throw 'Verification outputs must use the D drive.' } }
 if (![IO.File]::Exists($ExecutablePath)) { throw 'Executable not found.' }
+if (![IO.File]::Exists($LegacyExecutablePath)) { throw 'Legacy fixture producer not found.' }
 if ((Test-Path -LiteralPath $outputRoot) -or (Test-Path -LiteralPath $report)) { throw 'OutputDirectory and ReportPath must be new.' }
 if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($report))) { throw 'Create the report parent first.' }
 $null = [IO.Directory]::CreateDirectory($outputRoot)
@@ -144,7 +146,7 @@ try {
 }
 $results.Add(@{ name = 'actual-time-trigger-maintain'; passed = $casePassed; error = $caseError })
 $passed = if ($casePassed) { 1 } else { 0 }; $failed = 1 - $passed
-Save-Json $report @{ executable = $ExecutablePath; executableSha256 = (Digest $ExecutablePath); outputDirectory = $outputRoot; passed = $passed; failed = $failed; cases = @($results); commands = @($commands); schedule = $evidence; cleanup = $cleanup }
+Save-Json $report @{ executable = $ExecutablePath; executableSha256 = (Digest $ExecutablePath); legacyExecutable = $LegacyExecutablePath; legacyExecutableSha256 = (Digest $LegacyExecutablePath); outputDirectory = $outputRoot; passed = $passed; failed = $failed; cases = @($results); commands = @($commands); schedule = $evidence; cleanup = $cleanup }
 if ($casePassed) { Write-Output 'PASS scheduled-maintain' }
 Write-Output $report
 Write-Output "passed=$passed failed=$failed"

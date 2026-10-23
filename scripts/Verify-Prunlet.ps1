@@ -3,9 +3,19 @@ param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
-    [string]$LegacyExecutablePath
+    [string]$LegacyExecutablePath,
+    [string]$SecondaryVolumeDirectory,
+    [switch]$LegacyCopyVerification
 )
 $ErrorActionPreference = 'Stop'
+# 新規削除は移動方式で検証する。旧コピー生成の検証は過去exeの再現専用に隔離する。
+if (!$LegacyCopyVerification) {
+    $moveArguments = @{ ExecutablePath = $ExecutablePath; OutputDirectory = $OutputDirectory; ReportPath = $ReportPath }
+    if ($LegacyExecutablePath) { $moveArguments.LegacyExecutablePath = $LegacyExecutablePath }
+    if ($SecondaryVolumeDirectory) { $moveArguments.SecondaryVolumeDirectory = $SecondaryVolumeDirectory }
+    & (Join-Path $PSScriptRoot 'Verify-VolumeMoves.ps1') @moveArguments
+    exit $LASTEXITCODE
+}
 if (-not [IO.Path]::IsPathFullyQualified($OutputDirectory) -or -not [IO.Path]::IsPathFullyQualified($ReportPath)) { throw 'Verification paths must be absolute.' }
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)

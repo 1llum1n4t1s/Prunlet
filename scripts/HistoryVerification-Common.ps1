@@ -1,3 +1,4 @@
+# 失敗条件: 旧生成元の欠落・schema誤認、新版の本番専用領域への書込み、圧縮検証対象の取り違え。
 # 履歴検証の共通関数。呼び出し元のスクリプトスコープで使用する。
 function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { throw $Message } }
 
@@ -9,19 +10,21 @@ function Digest([string]$Path) {
 
 function Save-Json([string]$Path, [object]$Value) { [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 50), [Text.UTF8Encoding]::new($false)) }
 
-function Start-Cli([string[]]$Arguments, [switch]$Mcp) {
-    $values = @('--config', $script:Config) + $Arguments
-    foreach ($value in @($ExecutablePath) + $values) { if ($value -match '["%&|<>^!\r\n]') { throw 'Unsafe CMD argument.' } }
+function Start-Cli([string[]]$Arguments, [switch]$Mcp, [switch]$Legacy) {
+    $cliExecutable = if ($Legacy) { $LegacyExecutablePath } else { $ExecutablePath }
+    $cliConfig = if ($Legacy) { $script:LegacyConfig } else { $script:Config }
+    $values = @('--config', $cliConfig) + $Arguments
+    foreach ($value in @($cliExecutable) + $values) { if ($value -match '["%&|<>^!\r\n]') { throw 'Unsafe CMD argument.' } }
     $info = [Diagnostics.ProcessStartInfo]::new('cmd.exe')
     $info.UseShellExecute = $false; $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.RedirectStandardInput = [bool]$Mcp
     $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false); $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
-    $info.Arguments = '/d /s /c ""' + $ExecutablePath + '" ' + (($values | ForEach-Object { '"' + $_ + '"' }) -join ' ') + '"'
+    $info.Arguments = '/d /s /c ""' + $cliExecutable + '" ' + (($values | ForEach-Object { '"' + $_ + '"' }) -join ' ') + '"'
     foreach ($entry in $script:CliEnvironment.GetEnumerator()) { $info.Environment[$entry.Key] = $entry.Value }
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
     $null = $process.Start()
     if ($Mcp) { return @{ Process = $process; Stderr = $process.StandardError.ReadToEndAsync() } }
-    return @{ Process = $process; Stdout = $process.StandardOutput.ReadToEndAsync(); Stderr = $process.StandardError.ReadToEndAsync(); Arguments = $Arguments }
+    return @{ Process = $process; Stdout = $process.StandardOutput.ReadToEndAsync(); Stderr = $process.StandardError.ReadToEndAsync(); Arguments = $Arguments; Executable = $cliExecutable }
 }
 
 function Finish-Cli($Running) {
@@ -30,7 +33,7 @@ function Finish-Cli($Running) {
         if (!$process.WaitForExit(75000)) { $process.Kill($true); $process.WaitForExit(); throw 'CLI timed out.' }
         $raw = $Running.Stdout.GetAwaiter().GetResult(); $errorText = $Running.Stderr.GetAwaiter().GetResult()
         $json = if ($raw.Trim()) { $raw | ConvertFrom-Json -Depth 50 } else { $null }
-        $commands.Add(@{ case = [IO.Path]::GetFileName($script:CaseRoot); arguments = $Running.Arguments; exitCode = $process.ExitCode; response = $json; stderr = $errorText })
+        $commands.Add(@{ case = [IO.Path]::GetFileName($script:CaseRoot); arguments = $Running.Arguments; executable = $Running.Executable; exitCode = $process.ExitCode; response = $json; stderr = $errorText })
         return @{ ExitCode = $process.ExitCode; Json = $json }
     } finally { $process.Dispose() }
 }
@@ -43,6 +46,13 @@ function New-Case([string]$Name) {
     $script:Config = Join-Path $script:CaseRoot 'config.json'
     $null = [IO.Directory]::CreateDirectory($script:Recovery)
     Assert-True ((Invoke-Cli @('init', '--backup-directory', $script:Recovery)).ExitCode -eq 0) 'Initialization failed.'
+    # 旧形式の生成だけ旧exeで行い、新版の削除先はケース内へ隔離する。
+    $script:LegacyConfig = Join-Path $script:CaseRoot 'legacy-config.json'
+    $configValue = [IO.File]::ReadAllText($script:Config) | ConvertFrom-Json -AsHashtable
+    $null = $configValue.Remove('volumeRecoveryDirectories')
+    Save-Json $script:LegacyConfig $configValue
+    $configValue.volumeRecoveryDirectories = @{ ([IO.Path]::GetPathRoot($script:CaseRoot)) = (Join-Path $script:CaseRoot 'volume-store') }
+    Save-Json $script:Config $configValue
 }
 
 function New-History([int]$Schema = 1, [int]$WarningCount = 1, [switch]$Live) {
@@ -56,7 +66,7 @@ function New-History([int]$Schema = 1, [int]$WarningCount = 1, [switch]$Live) {
     }
     if ($Schema -eq 3) { [IO.File]::WriteAllText(($source + ':history-stream'), 'stream history') }
     $arguments = @('delete'); if ($Schema -eq 2) { $arguments += '--recursive' }; $arguments += @('--', $source)
-    $deleted = Invoke-Cli $arguments
+    $deleted = Finish-Cli (Start-Cli $arguments -Legacy)
     Assert-True ($deleted.ExitCode -eq 0) 'Fixture delete failed.'
     $operation = Join-Path $script:Recovery $deleted.Json.operationId
     $manifest = [IO.File]::ReadAllText((Join-Path $operation 'manifest.json')) | ConvertFrom-Json
