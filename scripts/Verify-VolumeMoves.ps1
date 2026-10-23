@@ -195,10 +195,29 @@ public static class PrunletVolumeMoveVerificationIdentity {
     return [PrunletVolumeMoveVerificationIdentity]::Read($Path)
 }
 function Acl-Permissions($Acl) {
-    $rules = @($Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object {
-        '{0}|{1}|{2}|{3}|{4}' -f $_.IdentityReference.Value, $_.AccessControlType, [long]$_.FileSystemRights, $_.InheritanceFlags, $_.PropagationFlags
-    } | Sort-Object)
-    return $Acl.Owner + '|' + $Acl.Group + '|' + ($rules -join ';')
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($Acl.GetSecurityDescriptorBinaryForm(), 0)
+    $identity = $descriptor.Owner.Value + '|' + $descriptor.Group.Value
+    $dacl = $descriptor.DiscretionaryAcl
+    if ($null -eq $dacl) { return $identity + '|null-dacl' }
+    $allowOnly = !@($dacl | Where-Object { $_.AceType -ne [Security.AccessControl.AceType]::AccessAllowed }).Count
+    foreach ($ace in $dacl) {
+        $ace.AceFlags = [Security.AccessControl.AceFlags]([int]$ace.AceFlags -band (-bnot [int][Security.AccessControl.AceFlags]::Inherited))
+    }
+    if ($allowOnly) {
+        # 継承ACEの明示化後と同じ標準APIで、分割・重複したAllowを統合する。
+        # 主体・権利・継承範囲・伝播を保持し、Owner/Groupとnull DACLも区別する。
+        $normalized = [Security.AccessControl.DiscretionaryAcl]::new($true, $false, $dacl)
+        $rules = @($normalized | ForEach-Object {
+            '{0}|{1}|{2}|{3}' -f $_.SecurityIdentifier.Value, $_.AccessMask, $_.InheritanceFlags, $_.PropagationFlags
+        } | Sort-Object)
+        return $identity + '|allow|' + ($rules -join ';')
+    }
+    # Denyや未知のACEは順序を維持し、継承元を示すflag以外の全bytesを照合する。
+    $rules = @($dacl | ForEach-Object {
+        $bytes = [byte[]]::new($_.BinaryLength); $_.GetBinaryForm($bytes, 0)
+        [Convert]::ToBase64String($bytes)
+    })
+    return $identity + '|ordered|' + ($rules -join ';')
 }
 function Snapshot-Tree([string]$Path) {
     $root = Get-Item -LiteralPath $Path -Force
@@ -354,6 +373,48 @@ Test-Case 'tree-one-entry-full-size-and-identities' {
     $snapshot = Snapshot-Tree $tree; $op = Delete-Entry $tree -Recursive
     Assert-True ($op.Manifest.entries[0].size -eq 370) 'Directory size omitted descendants.'
     Assert-Tree $op.Payload $snapshot -MovedRoot; Restore-Entry $op $tree; Assert-Tree $tree $snapshot
+}
+foreach ($difference in @('rights', 'propagation', 'deny')) {
+    Test-Case "moved-root-acl-$difference-change-is-detected" {
+        $tree = New-Directory (Join-Path $script:Scope 'acl-tree')
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $users = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+        $inherit = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+        $containers = [Security.AccessControl.InheritanceFlags]::ContainerInherit
+        $none = [Security.AccessControl.PropagationFlags]::None
+        $allow = [Security.AccessControl.AccessControlType]::Allow
+        $read = [Security.AccessControl.FileSystemRights]::ReadAndExecute
+        $write = [Security.AccessControl.FileSystemRights]::WriteData -bor [Security.AccessControl.FileSystemRights]::AppendData
+        $acl = Get-Acl -LiteralPath $tree; $acl.SetAccessRuleProtection($true, $false)
+        foreach ($principal in @($sid, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($principal, [Security.AccessControl.FileSystemRights]::FullControl, $inherit, $none, $allow))
+        }
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($users, $read, $inherit, $none, $allow))
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($users, $write, $containers, $none, $allow))
+        Set-Acl -LiteralPath $tree -AclObject $acl
+        $null = New-File 'acl-tree\child.bin'
+        $originalAcl = Get-Acl -LiteralPath $tree; $snapshot = Snapshot-Tree $tree
+        $op = Delete-Entry $tree -Recursive; Assert-Tree $op.Payload $snapshot -MovedRoot
+        $changed = [Security.AccessControl.DirectorySecurity]::new()
+        $changed.SetSecurityDescriptorSddlForm($originalAcl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access), [Security.AccessControl.AccessControlSections]::Access)
+        $changed.PurgeAccessRules($users)
+        $changed.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($users, $read, $inherit, $none, $allow))
+        $changedRights = if ($difference -eq 'rights') { [Security.AccessControl.FileSystemRights]::AppendData } else { $write }
+        $propagation = if ($difference -eq 'propagation') { [Security.AccessControl.PropagationFlags]::NoPropagateInherit } else { $none }
+        $changed.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($users, $changedRights, $containers, $propagation, $allow))
+        if ($difference -eq 'deny') {
+            $changed.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($users, [Security.AccessControl.FileSystemRights]::WriteData, [Security.AccessControl.InheritanceFlags]::None, $none, [Security.AccessControl.AccessControlType]::Deny))
+        }
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($op.Payload), $changed)
+        $rejected = $false
+        try { Assert-Tree $op.Payload $snapshot -MovedRoot } catch { $rejected = $_.Exception.Message -like 'ACL permissions changed:*' }
+        Assert-True $rejected "ACL $difference change was hidden by comparison."
+        $restoreAcl = [Security.AccessControl.DirectorySecurity]::new()
+        $restoreAcl.SetSecurityDescriptorSddlForm($originalAcl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access), [Security.AccessControl.AccessControlSections]::Access)
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($op.Payload), $restoreAcl)
+        Assert-Tree $op.Payload $snapshot -MovedRoot
+        Restore-Entry $op $tree; Assert-Tree $tree $snapshot
+    }
 }
 Test-Case 'nonrecursive-rejects-nonempty-tree' {
     $null = New-File 'tree\a'; $tree = Join-Path $script:Scope 'tree'; $snapshot = Snapshot-Tree $tree
