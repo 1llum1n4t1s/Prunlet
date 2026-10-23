@@ -202,12 +202,13 @@ function Acl-Permissions($Acl) {
 }
 function Snapshot-Tree([string]$Path) {
     $root = Get-Item -LiteralPath $Path -Force
-    $entries = @($root); if ($root.PSIsContainer) { $entries += @(Get-ChildItem -LiteralPath $Path -Force -Recurse) }
+    $snapshotRoot = $root.FullName
+    $entries = @($root); if ($root.PSIsContainer) { $entries += @(Get-ChildItem -LiteralPath $snapshotRoot -Force -Recurse) }
     return @($entries | ForEach-Object {
         Assert-True (!(($_.Attributes -band [IO.FileAttributes]::ReparsePoint))) 'Use ordinary trees for full snapshots.'
         $acl = Get-Acl -LiteralPath $_.FullName
-        @{ relative = $_.FullName.Substring($Path.Length); id = File-Id $_.FullName; attributes = [int]$_.Attributes
-           sddl = $acl.Sddl; permissions = $(if ($_.FullName -ceq $Path) { Acl-Permissions $acl } else { $null })
+        @{ relative = $_.FullName.Substring($snapshotRoot.Length); id = File-Id $_.FullName; attributes = [int]$_.Attributes
+           sddl = $acl.Sddl; permissions = $(if ($_.FullName -ceq $snapshotRoot) { Acl-Permissions $acl } else { $null })
            hash = $(if (!$_.PSIsContainer) { Digest $_.FullName } else { $null }) }
     })
 }
@@ -221,7 +222,8 @@ function Assert-Tree([string]$Path, [object[]]$Snapshot, [switch]$MovedRoot) {
         $actualAcl = Get-Acl -LiteralPath $actual
         if ($MovedRoot -and !$entry.relative) {
             # Windowsは移動した木のrootで継承ACEを明示化する。主体・権利・伝播は全て照合する。
-            Assert-True ((Acl-Permissions $actualAcl) -ceq $entry.permissions) "ACL permissions changed: $actual"
+            $actualPermissions = Acl-Permissions $actualAcl
+            Assert-True ($actualPermissions -ceq $entry.permissions) "ACL permissions changed: $actual; expectedPermissions=$($entry.permissions); actualPermissions=$actualPermissions; expectedSddl=$($entry.sddl); actualSddl=$($actualAcl.Sddl)"
         } else {
             Assert-True ($actualAcl.Sddl -ceq $entry.sddl) "ACL changed: $actual; expected=$($entry.sddl); actual=$($actualAcl.Sddl)"
         }

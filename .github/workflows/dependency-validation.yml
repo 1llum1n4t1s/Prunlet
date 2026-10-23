@@ -42,4 +42,9 @@ jobs:
           $report = Join-Path $env:RUNNER_TEMP "prunlet-dependency-verification.json"
           $runRoot = Join-Path $env:RUNNER_TEMP ("prunlet-e2e-" + [guid]::NewGuid().ToString("N"))
           & ./scripts/Verify-Prunlet.ps1 -ExecutablePath (Join-Path $env:RUNNER_TEMP "prunlet-bin/Release/net10.0-windows/prunlet.exe") -OutputDirectory $runRoot -ReportPath $report
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $verificationExitCode = $LASTEXITCODE
+          if (Test-Path -LiteralPath $report) {
+            $verification = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+            $verification.results | Select-Object name, passed, skipped, note, error | ConvertTo-Json -Depth 4
+          }
+          if ($verificationExitCode -ne 0) { exit $verificationExitCode }
