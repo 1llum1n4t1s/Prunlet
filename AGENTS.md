@@ -4,38 +4,35 @@
 
 Windowsのファイル削除は、配置済み共通指示のexe・設定の絶対パスを使い、最初から`cmd.exe`・`login: false`でPrunlet CLIを呼ぶ。空白・Unicode・多数・長い対象は絶対パスのUTF-8 JSON一覧を`delete [--dry-run] --paths-file <絶対パス>`で渡す。exe・設定自体をCMDで安全に表現できない場合は実行前に同じCoreのMCPを選ぶ。拒否された削除を別shell・Prunletへ付け替えて再試行しない。詳細は[連携手順](docs/integration.md)を参照する。
 
-削除対象フォルダーの許可リストは設けず、既存の`allowedRoots`は互換入力として扱う。復元データ保存先の保護、リンク先を辿らない処理、検証済みバックアップを永続化してから削除する順序、既存ファイルを上書きしない復元を維持する。フックはネイティブexeによる入力検査・拒否とCLI案内を担当し、削除・自動置換・PowerShell backend起動を行わない。ホストの承認・管理ポリシーを無効化しない。
+削除対象フォルダーの許可リストは設けず、既存の`allowedRoots`は互換入力として扱う。中央metadataとボリューム別専用領域の保護、リンク先を辿らない処理、File IDと移動intentを永続化してから同一ボリューム内でrenameする順序、既存ファイル・フォルダーを上書き・マージしない消費型復元を維持する。新規削除のコピー経路と異ボリュームへのfallbackは設けず、schema 1/2/3のコピー処理は既存記録の復元・整理の互換経路に限定する。フックはネイティブexeによる入力検査・拒否とCLI案内を担当し、削除・自動置換・PowerShell backend起動を行わない。ホストの承認・管理ポリシーを無効化しない。
 
-復元データの整理を変更する場合は、[整理の設計](DESIGN.md#復元データの自動整理)に従う。既定は7日・合計10 GiBとし、期限切れと容量超過時の古いコピーを自動整理する。intentの永続化、検証済みコピーだけの削除、記録とロックの保持を維持する。手動整理はCLIの明示適用とし、MCPへのpurge追加は行わない。
+復元データの整理を変更する場合は、[整理の設計](DESIGN.md#復元データの自動整理)に従う。既定は7日・合計10 GiBとし、期限切れと容量超過時の古い復元データを自動整理する。元対象の事前容量走査、新旧合計の整理前後の再走査、共通ロック、単一超過時だけの有効予算を維持する。新方式のFile ID・marker・receiptと旧コピーのサイズ・hashを検証し、intentの先行永続化、記録とロックの保持を維持する。手動整理はCLIの明示適用とし、MCPへのpurge追加は行わない。
 
 ## ビルドと検証
 
 Windows、.NET 10 SDK、PowerShell 7を使う。ビルドは`scripts/Publish-Prunlet.ps1`に外部の絶対出力先を渡す。直接の`dotnet build` / `dotnet publish`でリポジトリへ出力しない。
 
 ```powershell
-$buildRoot = Join-Path ([IO.Path]::GetTempPath()) ('Codex\Prunlet\build-' + [guid]::NewGuid().ToString('N'))
+$buildRoot = Join-Path 'D:\Codex\Prunlet' ('build-' + [guid]::NewGuid().ToString('N'))
 pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 ```
 
 出力は`$buildRoot\publish\prunlet.exe`。既定は`win-x64`、ARM64向けは`-Runtime win-arm64`を指定する。
 
-実装変更後は[検証手順](docs/verification.md)のコマンドで`scripts/Verify-Prunlet.ps1`に今回のexeを渡し、CLI・stdio MCP・フックのE2Eを実行する。インストーラーや共通指示の登録・解除を変更した場合は`scripts/Verify-LatestInstall.ps1`も実行し、検証用アーカイブの結果と実GitHubの結果を区別する。終了コード、`passed` / `failed`、外部JSONレポートを読んで判定する。Codex自身のフック読込・承認と共通指示の読込・MCP選択はスクリプトの検証範囲外なので、連携変更時は同文書の実ホスト確認も行う。
+実装変更後は[検証手順](docs/verification.md)の新方式E2Eに今回のexeと変更前1.0.9の`LegacyExecutablePath`を渡す。通常入口の振分けと各専用スクリプトの移行状態は同文書で確認し、新規通常経路へ旧コピー生成を戻さない。CLI・stdio MCP・フックの実プロセス検証、終了コード、`passed` / `failed`、外部JSONレポートを読んで判定する。インストーラーや共通指示の登録・解除を変更した場合は`scripts/Verify-LatestInstall.ps1`も実行し、検証用アーカイブと実GitHubの結果を区別する。Codex自身のフック読込・承認、共通指示の読込・CLI選択はスクリプト範囲外のため、連携変更時は実ホストで確認する。
 
-ロック待機・削除保留の再試行・待機進捗の通知を変更した場合は、通常E2Eに加えて`scripts/Verify-TransientLocks.ps1`へ今回のexeを渡す。[一時的なロックとロード中DLL](docs/verification.md#一時的なロックとロード中dll)に従い、60秒を超える待機、解放後の続行、拒否時の元対象・復元コピーの保全、CLIのstderrへの即時通知とstdoutのJSON維持、MCPのtoken付き進捗とtokenなし・最終応答後の通知抑止を確認する。
+検証fixtureの`volumeRecoveryDirectories`は対象と同じDボリュームの外部作業領域へ隔離し、本番の既定専用領域を使わない。中央metadataと専用baseは相互に包含させない。旧schema 1/2/3は変更前exeで作った記録のrestore・purge・maintainを新版で確認し、新版で旧コピーを新規生成する検証と混同しない。
 
-case-sensitive属性の復元を変更した場合は、通常E2Eの権限別ケースで、必要権限を付与した復元の成功、属性変更権限不足時の失敗と復元コピーの保全、同じ属性への不要な書込みをせずModify権限で復元できることを確認する。成功ケースだけで権限不足時の安全性を判断しない。
+変更対象ごとの追加検証は[検証手順](docs/verification.md)に従う。
 
-読み取り専用対象の削除や通常属性の保存・復元を変更した場合は、[通常E2Eの検証範囲](docs/verification.md)に従い、dry-runと拒否時の元属性・コピーの保全、ハードリンクの別名とリンク先の不変更、schema 1/2/3の旧記録互換性、不正属性の拒否、圧縮境界での属性復元を確認する。ロード中の読み取り専用DLLの失敗時保全は`scripts/Verify-TransientLocks.ps1`でも確認する。
+- ロック待機・通知: 60秒超の待機と解放後の続行、元対象・退避実体の保全、CLIのstderrとstdout JSON、MCPのtoken付き進捗と最終応答後の通知抑止を確認する。新規renameの拒否と旧コピーの削除保留待機を区別する。
+- 通常属性・case-sensitive・ACL・ADS・リンク: 同一オブジェクトとして保持されること、dry-runと拒否時の不変更、リンク先の保全、ハードリンク外部別名との共有関係、旧形式の属性復元と権限不足時のコピー保全を確認する。
+- 大量操作: 新方式は`Verify-VolumeMoves.ps1 -Large`でroot単位の記録と容量走査、往復・消費型復元を確認する。旧32,768件・8 MiB超のschema 2/3は既存記録の互換検証として分離する。
+- 削除速度: 変更前exeと同条件で複数回比較し、安全性と内容・IDの保持、衝突時の非上書き、各試行・中央値を確認する。旧コピー方式の性能値を新方式へ流用しない。
+- 保持制御: 新旧合計の容量、事前走査と整理前後再走査、通常予算、複数入力合計が上限を超える操作の例外予算、次回の通常上限、整理不能時の元対象と復元データ保全、並行操作を確認する。定期タスク変更時は所有者検証、既存タスクの保持、登録失敗時の復旧も確認する。
+- 履歴圧縮: schema 4は理由付きretained、旧1/2/3は従来のNTFS圧縮、JSON内容一致・冪等性・ロック保全・容量集計分離を確認する。自動経路と隔離した一回限りの時刻トリガーも対象とする。
 
-大量操作に関係する変更では、通常E2Eに加えて`scripts/Verify-LargeOperations.ps1`へ今回のexeを渡す。[大量操作と途中バックアップの検証手順](docs/verification.md#大量操作と途中バックアップ)に従い、件数・記録サイズが旧上限を超えるschema 2/3の削除・復元・整理を確認する。
-
-削除速度を変更した場合は、通常E2Eに加えて`scripts/Verify-DeletionPerformance.ps1`へ今回のexeを渡す。[削除性能の比較](docs/verification.md#削除性能の比較)に従い、変更前のexeを`-BaselineExecutablePath`で指定して同条件で複数回比較し、削除・復元内容・衝突時の非上書きと、JSONレポートの各試行・中央値を確認する。性能値だけで安全性の検証を代替しない。
-
-保持期限・容量制限を変更した場合は、通常E2Eに加えて`scripts/Verify-Retention.ps1`へ今回のexeを渡す。[自動整理の検証手順](docs/verification.md#復元データの自動整理)に従い、旧設定の互換性、整理できないコピーの保全、並行削除時の容量制御を確認する。上限を超える単一操作については、複数入力の合計とschema 2/3を含むバックアップ・復元、dry-runの不変更、次回削除・maintainでの通常上限の再適用、整理できない既存コピーがある場合の元対象とコピーの保全も確認する。定期タスクの登録・解除を変更した場合は`scripts/Verify-LatestInstall.ps1`で所有者検証、既存タスクの保持、登録失敗時の復旧も確認する。
-
-リポジトリおよびCodex homeへ`bin`・`obj`・一時物・検証出力・バックアップを作らない。検証用出力とレポートには新しい外部絶対パスを渡し、レポートの親を事前に作る。検証後の保持と清掃は[検証手順](docs/verification.md)に従う。
-
-履歴圧縮を変更した場合は、通常E2Eに加えて`scripts/Verify-HistoryCompaction.ps1`でdry-runの不変更、物理容量の減少とJSON内容一致、冪等性、既存操作IDの互換性、ロック・リンク・不正metadataの保持を確認する。自動経路は`scripts/Verify-AutomaticHistory.ps1`でmaintain・CLI/MCP削除からの発火、保護対象の保持、既圧縮の再実行と容量集計の分離を確認し、`scripts/Verify-AutomaticHistorySchedule.ps1`で隔離した一回限りの時刻トリガーによる実行を確認する。手順は[履歴圧縮の検証](docs/verification.md#操作履歴の圧縮)を参照する。
+リポジトリおよびCodex homeへ`bin`・`obj`・一時物・検証出力・バックアップを作らない。TEMP/TMP・ビルド・fixture・レポートには外部絶対パスを渡し、レポートの親を事前に作る。検証後の保持と清掃は[検証手順](docs/verification.md)に従う。移行前提が合わないスクリプトの失敗・未実行は合格扱いせず、未検証範囲を報告する。
 
 ## 導入と文書
 

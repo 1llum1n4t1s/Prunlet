@@ -1,47 +1,58 @@
 # E2E検証
 
-CLI・MCP・Codexフックを実際の別プロセスで起動して検証します。ユニットテストは使用しません。
+CLI・MCP・Codexフックを実際の別プロセスで起動して検証します。ユニットテストは使用しません。新規削除はschema 4の同一ボリュームrename、schema 1/2/3は既存コピーの復元・整理の互換経路として確認します。スクリプトの存在と実行成功は別であり、終了コード、`passed` / `failed`、外部JSONレポートを読んで判定してください。
+
+## 通常E2Eの検証範囲
+
+通常の入口`scripts/Verify-Prunlet.ps1`は、新方式を直接検証する`scripts/Verify-VolumeMoves.ps1`へ振り分けます。旧コピーを作るための変更前1.0.9 exeを`-LegacyExecutablePath`で指定し、新旧で同じexeを代用しません。省略時は旧形式互換ケースをskipし、未検証と明記します。
 
 ```powershell
-$runRoot = Join-Path ([IO.Path]::GetTempPath()) ('Codex\Prunlet\verification-' + [guid]::NewGuid().ToString('N'))
-$report = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\verification-' + [guid]::NewGuid().ToString('N') + '.json')
+$runRoot = Join-Path 'D:\Codex\Prunlet' ('verification-' + [guid]::NewGuid().ToString('N'))
+$report = Join-Path 'D:\Codex\TaskArtifacts\Prunlet' ('verification-' + [guid]::NewGuid().ToString('N') + '.json')
 New-Item -ItemType Directory -Path (Split-Path -Parent $report) -Force | Out-Null
-pwsh -NoProfile -File .\scripts\Verify-Prunlet.ps1 -ExecutablePath 'C:\path\to\prunlet.exe' -OutputDirectory $runRoot -ReportPath $report
+pwsh -NoProfile -File .\scripts\Verify-VolumeMoves.ps1 -ExecutablePath <今回のexe絶対パス> -LegacyExecutablePath <変更前1.0.9exe絶対パス> -OutputDirectory $runRoot -ReportPath $report
 ```
 
-`OutputDirectory`と`ReportPath`は新しい外部パスを指定します。レポートの親ディレクトリは事前に用意してください。検証用フォルダーには、この実行が作る使い捨てのファイル・設定・バックアップだけを置きます。標準出力の`passed`と`failed`、終了コード、JSONレポートを確認します。
+`OutputDirectory`と`ReportPath`は新しい外部絶対パスにします。子プロセスのTEMP/TMPと設定、中央metadata、volume recovery baseも外部作業領域へ隔離します。Dドライブのfixtureには`volumeRecoveryDirectories`でD上の専用baseを指定し、本番の既定`.Prunlet-Recovery-<SID>`を使用しません。復元領域と中央metadataは相互に包含させません。レポートの親は事前に作成してください。
 
-検証範囲は、読み取り専用ファイルの削除と通常属性の復元、dry-runの属性不変更、ACL拒否時の元属性とコピーの保全、属性のないschema 1/2/3旧記録の互換性、不正な属性値の拒否、圧縮の有無が変わる両方向での属性なし・Normalの復元、削除と復元の内容・時刻一致、欠損、dry-run、旧ルート外・ルート未指定設定での成功、復元データ保存先・ロックの拒否、リンク・ADS・ハードリンク・case-sensitiveの削除と復元、復元先の競合、復元データ改竄、MCPの実通信と不正引数、ネイティブフックの直接削除拒否・通常入力の通過、登録の冪等性と解除時の既存設定保持です。各ケースの所要時間と実行exeのSHA-256を記録します。
+新方式では次の契約を確認します。各ケースの実行・skip・失敗はその回のレポートを正本とし、ここに列挙しただけで合格にしません。
 
-CLIのJSON一覧では1〜256件・最大1 MiB・不正JSON・不正パス・重複を確認し、空白・Unicode・多数・長い対象をCMDから渡します。長い既存ファイルと本当の欠損を区別し、長いディレクトリ、ADS・リンク自体の削除と復元、slash・拡張長ローカル表記・8.3別名の削除と復元、同一実体の重複拒否、別名経由の復元領域保護、旧schema 1記録を変更しない復元・整理を確認します。MSIXのAppData転送は実パッケージのCodexホストで新規fixtureを使い、入力と実体の同一性、削除・復元のバイト一致、記録の実体パスを別途確認します。既存の拒否対象を再試行せず、新規fixtureだけを使います。purgeは既定dry-run・明示apply・コピーの内容検証・metadata保持・復元拒否・不正記録と複数リンク拒否・有効なintentからの再開を検証します。
+- 通常ファイルと再帰フォルダーを同じFile IDのまま退避・復元し、空階層・内容・ACL・ADS・通常属性・case-sensitive属性を保持する。フォルダーの全子をコピーした形式を新規作成しない。
+- dry-runで元対象、属性、中央記録、専用領域を変更しない。非再帰の非空フォルダー、重複・包含、専用領域とその祖先、不正パスを拒否する。
+- ハードリンクの外部別名とリンク先を削除しない。別名からの書込みが保管実体へ反映される共有関係を確認する。リンクはリンク自体を移動する。
+- 復元先の既存ファイル・フォルダーを上書き・マージしない。復元成功後はpayloadを消費し、整合する再実行は`already_restored`とする。元親・payload・領域のID、marker、ACL、volume、manifest・receiptの不一致を保全する。
+- 容量の事前走査、整理前後の再走査、期限・容量順序、複数入力の合計、単一超過時の例外予算と次回の通常予算、計数不能・整理不能時の元対象の保全を確認する。
+- 移動完了receipt不在、復元intent後などの中断形状から状態を照合し、矛盾・曖昧な欠損を成功扱いしない。
+- 旧exeで作成したschema 1/2/3それぞれを新版でrestore・purge・maintainする。コピーのhash・サイズ検証、旧復元後のコピー保持、新方式の消費型復元を区別する。
+- MCPの3ツール、CLIのJSON・終了コード、フックの直接削除拒否とCLI案内を実プロセスで確認する。purgeをMCPへ追加しない。
 
-purge記録の公開では、操作ディレクトリ外のバックアップルートに部分的な`purge-pending-*.json`を置くfixtureを使い、有効なintentからの再開を妨げず、未知draftも自動削除しないことを確認します。これは強制終了後の残存形状を用意したE2Eです。実プロセス強制終了、`Flush(true)`障害注入、電源断による永続化は未検証です。公開前draftと最終intent・結果を区別し、詳細な順序は[設計](../DESIGN.md#復元データの明示整理)を参照してください。
+中断fixtureは永続記録と移動済み配置を再現するE2Eです。実プロセスをrenameの瞬間に強制終了する試験、`Flush(true)`障害注入、電源断による永続性は別途実施しない限り未検証です。ハードリンク外部別名など共通ロック外からの変更を不変snapshotとして保証しません。
 
-フック入力はPowerShell・CMDの引用符直前のbackslash、CMDの`@del`と静的条件の`IF`を含めて拒否・通過結果を確認します。インストーラー検証には、exe・設定の独自パスを登録した手動導入の解除を含めます。これらの入力・登録スクリプトE2Eと、実Codexホストの解釈は別の検証です。
+`-CaseFilter`はケース名のwildcardで対象を絞り、対象外を`excludedCount`へ計上します。一致0件は失敗です。`Verify-Prunlet.ps1 -LegacyCopyVerification`は旧exeがコピーを生成した時代の再現専用で、新版の通常検証には使用しません。
 
-検証完了後はレポートを保持し、リンクとプロセスの終了を確認して今回の`OutputDirectory`だけを清掃します。既存の共有キャッシュ、ほかの作業、一度インストールしたexe、利用者の復元用データは対象にしません。
+別ボリュームの実機検証は`-SecondaryVolumeDirectory <別ドライブ上の新しい専用フォルダー>`を明示します。混在入力の退避先・volume ID・File ID、衝突時の非上書き、復元後の消費性を確認します。指定しない場合はこのケースをskipします。ローカルの出力先はDを維持し、GitHub Actionsでは共通検証ガードの範囲でrunnerの出力ドライブを使います。
 
-このE2EはCodexがフックを実際に読み込み、拒否や承認を行うことまでは確認しません。登録後はCodexで新しいチャットを開始し、新規の使い捨てfixtureでフックの読込・直接削除の拒否、配置済み絶対exe・設定を使うCMD CLI結果を照合してください。実ホストの引用符処理、共通指示に従った初回CLI選択、PowerShellがホストに拒否される環境での動作は、それぞれ実測するまで未検証です。ホストの拒否を別shell・Prunletへ付け替えて再試行しません。
+検証完了後はJSONレポートと再現に必要な最小データを保持し、プロセスの終了・リンク・他作業との混在を確認して今回の作業領域だけを清掃します。配置済みexe、既存共有キャッシュ、利用者の設定・復元データは対象にしません。
+
+このE2EはCodex自身のフック読込・承認や共通指示の読込みを検証しません。登録変更後は、新しいチャットで配置済みguide・管理マーカー・exe/config binding、最初からCMD CLIが選ばれること、直接削除が拒否されることを実ホストで確認し、スクリプト結果と分けて報告してください。MSIX転送も実パッケージの新規fixtureで実体と往復結果を確認し、既存の拒否対象を別経路で再試行しません。
 
 ## 一時的なロックとロード中DLL
 
-共有ロックや削除保留設定の待機を変更した場合は、通常E2Eに加えて次を実行します。新しい外部絶対パスを指定し、レポートの親を事前に作成してください。
+共通ロック待機は60秒超の保持、解放後の続行、CLIのstderr即時通知とstdout JSON、MCPのtoken付き進捗とtokenなし・最終応答後の通知抑止を確認します。
 
 ```powershell
-pwsh -NoProfile -File .\scripts\Verify-TransientLocks.ps1 -ExecutablePath <今回のexe> -OutputDirectory <新しい外部Temp> -ReportPath <外部JSONレポート>
+pwsh -NoProfile -File .\scripts\Verify-TransientLocks.ps1 -ExecutablePath <今回のexe> -OutputDirectory <新しい外部作業領域> -ReportPath <外部JSONレポート>
 ```
 
-専用の復元領域で、CLIの起動時間に余裕を持たせて共通ロックを保持してから解放したときの成功、65秒以上保持してもCLIが生存し解放後に成功すること、DLLを実際にロードして削除準備後に解放したときの成功、ロード継続時の10秒タイムアウト、読み取り専用ファイルの削除・属性を含む復元と、ロード中の読み取り専用DLLを削除できない場合の元属性・復元コピーの保持を確認します。CLIでは解放前にstderrへ複数の待機通知が届くこと、取得通知が最後に一度届くこと、無競合時は通知がないことも確認します。MCPでは文字列・整数のprogressTokenとtokenなしの要求を送り、解放前の進捗通知、tokenの一致、進捗値の単調増加、最終応答後とtokenなしでの通知抑止を確認します。ロック待機中の元対象のSHA-256と復元コピー未作成、解放後の復元コピーのSHA-256、親フォルダーの保持、待機時間・通知を外部JSONへ記録します。実ユーザーのコンパイラーや共有ビルドサーバーは終了しません。
-
-必要な結果JSONを保持し、検証用プロセスとハンドルの終了後に今回のfixtureをPrunletで清掃してください。読み取り専用検証で付けた属性だけは元に戻してから清掃します。
+ロード中DLLはrenameの成否を調べ、成功時は同一ID・内容・属性と消費型復元、拒否時は元対象と属性の保全を確認します。旧コピーの削除保留待機の期待値を新規renameへ当てはめません。Archiveを含まない読み取り専用ファイルも往復後の完全な属性一致を確認します。
 
 ## latestインストーラー
 
 更新バックアップも`OutputDirectory\update-backups`へ隔離し、`-UpdateBackupRoot`で実体のパスを渡します。実ユーザーの更新バックアップを検証用の保存先に使いません。
 
 ```powershell
-$latestRun = Join-Path ([IO.Path]::GetTempPath()) ('Codex\Prunlet\latest-verification-' + [guid]::NewGuid().ToString('N'))
-$latestReport = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\latest-verification-' + [guid]::NewGuid().ToString('N') + '.json')
+$latestRun = Join-Path 'D:\Codex\Prunlet' ('latest-verification-' + [guid]::NewGuid().ToString('N'))
+$latestReport = Join-Path 'D:\Codex\TaskArtifacts\Prunlet' ('latest-verification-' + [guid]::NewGuid().ToString('N') + '.json')
 New-Item -ItemType Directory -Path (Split-Path -Parent $latestReport) -Force | Out-Null
 pwsh -NoProfile -File .\scripts\Verify-LatestInstall.ps1 -OutputDirectory $latestRun -ReportPath $latestReport -CheckPublicHead
 ```
@@ -54,56 +65,54 @@ GitHub応答を検証用アーカイブへ差し替え、実際のインスト�
 
 共通指示の登録では、明示オプションなしの不変更、既存AGENTSの保持、配置済みexe・設定のbinding、既知の旧MCP優先ブロックとguideハッシュに一致する移行、冪等な登録と解除、利用者編集の保護、登録途中の失敗時の復旧を隔離したCodex homeで確認します。旧配置済みPowerShell backendの退役では、製品バックアップとCoreによるバックアップ付き削除を照合します。実ユーザーの共通AGENTS本文はこのE2Eで変更しません。実登録後は、専用guide・管理マーカー・bindingの保存内容、新しいチャットでの読込、最初からCMD CLIが選ばれた実動作を分けて確認してください。
 
-フォルダー対応では、空フォルダーと空の子階層の削除・復元、非空の明示recursive、CLIとMCP、dry-run、schema 2と旧schema 1、包含・重複・復元データ祖先の拒否、子のlockで削除しないこと、link先を辿らないこと、ADS/hardlink/case-sensitiveの復元、復元時の衝突を検証します。列挙後の追加ファイル競合は、実際にそのタイミングを再現できた場合だけ合格にします。
-
-特殊対象ではschema 3のstream名・保存位置・hash・必須field・reparseタグと生offsetの改竄、case-sensitive保存先の拒否、Foo/fooの個別指定と往復を確認します。ファイル・フォルダーのADSは、通常名と末尾空白・ピリオド付きの名前を別々に保存・復元し、既存対象の非上書きとpurge後の内容維持、MCP経由の末尾空白名の往復も確認します。削除保留とADS共有のnative検証は、元対象を削除せず保留を取り消す方法でsingle-link、hard-link別名、directory、既知ADSを確認します。CLIの並行追加の瞬間にプロセスを強制終了する競合は未検証です。復元は保存時点のsnapshotであり、第三者の同時変更とプロセス終了を含む全変更の原子的保全を保証しません。
-
 ## 大量操作と途中バックアップ
 
-大量操作に関係する変更では、通常E2Eに加えて次の独立したCLI E2Eを実行します。出力先は新しい外部絶対パス、レポートの親は事前作成済みにします。`-BaselineExecutablePath`は旧版の拒否を同じfixtureで比較する場合だけ指定します。
+新しい移動形式の大量ツリーは通常E2Eに`-Large`を追加して確認します。出力先・レポートは通常実行と別の未使用絶対パスを指定してください。
 
 ```powershell
-pwsh -NoProfile -File .\scripts\Verify-LargeOperations.ps1 -ExecutablePath <今回のexe> -OutputDirectory <新しい外部Temp> -ReportPath <外部JSONレポート> [-BaselineExecutablePath <旧版exe>]
+pwsh -NoProfile -File .\scripts\Verify-LargeOperations.ps1 -ExecutablePath <今回のexe> -LegacyExecutablePath <変更前1.0.9exe> -OutputDirectory <新しい外部作業領域> -ReportPath <外部JSONレポート>
 ```
 
-32,769ファイルをschema 3とschema 2の両方で削除・復元し、実manifestと結果が8 MiBを超えること、全ファイルの内容、既存ファイルの非上書き、purgeの検査・適用・再適用を確認します。CLI子プロセスの時間・メモリ・ハンドル数も記録します。通常E2Eでは旧schema 1/2/3の途中コピー、schema 2 purge intentの再開・改竄、正常コピーの破損、未知項目・link・ADS・hardlink、不正な巨大tokenや切断JSONを確認します。
+rootごとのschema 4記録、事前容量走査、同一File IDの往復、消費型復元を確認します。旧形式の32,768項目・8 MiB超のschema 2/3記録と途中コピー整理は互換専用の対象です。`Verify-LargeOperations.ps1`のコピー前提ケースは、旧exeで生成した記録を新版で復元・整理する検証へ分離し、新版に旧コピーを新規作成させません。
 
 ## 削除性能の比較
 
-削除速度を変更する場合は、通常E2Eに加えて次を実行します。`OutputDirectory`は新しい外部絶対パス、`ReportPath`も未使用の外部絶対パスとし、レポートの親は事前に用意します。WindowsローカルではD上の今回の作業領域を使います。旧版を比較する場合は`-BaselineExecutablePath`を指定し、省略時は今回のexeだけを測定します。
+新方式の速度を報告する場合は、内容・ACL・ADS・属性・File IDの往復、衝突時の非上書き、容量制御を同時に検証し、変更前exeと同条件で複数回比較します。
 
 ```powershell
-pwsh -NoProfile -File .\scripts\Verify-DeletionPerformance.ps1 -ExecutablePath <今回のexe> -BaselineExecutablePath <変更前のexe> -OutputDirectory <新しい外部D作業領域> -ReportPath <外部DのJSONレポート> -Iterations 3
+pwsh -NoProfile -File .\scripts\Verify-DeletionPerformance.ps1 -ExecutablePath <今回のexe> -BaselineExecutablePath <変更前のexe> -OutputDirectory <新しい外部作業領域> -ReportPath <外部JSONレポート>
 ```
 
-512個の32バイトファイル、深さ8の階層に128個の小ファイル、ルートと128個のファイルにADSを持つschema 3、0・1・1,024・131,071・131,072・131,073バイトの境界ケースを使います。境界サイズは通常データとschema 3の先頭6ファイルのADSで確認します。試行ごとにfixture・設定・復元先・TEMP/TMP・bundle展開先を独立させ、新旧の順序を交互に入れ替えます。削除の終了コード・全項目のstatus・元位置の不存在、schema、復元後の全ファイルとADSの全バイト、既存ファイルとの衝突時の非上書きを確認します。
+移動後のpayloadと旧コピーで構造・復元の消費性が異なるため、旧コピー形式のassertを流用していないことを確認してください。JSONレポートの各試行と中央値を読み、旧コピー方式で得た性能比を新方式の計測結果として引用しません。性能スクリプトの移行や実測が未了なら、その制限を明示します。
 
-`delete --recursive`だけの経過時間・CLI自身のCPU時間・10 ms間隔で採取したworking setのピークとprivate bytesの最大値を試行別に記録し、成功した試行の経過時間中央値を集計します。メモリを採取できなかった短命プロセスの値は`null`です。CLI起動・復元コピーの永続化を含み、fixture作成と復元検証は時間に含みません。ウォームアップやOSキャッシュの消去は行わず、初回展開・ファイルキャッシュ・ディスクや他プロセスの負荷の影響が残るため、同じ環境で複数回比較します。性能値への閾値判定は設けません。
+### 蓄積済み復元データでの比較
 
-終了コードとレポートの`passed` / `failed`、`results`の各試行、`summary`を読んで判定します。子プロセスの既定タイムアウトは120秒（`-ProcessTimeoutSeconds`で変更可）です。スクリプトは清掃しないため、利用中プロセスとリンクを確認したうえで、不要になった今回の`OutputDirectory`だけを配置済みPrunletで清掃します。失敗の再現に必要なfixtureと最小限のレポートは保持します。
+`Verify-DeletionPerformance.ps1 -ExistingRecoveryFileCount 1024 -CaseFilter buffer-boundaries`で、復元データが蓄積した状態の比較も行えます。変更前exeを`-BaselineExecutablePath`へ渡し、旧版ではschema 2を2操作、新版ではschema 2と4を1操作ずつ実生成します。新旧で保持するファイル数・論理容量を揃え、計測前後と復元後にseedの内容・記録が保たれていることを確認します。事前生成によってruntimeとファイルシステムのcacheが温まるため、空の復元領域での結果と区別します。走査・ロック・内容検証を省いた数値を削除全体の性能として扱いません。
 
 ## 操作履歴の圧縮
 
-履歴圧縮を変更した場合は、通常E2Eに加えて次を実行します。出力先とレポートは新しい外部絶対パスを指定し、親ディレクトリを事前に用意します。Windowsローカルの作業規約に従い、TEMP/TMPもD上の今回の作業領域へ指定します。
+schema 4は当面圧縮対象外で、`compact-history`と自動経路から理由付き`retained`となることを確認します。旧schema 1/2/3の正常purge済みJSONは従来どおり圧縮対象です。次の専用スクリプトは`-LegacyExecutablePath`を必須とし、旧記録の生成だけを旧exe、圧縮・整理・復元を今回のexeで実行します。
+
+- `Verify-HistoryCompaction.ps1`: dry-runの不変更、JSON内容・SHA-256一致、物理容量減少、冪等性、操作ID互換、ロック・リンク・不正metadataの保持。
+- `Verify-AutomaticHistory.ps1`: maintainと実削除前の旧履歴圧縮、既圧縮の扱い、保護対象の保持、metadataとpayload容量の分離。
+- `Verify-AutomaticHistorySchedule.ps1`: 隔離した一回限りの時刻トリガーによる発火と終了コード、旧履歴の内容一致と物理容量減少。
 
 ```powershell
-pwsh -NoProfile -File .\scripts\Verify-HistoryCompaction.ps1 -ExecutablePath <今回のexe> -OutputDirectory <新しい外部D作業領域> -ReportPath <外部DのJSONレポート>
-pwsh -NoProfile -File .\scripts\Verify-AutomaticHistory.ps1 -ExecutablePath <今回のexe> -OutputDirectory <別の新しい外部D作業領域> -ReportPath <別の外部DのJSONレポート>
-pwsh -NoProfile -File .\scripts\Verify-AutomaticHistorySchedule.ps1 -ExecutablePath <今回のexe> -OutputDirectory <さらに別の新しい外部D作業領域> -ReportPath <さらに別の外部DのJSONレポート>
+pwsh -NoProfile -File .\scripts\Verify-HistoryCompaction.ps1 -ExecutablePath <今回のexe> -LegacyExecutablePath <変更前1.0.9exe> -OutputDirectory <新しい外部作業領域> -ReportPath <外部JSONレポート>
+pwsh -NoProfile -File .\scripts\Verify-AutomaticHistory.ps1 -ExecutablePath <今回のexe> -LegacyExecutablePath <変更前1.0.9exe> -OutputDirectory <別の新しい外部作業領域> -ReportPath <別の外部JSONレポート>
+pwsh -NoProfile -File .\scripts\Verify-AutomaticHistorySchedule.ps1 -ExecutablePath <今回のexe> -LegacyExecutablePath <変更前1.0.9exe> -OutputDirectory <さらに別の新しい外部作業領域> -ReportPath <さらに別の外部JSONレポート>
 ```
 
-正常にpurge済みの操作で、dry-runの全バイト・属性不変更、適用前後のJSONのSHA-256と長さ一致、物理容量の減少、繰り返し適用、操作一覧・復元拒否・再purgeの互換性を確認します。復元コピーと不明項目を持つ操作、不正なmanifest・intent・結果、ADS・hardlink・reparse・ReadOnly、共通ロックと操作ロックの競合は内容を保全することを確認します。実ユーザーの履歴には検証fixtureを混ぜません。削減量は実測した物理容量で判断し、論理容量やドライブ空き容量の差だけでは判定しません。
-
-自動経路ではschema 1/2/3のmaintainによる検査・適用・再実行、CLI/MCP削除時に今回purgeした操作だけが圧縮されること、手動purgeの履歴が保持され次のmaintainで整理されることを確認します。既圧縮でもリンク・ADS・読み取り専用・未知memberは検査し、`skipped_compressed`は本文の妥当性を認定しない結果として扱います。保持理由はhistoryCompaction内で確認し、復元コピーの容量と履歴圧縮の物理削減量を混ぜません。
-
-時刻トリガーの検証では、隔離した設定と一回限りのタスクを使い、手動起動せずに`maintain --apply`の発火・終了コード・SHA-256一致・物理容量減少を確認します。検証用タスクは固有名と説明・アクションの所有情報を照合して解除します。実運用のタスクの登録・解除は行いません。
+実運用タスクの登録・解除や利用者の復元データは検証に使用しません。検証用タスクも固有名・説明・アクションの所有情報を照合して解除します。
 
 ## 復元データの自動整理
 
-保持期限・容量制限を変更した場合は、通常E2Eに加えて次を実行します。出力先は新しい外部絶対パス、レポートの親は事前作成済みにします。
+通常E2Eで新旧合計の容量制御を確認し、保持制御を変更した場合は追加ケースも実行します。
 
 ```powershell
-pwsh -NoProfile -File .\scripts\Verify-Retention.ps1 -ExecutablePath <今回のexe> -OutputDirectory <新しい外部Temp> -ReportPath <外部JSONレポート>
+pwsh -NoProfile -File .\scripts\Verify-Retention.ps1 -ExecutablePath <今回のexe> -OutputDirectory <新しい外部作業領域> -ReportPath <外部JSONレポート>
 ```
 
-既定の7日・10 GiBと旧設定の互換性、期限切れ・容量超過の古い操作からの整理、実削除前の自動整理、dry-runの不変更を確認します。上限を超える単一ファイル・複数ファイルの合計・再帰ツリー・ADSを持つ対象も、検証済みコピーを保持して削除・復元できること、次の削除やmaintainで通常の上限へ整理されることを確認します。容量境界には小さな設定値を使い、schema 2とADSを持つschema 3の実コピーを検証します。破損コピー・未検証の途中コピー・稼働中ロック・未知項目・reparse pointの保全と警告、整理後の復元拒否、途中のpurge intentからの再開、繰り返し実行時の記録増殖も確認します。2プロセスの実削除を競合させ、通常サイズは共通の設定上限、上限超過の操作は1操作の見積りサイズ以内に復元コピーの合計が収まることも確認します。検証fixtureではmanifestの日時を変更して期限を再現し、実ユーザーの復元データは使用しません。
+既定7日・10 GiB、旧設定、期限切れ・容量確保順、単一ファイル・複数入力合計・再帰ツリー・ADSの容量、dry-runの不変更を確認します。通常予算と単一超過時の`max(maxRecoveryBytes, incomingBytes)`、次回削除・maintainの通常上限、既存データが安全に0まで整理できない場合の新規移動拒否を区別します。
+
+schema 4と旧schema 1/2/3を混在させ、破損・未知項目・使用中・File IDやreceipt不一致を保全し、容量不明を成功扱いしないこと、整理前後の再走査と共通ロックによる並行削除の容量制御を確認します。`Verify-Retention.ps1`は新方式の保持関連ケースを選択します。`-LegacyCopyVerification`は旧exeの再現専用であり、新版の検証に使いません。定期登録・所有者検証・登録失敗時の復旧はlatestインストーラー検証で確認します。
