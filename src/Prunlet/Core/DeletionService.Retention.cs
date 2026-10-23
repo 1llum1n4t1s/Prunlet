@@ -24,75 +24,11 @@ public sealed class RecoveryMaintenanceResult
 
 public sealed partial class DeletionService
 {
-    private long? remainingRecoveryBytes;
-
     public RecoveryMaintenanceResult MaintainRecovery(bool apply = false)
     {
         config.Validate();
         using var coordination = AcquireRecoveryCoordination(create: apply);
-        return MaintainRecoveryCore(apply, incomingBytes: 0, compactAllHistory: true);
-    }
-
-    private RecoveryMaintenanceResult MaintainRecoveryCore(bool apply, long incomingBytes, bool compactAllHistory = false)
-    {
-        var result = new RecoveryMaintenanceResult
-        {
-            DryRun = !apply, RetentionDays = config.RetentionDays, MaxRecoveryBytes = config.MaxRecoveryBytes
-        };
-        var scan = ScanRecovery(result.Warnings);
-        result.RetainedBytesBefore = result.RetainedBytesAfter = scan.Bytes;
-        result.CapacityKnown = scan.Known;
-        var now = DateTimeOffset.UtcNow;
-        var expiry = now.AddDays(-config.RetentionDays);
-        // 上限より大きい操作は既存コピーを安全に整理し、今回の見積り分だけを予約する。
-        var retainedBudget = Math.Max(0, config.MaxRecoveryBytes - incomingBytes);
-        foreach (var candidate in scan.Candidates.OrderBy(candidate => candidate.CreatedUtc).ThenBy(candidate => candidate.Id, StringComparer.Ordinal))
-        {
-            if (candidate.CreatedUtc > now)
-            {
-                result.Warnings.Add($"Recovery operation {candidate.Id} has a future timestamp and was retained.");
-                continue;
-            }
-            if (candidate.CreatedUtc > expiry && result.RetainedBytesAfter <= retainedBudget) continue;
-            try
-            {
-                // 自動整理も既存のintent永続化・コピー検証・操作ロックを通す。
-                var purged = PurgeCore(candidate.Id, apply);
-                result.Operations.Add(purged);
-                result.Warnings.AddRange(purged.Warnings);
-                var bytes = apply ? purged.PurgedBytes
-                    : purged.Items.Where(item => item.Status == "would_purge").Aggregate(0L, (sum, item) => checked(sum + (item.Size ?? 0)));
-                result.RetainedBytesAfter = checked(result.RetainedBytesAfter - bytes);
-                if (apply) result.PurgedBytes = checked(result.PurgedBytes + bytes);
-                else result.PlannedPurgeBytes = checked(result.PlannedPurgeBytes + bytes);
-                if (purged.Items.Any(item => item.Status == "failed"))
-                    result.Warnings.Add($"Recovery operation {candidate.Id} could not be completely purged.");
-            }
-            catch (Exception ex) when (IsOperational(ex))
-            {
-                result.Warnings.Add($"Recovery operation {candidate.Id} was retained: {ex.Message}");
-            }
-        }
-        if (apply)
-        {
-            // 途中失敗や旧プロセスが残したコピーも、推測せず実体を数え直す。
-            var after = ScanRecovery(result.Warnings, collectCandidates: false);
-            result.RetainedBytesAfter = after.Bytes;
-            result.CapacityKnown = after.Known;
-        }
-        result.BudgetSatisfied = result.CapacityKnown && result.RetainedBytesAfter <= retainedBudget;
-        if (!result.CapacityKnown) result.Warnings.Add("Recovery capacity is unknown because some data is busy or cannot be safely inspected.");
-        else if (!result.BudgetSatisfied) result.Warnings.Add("Retained recovery data exceeds the available recovery budget; unverified copies were retained.");
-        // 定期・明示maintainは既存履歴も対象とする。削除前は今回purgeした操作だけを検証し、
-        // 毎削除で全履歴を開き直さない。共通ロックは呼出し元が保持済み。
-        result.HistoryCompaction = CompactHistoryCore(apply, automatic: true,
-            operationIds: compactAllHistory ? null : result.Operations.Select(operation => operation.OperationId));
-        foreach (var operation in result.HistoryCompaction.Operations.Where(operation => operation.Status == "failed"))
-            result.Warnings.Add($"History operation {operation.OperationId} could not be compressed: {operation.Error}");
-        result.Warnings = result.Warnings.Distinct(StringComparer.Ordinal).ToList();
-        result.Complete = result.BudgetSatisfied && result.Warnings.Count == 0
-            && result.Operations.All(operation => operation.Items.All(item => item.Status != "failed"));
-        return result;
+        return MaintainAllRecoveryCore(apply, incomingBytes: 0, compactAllHistory: true);
     }
 
     private RecoveryScan ScanRecovery(List<string> warnings, bool collectCandidates = true)
@@ -103,7 +39,7 @@ public sealed partial class DeletionService
             // 子の列挙では見えない、保存先ディレクトリ自身のADSも保持容量に含める。
             using var root = NativeFiles.OpenAny(config.BackupDirectory);
             NativeFiles.Verify(root, config.BackupDirectory, directory: true);
-            scan.Bytes = CountNamedStreams(config.BackupDirectory, root);
+            scan.Bytes = NativeFiles.NamedStreamBytes(root);
             if (scan.Bytes > 0) warnings.Add("Recovery root alternate streams were retained and counted against the budget.");
         }
         catch (Exception ex) when (IsOperational(ex) || ex is OverflowException)
@@ -111,13 +47,21 @@ public sealed partial class DeletionService
             scan.Known = false;
             warnings.Add($"Recovery root alternate streams cannot be safely counted and were retained: {ex.Message}");
         }
-        foreach (var path in Directory.EnumerateFileSystemEntries(config.BackupDirectory))
+        foreach (var member in new DirectoryInfo(config.BackupDirectory).EnumerateFileSystemInfos())
         {
-            var name = Path.GetFileName(path);
+            var path = member.FullName;
+            var name = member.Name;
             if (name == "maintenance.lock") continue;
             var operation = Guid.TryParseExact(name, "N", out var id) && id.ToString("N") == name;
+            var members = operation && collectCandidates ? new HashSet<string>(StringComparer.Ordinal) : null;
             long bytes;
-            try { bytes = CountRecoveryPayload(path, operation); scan.Bytes = checked(scan.Bytes + bytes); }
+            try
+            {
+                // 移動記録の別volumeにある実体は専用の走査で数える。不正記録も旧形式へ戻さない。
+                if (operation && IsMoveOperation(name)) continue;
+                bytes = CountRecoveryPayload(member, operation, members);
+                scan.Bytes = checked(scan.Bytes + bytes);
+            }
             catch (Exception ex) when (IsOperational(ex) || ex is OverflowException)
             {
                 scan.Known = false;
@@ -131,7 +75,10 @@ public sealed partial class DeletionService
             }
             try
             {
-                using var directories = PathPolicy.PinRecoveryDirectories(path);
+                // 共通ロックのleaseが保存先までの祖先を固定済み。操作フォルダーだけ追加で固定する。
+                using var directory = NativeFiles.OpenDirectory(path);
+                NativeFiles.Verify(directory, path, directory: true);
+                NativeFiles.RejectCaseSensitive(directory);
                 using var operationLock = NativeFiles.OpenLock(Path.Combine(path, "operation.lock"));
                 NativeFiles.Verify(operationLock, Path.Combine(path, "operation.lock"));
                 NativeFiles.VerifySingleLink(operationLock);
@@ -140,22 +87,21 @@ public sealed partial class DeletionService
                 // 整理済みの記録だけの操作もロックは確認し、旧版のコピー開始前を見落とさない。
                 // 容量の再走査ではmanifestを読み直さず、残るデータと使用中の操作だけを確かめる。
                 if (!collectCandidates) continue;
-                var members = Directory.EnumerateFileSystemEntries(path).Select(Path.GetFileName).ToHashSet(StringComparer.Ordinal);
                 // 空ファイルのコピーにも期限を適用する。コピーが残らない記録だけを省略する。
-                if (bytes == 0 && !members.Any(member => member?.EndsWith(".bak", StringComparison.OrdinalIgnoreCase) == true)) continue;
+                if (bytes == 0 && !members!.Any(member => member.EndsWith(".bak", StringComparison.OrdinalIgnoreCase))) continue;
                 var held = new List<FileStream>();
                 try
                 {
                     var manifest = ReadValidatedJson<OperationManifest>(HoldPurgeMetadata(Path.Combine(path, "manifest.json"), held));
                     ValidateManifest(manifest, name);
                     if (manifest.Items.Select((entry, index) => (entry, index))
-                        .Any(pair => !HasRecoveryCopy(manifest, pair.entry) && members.Contains($"{pair.index:D4}.bak")))
+                        .Any(pair => !HasRecoveryCopy(manifest, pair.entry) && members!.Contains($"{pair.index:D4}.bak")))
                     {
                         warnings.Add($"Recovery operation {name} contains unpublished or incomplete copies and was retained; explicit purge is required.");
                         continue;
                     }
                     if (bytes > 0 || manifest.Items.Select((entry, index) => (entry, index))
-                        .Any(pair => HasRecoveryCopy(manifest, pair.entry) && members.Contains($"{pair.index:D4}.bak")))
+                        .Any(pair => HasRecoveryCopy(manifest, pair.entry) && members!.Contains($"{pair.index:D4}.bak")))
                         scan.Candidates.Add(new RecoveryCandidate(name, manifest.CreatedUtc));
                 }
                 finally { foreach (var stream in held) stream.Dispose(); }
@@ -174,47 +120,82 @@ public sealed partial class DeletionService
         return scan;
     }
 
-    private static long CountRecoveryPayload(string path, bool operationDirectory = false)
+    private static long CountRecoveryPayload(FileSystemInfo member, bool operationDirectory = false, HashSet<string>? members = null)
     {
-        using var handle = NativeFiles.OpenAny(path);
-        if (NativeFiles.IsReparse(handle)) throw new IOException("Recovery links are not followed.");
-        var directory = NativeFiles.IsDirectory(handle);
+        var path = member.FullName;
+        // 列挙時の属性は開き方の選択にだけ使い、型・reparse・正規パスは取得したハンドルで検証する。
+        var directory = (member.Attributes & FileAttributes.Directory) != 0;
+        using var handle = directory ? NativeFiles.OpenAny(path) : NativeFiles.OpenBackup(path);
         NativeFiles.Verify(handle, path, directory);
         if (directory)
         {
             // このハンドルは削除共有を許さず、祖先も呼出し元の走査ハンドル/root leaseが保持する。
             NativeFiles.RejectCaseSensitive(handle);
-            long size = CountNamedStreams(path, handle);
-            foreach (var child in Directory.EnumerateFileSystemEntries(path))
+            long size = NativeFiles.NamedStreamBytes(handle);
+            var children = new DirectoryInfo(path).EnumerateFileSystemInfos();
+            if (!operationDirectory)
             {
-                var name = Path.GetFileName(child);
-                if (operationDirectory && (name is "manifest.json" or "operation.lock" or "purge-intent.json" || PurgeMetadataKind(name) is not null))
-                {
-                    // 名前だけで記録と見なさず、フォルダー・リンク・ADSによる容量計算の迂回を拒否する。
-                    using var metadata = NativeFiles.OpenBackup(child);
-                    NativeFiles.Verify(metadata, child);
-                    NativeFiles.VerifySingleLink(metadata);
-                    NativeFiles.RejectNamedStreams(child);
-                    continue;
-                }
-                size = checked(size + CountRecoveryPayload(child));
+                foreach (var child in children) size = checked(size + CountRecoveryPayload(child));
+                return size;
+            }
+            // 祖先ハンドルを保持したまま、小さな束ごとに検査する。全件配列化と再帰的な並列化はしない。
+            foreach (var batch in children.Chunk(128))
+            {
+                foreach (var child in batch) members?.Add(child.Name);
+                size = checked(size + CountRecoveryBatch(batch));
             }
             return size;
         }
-        using var payload = NativeFiles.OpenBackup(path);
-        NativeFiles.Verify(payload, path);
-        return checked(RandomAccess.GetLength(payload) + CountNamedStreams(path, payload));
+        // ADSの容量も同じハンドルのstream情報から得る。別パスで開き直さない。
+        return checked(RandomAccess.GetLength(handle) + NativeFiles.NamedStreamBytes(handle));
     }
 
-    private static long CountNamedStreams(string path, SafeFileHandle handle)
+    private static long CountRecoveryMember(FileSystemInfo member)
+    {
+        var name = member.Name;
+        if (name is "manifest.json" or "operation.lock" or "purge-intent.json" || PurgeMetadataKind(name) is not null)
+        {
+            // 名前だけで記録と見なさず、フォルダー・リンク・ADSによる容量計算の迂回を拒否する。
+            using var metadata = NativeFiles.OpenBackup(member.FullName);
+            NativeFiles.Verify(metadata, member.FullName);
+            NativeFiles.VerifySingleLink(metadata);
+            NativeFiles.RejectNamedStreams(member.FullName);
+            return 0;
+        }
+        return CountRecoveryPayload(member);
+    }
+
+    private static long CountRecoveryBatch(FileSystemInfo[] batch)
     {
         long bytes = 0;
-        foreach (var name in NativeFiles.NamedStreams(handle))
+        var workers = Math.Min(4, Environment.ProcessorCount);
+        if (batch.Length < 32 || workers == 1)
         {
-            using var stream = NativeFiles.OpenStream(path, name);
-            if (NativeFiles.Identity(stream) != NativeFiles.Identity(handle)) throw new IOException("Recovery stream identity changed.");
-            bytes = checked(bytes + RandomAccess.GetLength(stream));
+            foreach (var member in batch) bytes = checked(bytes + CountRecoveryMember(member));
+            return bytes;
         }
+        var gate = new object();
+        Exception? failure = null;
+        Parallel.ForEach(batch, new ParallelOptions { MaxDegreeOfParallelism = workers }, () => 0L,
+            (member, loop, local) =>
+            {
+                try { return checked(local + CountRecoveryMember(member)); }
+                catch (Exception ex) when (IsOperational(ex) || ex is OverflowException)
+                {
+                    Interlocked.CompareExchange(ref failure, ex, null);
+                    loop.Stop();
+                    return local;
+                }
+            }, local =>
+            {
+                lock (gate)
+                {
+                    try { bytes = checked(bytes + local); }
+                    catch (OverflowException ex) { Interlocked.CompareExchange(ref failure, ex, null); }
+                }
+            });
+        // 全workerのハンドル解放後に失敗を返し、部分集計を安全な容量として扱わない。
+        if (failure is not null) throw new IOException(failure.Message, failure);
         return bytes;
     }
 
@@ -261,14 +242,6 @@ public sealed partial class DeletionService
             return new RecoveryCoordination(root, handle);
         }
         catch { handle?.Dispose(); root.Dispose(); throw; }
-    }
-
-    private void ReserveRecoveryBytes(int count)
-    {
-        if (remainingRecoveryBytes is null) throw new InvalidOperationException("Recovery writes require the capacity coordination lease.");
-        if (count > remainingRecoveryBytes.Value) throw new IOException("Recovery budget exhausted; this original target was retained.");
-        // 書込み失敗時も予約を戻さず、途中コピーを含む実サイズが上限を超えないようにする。
-        remainingRecoveryBytes -= count;
     }
 
     private sealed class RecoveryScan

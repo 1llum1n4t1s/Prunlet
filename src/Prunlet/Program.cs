@@ -21,7 +21,7 @@ internal static class Program
             if (args.Length == 0 || args is ["--help"] or ["help"])
             {
                 Console.WriteLine("""
-                    Prunlet — Windows file deletion with verified recovery copies.
+                    Prunlet — Windows file deletion with per-volume recovery moves.
                     prunlet --config <absolute-json-path> init --backup-directory <directory>
                     prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]
                     prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>
@@ -33,9 +33,12 @@ internal static class Program
                     prunlet --config <absolute-json-path> mcp
                     prunlet --config <absolute-json-path> hook [--hook-script <legacy-path>]
                     Legacy --allowed-root <directory> options are accepted but do not restrict target directories.
-                    Files inside the configured recovery directory are protected.
-                    Recovery copies expire after 7 days by default and share a 10 GiB budget.
-                    Real deletion evicts expired/oldest copies as needed; maintain defaults to inspection only.
+                    Metadata and volume recovery directories are protected.
+                    Selected roots move into private recovery storage on the same volume after a capacity scan.
+                    Recovery data expire after 7 days by default and share a 10 GiB budget.
+                    Real deletion evicts expired/oldest recovery data as needed; maintain defaults to inspection only.
+                    Restore consumes moved items and never overwrites existing destinations.
+                    Moved hard links share content with surviving aliases; legacy copies restore as independent snapshots.
                     Empty directories are supported; deleting directory contents requires --recursive.
                     Wildcard expansion is unsupported. Links are deleted without following their targets.
                     """);

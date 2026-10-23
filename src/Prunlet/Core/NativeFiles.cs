@@ -20,9 +20,6 @@ internal static partial class NativeFiles
     internal static SafeFileHandle OpenInspect(string path) => Open(path, 0x80, 3, 3, OpenReparse);
     internal static SafeFileHandle OpenAny(string path) => Open(path, 0x80, 3, 3, OpenReparse | BackupSemantics);
     internal static SafeFileHandle OpenRestoreMetadata(string path) => Open(path, 0x180, 3, 3, OpenReparse | BackupSemantics);
-    internal static SafeFileHandle OpenSpecial(string path, bool deleting = false) => Open(path, Read | (deleting ? Delete : 0u), 1, 3, OpenReparse | BackupSemantics);
-    internal static SafeFileHandle OpenDirectorySource(string path) => Open(path, 0x80 | Delete, 3, 3, OpenReparse | BackupSemantics);
-    internal static SafeFileHandle OpenSource(string path) => Open(path, Read | Delete, 1, 3, OpenReparse);
     internal static SafeFileHandle OpenBackup(string path) => Open(path, Read, 1, 3, OpenReparse);
     internal static SafeFileHandle OpenHistoryCompression(string path) => Open(path, Read | Write, 1, 3, OpenReparse);
     internal static SafeFileHandle OpenPurgeTarget(string path) => Open(path, Read | Delete, 1, 3, OpenReparse);
@@ -167,12 +164,6 @@ internal static partial class NativeFiles
         return (info.Attributes & (uint)FileAttributes.ReparsePoint) != 0;
     }
 
-    internal static uint LinkCount(SafeFileHandle handle)
-    {
-        if (!GetFileInformationByHandle(handle, out var info)) ThrowLastError("Cannot inspect link count");
-        return info.Links;
-    }
-
     internal static bool IsCaseSensitive(SafeFileHandle handle)
     {
         if (!GetFileInformationByHandleEx(handle, FileCaseSensitiveInfo, out CaseSensitiveInformation info, (uint)Marshal.SizeOf<CaseSensitiveInformation>()))
@@ -195,10 +186,21 @@ internal static partial class NativeFiles
         if (IsCaseSensitive(handle)) throw new IOException("Recovery storage cannot use case-sensitive directories.");
     }
 
-    internal static List<string> NamedStreams(SafeFileHandle handle)
+    internal static List<string> NamedStreams(SafeFileHandle handle) =>
+        ReadStreams(handle).Select(stream => stream.Name).Order(StringComparer.Ordinal).ToList();
+
+    internal static long NamedStreamBytes(SafeFileHandle handle)
     {
-        var names = new List<string>();
-        var size = 65536;
+        long bytes = 0;
+        foreach (var stream in ReadStreams(handle)) bytes = checked(bytes + stream.Size);
+        return bytes;
+    }
+
+    private static List<(string Name, long Size)> ReadStreams(SafeFileHandle handle)
+    {
+        var streams = new List<(string Name, long Size)>();
+        // 通常は無名ストリームだけなので、小さく始め、多数のADSでは従来と同じ上限まで拡張する。
+        var size = 1024;
         while (true)
         {
             var buffer = Marshal.AllocHGlobal(size);
@@ -208,7 +210,7 @@ internal static partial class NativeFiles
                 {
                     var error = Marshal.GetLastWin32Error();
                     if ((error is 234 or 122) && size < 8 * 1024 * 1024) { size *= 2; continue; }
-                    if (error == 38) return names;
+                    if (error == 38) return streams;
                     ThrowLastError("Cannot inspect alternate streams by object handle");
                 }
                 var offset = 0;
@@ -218,18 +220,20 @@ internal static partial class NativeFiles
                     var next = Marshal.ReadInt32(buffer, offset); var nameBytes = Marshal.ReadInt32(buffer, offset + 4);
                     if (nameBytes < 0 || nameBytes % 2 != 0 || nameBytes > size - offset - 24)
                         throw new IOException("Invalid stream name buffer.");
+                    var streamSize = Marshal.ReadInt64(buffer, offset + 8);
+                    if (streamSize < 0) throw new IOException("Invalid stream size.");
                     var wireName = Marshal.PtrToStringUni(IntPtr.Add(buffer, offset + 24), nameBytes / 2)!;
                     if (wireName != "::$DATA")
                     {
                         if (!wireName.StartsWith(':') || !wireName.EndsWith(":$DATA", StringComparison.Ordinal))
                             throw new IOException("Unsupported stream type.");
-                        var name = wireName[1..^6]; ValidateStreamName(name); names.Add(name);
+                        var name = wireName[1..^6]; ValidateStreamName(name); streams.Add((name, streamSize));
                     }
                     if (next == 0) break;
                     if (next < 24 || next > size - offset) throw new IOException("Invalid stream information offset.");
                     offset += next;
                 }
-                return names.Order(StringComparer.Ordinal).ToList();
+                return streams;
             }
             finally { Marshal.FreeHGlobal(buffer); }
         }
@@ -409,7 +413,7 @@ internal static partial class NativeFiles
             ThrowLastError("Cannot restore original last-write time");
     }
 
-    internal static void RenameHandle(SafeFileHandle handle, string destination)
+    internal static unsafe void RenameHandle(SafeFileHandle handle, string destination)
     {
         var name = Encoding.Unicode.GetBytes(Win32Path(destination));
         // FILE_RENAME_INFO の HANDLE は自然境界へ整列する。FileNameLength は UTF-16 のバイト数。
@@ -421,7 +425,7 @@ internal static partial class NativeFiles
         try
         {
             // ReplaceIfExists=false、RootDirectory=NULL。既存の公開済み記録は置換しない。
-            Marshal.Copy(new byte[size], 0, buffer, size);
+            new Span<byte>((void*)buffer, size).Clear();
             Marshal.WriteInt32(buffer, lengthOffset, name.Length);
             Marshal.Copy(name, 0, IntPtr.Add(buffer, nameOffset), name.Length);
             if (!SetFileInformationByHandle(handle, 3, buffer, (uint)size))

@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Security.Cryptography;
 using System.Text.Json;
 
@@ -20,122 +19,15 @@ public sealed partial class DeletionService
             AllowedRoots = config.AllowedRoots?.ToArray() ?? [],
             RetentionDays = config.RetentionDays,
             MaxRecoveryBytes = config.MaxRecoveryBytes,
+            VolumeRecoveryDirectories = config.VolumeRecoveryDirectories.ToDictionary(pair => PathPolicy.Absolute(pair.Key),
+                pair => PathPolicy.Absolute(pair.Value), StringComparer.OrdinalIgnoreCase),
             BackupDirectory = PathPolicy.Resolve(config.BackupDirectory, finalDirectory: true, allowMissing: false)
         };
     }
 
     public DeleteResult Delete(string[] paths, bool dryRun = false, bool recursive = false)
     {
-        config.Validate();
-        ArgumentNullException.ThrowIfNull(paths);
-        if (paths.Length is 0 or > 256) throw new ArgumentException("Specify between 1 and 256 paths.");
-        var normalized = paths.Select(ValidateAnyTarget).ToArray();
-        for (var i = 0; i < normalized.Length; i++)
-            for (var j = i + 1; j < normalized.Length; j++)
-                if (ExactWithin(normalized[i], normalized[j]) || ExactWithin(normalized[j], normalized[i]))
-                    throw new ArgumentException("Duplicate or overlapping target paths are not allowed.");
-        if (dryRun) return DeleteDispatch(normalized, true, recursive);
-        using var coordination = AcquireRecoveryCoordination(create: true);
-        var preview = DeleteDispatch(normalized, true, recursive);
-        if (preview.Items.Any(item => item.Status == "failed"))
-            throw new IOException("Deletion preflight failed; no originals or recovery copies were removed. " +
-                string.Join(" ", preview.Items.Where(item => item.Error is not null).Select(item => item.Error)));
-        var incoming = preview.Items.Aggregate(0L, (sum, item) => checked(sum + (item.Size ?? 0)));
-        // 単一操作のコピーは保持上限を超えても確保し、次回の整理で通常の上限へ戻す。
-        var operationBudget = Math.Max(config.MaxRecoveryBytes, incoming);
-        var maintenance = MaintainRecoveryCore(apply: true, incoming);
-        if (!maintenance.CapacityKnown || !maintenance.BudgetSatisfied)
-            throw new IOException("Recovery capacity could not be safely made available; original targets were retained. " + string.Join(" ", maintenance.Warnings));
-        remainingRecoveryBytes = operationBudget - maintenance.RetainedBytesAfter;
-        try
-        {
-            var result = DeleteDispatch(normalized, false, recursive);
-            result.Warnings.AddRange(maintenance.Warnings);
-            if (incoming > config.MaxRecoveryBytes)
-                result.Warnings.Add("This operation's recovery copy may exceed maxRecoveryBytes and is eligible for cleanup at the next deletion or maintenance run.");
-            return result;
-        }
-        finally { remainingRecoveryBytes = null; }
-    }
-
-    private DeleteResult DeleteDispatch(string[] normalized, bool dryRun, bool recursive)
-    {
-        if (normalized.Any(path => HasSpecialTarget(path, recursive))) return DeleteSpecial(normalized, dryRun, recursive);
-        if (normalized.Any(IsDirectoryPath)) return DeleteTrees(normalized, dryRun, recursive);
-        return DeleteFiles(normalized, dryRun);
-    }
-
-    private DeleteResult DeleteFiles(string[] paths, bool dryRun)
-    {
-        config.Validate();
-        ArgumentNullException.ThrowIfNull(paths);
-        if (paths.Length == 0 || paths.Length > 256) throw new ArgumentException("Specify between 1 and 256 files.");
-        var normalized = paths.Select(ValidateTarget).ToArray();
-        if (normalized.Distinct(StringComparer.OrdinalIgnoreCase).Count() != normalized.Length)
-            throw new ArgumentException("Duplicate paths are not allowed.");
-        foreach (var path in normalized) PathPolicy.Resolve(path);
-        var result = new DeleteResult { DryRun = dryRun };
-        if (dryRun)
-        {
-            foreach (var path in normalized) result.Items.Add(CheckOnly(path));
-            return result;
-        }
-
-        using var operation = NewOperationLease.Create(config.BackupDirectory);
-        var operationId = operation.OperationId;
-        var directory = operation.Directory;
-        result.OperationId = operationId;
-        var manifest = new OperationManifest { OperationId = operationId };
-        var prepared = new List<PreparedFile>();
-        try
-        {
-            for (var i = 0; i < normalized.Length; i++)
-            {
-                var entry = new ManifestEntry { Path = normalized[i] };
-                var item = new FileOperationResult { Path = normalized[i], Status = "failed" };
-                manifest.Items.Add(entry);
-                result.Items.Add(item);
-                try
-                {
-                    var ready = Prepare(normalized[i], BackupPath(directory, i), entry, item);
-                    prepared.Add(ready);
-                    entry.State = "backup_ready";
-                    item.Status = "backup_ready";
-                }
-                catch (FileNotFoundException) { entry.State = item.Status = "already_absent"; }
-                catch (DirectoryNotFoundException) { entry.State = item.Status = "already_absent"; }
-                catch (Exception ex) when (IsOperational(ex)) { entry.State = "failed"; item.Error = ex.Message; }
-            }
-            try { WriteNewJson(Path.Combine(directory, "manifest.json"), manifest); }
-            catch (Exception ex) when (IsOperational(ex))
-            {
-                foreach (var ready in prepared)
-                {
-                    ready.Item.Status = "failed";
-                    ready.Item.Error = $"No deletion was attempted because manifest persistence failed: {ex.Message}";
-                }
-                return result;
-            }
-            foreach (var ready in prepared)
-            {
-                try
-                {
-                    NativeFiles.Verify(ready.Source.SafeFileHandle, ready.Entry.Path);
-                    NativeFiles.DeleteOriginalHandle(ready.Source.SafeFileHandle);
-                    // DELETE_PENDING は最後のハンドルを閉じた時点で反映される。
-                    ready.Source.Dispose();
-                    ready.Item.Status = "deleted";
-                }
-                catch (Exception ex) when (IsOperational(ex))
-                {
-                    ready.Item.Status = "failed";
-                    ready.Item.Error = ex.Message;
-                }
-            }
-            TryWriteResult(Path.Combine(directory, "delete-result.json"), result, result.Warnings);
-            return result;
-        }
-        finally { foreach (var ready in prepared) ready.Dispose(); }
+        return DeleteMoves(paths, dryRun, recursive);
     }
 
     public RestoreResult Restore(string operationId)
@@ -144,6 +36,7 @@ public sealed partial class DeletionService
         using var coordination = AcquireRecoveryCoordination(create: true);
         if (!Guid.TryParseExact(operationId, "N", out var id) || id.ToString("N") != operationId)
             throw new ArgumentException("Operation ID must be a lowercase 32-character GUID.");
+        if (IsMoveOperation(operationId)) return RestoreMoves(operationId);
         var directory = Path.Combine(config.BackupDirectory, operationId);
         using var directories = PathPolicy.PinRecoveryDirectories(directory);
         using var operationLock = NativeFiles.OpenLock(Path.Combine(directory, "operation.lock"));
@@ -185,70 +78,6 @@ public sealed partial class DeletionService
         if (PathPolicy.Within(normalized, config.BackupDirectory))
             throw new ArgumentException($"Target path is inside the recovery directory: {normalized}");
         return normalized;
-    }
-
-    private static FileOperationResult CheckOnly(string path, bool parentsPinned = false)
-    {
-        var item = new FileOperationResult { Path = path };
-        try
-        {
-            using var parents = parentsPinned ? null : PathPolicy.PinDirectories(Path.GetDirectoryName(path)!);
-            using var handle = NativeFiles.OpenBackup(path);
-            NativeFiles.Verify(handle, path);
-            NativeFiles.VerifySingleLink(handle);
-            NativeFiles.RejectNamedStreams(path);
-            using var stream = new FileStream(handle, FileAccess.Read);
-            item.Size = stream.Length;
-            item.Status = "would_delete";
-        }
-        catch (FileNotFoundException) { item.Status = "already_absent"; }
-        catch (DirectoryNotFoundException) { item.Status = "already_absent"; }
-        catch (Exception ex) when (IsOperational(ex)) { item.Status = "failed"; item.Error = ex.Message; }
-        return item;
-    }
-
-    private PreparedFile Prepare(string path, string backupPath, ManifestEntry entry, FileOperationResult item, bool parentsPinned = false)
-    {
-        var parents = parentsPinned ? null : PathPolicy.PinDirectories(Path.GetDirectoryName(path)!);
-        FileStream? source = null, backup = null;
-        try
-        {
-            var sourceHandle = NativeFiles.OpenSource(path);
-            try { NativeFiles.Verify(sourceHandle, path); NativeFiles.VerifySingleLink(sourceHandle); source = new FileStream(sourceHandle, FileAccess.Read); }
-            catch { sourceHandle.Dispose(); throw; }
-            NativeFiles.RejectNamedStreams(path);
-            var backupHandle = NativeFiles.CreateDestination(backupPath);
-            try { NativeFiles.Verify(backupHandle, backupPath); backup = new FileStream(backupHandle, FileAccess.ReadWrite); }
-            catch { backupHandle.Dispose(); throw; }
-            entry.Size = source.Length;
-            entry.Attributes = NativeFiles.RestorableAttributes(source.SafeFileHandle);
-            entry.LastWriteUtc = File.GetLastWriteTimeUtc(path);
-            using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            var bufferSize = (int)Math.Clamp(source.Length, 1L, CopyBufferSize);
-            var buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
-            try
-            {
-                int count;
-                while ((count = source.Read(buffer, 0, bufferSize)) != 0)
-                {
-                    ReserveRecoveryBytes(count);
-                    backup.Write(buffer, 0, count);
-                    digest.AppendData(buffer, 0, count);
-                }
-            }
-            finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
-            backup.Flush(true);
-            entry.Sha256 = Convert.ToHexStringLower(digest.GetHashAndReset());
-            backup.Position = 0;
-            var backupHash = Convert.ToHexStringLower(SHA256.HashData(backup));
-            if (entry.Sha256 != backupHash || backup.Length != entry.Size)
-                throw new IOException("Backup size/hash verification failed. Source was not deleted.");
-            item.BackupPath = backupPath;
-            item.Sha256 = entry.Sha256;
-            item.Size = entry.Size;
-            return new PreparedFile(parents, source, backup, entry, item);
-        }
-        catch { backup?.Dispose(); source?.Dispose(); parents?.Dispose(); throw; }
     }
 
     private void ValidateManifest(OperationManifest manifest, string operationId)
@@ -349,12 +178,4 @@ public sealed partial class DeletionService
     }
 
     private static bool IsOperational(Exception ex) => ex is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or System.Security.SecurityException;
-
-    private sealed class PreparedFile(DirectoryLease? parents, FileStream source, FileStream backup, ManifestEntry entry, FileOperationResult item) : IDisposable
-    {
-        internal FileStream Source { get; } = source;
-        internal ManifestEntry Entry { get; } = entry;
-        internal FileOperationResult Item { get; } = item;
-        public void Dispose() { backup.Dispose(); Source.Dispose(); parents?.Dispose(); }
-    }
 }

@@ -263,7 +263,7 @@ try {
     [ordered]@{ purpose = 'Restore the owned maintenance task if this installation fails.'; installDirectory = $InstallDirectory; taskName = $maintenanceState.name; taskPath = '\'; existed = [bool]$maintenanceState.previousXml; previousXml = $(if ($maintenanceState.previousXml) { 'maintenance-task.xml' } else { $null }); restore = 'First verify current task ownership using maintenance-task.ps1; restore previous XML if existed, otherwise unregister only the owned task.' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $updateBackup 'maintenance-task-backup-info.json') -Encoding utf8NoBOM
     $maintenanceStarted = $true
     Register-PrunletMaintenanceTask $maintenanceState
-    # 廃止したバックエンドもCoreの検証済みバックアップ付き削除で退役する。
+    # 廃止したバックエンドもCoreの同一ボリューム移動で退役する。
     foreach ($relative in $retiredProducts) {
         $target = Assert-PlainPath (Join-Path $InstallDirectory $relative) 'Retired product path'
         if (!(Test-Path -LiteralPath $target -PathType Leaf)) { continue }
@@ -273,6 +273,25 @@ try {
         $installedExe = Join-Path $InstallDirectory 'bin\prunlet.exe'
         $retirementInitJson = & $installedExe --config $retirementConfig init --backup-directory $retirementBackup
         if ($LASTEXITCODE -ne 0) { throw "Prunlet rejected the retired product configuration: $retirementInitJson" }
+        # metadataは退役専用に分離し、実体の配置先だけ利用者の設定を引き継ぐ。
+        # 元設定は変更せず、引継いだ設定全体をCoreで検証してから移動する。
+        $mainSettings = [IO.File]::ReadAllText($configPath) | ConvertFrom-Json -AsHashtable
+        $volumeMapPresent = $false
+        $volumeMap = $null
+        # CoreのWeb JSON読込みと同様に大文字小文字を無視し、出現順の最後を採用する。
+        foreach ($setting in $mainSettings.GetEnumerator()) {
+            if ($setting.Key -ieq 'volumeRecoveryDirectories') {
+                $volumeMapPresent = $true
+                $volumeMap = $setting.Value
+            }
+        }
+        if ($volumeMapPresent) {
+            $retirementSettings = [IO.File]::ReadAllText($retirementConfig) | ConvertFrom-Json -AsHashtable
+            $retirementSettings.volumeRecoveryDirectories = $volumeMap
+            [IO.File]::WriteAllText($retirementConfig, ($retirementSettings | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+            & $installedExe --config $retirementConfig operations | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Prunlet rejected the inherited retirement volume recovery directories.' }
+        }
         [void]$changed.Add($relative)
         $retirementJson = & $installedExe --config $retirementConfig delete -- $target
         if ($LASTEXITCODE -ne 0) { throw 'Prunlet could not retire the obsolete hook backend; recovery data was preserved.' }

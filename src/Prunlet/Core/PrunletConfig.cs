@@ -12,6 +12,8 @@ public sealed class PrunletConfig
     public string BackupDirectory { get; set; } = string.Empty;
     public int RetentionDays { get; set; } = 7;
     public long MaxRecoveryBytes { get; set; } = 10L * 1024 * 1024 * 1024;
+    // 省略時は各ボリュームのユーザー専用領域を使う。検証・管理用の同一ボリューム内配置指定。
+    public Dictionary<string, string> VolumeRecoveryDirectories { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
     public static PrunletConfig Load(string path)
     {
@@ -28,6 +30,14 @@ public sealed class PrunletConfig
         if (Schema != 1) throw new InvalidDataException("Unsupported configuration schema.");
         if (RetentionDays is < 1 or > 36500) throw new InvalidDataException("retentionDays must be between 1 and 36500.");
         if (MaxRecoveryBytes <= 0) throw new InvalidDataException("maxRecoveryBytes must be positive.");
+        if (VolumeRecoveryDirectories is null) throw new InvalidDataException("volumeRecoveryDirectories cannot be null.");
+        var volumes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in VolumeRecoveryDirectories)
+        {
+            var volume = PathPolicy.Absolute(pair.Key);
+            if (volume.Length != 3 || !volumes.Add(volume)) throw new InvalidDataException("Volume recovery keys must be distinct drive roots.");
+            _ = PathPolicy.Absolute(pair.Value);
+        }
         var backup = PathPolicy.Absolute(BackupDirectory);
         PathPolicy.ExistingDirectory(backup);
     }
@@ -39,6 +49,9 @@ public sealed class PrunletConfig
         var resolver = new DefaultJsonTypeInfoResolver();
         resolver.Modifiers.Add(info =>
         {
+            if (info.Type == typeof(PrunletConfig))
+                foreach (var property in info.Properties.Where(property => property.Name == "volumeRecoveryDirectories"))
+                    property.ShouldSerialize = (value, _) => ((PrunletConfig)value).VolumeRecoveryDirectories.Count != 0;
             // 通常属性が既定のschema 1は旧exeの厳密JSON読込との互換性を維持する。
             if (info.Type == typeof(ManifestEntry))
             {
