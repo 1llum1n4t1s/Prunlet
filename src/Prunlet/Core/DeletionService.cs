@@ -33,7 +33,7 @@ public sealed partial class DeletionService
 
     public DeleteResult Delete(string[] paths, bool dryRun = false, bool recursive = false)
     {
-        return DeleteMoves(paths, dryRun, recursive);
+        return DeleteRecycle(paths, dryRun, recursive);
     }
 
     public RestoreResult Restore(string operationId)
@@ -54,6 +54,7 @@ public sealed partial class DeletionService
         if (expectedRegistry is bool expected && expected != registry)
             throw new ArgumentException(expected ? "Operation is not a registry recovery operation." : "Registry operations cannot be restored through the file-only entry point.");
         if (registry) return RestoreRegistryCore(operationId);
+        if (IsRecycleOperation(operationId)) return RestoreRecycle(operationId);
         if (IsMoveOperation(operationId)) return RestoreMoves(operationId);
         var directory = Path.Combine(config.BackupDirectory, operationId);
         using var directories = PathPolicy.PinRecoveryDirectories(directory);

@@ -43,6 +43,12 @@ public sealed partial class DeletionService
             NativeFiles.RejectNamedStreams(lockPath);
             if (RandomAccess.GetLength(operationLock) != 0) throw new InvalidDataException("Operation lock is not empty.");
             var members = Directory.EnumerateFileSystemEntries(directory).Select(Path.GetFileName).ToHashSet(StringComparer.Ordinal);
+            if (members.Contains(RecycleManifestName))
+            {
+                result.Status = "retained";
+                warnings.Add($"Recycle Bin history operation {id} was retained; schema 6 receipts remain available for reconciliation.");
+                return;
+            }
             if (members.Contains(RegistryManifestName))
             {
                 result.Status = "retained";

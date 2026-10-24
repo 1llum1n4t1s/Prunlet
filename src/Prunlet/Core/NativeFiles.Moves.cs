@@ -16,6 +16,11 @@ internal static partial class NativeFiles
     internal static SafeFileHandle OpenMoveMeasurement(string path) =>
         Open(path, 0x80, 5, 3, OpenReparse | BackupSemantics);
 
+    // Shellの完了callbackはShell自身のハンドルが開いている場合も照合する。
+    // ここでは共有を制限せず、CoreはFile ID不一致を曖昧な状態として保全する。
+    internal static SafeFileHandle OpenShellInspection(string path) =>
+        Open(path, 0x80, 7, 3, OpenReparse | BackupSemantics);
+
     // DELETEハンドルと共存し、renameのclose時に付くArchiveだけを元属性へ戻す。
     internal static SafeFileHandle OpenMoveAttributeGuard(string path) =>
         Open(path, 0x180, 5, 3, OpenReparse | BackupSemantics);

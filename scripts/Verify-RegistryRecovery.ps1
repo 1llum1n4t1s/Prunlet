@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
+    [Alias('BaselineMoveExecutablePath')][string]$MoveExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
     [ValidateSet('HKCU\Software\PrunletE2E','HKEY_CURRENT_USER\Software\PrunletE2E','HKLM\SYSTEM\PrunletE2E','HKEY_LOCAL_MACHINE\SYSTEM\PrunletE2E')]
@@ -14,10 +15,14 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
-foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
+foreach ($path in @($ExecutablePath, $MoveExecutablePath, $OutputDirectory, $ReportPath) | Where-Object { $_ }) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Executable/output/report paths must be absolute.' }
 }
 $ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath)
+if ($MoveExecutablePath) {
+    $MoveExecutablePath = [IO.Path]::GetFullPath($MoveExecutablePath)
+    if (![IO.File]::Exists($MoveExecutablePath)) { throw 'MoveExecutablePath missing.' }
+}
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $ReportPath = [IO.Path]::GetFullPath($ReportPath)
 foreach ($path in @($OutputDirectory, $ReportPath)) {
@@ -42,8 +47,8 @@ function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { th
 function Save-Json([string]$Path, [object]$Value) { [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 80), $utf8) }
 function Read-Json([string]$Path) { [IO.File]::ReadAllText($Path) | ConvertFrom-Json -Depth 80 -AsHashtable }
 function Digest([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
-function Start-Child([string[]]$Arguments) {
-    $info = [Diagnostics.ProcessStartInfo]::new($ExecutablePath)
+function Start-Child([string[]]$Arguments, [string]$Binary = $ExecutablePath) {
+    $info = [Diagnostics.ProcessStartInfo]::new($Binary)
     $info.UseShellExecute = $false; $info.CreateNoWindow = $true
     $info.RedirectStandardInput = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
     $info.StandardInputEncoding = $utf8; $info.StandardOutputEncoding = $utf8; $info.StandardErrorEncoding = $utf8
@@ -53,14 +58,15 @@ function Start-Child([string[]]$Arguments) {
     foreach ($arg in (@('--config', $script:Config) + $Arguments)) { $info.ArgumentList.Add($arg) }
     $p = [Diagnostics.Process]::new(); $p.StartInfo = $info; $null = $p.Start(); return $p
 }
-function Invoke-RegistryCli([string[]]$Arguments) {
-    $p = Start-Child $Arguments
+function Invoke-RegistryCli([string[]]$Arguments, [switch]$LegacyMove) {
+    $binary = if ($LegacyMove) { $MoveExecutablePath } else { $ExecutablePath }
+    $p = Start-Child $Arguments $binary
     try {
         $out = $p.StandardOutput.ReadToEndAsync(); $err = $p.StandardError.ReadToEndAsync(); $p.StandardInput.Close()
         if (!$p.WaitForExit(180000)) { $p.Kill($true); $p.WaitForExit(); throw 'CLI timeout.' }
         $stdout = $out.GetAwaiter().GetResult(); $stderr = $err.GetAwaiter().GetResult()
         $script:Invocation++
-        Save-Json (Join-Path $script:CaseRoot ('process-{0:D3}.json' -f $script:Invocation)) @{ arguments = $Arguments; exitCode = $p.ExitCode; stdout = $stdout; stderr = $stderr }
+        Save-Json (Join-Path $script:CaseRoot ('process-{0:D3}.json' -f $script:Invocation)) @{ executablePath = $binary; arguments = $Arguments; exitCode = $p.ExitCode; stdout = $stdout; stderr = $stderr }
         $json = if ($stdout.Trim()) { $stdout | ConvertFrom-Json -Depth 80 } else { $null }
         return @{ ExitCode = $p.ExitCode; Json = $json; Stdout = $stdout; Stderr = $stderr }
     } finally { $p.Dispose() }
@@ -74,8 +80,11 @@ function New-Case([string]$Name) {
     $config = Read-Json $script:Config; $config.volumeRecoveryDirectories = @{ 'D:\' = (Join-Path $script:CaseRoot 'volume-store') }; Save-Json $script:Config $config
     $script:Relative = $runRelative + '\' + $Name; $script:Path = $fixtureHive + '\' + $script:Relative
 }
-function Case([string]$Name, [scriptblock]$Body) {
+function Case([string]$Name, [scriptblock]$Body, [switch]$RequiresMove) {
     if (!@($CaseFilter | Where-Object { $Name -like $_ }).Count) { $script:excluded++; return }
+    if ($RequiresMove -and !$MoveExecutablePath) {
+        $results.Add(@{ name = $Name; passed = $null; skipped = $true; note = 'MoveExecutablePath not supplied; mixed schema 4/5 retention was not verified.'; milliseconds = 0 }); return
+    }
     $timer = [Diagnostics.Stopwatch]::StartNew()
     try { New-Case $Name; & $Body; $results.Add(@{ name = $Name; passed = $true; milliseconds = $timer.ElapsedMilliseconds }) }
     catch { $results.Add(@{ name = $Name; passed = $false; error = $_.Exception.Message; milliseconds = $timer.ElapsedMilliseconds }); Write-Warning "$Name : $($_.Exception.Message)" }
@@ -107,6 +116,34 @@ public static class PrunletRegistryE2E {
  [DllImport("advapi32.dll")] static extern int RegGetKeySecurity(SafeRegistryHandle k,uint i,byte[] b,ref uint l);
  [DllImport("advapi32.dll")] static extern int RegSetKeySecurity(SafeRegistryHandle k,uint information,byte[] descriptor);
  [DllImport("advapi32.dll",CharSet=CharSet.Unicode)] static extern int RegOpenKeyExW(IntPtr root,string path,uint options,uint access,out SafeRegistryHandle key);
+ [DllImport("KtmW32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateTransaction(IntPtr security,IntPtr unitOfWork,uint options,uint isolationLevel,uint isolationFlags,uint timeout,string description);
+ [DllImport("KtmW32.dll",SetLastError=true)] static extern bool RollbackTransaction(SafeFileHandle transaction);
+ [DllImport("advapi32.dll",CharSet=CharSet.Unicode)] static extern int RegOpenKeyTransactedW(IntPtr root,string path,uint options,uint access,out SafeRegistryHandle key,SafeFileHandle transaction,IntPtr extendedParameter);
+ public sealed class KtmPreflightResult {
+  public int View;
+  public string Parent;
+  public string Stage;
+  public int NativeError;
+  public int RollbackError;
+  public bool Available { get { return NativeError==0&&RollbackError==0&&Stage=="complete"; } }
+ }
+ public static KtmPreflightResult PreflightKtm(int view) {
+  if(FixturePrefix==null)throw new InvalidOperationException("Configure the fixture hive before preflight.");
+  var result=new KtmPreflightResult { View=view,Parent=Hive==RegistryHive.LocalMachine?"SYSTEM":"Software",Stage="CreateTransaction" };
+  using(var transaction=CreateTransaction(IntPtr.Zero,IntPtr.Zero,0,0,0,30000,"Prunlet E2E read-only KTM preflight")) {
+   if(transaction.IsInvalid) { result.NativeError=Marshal.GetLastWin32Error();return result; }
+   try {
+    result.Stage="RegOpenKeyTransactedW(KEY_READ)";
+    SafeRegistryHandle key;
+    result.NativeError=RegOpenKeyTransactedW(Root,result.Parent,0,(uint)(0x20019|(view==32?0x200:0x100)),out key,transaction,IntPtr.Zero);
+    if(key!=null)key.Dispose();
+   } finally {
+    if(!RollbackTransaction(transaction))result.RollbackError=Marshal.GetLastWin32Error();
+   }
+  }
+  if(result.NativeError==0)result.Stage=result.RollbackError==0?"complete":"RollbackTransaction";
+  return result;
+ }
  [DllImport("advapi32.dll",EntryPoint="RegOpenKeyExW",CharSet=CharSet.Unicode)] static extern int ReopenSecurity(SafeRegistryHandle root,string path,uint options,uint access,out SafeRegistryHandle key);
  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
  [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr p,uint a,out IntPtr t);
@@ -174,6 +211,35 @@ try { $env:TEMP = $compilerTemp; $env:TMP = $compilerTemp; Add-Type -TypeDefinit
 finally { $env:TEMP = $previousTemp; $env:TMP = $previousTmp }
 $securityPrivilege = [PrunletRegistryE2E]::EnableSecurity()
 [PrunletRegistryE2E]::Configure($machineFixture,$runRelative)
+$preflight = @()
+foreach ($view in @(64,32)) {
+    try { $preflight += [PrunletRegistryE2E]::PreflightKtm($view) }
+    catch { $preflight += @{ View=$view; Available=$false; Stage='native preflight exception'; error=$_.Exception.Message; hresult=$_.Exception.HResult } }
+}
+if (@($preflight | Where-Object { !$_.Available }).Count) {
+    # 読み取り専用の既存親接続に失敗した環境では、fixtureキーを一つも作らない。
+    $presence = @(); $remaining = $null
+    foreach ($view in @(64,32)) {
+        try {
+            $existing = [PrunletRegistryE2E]::Open($runRelative,$view)
+            $exists = $null -ne $existing
+            if ($existing) { $existing.Dispose(); $remaining = $runPath }
+            $presence += @{ view=$view; exists=$exists; observed=$true }
+        } catch { $presence += @{ view=$view; exists=$null; observed=$false; error=$_.Exception.Message }; $remaining=$runPath }
+    }
+    $reason = 'Read-only KTM preflight unavailable; no registry fixture creation was attempted. Registry behavior remains unverified in this process context.'
+    Save-Json $ReportPath @{
+        schema=1; timestampUtc=[DateTimeOffset]::UtcNow.ToString('O'); executablePath=$ExecutablePath; moveExecutablePath=$MoveExecutablePath
+        passed=0; failed=1; skipped=0; excludedCount=0; createdFixture=$false
+        results=@(@{ name='read-only-ktm-preflight'; passed=$false; error=$reason; probes=$preflight })
+        preflight=$preflight; securityPrivilegeEnabled=$securityPrivilege; registryFixtureRoot=$RegistryFixtureRoot
+        registryFixture=$null; intendedRegistryFixture=$runPath; fixturePresence=$presence
+        cleanup=@{ attempted=$false; remainingRegistryPath=$remaining; operations=@() }; retainedDirectory=$OutputDirectory
+        unverified=@($reason)
+    }
+    [ordered]@{ passed=0; failed=1; skipped=0; createdFixture=$false; reportPath=$ReportPath; remainingRegistryPath=$remaining; error=$reason } | ConvertTo-Json
+    exit 1
+}
 foreach ($view in @(32,64)) {
     $existing = [PrunletRegistryE2E]::Open($runRelative,$view)
     if ($existing) { $existing.Dispose(); throw 'Unique registry fixture already exists.' }
@@ -441,12 +507,12 @@ Case 'capacity-single-oversized-then-normal-budget' {
     $maintained = Invoke-RegistryCli @('maintain','--apply')
     Assert-True ($maintained.ExitCode -eq 0 -and ![IO.File]::Exists($second.Payload)) 'Maintenance retained previous oversized exception.'
 }
-Case 'mixed-file-registry-capacity-order-and-restore-type-guards' {
+Case 'mixed-file-registry-capacity-order-and-restore-type-guards' -RequiresMove {
     $file = Join-Path $script:CaseRoot 'mixed-file.bin'
     [IO.File]::WriteAllBytes($file,[byte[]](0..255)*16)
     $fileHash = Digest $file; $fileBytes = [IO.FileInfo]::new($file).Length
     Fixture; $registryBefore = Snapshot
-    # file削除もPrunletの専用MCPを使い、補助APIで削除しない。
+    # 保持予算を持つ旧schema 4だけを変更前exeで作り、新版MCPで復元と型境界を検証する。
     $p = Start-Child @('mcp'); $mcpCompleted = $false
     try {
         $stderrTask = $p.StandardError.ReadToEndAsync()
@@ -462,16 +528,16 @@ Case 'mixed-file-registry-capacity-order-and-restore-type-guards' {
         $init = Mixed-Rpc @{ jsonrpc='2.0'; id=1; method='initialize'; params=@{ protocolVersion='2024-11-05'; capabilities=@{}; clientInfo=@{name='mixed-retention-e2e';version='1'} } }
         Assert-True ($null -ne $init.result) 'Mixed-retention MCP initialize failed.'
         $p.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}'); $p.StandardInput.Flush()
-        $first = Mixed-Rpc @{ jsonrpc='2.0'; id=2; method='tools/call'; params=@{name='delete_files';arguments=@{paths=@($file)}} }
-        Assert-True (!$first.result.isError -and ![IO.File]::Exists($file)) 'Mixed-retention file deletion failed.'
-        $firstId = $first.result.structuredContent.operationId
+        $first = Invoke-RegistryCli @('delete','--',$file) -LegacyMove
+        Assert-True ($first.ExitCode -eq 0 -and ![IO.File]::Exists($file)) 'Mixed-retention legacy file deletion failed.'
+        $firstId = $first.Json.operationId
         $wrongRegistry = Mixed-Rpc @{ jsonrpc='2.0'; id=3; method='tools/call'; params=@{name='restore_registry';arguments=@{operationId=$firstId}} }
         Assert-True ($wrongRegistry.result.isError -and ![IO.File]::Exists($file)) 'Registry restore accepted a file operation.'
         $restoredFile = Mixed-Rpc @{ jsonrpc='2.0'; id=4; method='tools/call'; params=@{name='restore_files';arguments=@{operationId=$firstId}} }
         Assert-True (!$restoredFile.result.isError -and [IO.File]::Exists($file) -and (Digest $file) -ceq $fileHash) 'File restore after type rejection changed content.'
-        $deletedFile = Mixed-Rpc @{ jsonrpc='2.0'; id=5; method='tools/call'; params=@{name='delete_files';arguments=@{paths=@($file)}} }
-        Assert-True (!$deletedFile.result.isError -and ![IO.File]::Exists($file)) 'Mixed-retention second file deletion failed.'
-        $fileId = $deletedFile.result.structuredContent.operationId
+        $deletedFile = Invoke-RegistryCli @('delete','--',$file) -LegacyMove
+        Assert-True ($deletedFile.ExitCode -eq 0 -and ![IO.File]::Exists($file)) 'Mixed-retention second legacy file deletion failed.'
+        $fileId = $deletedFile.Json.operationId
         $fileManifest = Read-Json (Join-Path (Join-Path $script:Recovery $fileId) 'move-manifest.json')
         Assert-True ($fileManifest.schema -eq 4 -and $fileManifest.entries.Count -eq 1) 'Mixed-retention file operation did not use schema 4 root rename.'
         $entry = $fileManifest.entries[0]
@@ -572,10 +638,10 @@ if ($createdFixture) {
         if (!(Exists $runRelative 64) -and !(Exists $runRelative 32)) { $cleanup.remainingRegistryPath = $null }
     } catch { $cleanup.error = $_.Exception.Message }
 }
-$passed = @($results | Where-Object passed).Count; $failed = $results.Count - $passed
+$passed = @($results | Where-Object passed).Count; $skipped = @($results | Where-Object skipped).Count; $failed = $results.Count - $passed - $skipped
 $unverified = @('Native registry link rejection and exact privilege-deficient token behavior require separate native probes.','KTM concurrency and crash timing require separate integration probes.','Distinct WOW64 view isolation requires separate views; SYSTEM shared views do not verify isolation. See view-observation.json.')
-if (!@($results | Where-Object { $_.name -eq 'mixed-file-registry-capacity-order-and-restore-type-guards' -and $_.passed }).Count) { $unverified += 'Mixed file/registry retention was not verified because its case was excluded or failed.' }
+if (!@($results | Where-Object { $_.name -eq 'mixed-file-registry-capacity-order-and-restore-type-guards' -and $_.passed }).Count) { $unverified += 'Mixed file/registry retention was not verified because its case was excluded, skipped, or failed.' }
 if ($machineFixture) { $unverified += 'Normal HKCU roundtrip was not verified by this HKLM SYSTEM run; HKCU ERROR_RM_NOT_ACTIVE preservation requires a separate probe.' }
-Save-Json $ReportPath @{ schema=1; timestampUtc=[DateTimeOffset]::UtcNow.ToString('O'); executablePath=$ExecutablePath; passed=$passed; failed=$failed; excludedCount=$excluded; results=@($results); securityPrivilegeEnabled=$securityPrivilege; registryFixtureRoot=$RegistryFixtureRoot; registryFixture=$runPath; cleanup=$cleanup; retainedDirectory=$OutputDirectory; unverified=$unverified }
-[ordered]@{ passed=$passed; failed=$failed; excludedCount=$excluded; reportPath=$ReportPath; remainingRegistryPath=$cleanup.remainingRegistryPath } | ConvertTo-Json
+Save-Json $ReportPath @{ schema=1; timestampUtc=[DateTimeOffset]::UtcNow.ToString('O'); executablePath=$ExecutablePath; moveExecutablePath=$MoveExecutablePath; passed=$passed; failed=$failed; skipped=$skipped; excludedCount=$excluded; results=@($results); preflight=$preflight; createdFixture=$createdFixture; securityPrivilegeEnabled=$securityPrivilege; registryFixtureRoot=$RegistryFixtureRoot; registryFixture=$runPath; cleanup=$cleanup; retainedDirectory=$OutputDirectory; unverified=$unverified }
+[ordered]@{ passed=$passed; failed=$failed; skipped=$skipped; excludedCount=$excluded; reportPath=$ReportPath; remainingRegistryPath=$cleanup.remainingRegistryPath } | ConvertTo-Json
 if ($failed) { exit 1 }; exit 0

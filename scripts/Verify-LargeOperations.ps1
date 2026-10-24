@@ -4,15 +4,21 @@ param(
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
     [string]$LegacyExecutablePath,
+    [string]$MoveExecutablePath,
     [string]$BaselineExecutablePath,
+    [switch]$LegacyCopyVerification,
     [ValidateRange(32769, 1000000)][int]$FileCount = 32769,
     [ValidateRange(60, 86400)][int]$ProcessTimeoutSeconds = 1800
 )
 $ErrorActionPreference = 'Stop'
-if (!$LegacyExecutablePath) {
-    & (Join-Path $PSScriptRoot 'Verify-VolumeMoves.ps1') -ExecutablePath $ExecutablePath -OutputDirectory $OutputDirectory -ReportPath $ReportPath -Large -CaseFilter '*large-*' -ProcessTimeoutSeconds ([Math]::Min($ProcessTimeoutSeconds, 3600))
+if (!$LegacyCopyVerification) {
+    $verificationArguments = @{ ExecutablePath = $ExecutablePath; OutputDirectory = $OutputDirectory; ReportPath = $ReportPath; Large = $true; LargeFileCount = $FileCount; CaseFilter = @('*large-*'); ProcessTimeoutSeconds = [Math]::Min($ProcessTimeoutSeconds, 3600) }
+    if ($LegacyExecutablePath) { $verificationArguments.LegacyExecutablePath = $LegacyExecutablePath }
+    if ($MoveExecutablePath) { $verificationArguments.MoveExecutablePath = $MoveExecutablePath }
+    & (Join-Path $PSScriptRoot 'Verify-RecycleBin.ps1') @verificationArguments
     exit $LASTEXITCODE
 }
+if (!$LegacyExecutablePath) { throw 'LegacyCopyVerification requires the pre-migration LegacyExecutablePath.' }
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
 foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
@@ -128,12 +134,12 @@ function Assert-BaselineRejects([string[]]$Arguments) {
 
 # 想定する失敗: 新方式が木をコピーへ戻す、旧schema 2/3の大きな記録を読めない、
 # 競合復元で上書きする、整理が記録を壊す。旧記録の生成は指定した旧exeだけが行う。
-Test-Case 'schema 4 large folder moves and restores with persistent identities' {
+Test-Case 'schema 6 large folder recycles and restores with persistent identities' {
     $moveReport = $report + '.moves.json'
     $global:LASTEXITCODE = 0
-    & (Join-Path $PSScriptRoot 'Verify-VolumeMoves.ps1') -ExecutablePath $ExecutablePath -OutputDirectory (Join-Path $outputRoot 'move-validation') -ReportPath $moveReport -Large -CaseFilter '*large-*' -ProcessTimeoutSeconds ([Math]::Min($ProcessTimeoutSeconds, 3600))
+    & (Join-Path $PSScriptRoot 'Verify-RecycleBin.ps1') -ExecutablePath $ExecutablePath -OutputDirectory (Join-Path $outputRoot 'recycle-validation') -ReportPath $moveReport -Large -LargeFileCount $FileCount -CaseFilter '*large-*' -ProcessTimeoutSeconds ([Math]::Min($ProcessTimeoutSeconds, 3600))
     $moveResult = [IO.File]::ReadAllText($moveReport) | ConvertFrom-Json
-    Assert-True ($LASTEXITCODE -eq 0 -and $moveResult.failed -eq 0 -and $moveResult.passed -eq 1) 'Large move verification failed.'
+    Assert-True ($LASTEXITCODE -eq 0 -and $moveResult.failed -eq 0 -and $moveResult.passed -eq 1) 'Large recycle verification failed.'
 }
 Test-Case 'create one reusable legacy fixture and initialize isolated recovery' {
     $null = [IO.Directory]::CreateDirectory($recovery)

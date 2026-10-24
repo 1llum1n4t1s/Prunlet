@@ -63,6 +63,11 @@ public sealed partial class DeletionService
                     ScanRegistryRecovery(scan, name, warnings, collectCandidates);
                     continue;
                 }
+                if (operation && IsRecycleOperation(name))
+                {
+                    ScanRecycleRecovery(name);
+                    continue;
+                }
                 if (operation && IsMoveOperation(name)) continue;
                 bytes = CountRecoveryPayload(member, operation, members);
                 scan.Bytes = checked(scan.Bytes + bytes);

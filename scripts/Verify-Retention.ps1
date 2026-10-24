@@ -3,12 +3,17 @@ param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
+    [string]$LegacyExecutablePath,
+    [string]$MoveExecutablePath,
     [switch]$LegacyCopyVerification
 )
 $ErrorActionPreference = 'Stop'
-# 期限・容量・旧記録混在・hardlink更新を移動方式で検証する。
+# ごみ箱項目の整理除外と旧記録の期限・明示整理を検証する。
 if (!$LegacyCopyVerification) {
-    & (Join-Path $PSScriptRoot 'Verify-VolumeMoves.ps1') -ExecutablePath $ExecutablePath -OutputDirectory $OutputDirectory -ReportPath $ReportPath -CaseFilter '*retention*', '*oversized*', '*capacity*', '*mutable-hardlink*'
+    $verificationArguments = @{ ExecutablePath = $ExecutablePath; OutputDirectory = $OutputDirectory; ReportPath = $ReportPath; CaseFilter = @('*retention*', '*legacy-schema-*-maintain*', '*legacy-schema-*-purge*') }
+    if ($LegacyExecutablePath) { $verificationArguments.LegacyExecutablePath = $LegacyExecutablePath }
+    if ($MoveExecutablePath) { $verificationArguments.MoveExecutablePath = $MoveExecutablePath }
+    & (Join-Path $PSScriptRoot 'Verify-RecycleBin.ps1') @verificationArguments
     exit $LASTEXITCODE
 }
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))

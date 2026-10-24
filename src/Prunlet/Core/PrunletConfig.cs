@@ -11,7 +11,7 @@ public sealed class PrunletConfig
     public string[] AllowedRoots { get; set; } = [];
     public string BackupDirectory { get; set; } = string.Empty;
     public int RetentionDays { get; set; } = 7;
-    public long MaxRecoveryBytes { get; set; } = 10L * 1024 * 1024 * 1024;
+    public long MaxRecoveryBytes { get; set; } = 1L * 1024 * 1024 * 1024;
     // 省略時は各ボリュームのユーザー専用領域を使う。検証・管理用の同一ボリューム内配置指定。
     public Dictionary<string, string> VolumeRecoveryDirectories { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public string RegistryScope { get; set; } = "current";

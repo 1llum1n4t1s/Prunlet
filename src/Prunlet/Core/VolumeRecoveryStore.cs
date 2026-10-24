@@ -32,7 +32,9 @@ internal static class VolumeRecoveryStore
     internal static IReadOnlyList<string> ProtectedRoots(PrunletConfig config, string sourcePath)
     {
         var location = Location(config, sourcePath);
-        return [location.PrivateBase, location.Root];
+        var restore = Location(config, sourcePath, restore: true);
+        var defaultRestore = Location(config, sourcePath, useDefault: true, restore: true);
+        return [location.PrivateBase, location.Root, restore.PrivateBase, restore.Root, defaultRestore.PrivateBase, defaultRestore.Root];
     }
 
     // 容量走査は中央記録を失った実体も見つける。作成・ACL変更・他StoreKeyの列挙は行わない。
@@ -115,23 +117,32 @@ internal static class VolumeRecoveryStore
     private static bool IsInventoryFailure(Exception ex) => ex is IOException or InvalidDataException or UnauthorizedAccessException
         or ArgumentException or System.Security.SecurityException or JsonException or InvalidOperationException or FormatException or OverflowException;
 
-    internal static VolumeRecoveryLease Open(PrunletConfig config, string sourcePath, string operationId, bool create)
+    internal static VolumeRecoveryLease Open(PrunletConfig config, string sourcePath, string operationId, bool create) =>
+        OpenCore(config, sourcePath, operationId, create, restore: false);
+
+    internal static string RestoreOperationPath(PrunletConfig config, string sourcePath, string operationId) =>
+        Path.Combine(Location(config, sourcePath, restore: true).Root, operationId);
+
+    internal static VolumeRecoveryLease OpenRestore(PrunletConfig config, string sourcePath, string operationId, bool create) =>
+        OpenCore(config, sourcePath, operationId, create, restore: true);
+
+    private static VolumeRecoveryLease OpenCore(PrunletConfig config, string sourcePath, string operationId, bool create, bool restore)
     {
         if (!Guid.TryParseExact(operationId, "N", out var operationGuid) || operationGuid.ToString("N") != operationId)
             throw new InvalidDataException("Recovery operation ID must be a lowercase GUID without separators.");
-        var location = Location(config, sourcePath);
+        var location = Location(config, sourcePath, restore: restore);
         var lease = new VolumeRecoveryLease(location.Root, Path.Combine(location.Root, operationId), location.VolumeName);
         try
         {
             // 既存祖先は変更せず、作成する各階層だけに専用ACLを与える。
             lease.Add(PathPolicy.PinRecoveryDirectories(Path.GetDirectoryName(location.PrivateBase)!));
-            if (create) _ = CreateSecureDirectory(location.PrivateBase);
+            if (create) _ = CreateSecureDirectory(location.PrivateBase, restore);
             lease.Add(PathPolicy.PinRecoveryDirectories(location.PrivateBase));
-            VerifySecureDirectory(location.PrivateBase);
+            VerifySecureDirectory(location.PrivateBase, restore);
 
-            var rootCreated = create && CreateSecureDirectory(location.Root);
+            var rootCreated = create && CreateSecureDirectory(location.Root, restore);
             lease.Add(PathPolicy.PinRecoveryDirectories(location.Root));
-            VerifySecureDirectory(location.Root);
+            VerifySecureDirectory(location.Root, restore);
             lease.StoreRootHandle = NativeFiles.OpenMoveParent(location.Root);
             NativeFiles.Verify(lease.StoreRootHandle, location.Root, directory: true);
             NativeFiles.RejectCaseSensitive(lease.StoreRootHandle);
@@ -144,10 +155,10 @@ internal static class VolumeRecoveryStore
             lease.Marker = ReadMarker(markerPath, location, lease.RootIdentity);
 
             // ルート全体を列挙すると過去の操作数に比例するため、今回の操作だけを検査する。
-            if (create && !CreateSecureDirectory(lease.OperationPath))
+            if (create && !CreateSecureDirectory(lease.OperationPath, restore))
                 throw new IOException("Recovery operation directory already exists; it was not reused.");
             lease.Add(PathPolicy.PinRecoveryDirectories(lease.OperationPath));
-            VerifySecureDirectory(lease.OperationPath);
+            VerifySecureDirectory(lease.OperationPath, restore);
             lease.ParentHandle = NativeFiles.OpenMoveParent(lease.OperationPath);
             NativeFiles.Verify(lease.ParentHandle, lease.OperationPath, directory: true);
             NativeFiles.RejectCaseSensitive(lease.ParentHandle);
@@ -160,7 +171,7 @@ internal static class VolumeRecoveryStore
         catch { lease.Dispose(); throw; }
     }
 
-    private static StoreLocation Location(PrunletConfig config, string sourcePath, bool useDefault = false)
+    private static StoreLocation Location(PrunletConfig config, string sourcePath, bool useDefault = false, bool restore = false)
     {
         var source = PathPolicy.Absolute(sourcePath);
         // reparse対象自身ではなく、その名前が置かれているボリュームを選ぶ。
@@ -169,7 +180,7 @@ internal static class VolumeRecoveryStore
         if (mountRoot.Length != 3) throw new IOException("Recovery stores require a local drive-root volume mount.");
         var volumeName = NativeFiles.VolumeName(mountRoot);
         var metadata = PathPolicy.Resolve(config.BackupDirectory, finalDirectory: true, allowMissing: false);
-        var privateBase = Path.Combine(mountRoot, ".Prunlet-Recovery-" + OwnerSid);
+        var privateBase = Path.Combine(mountRoot, (restore ? ".Prunlet-Restore-" : ".Prunlet-Recovery-") + OwnerSid);
         string? configured = null;
         if (!useDefault && config.VolumeRecoveryDirectories is not null)
         {
@@ -181,7 +192,7 @@ internal static class VolumeRecoveryStore
                 configured = PathPolicy.Absolute(pair.Value);
             }
         }
-        if (configured is not null) privateBase = configured;
+        if (configured is not null) privateBase = configured + (restore ? ".restore" : string.Empty);
         privateBase = PathPolicy.Resolve(privateBase, finalDirectory: true, allowMissing: true);
         var recoveryMountRoot = NativeFiles.VolumeMountRoot(privateBase);
         if (recoveryMountRoot.Length != 3) throw new IOException("Recovery stores require a local drive-root volume mount.");
@@ -275,10 +286,10 @@ internal static class VolumeRecoveryStore
         }
     }
 
-    private static bool CreateSecureDirectory(string path)
+    private static bool CreateSecureDirectory(string path, bool restore = false)
     {
         var owner = OwnerSid;
-        var principals = new[] { owner, "S-1-5-18", "S-1-5-32-544" }.Distinct(StringComparer.Ordinal);
+        var principals = (restore ? new[] { owner, "S-1-5-18" } : new[] { owner, "S-1-5-18", "S-1-5-32-544" }).Distinct(StringComparer.Ordinal);
         var sddl = $"O:{owner}D:P" + string.Concat(principals.Select(sid => $"(A;OICI;FA;;;{sid})"));
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out var descriptor, out _))
             ThrowNative("Cannot construct recovery directory security descriptor");
@@ -293,7 +304,7 @@ internal static class VolumeRecoveryStore
         finally { _ = LocalFree(descriptor); }
     }
 
-    private static void VerifySecureDirectory(string path)
+    private static void VerifySecureDirectory(string path, bool restore = false)
     {
         using var handle = CreateFileW(Extended(path), 0x00020080, 3, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
         if (handle.IsInvalid) ThrowNative("Cannot inspect recovery directory owner and permissions");
@@ -311,7 +322,7 @@ internal static class VolumeRecoveryStore
             var bytes = new byte[(int)length];
             Marshal.Copy(descriptor, bytes, 0, bytes.Length);
             var security = new RawSecurityDescriptor(bytes, 0);
-            var expected = new HashSet<string>([OwnerSid, "S-1-5-18", "S-1-5-32-544"], StringComparer.Ordinal);
+            var expected = new HashSet<string>(restore ? [OwnerSid, "S-1-5-18"] : [OwnerSid, "S-1-5-18", "S-1-5-32-544"], StringComparer.Ordinal);
             if (security.Owner?.Value != OwnerSid || (security.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0
                 || security.DiscretionaryAcl is not RawAcl acl || acl.Count != expected.Count)
                 throw new IOException("Existing recovery directory has an unexpected owner or unprotected permissions; its ACL was not modified.");

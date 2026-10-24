@@ -45,7 +45,9 @@ $config = Join-Path $env:USERPROFILE '.local\Prunlet\config.json'
 }
 ```
 
-新規削除の実体は同じボリュームの専用領域へrenameします。既定の配置、`volumeRecoveryDirectories`による同一ボリューム内の配置指定、ACL・所有markerの条件は[設計](../DESIGN.md#ボリューム別の復元領域)を参照してください。中央metadataと専用baseを包含させず、異ボリュームへのコピーに切り替えないでください。復元は退避実体を消費し、既存フォルダーへもマージしません。旧schema 1/2/3は互換経路で復元・整理します。
+新規ファイル・フォルダーはWindowsのゴミ箱へ移し、Prunletは操作ID・Shell項目・File ID・元のOwner/Group/DACLを記録します。ゴミ箱へ移せない場合の永久削除や独自領域へのfallbackはありません。保持期間・容量はWindowsの設定に従います。`backupDirectory`は操作記録・レジストリsnapshot・旧コピーの保存先として残します。`volumeRecoveryDirectories`は既存schema 4の復元・整理に使い、schema 6の復元中はそのbaseに`.restore`を付けた別領域で元DACLを検証してから非上書き移動します。旧schema 1〜4と、ACL snapshotのない旧schema 6の互換復元も保持します。旧schema 6は元ACLを保証できない旨をwarningsに返します。[方式の設計](../DESIGN.md#削除と復元のデータフロー)を参照してください。
+
+復元途中で停止した場合も、同じ操作IDを指定します。ready記録のあるstageは内容の識別情報・ACL・属性を照合して再開します。readyがないstageや照合不一致は保全して停止するため、結果の`backupPath`と操作記録を保持してください。別の削除方法でstageを消したり、元パスへ手動でマージしたりしないでください。
 
 ## 使用中のファイルと同時実行
 

@@ -98,7 +98,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                 protocolVersion = SupportedVersions.Contains(requestedVersion) ? requestedVersion : SupportedVersions[0],
                 capabilities = new { tools = new { listChanged = false } },
                 serverInfo = new { name = "prunlet", title = "Prunlet", version = typeof(McpServer).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion },
-                instructions = "Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true to include directory contents. Metadata and volume recovery directories and their ancestors are protected. Prunlet scans capacity and persists a manifest before moving each selected root into private recovery storage on the same volume. Recovery data expire after 7 days by default; a shared 10 GiB budget may evict older operations sooner. Use restore_files with operationId while recovery data remain. Restore consumes moved items and never overwrites existing destinations; legacy copy records remain supported. Use dryRun to inspect targets. Symbolic links and junctions move as links without following their targets. ADS and case-sensitive directory names are preserved. Moved hard links share content with surviving aliases, so alias writes also change the recovery data; legacy copies restore as independent snapshots. Wildcards and unknown reparse tags are unsupported. Use delete_registry for explicitly authorized local registry keys/values with required view 32 or 64, and restore_registry for their operationId. Empty valueName selects the default value; omitted valueName selects the key. Full key ACL snapshots require SeSecurityPrivilege; no automatic elevation or nontransactional fallback. Existing host approvals and policies still apply."
+                instructions = "Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true for directory contents. File items go to the Windows Recycle Bin; Prunlet persists operation records for non-overwriting restore_files. Windows controls bin retention and users may empty it. Recycling failure never falls back to permanent deletion. Metadata and legacy volume recovery directories and their ancestors remain protected. Use dryRun for inspection. Links are handled without following their targets. Hard links share content with surviving aliases. Legacy schema 1-4 recovery operations remain restorable. Prunlet retention and capacity settings default to 7 days and 1 GiB for registry snapshots and legacy file recovery, never for the Windows bin. Use delete_registry for explicitly authorized local keys/values with required view 32 or 64, and restore_registry for their operationId. Empty valueName selects the default value; omitted valueName selects the key. Full key ACL snapshots require SeSecurityPrivilege; no automatic elevation or nontransactional fallback. Existing host approvals and policies still apply."
             };
         }
         if (!ready) throw new RpcException(-32600, "Initialize and send notifications/initialized first.");
@@ -188,8 +188,8 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
     [
         new
         {
-            name = "delete_files", title = "Move files and folders into recovery storage",
-            description = "Delete authorized absolute Windows files and empty directories by moving each selected root into private recovery storage on the same volume after a capacity scan and durable manifest. Set recursive=true to move a folder with its contents. Recovery data expire after 7 days and share a 10 GiB budget by default. Metadata and volume recovery directories and their ancestors are protected. Moved hard links still share content with surviving aliases. Does not expand wildcards or follow links.",
+            name = "delete_files", title = "Move files and folders to the Windows Recycle Bin",
+            description = "Move authorized absolute Windows files and empty directories to the Windows Recycle Bin after validating targets and persisting operation records. Set recursive=true for folder contents. Windows controls bin retention; Prunlet never permanently deletes an item when recycling is unavailable. Metadata and legacy recovery storage stay protected. Hard links retain their shared content. Does not expand wildcards or follow link targets.",
             inputSchema = new
             {
                 type = "object", properties = new
@@ -205,7 +205,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
         new
         {
             name = "restore_files", title = "Restore a file deletion operation",
-            description = "Restore retained recovery data by operationId. Moving an item back consumes its recovery payload and refuses any existing destination. Legacy copy records restore as independent snapshots without overwriting existing files.",
+            description = "Restore a recorded Windows Recycle Bin item or legacy schema 1-4 recovery data by operationId. Refuses existing destinations without overwriting or merging. Windows bin items must still exist and match their recorded identity. Legacy copy records restore as independent snapshots.",
             inputSchema = new
             {
                 type = "object", properties = new { operationId = new { type = "string" } },

@@ -424,12 +424,15 @@ internal static partial class NativeFiles
         var buffer = Marshal.AllocHGlobal(size);
         try
         {
-            // ReplaceIfExists=false、RootDirectory=NULL。既存の公開済み記録は置換しない。
+            // ReplaceIfExists=false、RootDirectory=NULL。ファイル・ディレクトリとも既存の移動先を置換しない。
             new Span<byte>((void*)buffer, size).Clear();
             Marshal.WriteInt32(buffer, lengthOffset, name.Length);
             Marshal.Copy(name, 0, IntPtr.Add(buffer, nameOffset), name.Length);
             if (!SetFileInformationByHandle(handle, 3, buffer, (uint)size))
-                ThrowLastError("Cannot atomically publish file without replacing an existing destination");
+            {
+                var error = new Win32Exception(Marshal.GetLastWin32Error());
+                throw new IOException($"Cannot rename filesystem object without replacing an existing destination (Win32 {error.NativeErrorCode}): {error.Message}", error);
+            }
         }
         finally { Marshal.FreeHGlobal(buffer); }
     }
