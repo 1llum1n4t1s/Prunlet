@@ -24,12 +24,20 @@ PrunletはWindowsのファイル・フォルダーをWindowsのゴミ箱へ移�
 ## 削除と復元のデータフロー
 
 1. 1〜256件のローカル絶対パスを検証する。重複・祖先重複、中央metadataと旧専用領域、その祖先を拒否する。リンク先を辿らず、非空フォルダーには明示`recursive`を必要とする。
-2. 共通`maintenance.lock`を取得し、対象・元親のFile IDと種類を検査する。dry-runは読取りのみで、ゴミ箱・操作記録・ロックを変更しない。新規削除は専用payload領域を作らず、Prunletの容量予算を消費しない。
+2. 共通`maintenance.lock`を読み取り共有で保持し、正規化した全対象と祖先のclaimを取得してから対象・元親のFile IDと種類を検査する。対象は排他、祖先は共有で、大文字化したパスのUTF-8 SHA-256から65,536個のEOF以降のbyte slotへ割り当てる。衝突は強いclaimへ統合し、全batchを昇順で取得する。同じ対象と親子の削除を排他し、別対象は並行できる。ファイル長は0のまま、handle終了でclaimも解放する。dry-runは読取りのみで、ゴミ箱・操作記録・ロックを変更しない。新規削除は専用payload領域を作らず、Prunletの容量予算を消費しない。
 3. `backupDirectory`のGUID操作フォルダーに`operation.lock`とschema 6の`recycle-manifest.json`を置く。machine・ユーザーSID・対象と元親の128-bit File ID・種類に加え、リンク先を辿らず全項目の相対名・ID・Owner/Group/DACLのnative bytesを記録する。全項目のREAD_CONTROL・WRITE_DACを確認し、`recycle_intent`を永続化してからShellを呼ぶ。直前にも構成・ID・ACLを照合する。上限は1対象65,536項目・descriptorごと1 MiB・記録128 MiBで、超過は移動前に拒否する。
 4. 専用STAで対象親の`ITransferSource::RecycleItem`だけを呼ぶ。永久削除の`RemoveItem`や高位の削除fallbackを呼ぶ経路は持たない。UI・自動昇格を使わず、返却された項目を現在のゴミ箱namespaceの実体・File IDと照合してcanonical PIDLを完了receiptへ永続化する。正常情報値`COPYENGINE_S_DONT_PROCESS_CHILDREN`は非NULL実体とID一致を条件に扱う。callback失敗、項目不一致、完了記録欠損は成功と推定しない。
-5. `operationId`と項目ごとの成否を返す。複数入力全体は一括トランザクションではなく、途中失敗でも完了項目と記録を保持する。
+5. `operationId`と項目ごとの成否を入力順で返す。preflightは全workerの完了を待ち、1件でも失敗したら全対象を保持する。manifest公開とhash確定後に各項目を並行実行する。preflightとShell実処理はprocess共通で最大4workerとし、専用STAへの実効token継承を維持する。snapshotの全nodeを同じhandleから調べ、複数hardlinkを持つfileがあればmanifest作成前に全pin・共有claimを解放し、排他lockで正規化・全preflightから取り直してbatchを逐次実行する。ShellのACL変更を共有する別名を並行処理せず、snapshotの照合条件も緩和しない。複数入力全体は一括トランザクションではなく、途中失敗でも完了項目と記録を保持する。
+
+stdio MCPは解析・initialize・通知をreader順で処理し、`delete_files`は最大4要求を並行実行する。他のtoolは受理済み削除の完了を待ってからreaderで同期実行し、レジストリのprocess privilege変更をfile workerへ持ち込まない。引数を複製し、要求専用serviceへ進捗を購読する。全出力を同じwriter gateで直列化し、完了後の進捗を抑止する。EOFでも受理済み要求の完了を待つ。要求枠と削除worker枠は別で、4要求のbatchを受けてもShell実処理はprocess全体で4件までとなる。
 
 削除完了receiptにはゴミ箱到着時の全項目のIDとOwner/Group/DACLも記録する。復元前はこのreceiptと現在のゴミ箱実体を照合し、外部ハードリンク等からACLが変更されていたら書き戻さず停止する。
+
+同一batchの異なるentryが同じVolume/File IDを共有する場合、新規manifestだけが`hardlinkProtocol:1`を記録する。全snapshot nodeから共有IDを介するentryの連結成分を導出し、共有IDの元Owner/Group/DACL・種類・属性が全entryで一致することを確認する。元snapshotは変更しない。共有IDを持つcomponentは排他lock内で逐次削除し、直前の照合には元snapshotと、そのcomponentの完了済みShell操作が証明した共有IDの状態だけを用いる。
+
+共有状態は`hardlink-<leader>-<sequence>-intent/proof/complete.json`の順で永続化する。intentは前completeのhashと実行前の厳密な共有状態、proofは実行したentry・action・移動先・実測snapshotと原因receiptのhash、completeはintent/proofのhashを結び付ける。削除proofは既存のimmutable recycle完了receipt、stage到着proofは既存のstage intentへ結び付ける。読込時は連続sequence・許可ID集合・前状態・File ID・原因proofを照合し、最新ACLだけから正当な変更を推定しない。未完了・曖昧な操作・receipt保存失敗では同componentの後続を停止し、独立componentだけを続行できる。従来のschema 6記録へ共有状態の証拠を後付けしない。
+
+共有componentの復元では全Bin/PIDL・親・stage・原本と共有状態を先に照合し、初期の復元先競合が1件でもあればcomponent全体を保持する。全entryを非公開stageへ移してから全Owner/Group/DACL・属性を元snapshotへ戻し、全件を厳密照合する。各stage-readyに加え、それらのhashと最終transitionのhashを結び付けた単一の`hardlink-<leader>-ready.json`を非上書きで永続化した後、各entryを非上書き公開する。これにより後続Shell移動が公開済み別名のACLを変える順序を作らない。group-readyのない既存stageはACLを再補正せず保持する。group-ready後の公開途中だけは、全原本・残stageを再照合してShellやACL補正を繰り返さず再開できる。外部別名のOGD変更やhash不整合は拒否する。API境界間での外部変更を完全に識別する保証やSACLの追加保証は持ち込まない。
 
 復元はmanifest・receipt、現在のゴミ箱namespaceへの所属、元親と実体のIDを照合する。元パスが空いていることを確認し、同一ボリュームの復元用stageのID・場所をintentへ先行永続化する。ゴミ箱の`ITransferSource::MoveItem`へ`TSF_FAIL_EXIST`を指定してstageへ移し、全項目のWRITE_DACハンドルと同一ID・Owner/Groupを確認した後、元DACLを復元する。native bytes・ID・属性の完全一致を検証してreadyを永続化し、最後にハンドル指定の非上書きrenameで元パスへ公開する。公開後の再照合まで通ってから完了receiptを書く。既存ファイル・フォルダーへ上書きもマージもせず`conflict`とし、ゴミ箱またはstageの実体を保持する。成功時は`restored`、同一オブジェクトの復元を確認できる再実行は`already_restored`となる。元親がなくなった場合やIDが変わった場合は停止する。
 
@@ -95,7 +103,7 @@ schema 1/2/3のコピー作成とschema 4の専用領域への新規移動を通
 
 Prunletの保持制御は既存schema 1〜4とレジストリschema 5だけを対象とし、既定7日・合計1 GiBを維持する。期限切れ、次いで必要容量に応じた古い操作を整理する。レジストリ削除前と`maintain --apply`が同じCoreを使う。定期タスクは毎日03:00とログオン時に保守専用`prunlet-maintenance.exe`を起動する。専用exeはWindows GUI subsystemで`--config <path> maintain --apply`だけを受理し、通常CLIはconsole subsystemを保つ。所有を確認した旧タスクはCommandだけを移行し、Triggers・Principals・Settingsを保つ。新規ファイル削除は旧データの整理を起動しない。schema 6はWindowsが保持・清掃し、Prunletはゴミ箱を空にしない。
 
-共通`maintenance.lock`で実削除・復元・purge・maintainを直列化する。元対象の容量走査、整理前後の既存全体走査、移動直前・直後の照合で予算を検証する。通常の有効予算は`maxRecoveryBytes`。1回の入力合計がそれを超える場合だけ`max(maxRecoveryBytes, incomingBytes)`を有効予算とし、既存データを0バイトまで安全に整理できることを必要とする。設定は変更せず、次回の削除・maintainは通常予算を再適用する。
+共通`maintenance.lock`はschema 6の新規ファイル削除だけが読み取り共有で保持でき、hardlink検出時の再実行・復元・レジストリ・旧形式・purge・maintain・履歴圧縮は従来の読み書き排他handleで直列化する。共有削除の連続流入に対するwriter優先は保証しない。元対象の容量走査、整理前後の既存全体走査、移動直前・直後の照合で予算を検証する。通常の有効予算は`maxRecoveryBytes`。1回の入力合計がそれを超える場合だけ`max(maxRecoveryBytes, incomingBytes)`を有効予算とし、既存データを0バイトまで安全に整理できることを必要とする。設定は変更せず、次回の削除・maintainは通常予算を再適用する。
 
 中央記録と、利用可能なローカルボリュームの同じStoreKeyの実体を両側から照合する。中央記録を失った退避データや未知の領域内データ、計数できない領域、不正・破損・使用中・矛盾した記録を無視して上限達成とは判定しない。安全に容量を確保できなければ新しい移動を停止する。ハードリンクの外部別名など、Prunletの共通ロック外からの変更を不変コピーとして扱わない。
 
@@ -128,7 +136,7 @@ schema 4は入力rootごとに記録するため、再帰ツリーの全子項�
 
 ## 導入と検証の境界
 
-インストーラーはGitHubの既定ブランチ最新HEADを解決し、そのSHAのアーカイブを検査・ビルドして配置する。ローカルクローンへのフォールバックはしない。`source-info.json`に取得元・ブランチ・SHAとアーカイブ・exeのハッシュを記録する。更新対象の製品ファイルを検証済みバックアップへ保全し、既存設定と復元データを保持する。失敗時は変更済み製品と登録設定の復旧を試み、復旧失敗時は保存先を報告する。
+インストーラーはGitHubの既定ブランチ最新HEADを解決し、そのSHAのアーカイブを検査・ビルドして配置する。ローカルクローンへのフォールバックはしない。`source-info.json`に取得元・ブランチ・SHAとアーカイブ・exeのハッシュを記録する。更新対象の製品ファイルを検証済みバックアップへ保全する。既存設定は`capacityDefaultMigrationVersion`未設定または0の場合だけ、容量を1 GiBへ変更してversion 1を保存する。新規`init`もversion 1とし、以後の明示的な容量変更と他の設定・復元データを保持する。読込・dry-runでは移行せず、容量移行そのものは整理を起動しない。移行は同一ディレクトリの一時ファイルから原子的に置換し、インストール失敗時は移行後に利用者変更がない場合だけ設定の元バイト列へ戻す。未知の設定は従来どおり拒否して変更しない。失敗時は変更済み製品と登録設定の復旧を試み、復旧失敗時は保存先を報告する。
 
 定期整理タスクの識別子は現在のユーザーSID・exe・設定の絶対パスから導出する。所有マーカー・ユーザー・実行先が一致する既存タスクは再登録せず、時刻や無効化を保持する。不一致は製品ファイルの変更前に拒否する。更新バックアップには既存タスクのXMLと復旧情報も保存し、登録の復旧に失敗した場合は残った登録先の製品ファイルを保持する。Codex連携の解除ではタスクを残し、専用の解除入口で所有を検証して解除する。
 

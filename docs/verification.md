@@ -53,6 +53,14 @@ TEMP/TMP・runtime展開・metadata・レポートは外部D絶対パスへ隔�
 
 ## 一時的なロックとロード中DLL
 
+`scripts/Verify-ConcurrentDeletion.ps1`では、共有lockを保持した削除中にも独立したCLI/MCP削除が先に完了すること、同一対象・親子の排他、preflight失敗時の全対象保全、入力順、EOF後の応答完了、token別進捗と最終応答後の通知抑止を確認します。全batchのpreflight完了前にShellを呼ばず、公開済みmanifestを各workerが変更しないことを維持します。通常のゴミ箱E2EでID・内容・ACL・非上書き復元も照合します。
+
+`hardlink-two-aliases-same-batch`は、同じ実体の別名を同一batchで削除し、外部別名とのFile ID共有・内容・ADS・属性・Owner/Group/DACLのnative bytesを維持して復元するケースです。変更前の1件削除・後続ACL拒否は旧exeで反証し、新形式の`hardlinkProtocol:1`とtransition chain・group-readyによる成功と区別します。旧schema 6へ新しい証拠を後付けせず、旧記録の従来経路も別途検証します。選択ケースの成功を既定全件実行の成功としては扱いません。
+
+共有IDの検証は2/3別名、別rootの子を共有するdirectoryと連結成分、同じtree内の別名、CLI/MCPを含めます。全stage移動後・全OGD検証後・単一group-ready後・公開途中の各境界、初期と公開直前の競合、外部別名からのACL改変、transitionの欠落・前hash・原因proofの改変を確認します。group-readyのない既存stageには再開時にACLを再適用せず、group-ready後の公開途中だけが非上書きで再開することを確認します。
+
+低レベルのbyte-lockは専用E2Eに含まれず、別途native APIのprobeで確認します。2026-10-25は外部作業領域の`lock-probe.ps1`で、`GENERIC_READ`・`FILE_SHARE_READ`の別handle・別processから空のfixtureファイルを開き、EOF以降の1 byteへ`LockFileEx`を適用しました。共有同士の取得成功、共有対排他・排他同士の拒否（error 33）、明示`UnlockFileEx`およびprocess強制終了後の取得成功、ファイル長0の維持をprobeで確認済みです。通常終了時の解放はCLI/MCP E2Eで間接確認しています。再現時も本番`maintenance.lock`を使わず、専用の空ファイルで同じaccess・share・lock条件を検査します。
+
 共通ロック待機は60秒超の保持、解放後の続行、CLIのstderr即時通知とstdout JSON、MCPのtoken付き進捗とtokenなし・最終応答後の通知抑止を確認します。
 
 ```powershell
@@ -72,7 +80,7 @@ New-Item -ItemType Directory -Path (Split-Path -Parent $latestReport) -Force | O
 pwsh -NoProfile -File .\scripts\Verify-LatestInstall.ps1 -OutputDirectory $latestRun -ReportPath $latestReport -CheckPublicHead
 ```
 
-GitHub応答を検証用アーカイブへ差し替え、実際のインストーラー・.NETビルド・配置・Codex登録を通すE2Eです。最新HEADの再解決、同一SHAからの導入、クローンに依存しない登録、既存設定と復元データの保持、ZIPの不正経路・重複・リンク、取得とビルドの失敗、製品更新の失敗時の復元を検証します。Codex設定がロックされて登録が途中で失敗した場合の復旧と、旧`allowedRoots`内外にある作業場所での導入も確認します。実ユーザーの配置先・Codex設定は使いません。
+GitHub応答を検証用アーカイブへ差し替え、実際のインストーラー・.NETビルド・配置・Codex登録を通すE2Eです。最新HEADの再解決、同一SHAからの導入、クローンに依存しない登録、旧設定の容量を一度だけ1 GiBへ移すこと、新規設定の移行印、移行後の明示容量と他設定・復元データの保持、大小文字を変えた印・容量、設定だけ残る再導入、未知設定の拒否、設定ロック時の保全、制限DACLの保存と登録失敗時の設定バイト列・SDDL復旧、ZIPの不正経路・重複・リンク、取得とビルドの失敗、製品更新の失敗時の復元を検証します。Codex設定がロックされて登録が途中で失敗した場合の復旧と、旧`allowedRoots`内外にある作業場所での導入も確認します。実ユーザーの配置先・Codex設定は使いません。
 
 定期整理はTask Scheduler境界を隔離して、毎日03:00と現在のユーザーのログオンの両トリガー、有効状態、`StartWhenAvailable`、電池使用時の実行許可、既存タスク設定の保持をXMLで検証します。PCの電源断・スリープ・ログオフを伴う取り逃し回復の実動作は、この検証の対象外です。
 
