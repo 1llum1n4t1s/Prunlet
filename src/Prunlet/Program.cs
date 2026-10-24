@@ -229,7 +229,7 @@ internal static class Program
             }
         }
         if (backupDirectory is null) throw new ArgumentException("Specify a backup directory.");
-        var config = new PrunletConfig { Schema = 1, AllowedRoots = roots.ToArray(), BackupDirectory = backupDirectory };
+        var config = new PrunletConfig { Schema = 1, AllowedRoots = roots.ToArray(), BackupDirectory = backupDirectory, CapacityDefaultMigrationVersion = 1 };
         config.Validate();
         config.BackupDirectory = PathPolicy.Resolve(config.BackupDirectory, finalDirectory: true, allowMissing: false);
         var parent = Path.GetDirectoryName(configPath)!;

@@ -150,6 +150,7 @@ $changed = [Collections.Generic.List[string]]::new()
 $saved = @{}
 $createdDirectories = [Collections.Generic.List[object]]::new()
 $createdConfig = $null
+$migratedConfig = $null
 $profileSnapshot = [Collections.Generic.List[object]]::new()
 $registrationStarted = $false
 $maintenanceState = $null
@@ -184,7 +185,7 @@ try {
     if (!(Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Build did not produce prunlet.exe.' }
     $maintenanceExe = Join-Path $buildRoot 'publish\prunlet-maintenance.exe'
     if (!(Test-Path -LiteralPath $maintenanceExe -PathType Leaf)) { throw 'Build did not produce prunlet-maintenance.exe.' }
-    # 初期設定も外部作業場所で検証する。既存設定は一切書き換えない。
+    # 初期設定も外部作業場所で検証する。既存設定の移行は配置後に行う。
     $newConfig = Join-Path $WorkDirectory 'config.json'
     if (!$existingConfig) {
         # 最終的な復元先の安全性をCoreに検査させる。
@@ -199,7 +200,7 @@ try {
     }
     $provenance = [ordered]@{ repository = $Repository; defaultBranch = $branch; commitSha = $sha; downloadUrl = $downloadUrl; archiveSha256 = $archiveHash; executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; maintenanceExecutableSha256 = (Get-FileHash -LiteralPath $maintenanceExe -Algorithm SHA256).Hash; installedUtc = [DateTimeOffset]::UtcNow.ToString('o'); runtime = $Runtime }
     $provenance | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $WorkDirectory 'source-info.json') -Encoding utf8NoBOM
-    # 更新対象だけ保全し、config/recoveryは既存のまま保持する。
+    # 製品ファイルを保全する。設定移行の原本は別途保存し、復元データは変更しない。
     foreach ($relative in @($products + $retiredProducts)) {
         $target = Join-Path $InstallDirectory $relative
         [void](Assert-PlainPath $target 'Installed product path')
@@ -228,6 +229,42 @@ try {
         $createdConfig = @{ createdUtcTicks = (Get-Item -LiteralPath $configPath).CreationTimeUtc.Ticks; sha256 = $null }
         try { $bytes = [IO.File]::ReadAllBytes($newConfig); $stream.Write($bytes); $stream.Flush($true) } finally { $stream.Dispose() }
         $createdConfig.sha256 = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
+    }
+    if ($existingConfig) {
+        [void](Assert-PlainPath $configPath 'Capacity migration configuration')
+        # 読込経路は変更せず、正式更新時だけ一度移行する。未知の設定もJSON木で保持する。
+        $originalBytes = [IO.File]::ReadAllBytes($configPath)
+        $nodeOptions = [Text.Json.Nodes.JsonNodeOptions]::new()
+        $nodeOptions.PropertyNameCaseInsensitive = $true
+        $settings = [Text.Json.Nodes.JsonNode]::Parse([Text.Encoding]::UTF8.GetString($originalBytes).TrimStart([char]0xfeff), $nodeOptions, [Text.Json.JsonDocumentOptions]::new())
+        if ($settings -isnot [Text.Json.Nodes.JsonObject]) { throw 'Configuration must be a JSON object.' }
+        $migrationVersion = $settings['capacityDefaultMigrationVersion']
+        if ($null -eq $migrationVersion -or $migrationVersion.GetValue[int]() -lt 1) {
+            $settings['maxRecoveryBytes'] = [Text.Json.Nodes.JsonValue]::Create([long]1073741824)
+            $settings['capacityDefaultMigrationVersion'] = [Text.Json.Nodes.JsonValue]::Create([int]1)
+            $candidate = Join-Path $WorkDirectory 'migrated-config.json'
+            [IO.File]::WriteAllText($candidate, $settings.ToJsonString(), [Text.UTF8Encoding]::new($false))
+            & $exe --config $candidate operations | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Prunlet rejected the migrated configuration; the original was preserved.' }
+            $originalHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($originalBytes))
+            $migrationBackup = Join-Path $updateBackup 'config-before-capacity-migration.json'
+            New-Item -ItemType Directory -Path $updateBackup -Force | Out-Null
+            [IO.File]::WriteAllBytes($migrationBackup, $originalBytes)
+            $temporaryConfig = Join-Path $InstallDirectory ('config-migration-' + [guid]::NewGuid().ToString('N') + '.json')
+            try {
+                [IO.File]::Copy($candidate, $temporaryConfig, $false)
+                # 通常の書込みを排除し、検証した原本だけを原子的に置換する。
+                $guard = [IO.File]::Open($configPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::Read -bor [IO.FileShare]::Delete))
+                try {
+                    if ((Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash -ne $originalHash) { throw 'Configuration changed during capacity migration; it was preserved.' }
+                    $migratedHash = (Get-FileHash -LiteralPath $temporaryConfig -Algorithm SHA256).Hash
+                    [IO.File]::Replace($temporaryConfig, $configPath, [Management.Automation.Language.NullString]::Value)
+                    $migratedConfig = @{ backup = $migrationBackup; sha256 = $migratedHash }
+                } finally { $guard.Dispose() }
+            } finally {
+                if (Test-Path -LiteralPath $temporaryConfig -PathType Leaf) { Remove-Item -LiteralPath $temporaryConfig }
+            }
+        }
     }
     if ($RegisterCodex) {
         # 連携側の2ファイル書込みを一つの操作として戻せるよう、呼出し前のバイト列を保全する。
@@ -306,6 +343,20 @@ try {
 } catch {
     $originalError = $_
     $rollbackErrors = [Collections.Generic.List[string]]::new()
+    if ($migratedConfig) {
+        try {
+            [void](Assert-PlainPath $configPath 'Capacity migration rollback path')
+            $rollbackConfig = Join-Path $InstallDirectory ('config-rollback-' + [guid]::NewGuid().ToString('N') + '.json')
+            try {
+                [IO.File]::Copy($migratedConfig.backup, $rollbackConfig, $false)
+                $guard = [IO.File]::Open($configPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::Read -bor [IO.FileShare]::Delete))
+                try {
+                    if ((Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash -ne $migratedConfig.sha256) { throw 'Migrated configuration changed; it was preserved.' }
+                    [IO.File]::Replace($rollbackConfig, $configPath, [Management.Automation.Language.NullString]::Value)
+                } finally { $guard.Dispose() }
+            } finally { if (Test-Path -LiteralPath $rollbackConfig -PathType Leaf) { Remove-Item -LiteralPath $rollbackConfig } }
+        } catch { $rollbackErrors.Add("Capacity configuration: $_") }
+    }
     if ($maintenanceStarted) {
         try { Restore-PrunletMaintenanceTask $maintenanceState } catch { $rollbackErrors.Add("Maintenance task: $_") }
     }

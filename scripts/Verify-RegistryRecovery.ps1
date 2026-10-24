@@ -47,7 +47,7 @@ function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { th
 function Save-Json([string]$Path, [object]$Value) { [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 80), $utf8) }
 function Read-Json([string]$Path) { [IO.File]::ReadAllText($Path) | ConvertFrom-Json -Depth 80 -AsHashtable }
 function Digest([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
-function Start-Child([string[]]$Arguments, [string]$Binary = $ExecutablePath) {
+function Start-Child([string[]]$Arguments, [string]$Binary = $ExecutablePath, [string]$ConfigPath = $script:Config) {
     $info = [Diagnostics.ProcessStartInfo]::new($Binary)
     $info.UseShellExecute = $false; $info.CreateNoWindow = $true
     $info.RedirectStandardInput = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
@@ -55,12 +55,17 @@ function Start-Child([string[]]$Arguments, [string]$Binary = $ExecutablePath) {
     $info.WorkingDirectory = $script:CaseRoot
     $info.Environment['TEMP'] = Join-Path $script:CaseRoot 'temp'; $info.Environment['TMP'] = $info.Environment['TEMP']
     $info.Environment['DOTNET_BUNDLE_EXTRACT_BASE_DIR'] = Join-Path $script:CaseRoot 'runtime-cache'
-    foreach ($arg in (@('--config', $script:Config) + $Arguments)) { $info.ArgumentList.Add($arg) }
+    foreach ($arg in (@('--config', $ConfigPath) + $Arguments)) { $info.ArgumentList.Add($arg) }
     $p = [Diagnostics.Process]::new(); $p.StartInfo = $info; $null = $p.Start(); return $p
 }
 function Invoke-RegistryCli([string[]]$Arguments, [switch]$LegacyMove) {
     $binary = if ($LegacyMove) { $MoveExecutablePath } else { $ExecutablePath }
-    $p = Start-Child $Arguments $binary
+    $configPath = $script:Config
+    if ($LegacyMove) {
+        $settings = Read-Json $script:Config; $null = $settings.Remove('capacityDefaultMigrationVersion')
+        $configPath = Join-Path $script:CaseRoot 'legacy-config.json'; Save-Json $configPath $settings
+    }
+    $p = Start-Child $Arguments $binary $configPath
     try {
         $out = $p.StandardOutput.ReadToEndAsync(); $err = $p.StandardError.ReadToEndAsync(); $p.StandardInput.Close()
         if (!$p.WaitForExit(180000)) { $p.Kill($true); $p.WaitForExit(); throw 'CLI timeout.' }

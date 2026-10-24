@@ -319,6 +319,7 @@ try {
         $installedExe = Join-Path $install 'bin\prunlet.exe'
         $installedConfig = Join-Path $install 'config.json'
         $initialSettings = Get-Content -LiteralPath $installedConfig -Raw | ConvertFrom-Json -AsHashtable
+        Assert-True ($initialSettings.capacityDefaultMigrationVersion -eq 1) 'New installation was not marked migrated.'
         Assert-True (!$initialSettings.ContainsKey('volumeRecoveryDirectories') -or $initialSettings.volumeRecoveryDirectories.Count -eq 0) 'Fresh installation changed default volume placement.'
         Set-FixtureVolumeMap $installedConfig
         $target = Join-Path $OutputDirectory 'unregistered-install-target.txt'
@@ -332,10 +333,20 @@ try {
         $null = & $installedExe --config $installedConfig delete -- $protected
         Assert-True ($LASTEXITCODE -ne 0 -and [IO.File]::ReadAllText($protected) -eq 'keep recovery storage') 'Installed CLI deletes from its own recovery storage.'
     }
-    Test-Case 'Next install resolves new HEAD and preserves legacy config and recovery' {
+    Test-Case 'Next install migrates legacy capacity once and preserves other settings and recovery' {
         $legacyConfigPath = Join-Path $install 'config.json'
         $legacyConfig = Get-Content -LiteralPath $legacyConfigPath -Raw | ConvertFrom-Json
         $legacyConfig.allowedRoots = @((Join-Path $OutputDirectory 'nonexistent-legacy-root'))
+        $legacyConfig.PSObject.Properties.Remove('capacityDefaultMigrationVersion')
+        $legacyConfig.maxRecoveryBytes = [long]34359738368
+        $legacyConfig.retentionDays = 19
+        $configAcl = Get-Acl -LiteralPath $legacyConfigPath
+        $configAcl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($configAcl.Access)) { [void]$configAcl.RemoveAccessRuleSpecific($rule) }
+        $configAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.WindowsIdentity]::GetCurrent().User, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
+        $configAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-18'), [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
+        Set-Acl -LiteralPath $legacyConfigPath -AclObject $configAcl
+        $configSddl = (Get-Acl -LiteralPath $legacyConfigPath).Sddl
         [IO.File]::WriteAllText($legacyConfigPath, ($legacyConfig | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         $configHash = (Get-FileHash -LiteralPath $legacyConfigPath).Hash
         $recoveryMarker = Join-Path $install 'recovery\user-marker.txt'
@@ -345,8 +356,74 @@ try {
         & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -RegisterCodex -CodexHome $isolatedCodex -SettingsBackupDirectory $settingsBackup -WorkDirectory (Join-Path $OutputDirectory 'second-work') | Out-Null
         $info = Get-Content -LiteralPath (Join-Path $install 'source-info.json') -Raw | ConvertFrom-Json
         Assert-True ($info.commitSha -eq ('b' * 40)) 'Update reused old HEAD.'
-        Assert-True ($configHash -eq (Get-FileHash -LiteralPath (Join-Path $install 'config.json')).Hash) 'Update rewrote config.'
+        $migrated = Get-Content -LiteralPath $legacyConfigPath -Raw | ConvertFrom-Json
+        Assert-True ($migrated.maxRecoveryBytes -eq 1073741824 -and $migrated.capacityDefaultMigrationVersion -eq 1) 'Legacy capacity was not migrated.'
+        Assert-True ($migrated.retentionDays -eq 19 -and $migrated.allowedRoots[0] -eq $legacyConfig.allowedRoots[0]) 'Migration changed other settings.'
+        Assert-True ((Get-Acl -LiteralPath $legacyConfigPath).Sddl -ceq $configSddl) 'Migration changed configuration ACL.'
         Assert-True ($markerHash -eq (Get-FileHash -LiteralPath $recoveryMarker).Hash) 'Update rewrote recovery.'
+    }
+    Test-Case 'Later updates preserve explicit capacity after migration' {
+        $legacyConfigPath = Join-Path $install 'config.json'
+        $settings = Get-Content -LiteralPath $legacyConfigPath -Raw | ConvertFrom-Json
+        $settings.maxRecoveryBytes = [long]2147483648
+        $json = ($settings | ConvertTo-Json -Depth 20).Replace('"capacityDefaultMigrationVersion"', '"CAPACITYDEFAULTMIGRATIONVERSION"')
+        [IO.File]::WriteAllText($legacyConfigPath, $json, [Text.UTF8Encoding]::new($false))
+        $configHash = (Get-FileHash -LiteralPath $legacyConfigPath).Hash
+        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -WorkDirectory (Join-Path $OutputDirectory 'post-migration-work') | Out-Null
+        Assert-True ($configHash -eq (Get-FileHash -LiteralPath $legacyConfigPath).Hash) 'Update repeated capacity migration.'
+    }
+    Test-Case 'Config-only installation migrates mixed-case capacity and preserves recovery' {
+        $legacyConfigPath = Join-Path $install 'config.json'
+        $configOnlyInstall = Join-Path $OutputDirectory 'config-only-install'
+        New-Item -ItemType Directory -Path $configOnlyInstall | Out-Null
+        $settings = Get-Content -LiteralPath $legacyConfigPath -Raw | ConvertFrom-Json -AsHashtable
+        $null = $settings.Remove('capacityDefaultMigrationVersion')
+        $null = $settings.Remove('CAPACITYDEFAULTMIGRATIONVERSION')
+        $settings.maxRecoveryBytes = [long]34359738368
+        $json = ($settings | ConvertTo-Json -Depth 20).Replace('"maxRecoveryBytes"', '"MAXRECOVERYBYTES"')
+        $onlyConfig = Join-Path $configOnlyInstall 'config.json'
+        [IO.File]::WriteAllText($onlyConfig, $json, [Text.UTF8Encoding]::new($false))
+        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $configOnlyInstall -WorkDirectory (Join-Path $OutputDirectory 'config-only-work') | Out-Null
+        $after = Get-Content -LiteralPath $onlyConfig -Raw | ConvertFrom-Json
+        Assert-True ($after.maxRecoveryBytes -eq 1073741824 -and $after.capacityDefaultMigrationVersion -eq 1) 'Config-only capacity migration failed.'
+    }
+    Test-Case 'Unknown setting and locked configuration are preserved without migration' {
+        $legacyConfigPath = Join-Path $install 'config.json'
+        $settings = Get-Content -LiteralPath $legacyConfigPath -Raw | ConvertFrom-Json -AsHashtable
+        $null = $settings.Remove('capacityDefaultMigrationVersion')
+        $null = $settings.Remove('CAPACITYDEFAULTMIGRATIONVERSION')
+        $settings.maxRecoveryBytes = [long]34359738368
+        $original = [IO.File]::ReadAllBytes($legacyConfigPath)
+        try {
+            $settings.unknownMigrationFixture = @{ nested = @('keep', 42) }
+            [IO.File]::WriteAllText($legacyConfigPath, ($settings | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+            $before = Snapshot-Install
+            Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -WorkDirectory (Join-Path $OutputDirectory 'unknown-setting-work') } 'existing configuration'
+            Assert-Snapshot $before
+            $null = $settings.Remove('unknownMigrationFixture')
+            [IO.File]::WriteAllText($legacyConfigPath, ($settings | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+            $before = Snapshot-Install
+            $lock = [IO.File]::Open($legacyConfigPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try {
+                Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -WorkDirectory (Join-Path $OutputDirectory 'locked-migration-work') } 'Replace'
+                Assert-Snapshot $before
+            } finally { $lock.Dispose() }
+        } finally { [IO.File]::WriteAllBytes($legacyConfigPath, $original) }
+    }
+    Test-Case 'Registration failure restores exact pre-migration configuration' {
+        $legacyConfigPath = Join-Path $install 'config.json'
+        $configSddl = (Get-Acl -LiteralPath $legacyConfigPath).Sddl
+        $settings = Get-Content -LiteralPath $legacyConfigPath -Raw | ConvertFrom-Json
+        $settings.PSObject.Properties.Remove('capacityDefaultMigrationVersion')
+        $settings.maxRecoveryBytes = [long]34359738368
+        [IO.File]::WriteAllText($legacyConfigPath, ($settings | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($true))
+        $before = Snapshot-Install
+        $blocked = Join-Path $OutputDirectory 'migration-blocked-codex'
+        New-Item -ItemType Directory -Path $blocked | Out-Null
+        Set-Content -LiteralPath (Join-Path $blocked 'config.toml') -Value "[features]`nhooks = false`n" -Encoding utf8NoBOM
+        Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -RegisterCodex -CodexHome $blocked -SettingsBackupDirectory $settingsBackup -WorkDirectory (Join-Path $OutputDirectory 'migration-rollback-work') } 'features.hooks is false'
+        Assert-Snapshot $before
+        Assert-True ((Get-Acl -LiteralPath $legacyConfigPath).Sddl -ceq $configSddl) 'Migration rollback changed configuration ACL.'
     }
     Test-Case 'Partial product write failure rolls back all product files' {
         $before = Snapshot-Install

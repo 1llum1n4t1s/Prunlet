@@ -702,14 +702,18 @@ Test-Case 'default-recovery-budget-cli-and-mcp' {
     $explicitBytes = [long]34359738368
     $config = Read-Json $script:Config
     Assert-True ([long]$config.maxRecoveryBytes -eq $oneGiB) 'Fresh init did not write the 1 GiB default.'
+    Assert-True ($config.capacityDefaultMigrationVersion -eq 1) 'Fresh init was not marked migrated.'
     $initial = Invoke-RecycleCli @('maintain', '--dry-run')
     Assert-True ($initial.ExitCode -eq 0 -and [long]$initial.Json.maxRecoveryBytes -eq $oneGiB) 'Fresh config maintenance did not use the 1 GiB default.'
     $null = $config.Remove('maxRecoveryBytes'); Save-Json $script:Config $config
     $omitted = Invoke-RecycleCli @('maintain', '--dry-run')
     Assert-True ($omitted.ExitCode -eq 0 -and [long]$omitted.Json.maxRecoveryBytes -eq $oneGiB -and !(Read-Json $script:Config).Contains('maxRecoveryBytes')) 'Omitted property did not load the 1 GiB default or was rewritten.'
-    $config = Read-Json $script:Config; $config.maxRecoveryBytes = $explicitBytes; Save-Json $script:Config $config
+    $config = Read-Json $script:Config; $config.maxRecoveryBytes = $explicitBytes
+    $null = $config.Remove('capacityDefaultMigrationVersion'); Save-Json $script:Config $config
+    $legacyConfigHash = Digest $script:Config
     $explicit = Invoke-RecycleCli @('maintain', '--dry-run')
     Assert-True ($explicit.ExitCode -eq 0 -and [long]$explicit.Json.maxRecoveryBytes -eq $explicitBytes -and [long](Read-Json $script:Config).maxRecoveryBytes -eq $explicitBytes) 'Explicit 32 GiB budget was not preserved.'
+    Assert-True ((Digest $script:Config) -ceq $legacyConfigHash) 'Reading a legacy config unexpectedly migrated it.'
     $help = Invoke-Child $ExecutablePath @('--help') -Raw
     Assert-True ($help.ExitCode -eq 0 -and $help.Stdout -match '(?i)1\s*GiB') 'CLI help does not describe the 1 GiB default.'
     $process = Start-Child $ExecutablePath @('--config', $script:Config, 'mcp')
@@ -906,7 +910,9 @@ Test-Case 'schema6-without-security-snapshot-compatibility' {
     $file = New-File 'legacy-recycle-original.bin' 513
     [IO.File]::WriteAllText("${file}:proof", 'legacy schema6 ADS', $utf8)
     $before = Snapshot-NativeTree $file
-    $deleted = Invoke-RecycleCli @('delete', '--', $file) -Exe $RecycleLegacyExecutablePath
+    $config = Read-Json $script:Config; $null = $config.Remove('capacityDefaultMigrationVersion')
+    $legacyConfig = Join-Path $script:CaseRoot 'legacy-config.json'; Save-Json $legacyConfig $config
+    $deleted = Invoke-RecycleCli @('delete', '--', $file) -Exe $RecycleLegacyExecutablePath -ConfigPath $legacyConfig
     Assert-True ($deleted.ExitCode -eq 0 -and !(Test-Path -LiteralPath $file)) 'Pre-security schema 6 executable did not recycle the fixture.'
     $op = Assert-Bin $deleted.Json.operationId $file
     Assert-True (!$op.Manifest.entries[0].ContainsKey('security') -and !$op.Receipt.ContainsKey('security')) 'Compatibility fixture unexpectedly has a security snapshot.'
@@ -1250,11 +1256,10 @@ foreach ($schema in @(1, 2, 3, 4)) {
             $path = if ($schema -eq 1) { $file } else { Split-Path -Parent $file }
             if ($schema -eq 3) { [IO.File]::WriteAllText("${file}:legacy-stream", 'legacy ADS', $utf8) }
             $generator = if ($schema -eq 4) { $MoveExecutablePath } else { $LegacyExecutablePath }
-            $configPath = $script:Config
-            if ($schema -ne 4) {
-                $configPath = Join-Path $script:CaseRoot 'legacy-config.json'; $config = Read-Json $script:Config
-                $null = $config.Remove('volumeRecoveryDirectories'); Save-Json $configPath $config
-            }
+            $configPath = Join-Path $script:CaseRoot 'legacy-config.json'; $config = Read-Json $script:Config
+            $null = $config.Remove('capacityDefaultMigrationVersion')
+            if ($schema -ne 4) { $null = $config.Remove('volumeRecoveryDirectories') }
+            Save-Json $configPath $config
             $argsList = @('delete'); if ($schema -ne 1) { $argsList += '--recursive' }; $argsList += @('--', $path)
             $deleted = Invoke-RecycleCli $argsList $generator $configPath
             Assert-True ($deleted.ExitCode -eq 0 -and !(Test-Path -LiteralPath $path)) 'Legacy fixture generation failed.'

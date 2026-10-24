@@ -66,7 +66,14 @@ function New-Operation([string]$Name, [string]$Content, [switch]$LegacyMove) {
     $path = Join-Path $fixture $Name; [IO.File]::WriteAllText($path, $Content, $utf8)
     # 期限整理の対象だけは変更前exeでschema 4を作る。新版の新規削除は常にごみ箱方式。
     $generator = if ($LegacyMove) { $MoveExecutablePath } else { $ExecutablePath }
-    $deleted = Invoke-Binary $generator @('--config', $config, 'delete', '--', $path)
+    $generatorConfig = $config
+    if ($LegacyMove) {
+        $legacySettings = Read-Json $config
+        $null = $legacySettings.Remove('capacityDefaultMigrationVersion')
+        $generatorConfig = Join-Path $fixture 'legacy-config.json'
+        Save-Json $generatorConfig $legacySettings
+    }
+    $deleted = Invoke-Binary $generator @('--config', $generatorConfig, 'delete', '--', $path)
     Assert-True ($deleted.exitCode -eq 0 -and ![IO.File]::Exists($path)) "Delete failed: $($deleted.stderr)"
     $id = ($deleted.stdout | ConvertFrom-Json).operationId
     $root = Join-Path $metadata $id

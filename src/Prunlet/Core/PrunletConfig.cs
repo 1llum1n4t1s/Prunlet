@@ -12,6 +12,8 @@ public sealed class PrunletConfig
     public string BackupDirectory { get; set; } = string.Empty;
     public int RetentionDays { get; set; } = 7;
     public long MaxRecoveryBytes { get; set; } = 1L * 1024 * 1024 * 1024;
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public int CapacityDefaultMigrationVersion { get; set; }
     // 省略時は各ボリュームのユーザー専用領域を使う。検証・管理用の同一ボリューム内配置指定。
     public Dictionary<string, string> VolumeRecoveryDirectories { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public string RegistryScope { get; set; } = "current";
@@ -32,6 +34,7 @@ public sealed class PrunletConfig
         if (Schema != 1) throw new InvalidDataException("Unsupported configuration schema.");
         if (RetentionDays is < 1 or > 36500) throw new InvalidDataException("retentionDays must be between 1 and 36500.");
         if (MaxRecoveryBytes <= 0) throw new InvalidDataException("maxRecoveryBytes must be positive.");
+        if (CapacityDefaultMigrationVersion < 0) throw new InvalidDataException("capacityDefaultMigrationVersion cannot be negative.");
         if (VolumeRecoveryDirectories is null) throw new InvalidDataException("volumeRecoveryDirectories cannot be null.");
         if (RegistryScope is not ("current" or "nativeWindows")) throw new InvalidDataException("registryScope must be current or nativeWindows.");
         if (RegistryScope == "nativeWindows" && RegistrySessionFile is null)

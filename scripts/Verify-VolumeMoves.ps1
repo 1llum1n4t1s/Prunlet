@@ -123,6 +123,7 @@ function New-Case([string]$Name) {
     $config.volumeRecoveryDirectories = @{ $fixtureDrive = $script:Store }
     Save-Json $script:Config $config
     $legacy = @{} + $config; $null = $legacy.Remove('volumeRecoveryDirectories')
+    $null = $legacy.Remove('capacityDefaultMigrationVersion')
     Save-Json $script:LegacyConfig $legacy
 }
 function Test-Case([string]$Name, [scriptblock]$Body, [switch]$RequiresLegacy) {

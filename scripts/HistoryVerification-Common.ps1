@@ -49,8 +49,10 @@ function New-Case([string]$Name) {
     # 旧形式の生成だけ旧exeで行い、新版の削除先はケース内へ隔離する。
     $script:LegacyConfig = Join-Path $script:CaseRoot 'legacy-config.json'
     $configValue = [IO.File]::ReadAllText($script:Config) | ConvertFrom-Json -AsHashtable
-    $null = $configValue.Remove('volumeRecoveryDirectories')
-    Save-Json $script:LegacyConfig $configValue
+    $legacyValue = @{} + $configValue
+    $null = $legacyValue.Remove('volumeRecoveryDirectories')
+    $null = $legacyValue.Remove('capacityDefaultMigrationVersion')
+    Save-Json $script:LegacyConfig $legacyValue
     $configValue.volumeRecoveryDirectories = @{ ([IO.Path]::GetPathRoot($script:CaseRoot)) = (Join-Path $script:CaseRoot 'volume-store') }
     Save-Json $script:Config $configValue
 }

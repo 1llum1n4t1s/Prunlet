@@ -145,8 +145,10 @@ Test-Case 'create one reusable legacy fixture and initialize isolated recovery' 
     $null = [IO.Directory]::CreateDirectory($recovery)
     $init = Invoke-Cli @('init', '--backup-directory', $recovery)
     Assert-True ($init.ExitCode -eq 0) 'Initialization failed.'
-    [IO.File]::Copy($config, $legacyConfig)
     $candidateConfig = [IO.File]::ReadAllText($config) | ConvertFrom-Json -AsHashtable
+    $legacySettings = @{} + $candidateConfig
+    $null = $legacySettings.Remove('capacityDefaultMigrationVersion')
+    [IO.File]::WriteAllText($legacyConfig, ($legacySettings | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
     $candidateConfig.volumeRecoveryDirectories = @{ 'D:\' = (Join-Path $outputRoot 'volume-store') }
     [IO.File]::WriteAllText($config, ($candidateConfig | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
     $null = [IO.Directory]::CreateDirectory((Join-Path $outputRoot 'temp'))
