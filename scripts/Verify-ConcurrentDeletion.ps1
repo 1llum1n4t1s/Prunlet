@@ -717,15 +717,26 @@ Test-Case 'hardlink-batch-published-receipt-write-failure-not-success' {
 
 Test-Case 'hardlink-batch-legacy-schema6-and-partial-failure-preserved' {
     if (!$LegacyHardlinkExecutablePath -or ![IO.File]::Exists($LegacyHardlinkExecutablePath)) { $script:SkipReason = 'LegacyHardlinkExecutablePath is required to create genuine pre-feature schema 6 records.'; return }
+    $originalConfig = $script:Config
+    $legacyConfig = Join-Path $script:CaseRoot 'legacy-config.json'
+    $config = Read-Json $originalConfig; $null = $config.Remove('capacityDefaultMigrationVersion')
+    Save-Json $legacyConfig $config
     $fixture = New-HardlinkFixture 'files-2'
-    $legacy = Complete-Child (Start-Delete $fixture.Paths -Exe $LegacyHardlinkExecutablePath)
+    try {
+        $script:Config = $legacyConfig
+        $legacy = Complete-Child (Start-Delete $fixture.Paths -Exe $LegacyHardlinkExecutablePath)
+    } finally { $script:Config = $originalConfig }
     Assert-True ($legacy.ExitCode -ne 0 -and $legacy.Json.items[0].status -eq 'deleted' -and $legacy.Json.items[1].status -eq 'failed') 'Legacy creator did not produce the known partial schema 6 operation.'
     $restored = Invoke-Cli @('restore', $legacy.Json.operationId)
     Assert-True ($restored.Json.items[0].status -eq 'restored' -and $restored.Json.items[1].status -eq 'failed') 'Legacy partial record was guessed or rerouted as a new shared component.'
     Assert-HardlinkFixture $fixture
     $single = New-File 'legacy-single.txt'; [IO.File]::WriteAllText($single + ':concurrent', 'legacy single ADS', $utf8)
     $before = Snapshot $single
-    $singleDelete = Complete-Child (Start-Delete @($single) -Exe $LegacyHardlinkExecutablePath); Assert-Deleted $singleDelete @($single)
+    try {
+        $script:Config = $legacyConfig
+        $singleDelete = Complete-Child (Start-Delete @($single) -Exe $LegacyHardlinkExecutablePath)
+    } finally { $script:Config = $originalConfig }
+    Assert-Deleted $singleDelete @($single)
     Restore-Result $singleDelete; Assert-Snapshot $before
     $script:Evidence.legacyCreator = $LegacyHardlinkExecutablePath; $script:Evidence.legacyPartialDelete = $legacy.Json; $script:Evidence.legacyPartialRestore = $restored.Json
 }
