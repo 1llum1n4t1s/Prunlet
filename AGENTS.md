@@ -8,6 +8,8 @@ Windowsのファイル・フォルダー・レジストリ削除は、配置済�
 
 レジストリ変更では[レジストリの設計](DESIGN.md#レジストリの削除と復元)のstage・snapshot・永続化・commitの順序、完全なsecurity bytesの照合、schema 5の作成時からの非公開ACL、曖昧な状態の保全を維持する。非トランザクション削除へのfallbackや自動昇格は追加しない。native sessionは利用者の明示起動・scope選択を必要とし、切断時は同じ削除を再送せず`registry-reconcile <operation-id>`で照合する。
 
+並列削除・ハードリンク復元の変更では[削除と復元のデータフロー](DESIGN.md#削除と復元のデータフロー)のclaim取得順、全preflight完了後のmanifest公開、process共通worker上限、hardlink検出時の排他再実行を維持する。共有実体の復元はtransition chainと単一group-readyに従い、旧schema 6へ証拠を後付けしない。MCPの要求枠と削除worker枠を分け、レジストリのprivilege変更をfile workerと並行させない。
+
 Prunletの[保持制御](DESIGN.md#復元データの自動整理)は旧schema 1〜4とレジストリschema 5を対象とし、既定7日・合計1 GiB、事前容量走査・整理前後の再走査・共通ロック・単一超過時だけの予算を維持する。新schema 6の実体はWindows管理で、Prunletの容量・期限・purge対象にしない。新規filedeleteは旧保持制御を起動せず、レジストリ削除前・明示maintain・非表示の定期保守で旧データを整理する。手動整理はCLI明示適用のみ、MCPへpurgeは追加しない。
 
 ## ビルドと検証
@@ -28,6 +30,7 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 変更対象ごとの追加検証は[検証手順](docs/verification.md)に従う。
 
 - ロック待機・通知: 60秒超の待機と解放後の続行、元対象・退避実体の保全、CLIのstderrとstdout JSON、MCPのtoken付き進捗と最終応答後の通知抑止を確認する。新規renameの拒否と旧コピーの削除保留待機を区別する。
+- 並列削除・共有ハードリンク: `scripts/Verify-ConcurrentDeletion.ps1 -ExecutablePath <今回のexe> -LegacyHardlinkExecutablePath <変更前のschema 6対応exe> -OutputDirectory <新しい外部D絶対パス> -ReportPath <外部JSONパス>`で独立対象の並行完了、同一対象・親子の排他、preflight失敗時の全対象保全、入力順、MCPの進捗分離とEOF後の完了を確認する。共有実体の復元は`scripts/Verify-HardlinkBatch.ps1`へ`-ExecutablePath`、別の未使用出力・レポートと`-LegacyExecutablePath <変更前のschema 6対応exe>`を渡し、競合・改変・中断再開も確認する。この旧exeはschema 1〜4用の版と区別し、旧版専用設定から`capacityDefaultMigrationVersion`を除く既存runnerを使う。skipや選択ケースだけの成功を全件合格にしない。性能比較には`Verify-ConcurrentDeletion.ps1`へ別途`-BaselineExecutablePath`を渡す。
 - 通常属性・case-sensitive・ACL・ADS・リンク: 同一オブジェクトとして保持されること、dry-runと拒否時の不変更、リンク先の保全、ハードリンク外部別名との共有関係、旧形式の属性復元と権限不足時のコピー保全を確認する。`Verify-VolumeMoves.ps1`の退避中rootのACL比較では、Inheritedフラグと標準APIによるAllow ACEの分割・統合だけを同値として扱い、所有者・グループ・主体・権利・継承範囲・伝播を保持する。Denyや未知のACEは順序も照合し、権利・伝播・Denyの改変を検出するケースを維持する。子項目と復元後はSDDLの完全一致を確認する。
 - 大量操作: ゴミ箱方式は`Verify-RecycleBin.ps1 -Large`で再帰rootのFile ID・内容と非上書き往復を確認する。schema 4の専用領域と旧schema 1/2/3の大規模記録は互換検証へ分離する。
 - 削除速度: 変更前exeと同条件で複数回比較し、安全性と内容・IDの保持、衝突時の非上書き、各試行・中央値を確認する。旧コピー方式の性能値を新方式へ流用しない。
