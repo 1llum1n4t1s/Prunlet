@@ -97,7 +97,7 @@ $isolatedCodex = Join-Path $OutputDirectory 'isolated-codex'
 $settingsBackup = Join-Path $OutputDirectory 'settings-backup'
 
 # 起こり得る失敗を列挙してから実システムの検証を組み立てる。
-$failureConditions = @('退役用設定が利用者のvolume mapを無視する', '退役が元設定や他の設定を変更する', 'schema 4退役payloadのID/hash不一致', 'fixtureが本番専用領域へ書き込む', '未追跡C#がfixture archiveから欠落する', 'フォルダー未登録の初回導入が拒否される', '旧rootsが削除範囲へ再適用される', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '公開HEADに必要ソース欠落', 'ZIP traversal/重複/リンク', 'ビルド失敗', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '旧roots内外の作業場所と復元先の検証', '指示登録オプションの組合せ不備', '指示marker重複・不完全・利用者編集', 'guide既存未所有・利用者編集', '指示登録途中での書込み失敗')
+$failureConditions = @('退役用設定が利用者のvolume mapを無視する', '退役が元設定や他の設定を変更する', 'schema 6退役ごみ箱項目のID/hash不一致', 'fixtureが本番専用領域へ書き込む', '未追跡C#がfixture archiveから欠落する', 'フォルダー未登録の初回導入が拒否される', '旧rootsが削除範囲へ再適用される', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '公開HEADに必要ソース欠落', 'ZIP traversal/重複/リンク', 'ビルド失敗', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '旧roots内外の作業場所と復元先の検証', '指示登録オプションの組合せ不備', '指示marker重複・不完全・利用者編集', 'guide既存未所有・利用者編集', '指示登録途中での書込み失敗')
 Test-Case 'Agent instructions require explicit Codex registration' {
     Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -RegisterAgentInstructions } 'requires explicit -RegisterCodex'
 }
@@ -190,9 +190,11 @@ try {
         $taskExe = Join-Path $OutputDirectory '空白 & name\prunlet.exe'
         $taskConfig = Join-Path $OutputDirectory '空白 & name\設定.json'
         $state = Get-PrunletMaintenanceState $taskExe $taskConfig
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($state.maintenanceExecutable))
+        [IO.File]::WriteAllBytes($state.maintenanceExecutable, [byte[]]@(0))
         Register-PrunletMaintenanceTask $state
         $xml = [xml]$global:PrunletMaintenanceFixture.tasks[$state.name]
-        Assert-True ($xml.Task.Actions.Exec.Command -ceq $taskExe -and $xml.Task.Actions.Exec.Arguments -ceq ('--config "' + $taskConfig + '" maintain --apply')) 'Task altered quoted paths or invokes a shell.'
+        Assert-True ($xml.Task.Actions.Exec.Command -ceq $state.maintenanceExecutable -and $xml.Task.Actions.Exec.Arguments -ceq ('--config "' + $taskConfig + '" maintain --apply')) 'Task altered quoted paths or invokes a shell.'
         Assert-True ($xml.Task.Principals.Principal.RunLevel -ceq 'LeastPrivilege' -and $xml.Task.Principals.Principal.LogonType -ceq 'InteractiveToken') 'Task requires elevated or password logon.'
         Assert-True ($xml.Task.Settings.MultipleInstancesPolicy -ceq 'IgnoreNew' -and $xml.Task.Settings.StartWhenAvailable -ceq 'true') 'Task lacks overlap or missed-run policy.'
         Assert-True ($xml.Task.Triggers.CalendarTrigger.ScheduleByDay.DaysInterval -eq 1 -and $xml.Task.Triggers.LogonTrigger.UserId -ceq $state.sid) 'Task lacks daily or logon trigger.'
@@ -230,6 +232,8 @@ try {
                 [Globalization.CultureInfo]::CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo($cultureName)
                 $cultureRoot = Join-Path $OutputDirectory ('culture-' + $cultureName)
                 $cultureState = Get-PrunletMaintenanceState (Join-Path $cultureRoot 'prunlet.exe') (Join-Path $cultureRoot 'config.json')
+                [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($cultureState.maintenanceExecutable))
+                [IO.File]::WriteAllBytes($cultureState.maintenanceExecutable, [byte[]]@(0))
                 try {
                     Register-PrunletMaintenanceTask $cultureState
                     $xml = [xml]$global:PrunletMaintenanceFixture.tasks[$cultureState.name]
@@ -493,13 +497,16 @@ try {
         $retirementConfig = Get-Content -LiteralPath (Join-Path $legacyResult.updateBackupDirectory 'retirement-config.json') -Raw | ConvertFrom-Json
         Assert-True ($retirementConfig.volumeRecoveryDirectories.'D:\' -ceq $fixtureVolumeStore -and $retirementConfig.backupDirectory -ceq (Join-Path $legacyResult.updateBackupDirectory 'retired-recovery')) 'Retirement lost the user volume map or dedicated metadata directory.'
         Assert-True ($retirementConfig.retentionDays -eq 7 -and $retirementConfig.maxRecoveryBytes -eq 10GB) 'Retirement inherited unrelated main configuration settings.'
-        $retiredManifests = @(Get-ChildItem -LiteralPath (Join-Path $legacyResult.updateBackupDirectory 'retired-recovery') -Filter 'move-manifest.json' -File -Recurse)
+        $retiredManifests = @(Get-ChildItem -LiteralPath (Join-Path $legacyResult.updateBackupDirectory 'retired-recovery') -Filter 'recycle-manifest.json' -File -Recurse)
         Assert-True ($retiredManifests.Count -eq 1) 'Retirement has no unique recovery operation.'
         $retired = [IO.File]::ReadAllText($retiredManifests[0].FullName) | ConvertFrom-Json
-        Assert-True ($retired.schema -eq 4 -and @($retired.entries).Count -eq 1 -and $retired.entries[0].path -ieq $obsoleteBackend -and $retired.entries[0].identity.fileId -ceq $obsoleteId.Substring(16)) 'Retirement manifest does not match the old backend identity.'
+        Assert-True ($retired.schema -eq 6 -and @($retired.entries).Count -eq 1 -and $retired.entries[0].path -ieq $obsoleteBackend -and $retired.entries[0].identity.fileId -ceq $obsoleteId.Substring(16)) 'Retirement manifest does not match the old backend identity.'
         $retiredEntry = $retired.entries[0]
-        $retiredPayload = Join-Path (Join-Path $retiredEntry.storeRoot $retired.operationId) $retiredEntry.payloadName
-        Assert-True ($retiredPayload.StartsWith($fixtureVolumeStore + '\', [StringComparison]::OrdinalIgnoreCase)) 'Retirement escaped the isolated volume store.'
+        $retiredReceiptPath = Join-Path $retiredManifests[0].DirectoryName 'recycle-0000-complete.json'
+        $retiredReceipt = [IO.File]::ReadAllText($retiredReceiptPath) | ConvertFrom-Json
+        Assert-True ($retiredReceipt.schema -eq 6 -and $retiredReceipt.operationId -ceq $retired.operationId -and $retiredReceipt.manifestSha256 -ieq (Get-FileHash -LiteralPath $retiredManifests[0].FullName -Algorithm SHA256).Hash -and $retiredReceipt.pidl -and $retiredReceipt.identity.fileId -ceq $retiredEntry.identity.fileId) 'Retirement completion receipt does not match the old backend.'
+        $retiredPayload = $retiredReceipt.physicalPath
+        Assert-True ([IO.Path]::IsPathFullyQualified($retiredPayload) -and ($retiredPayload.Split([char]92) -icontains '$Recycle.Bin')) 'Retirement did not use Windows Recycle Bin.'
         Assert-True ((Get-FileHash -LiteralPath $retiredPayload -Algorithm SHA256).Hash -ceq $obsoleteHash -and [PrunletLatestMoveIdentity]::Read($retiredPayload) -ceq $obsoleteId) 'Retired backend was copied or its bytes changed.'
         $updated = [IO.File]::ReadAllText($legacyAgents)
         Assert-True ($updated.Contains('Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。')) 'Legacy instructions did not migrate.'

@@ -25,4 +25,13 @@ New-Item -ItemType Directory -Path $intermediate, $publish -Force | Out-Null
 & dotnet publish (Join-Path $repoRoot 'src\Prunlet\Prunlet.csproj') -c Release -r $Runtime --self-contained true -o $publish "-p:BaseIntermediateOutputPath=$intermediate\" "-p:BaseOutputPath=$outputRoot\bin\" '-p:PublishSingleFile=true' '-p:IncludeNativeLibrariesForSelfExtract=true' '-p:DebugType=None' '-p:DebugSymbols=false' '-p:UseSharedCompilation=false'
 if ($LASTEXITCODE -ne 0) { throw "Publish failed: $LASTEXITCODE" }
 $exe = Join-Path $publish 'prunlet.exe'
-[ordered]@{ executable = $exe; runtime = $Runtime; sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; bytes = (Get-Item -LiteralPath $exe).Length } | ConvertTo-Json
+# 同じCoreをGUI subsystemで発行し、対話ログオンでもコンソールを作らない。
+$maintenanceRoot = Join-Path $outputRoot 'maintenance'
+$maintenanceIntermediate = Join-Path $maintenanceRoot 'obj'
+$maintenancePublish = Join-Path $maintenanceRoot 'publish'
+New-Item -ItemType Directory -Path $maintenanceIntermediate, $maintenancePublish -Force | Out-Null
+& dotnet publish (Join-Path $repoRoot 'src\Prunlet\Prunlet.csproj') -c Release -r $Runtime --self-contained true -o $maintenancePublish "-p:BaseIntermediateOutputPath=$maintenanceIntermediate\" "-p:BaseOutputPath=$maintenanceRoot\bin\" '-p:PrunletMaintenanceHost=true' '-p:PublishSingleFile=true' '-p:IncludeNativeLibrariesForSelfExtract=true' '-p:DebugType=None' '-p:DebugSymbols=false' '-p:UseSharedCompilation=false'
+if ($LASTEXITCODE -ne 0) { throw "Maintenance publish failed: $LASTEXITCODE" }
+$maintenanceExe = Join-Path $publish 'prunlet-maintenance.exe'
+Copy-Item -LiteralPath (Join-Path $maintenancePublish 'prunlet-maintenance.exe') -Destination $maintenanceExe
+[ordered]@{ executable = $exe; maintenanceExecutable = $maintenanceExe; runtime = $Runtime; sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; maintenanceSha256 = (Get-FileHash -LiteralPath $maintenanceExe -Algorithm SHA256).Hash; bytes = (Get-Item -LiteralPath $exe).Length } | ConvertTo-Json

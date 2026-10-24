@@ -14,8 +14,13 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
+#if PRUNLET_MAINTENANCE_HOST
+        // 非表示の定期保守入口は既存Coreの明示適用だけを受け付ける。
+        if (args is not ["--config", _, "maintain", "--apply"]) return 2;
+#else
         Console.InputEncoding = new System.Text.UTF8Encoding(false);
         Console.OutputEncoding = new System.Text.UTF8Encoding(false);
+#endif
         try
         {
             if (args.Length == 0 || args is ["--help"] or ["help"])
@@ -37,10 +42,11 @@ internal static class Program
                     prunlet --config <absolute-json-path> hook [--hook-script <legacy-path>]
                     Legacy --allowed-root <directory> options are accepted but do not restrict target directories.
                     Metadata and volume recovery directories are protected.
-                    Selected roots move into private recovery storage on the same volume after a capacity scan.
-                    Recovery data expire after 7 days by default and share a 10 GiB budget.
-                    Real deletion evicts expired/oldest recovery data as needed; maintain defaults to inspection only.
-                    Restore consumes moved items and never overwrites existing destinations.
+                    Files and folders move into the Windows Recycle Bin; Prunlet keeps operation records.
+                    Windows controls Recycle Bin retention; unavailable recycling fails without permanent-delete fallback.
+                    Registry snapshots and legacy file backups retain the configured 7-day / 1 GiB defaults.
+                    Maintain manages those Prunlet backups, never the Windows Recycle Bin; inspection is the default.
+                    Restore uses the operation ID, consumes recycled items, and never overwrites or merges destinations.
                     Moved hard links share content with surviving aliases; legacy copies restore as independent snapshots.
                     Empty directories are supported; deleting directory contents requires --recursive.
                     Wildcard expansion is unsupported. Links are deleted without following their targets.
@@ -272,7 +278,7 @@ internal static class Program
         };
         if (typedItems is not null)
             return typedItems.Any(item => !string.IsNullOrEmpty(item.Error) ||
-                item.Status is "failed" or "conflict" or "error" or "restore_failed");
+                item.Status is "failed" or "conflict" or "error" or "restore_failed" or "ambiguous" or "missing");
 
         return false;
     }

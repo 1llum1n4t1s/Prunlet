@@ -7,7 +7,12 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <AssemblyName>prunlet</AssemblyName>
-    <Version>1.0.11</Version>
+    <Version>1.0.12</Version>
     <Authors>Kagayoi</Authors>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(PrunletMaintenanceHost)' == 'true'">
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>prunlet-maintenance</AssemblyName>
+    <DefineConstants>$(DefineConstants);PRUNLET_MAINTENANCE_HOST</DefineConstants>
   </PropertyGroup>
 </Project>

@@ -132,7 +132,7 @@ if ($RegisterCodex -and $SettingsBackupDirectory) { $SettingsBackupDirectory = A
 if (!(Get-Command dotnet -ErrorAction SilentlyContinue)) { throw '.NET 10 SDK is required. Install the SDK and run this installer again.' }
 $sdks = @(& dotnet --list-sdks)
 if ($LASTEXITCODE -ne 0 -or !($sdks | Where-Object { $_ -match '^10\.' })) { throw '.NET 10 SDK is required; an installed runtime alone cannot build latest source.' }
-$products = @('bin\prunlet.exe', 'bin\configuration-common.ps1', 'bin\maintenance-task.ps1', 'bin\uninstall-maintenance.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
+$products = @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\configuration-common.ps1', 'bin\maintenance-task.ps1', 'bin\uninstall-maintenance.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
 $retiredProducts = @('bin\codex-pretooluse.ps1')
 $previousGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
 $previousGuideSha256 = if (Test-Path -LiteralPath $previousGuidePath -PathType Leaf) { (Get-FileHash -LiteralPath $previousGuidePath -Algorithm SHA256).Hash } else { $null }
@@ -182,6 +182,8 @@ try {
     & (Join-Path $sourceRoot 'scripts\Publish-Prunlet.ps1') -OutputDirectory $buildRoot -Runtime $Runtime | Out-Null
     $exe = Join-Path $buildRoot 'publish\prunlet.exe'
     if (!(Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Build did not produce prunlet.exe.' }
+    $maintenanceExe = Join-Path $buildRoot 'publish\prunlet-maintenance.exe'
+    if (!(Test-Path -LiteralPath $maintenanceExe -PathType Leaf)) { throw 'Build did not produce prunlet-maintenance.exe.' }
     # 初期設定も外部作業場所で検証する。既存設定は一切書き換えない。
     $newConfig = Join-Path $WorkDirectory 'config.json'
     if (!$existingConfig) {
@@ -195,7 +197,7 @@ try {
         & $exe --config $configPath operations | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'Prunlet rejected the existing configuration; it was preserved.' }
     }
-    $provenance = [ordered]@{ repository = $Repository; defaultBranch = $branch; commitSha = $sha; downloadUrl = $downloadUrl; archiveSha256 = $archiveHash; executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; installedUtc = [DateTimeOffset]::UtcNow.ToString('o'); runtime = $Runtime }
+    $provenance = [ordered]@{ repository = $Repository; defaultBranch = $branch; commitSha = $sha; downloadUrl = $downloadUrl; archiveSha256 = $archiveHash; executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; maintenanceExecutableSha256 = (Get-FileHash -LiteralPath $maintenanceExe -Algorithm SHA256).Hash; installedUtc = [DateTimeOffset]::UtcNow.ToString('o'); runtime = $Runtime }
     $provenance | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $WorkDirectory 'source-info.json') -Encoding utf8NoBOM
     # 更新対象だけ保全し、config/recoveryは既存のまま保持する。
     foreach ($relative in @($products + $retiredProducts)) {
@@ -214,7 +216,7 @@ try {
     }
     New-TrackedDirectory (Join-Path $InstallDirectory 'bin')
     foreach ($relative in $products) {
-        $inputPath = if ($relative -eq 'bin\prunlet.exe') { $exe } elseif ($relative -eq 'source-info.json') { Join-Path $WorkDirectory $relative } else { Join-Path $sourceRoot ('integration\' + [IO.Path]::GetFileName($relative)) }
+        $inputPath = if ($relative -in @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe')) { Join-Path (Join-Path $buildRoot 'publish') ([IO.Path]::GetFileName($relative)) } elseif ($relative -eq 'source-info.json') { Join-Path $WorkDirectory $relative } else { Join-Path $sourceRoot ('integration\' + [IO.Path]::GetFileName($relative)) }
         $target = Join-Path $InstallDirectory $relative
         [void]$changed.Add($relative)
         Copy-Item -LiteralPath $inputPath -Destination $target -Force
