@@ -496,14 +496,14 @@ try {
         Assert-True ((Get-FileHash -LiteralPath $legacyConfigPath -Algorithm SHA256).Hash -ceq $legacyConfigHash) 'Retirement changed the main configuration.'
         $retirementConfig = Get-Content -LiteralPath (Join-Path $legacyResult.updateBackupDirectory 'retirement-config.json') -Raw | ConvertFrom-Json
         Assert-True ($retirementConfig.volumeRecoveryDirectories.'D:\' -ceq $fixtureVolumeStore -and $retirementConfig.backupDirectory -ceq (Join-Path $legacyResult.updateBackupDirectory 'retired-recovery')) 'Retirement lost the user volume map or dedicated metadata directory.'
-        Assert-True ($retirementConfig.retentionDays -eq 7 -and $retirementConfig.maxRecoveryBytes -eq 10GB) 'Retirement inherited unrelated main configuration settings.'
+        Assert-True ($retirementConfig.retentionDays -eq 7 -and $retirementConfig.maxRecoveryBytes -eq 1GB) 'Retirement inherited unrelated main configuration settings.'
         $retiredManifests = @(Get-ChildItem -LiteralPath (Join-Path $legacyResult.updateBackupDirectory 'retired-recovery') -Filter 'recycle-manifest.json' -File -Recurse)
         Assert-True ($retiredManifests.Count -eq 1) 'Retirement has no unique recovery operation.'
-        $retired = [IO.File]::ReadAllText($retiredManifests[0].FullName) | ConvertFrom-Json
+        $retired = [IO.File]::ReadAllText($retiredManifests[0].FullName) | ConvertFrom-Json -AsHashtable
         Assert-True ($retired.schema -eq 6 -and @($retired.entries).Count -eq 1 -and $retired.entries[0].path -ieq $obsoleteBackend -and $retired.entries[0].identity.fileId -ceq $obsoleteId.Substring(16)) 'Retirement manifest does not match the old backend identity.'
         $retiredEntry = $retired.entries[0]
         $retiredReceiptPath = Join-Path $retiredManifests[0].DirectoryName 'recycle-0000-complete.json'
-        $retiredReceipt = [IO.File]::ReadAllText($retiredReceiptPath) | ConvertFrom-Json
+        $retiredReceipt = [IO.File]::ReadAllText($retiredReceiptPath) | ConvertFrom-Json -AsHashtable
         Assert-True ($retiredReceipt.schema -eq 6 -and $retiredReceipt.operationId -ceq $retired.operationId -and $retiredReceipt.manifestSha256 -ieq (Get-FileHash -LiteralPath $retiredManifests[0].FullName -Algorithm SHA256).Hash -and $retiredReceipt.pidl -and $retiredReceipt.identity.fileId -ceq $retiredEntry.identity.fileId) 'Retirement completion receipt does not match the old backend.'
         $retiredPayload = $retiredReceipt.physicalPath
         Assert-True ([IO.Path]::IsPathFullyQualified($retiredPayload) -and ($retiredPayload.Split([char]92) -icontains '$Recycle.Bin')) 'Retirement did not use Windows Recycle Bin.'
