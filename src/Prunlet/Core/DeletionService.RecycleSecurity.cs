@@ -8,7 +8,8 @@ public sealed partial class DeletionService
     private const int MaximumRecycleSecurityNodes = 65536;
 
     // 名前はordinalな相対パス。reparse自身を記録し、その配下やリンク先を列挙しない。
-    private static Dictionary<string, RecycleSecurityNode> CaptureRecycleSecurity(string root, bool writable, bool rootHasDeleteHandle = false)
+    private static Dictionary<string, RecycleSecurityNode> CaptureRecycleSecurity(string root, bool writable,
+        bool rootHasDeleteHandle = false, Action? hardLinkDetected = null)
     {
         var nodes = new Dictionary<string, RecycleSecurityNode>(StringComparer.Ordinal);
         using var parents = PathPolicy.PinDirectories(Path.GetDirectoryName(root)!);
@@ -22,6 +23,7 @@ public sealed partial class DeletionService
             using var handle = NativeFiles.OpenRecycleSecurity(path, writable);
             var identity = NativeFiles.MoveIdentity(handle);
             VerifyMoveHandle(handle, path, identity);
+            if (hardLinkDetected is not null && !identity.IsDirectory && NativeFiles.HasMultipleLinks(handle)) hardLinkDetected();
             var descriptor = NativeFiles.ReadRecycleSecurity(handle);
             NativeFiles.ValidateRecycleSecurity(descriptor);
             nodes.Add(relative, new RecycleSecurityNode { Identity = identity, Descriptor = descriptor });

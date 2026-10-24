@@ -13,6 +13,8 @@ public sealed partial class DeletionService
         public string MachineName { get; set; } = string.Empty;
         public string OwnerSid { get; set; } = string.Empty;
         public List<RecycleEntry> Entries { get; set; } = [];
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public int HardlinkProtocol { get; set; }
     }
 
     private sealed class RecycleEntry

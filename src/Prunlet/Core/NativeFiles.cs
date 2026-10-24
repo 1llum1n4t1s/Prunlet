@@ -327,6 +327,12 @@ internal static partial class NativeFiles
             throw new IOException("Recovery files with multiple hard links cannot be purged.");
     }
 
+    internal static bool HasMultipleLinks(SafeFileHandle handle)
+    {
+        if (!GetFileInformationByHandle(handle, out var info)) ThrowLastError("Cannot inspect hardlink count");
+        return info.Links > 1;
+    }
+
     internal static bool IsDirectory(SafeFileHandle handle)
     {
         if (!GetFileInformationByHandle(handle, out var info)) ThrowLastError("Cannot inspect handle type");

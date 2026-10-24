@@ -5,6 +5,10 @@ namespace Prunlet.Core;
 public sealed partial class DeletionService
 {
     private DeleteResult DeleteRecycle(string[] paths, bool dryRun, bool recursive)
+        => DeleteRecycleCore(paths, dryRun, recursive, exclusive: false)
+            ?? DeleteRecycleCore(paths, dryRun, recursive, exclusive: true)!;
+
+    private DeleteResult? DeleteRecycleCore(string[] paths, bool dryRun, bool recursive, bool exclusive)
     {
         config.Validate();
         ArgumentNullException.ThrowIfNull(paths);
@@ -16,26 +20,26 @@ public sealed partial class DeletionService
                     throw new ArgumentException("Duplicate or overlapping target paths are not allowed.");
 
         // dry-runでは記録・共通lock・Windowsゴミ箱を変更しない。
-        using var coordination = dryRun ? null : AcquireRecoveryCoordination(create: true);
+        using var coordination = dryRun ? null : AcquireRecoveryCoordination(create: true, deletionTargets: exclusive ? null : normalized);
         var result = new DeleteResult { DryRun = dryRun };
-        var entries = new List<RecycleEntry>();
-        var parents = new List<DirectoryLease>();
+        var entries = normalized.Select((path, index) => new RecycleEntry { Index = index, Path = path }).ToList();
+        result.Items.AddRange(normalized.Select(path => new FileOperationResult { Schema2Wire = true, Path = path, Status = "failed" }));
+        var parents = new DirectoryLease?[normalized.Length];
+        var hardLinks = new bool[normalized.Length];
         try
         {
-            for (var index = 0; index < normalized.Length; index++)
+            DeletionWorkers.For(normalized.Length, index =>
             {
                 var path = normalized[index];
-                var entry = new RecycleEntry { Index = index, Path = path };
-                entries.Add(entry);
-                var item = new FileOperationResult { Schema2Wire = true, Path = path, Status = "failed" };
-                result.Items.Add(item);
+                var entry = entries[index];
+                var item = result.Items[index];
                 try
                 {
                     var identity = InspectMoveLocation(path);
                     CheckRecycleTarget(path, identity?.IsDirectory == true);
-                    if (identity is null) { entry.State = item.Status = "already_absent"; continue; }
+                    if (identity is null) { entry.State = item.Status = "already_absent"; return; }
                     var parentPath = Path.GetDirectoryName(path)!;
-                    parents.Add(PathPolicy.PinDirectories(parentPath));
+                    parents[index] = PathPolicy.PinDirectories(parentPath);
                     using var parent = NativeFiles.OpenDirectory(parentPath);
                     NativeFiles.Verify(parent, parentPath, directory: true);
                     entry.OriginalParent = NativeFiles.MoveIdentity(parent);
@@ -47,13 +51,17 @@ public sealed partial class DeletionService
                         throw new ArgumentException("Nonempty directories require explicit recursive deletion.");
                     using var target = NativeFiles.OpenMoveMeasurement(path);
                     VerifyMoveHandle(target, path, identity);
-                    entry.Security = CaptureRecycleSecurity(path, writable: true);
+                    entry.Security = CaptureRecycleSecurity(path, writable: true,
+                        hardLinkDetected: !dryRun && !exclusive ? () => hardLinks[index] = true : null);
                     ValidateRecycleSecurity(entry.Security, identity);
                     item.Status = "would_delete";
                 }
                 catch (Exception ex) when (IsRecycleFailure(ex)) { item.Error = ex.Message; }
-            }
+            }, sequential: exclusive);
             if (dryRun) return result;
+            // 別名を持つ全nodeはShellのACL変更を共有する。全pin/共有claimを解放してから
+            // wrapperが排他lockでsnapshotを取り直す。共有handleを保持したupgradeは行わない。
+            if (!exclusive && hardLinks.Any(found => found)) return null;
             if (result.Items.Any(item => item.Status == "failed"))
                 throw new IOException("Deletion preflight failed; original targets were retained. " +
                     string.Join(" ", result.Items.Where(item => item.Error is not null).Select(item => item.Error)));
@@ -66,6 +74,8 @@ public sealed partial class DeletionService
                 OperationId = operation.OperationId, MetadataRoot = config.BackupDirectory,
                 MachineName = Environment.MachineName, OwnerSid = VolumeRecoveryStore.OwnerSid, Entries = entries
             };
+            var hardlinks = BuildHardlinkGroups(manifest);
+            if (hardlinks.Count != 0) manifest.HardlinkProtocol = 1;
             ValidateRecycleManifest(manifest, operation.OperationId);
             var manifestPath = Path.Combine(operation.Directory, RecycleManifestName);
             PublishRecycleJson(manifestPath, operation.OperationId, manifest);
@@ -74,28 +84,38 @@ public sealed partial class DeletionService
             {
                 var stream = HoldPurgeMetadata(manifestPath, held);
                 var hash = HashStream(stream);
-                foreach (var entry in entries.Where(entry => entry.State == "recycle_intent"))
-                    ExecuteRecycleDeletion(operation.Directory, manifest, hash, entry, result.Items[entry.Index]);
+                DeletionWorkers.For(entries.Count, index =>
+                {
+                    var entry = entries[index];
+                    if (entry.State == "recycle_intent")
+                    {
+                        var group = hardlinks.FirstOrDefault(group => group.Entries.Contains(entry));
+                        ExecuteRecycleDeletion(operation.Directory, manifest, hash, entry, result.Items[index], group);
+                    }
+                }, sequential: exclusive);
                 TryWriteResult(Path.Combine(operation.Directory, "delete-result.json"), result, result.Warnings);
             }
             finally { foreach (var stream in held) stream.Dispose(); }
             return result;
         }
-        finally { for (var index = parents.Count - 1; index >= 0; index--) parents[index].Dispose(); }
+        finally { for (var index = parents.Length - 1; index >= 0; index--) parents[index]?.Dispose(); }
     }
 
-    private void ExecuteRecycleDeletion(string directory, RecycleManifest manifest, string hash, RecycleEntry entry, FileOperationResult item)
+    private void ExecuteRecycleDeletion(string directory, RecycleManifest manifest, string hash, RecycleEntry entry, FileOperationResult item,
+        HardlinkGroup? group = null)
     {
         var started = false;
         var receipted = false;
         try
         {
+            if (group?.Blocked == true) throw new IOException("A shared-object predecessor did not complete; this component was retained.");
             var recycled = NativeRecycleBin.Recycle(entry.Path, source =>
             {
                 if (source != entry.Path) throw new IOException("The Shell source differs from the persisted intent.");
                 VerifyRecycleParent(entry);
                 VerifyRecycleObject(source, entry.Identity!);
-                RequireRecycleSecurity(source, entry.Security!, writable: true, exactAttributes: true);
+                RequireRecycleSecurity(source, HardlinkExpected(entry.Security!, group), writable: true, exactAttributes: true);
+                if (group is not null) BeginHardlinkTransition(directory, manifest, hash, group, entry, "delete");
                 started = true;
             }, bin =>
             {
@@ -107,6 +127,9 @@ public sealed partial class DeletionService
                 var security = CaptureRecycleSecurity(bin.PhysicalPath, writable: false);
                 RequireRecycleSecurity(bin.PhysicalPath, entry.Security!, compareSecurity: false);
                 WriteRecycleReceipt(directory, manifest, hash, entry, "recycle", "complete", bin, identity, security: security);
+                if (group is not null)
+                    CompleteHardlinkTransition(directory, manifest, hash, group, entry, "delete", security,
+                        HashHardlinkFile(Path.Combine(directory, RecycleReceiptName(entry, "recycle", "complete"))), bin.PhysicalPath);
                 item.BackupPath = bin.PhysicalPath;
                 receipted = true;
             });
@@ -115,6 +138,7 @@ public sealed partial class DeletionService
         }
         catch (Exception ex) when (IsRecycleFailure(ex))
         {
+            if (group is not null) group.Blocked = true;
             item.Status = started ? "ambiguous" : "failed";
             item.Error = ex.Message + (started ? " The operation was not retried; inspect the Windows Recycle Bin and retained metadata." : string.Empty);
         }
@@ -126,10 +150,27 @@ public sealed partial class DeletionService
         var result = new RestoreResult { OperationId = operationId };
         if (operation.Manifest.Entries.Any(entry => entry.State == "recycle_intent" && entry.Security is null))
             result.Warnings.Add("This older schema 6 record has no ACL snapshot; restoration uses Windows ACL behavior and cannot guarantee the original ACL.");
+        result.Items.AddRange(operation.Manifest.Entries.Select(entry => new FileOperationResult
+            { Schema2Wire = true, Path = entry.Path, Kind = entry.Kind, Status = "failed" }));
+        var handled = new HashSet<int>();
         foreach (var entry in operation.Manifest.Entries)
         {
-            var item = new FileOperationResult { Schema2Wire = true, Path = entry.Path, Kind = entry.Kind, Status = "failed" };
-            result.Items.Add(item);
+            var item = result.Items[entry.Index];
+            var group = operation.Hardlinks.FirstOrDefault(group => group.Entries.Contains(entry));
+            if (group is not null)
+            {
+                if (handled.Add(group.Leader))
+                {
+                    try { RestoreHardlinkGroup(operation, group, result); }
+                    catch (Exception ex) when (IsRecycleFailure(ex))
+                    {
+                        foreach (var member in group.Entries)
+                            if (result.Items[member.Index].Status is not ("restored" or "already_restored"))
+                            { result.Items[member.Index].Status = "failed"; result.Items[member.Index].Error = ex.Message; }
+                    }
+                }
+                continue;
+            }
             if (entry.State == "already_absent") { item.Status = "not_moved"; continue; }
             try
             {

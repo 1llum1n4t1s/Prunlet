@@ -8,13 +8,19 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
 {
     private bool initialized;
     private bool ready;
+    private readonly object writerGate = new();
     private static readonly string[] SupportedVersions = ["2025-11-25", "2025-06-18", "2024-11-05"];
 
     public async Task RunAsync(TextReader input, TextWriter output)
     {
         var reader = new BoundedInputReader(input, BoundedInputReader.RequestLimit);
+        var pending = new List<Task>();
+        using var requests = new SemaphoreSlim(4, 4);
+        try
+        {
         while (await reader.ReadLineAsync() is { } line)
         {
+            foreach (var failed in pending.Where(task => task.IsFaulted)) await failed;
             if (line.IsWhiteSpace) continue;
             JsonElement? id = null;
             object response;
@@ -40,7 +46,37 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                     if (method == "notifications/initialized" && initialized) ready = true;
                     continue;
                 }
-                var parameters = request.TryGetProperty("params", out var p) ? p : default;
+                var parameters = request.TryGetProperty("params", out var p) ? p.Clone() : default;
+                var parallelDelete = method == "tools/call" && ready && parameters.ValueKind == JsonValueKind.Object
+                    && parameters.TryGetProperty("name", out var toolName) && toolName.ValueKind == JsonValueKind.String
+                    && toolName.GetString() == "delete_files";
+                if (method == "tools/call" && !parallelDelete)
+                {
+                    // レジストリのprocess privilege等を並行するfile workerへ持ち込まない。
+                    await Task.WhenAll(pending);
+                    pending.Clear();
+                }
+                if (parallelDelete)
+                {
+                    var requestService = service.CreateRequestService();
+                    await requests.WaitAsync();
+                    var requestIdCopy = id;
+                    pending.RemoveAll(task => task.IsCompletedSuccessfully);
+                    pending.Add(Task.Run(() =>
+                    {
+                        try
+                        {
+                            object toolResponse;
+                            try { toolResponse = new { jsonrpc = "2.0", id = requestIdCopy, result = DispatchWithProgress(method, parameters, output, requestService) }; }
+                            catch (RpcException ex) { toolResponse = Error(requestIdCopy, ex.Code, ex.Message); }
+                            catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
+                            { toolResponse = Error(requestIdCopy, -32603, ex.Message); }
+                            WriteResponse(output, toolResponse);
+                        }
+                        finally { requests.Release(); }
+                    }));
+                    continue;
+                }
                 var result = DispatchWithProgress(method, parameters, output);
                 response = new { jsonrpc = "2.0", id, result };
             }
@@ -56,36 +92,55 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
             {
                 response = Error(id, -32603, ex.Message);
             }
-            await output.WriteLineAsync(JsonSerializer.Serialize(response, Program.JsonOptions));
-            await output.FlushAsync();
+            WriteResponse(output, response);
+        }
+        }
+        finally { await Task.WhenAll(pending); }
+    }
+
+    private void WriteResponse(TextWriter output, object response)
+    {
+        lock (writerGate)
+        {
+            output.WriteLine(JsonSerializer.Serialize(response, Program.JsonOptions));
+            output.Flush();
         }
     }
 
-    private object DispatchWithProgress(string method, JsonElement parameters, TextWriter output)
+    private object DispatchWithProgress(string method, JsonElement parameters, TextWriter output, DeletionService? requestService = null)
     {
+        var targetService = requestService ?? service;
         // 進捗は要求に紐づけ、最終応答後やtokenのない要求へ流さない。
         if (method != "tools/call" || parameters.ValueKind != JsonValueKind.Object ||
             !parameters.TryGetProperty("_meta", out var metadata) || metadata.ValueKind != JsonValueKind.Object ||
             !metadata.TryGetProperty("progressToken", out var token) ||
             (token.ValueKind != JsonValueKind.String && (token.ValueKind != JsonValueKind.Number || !token.TryGetInt64(out _))))
-            return Dispatch(method, parameters);
+            return Dispatch(method, parameters, targetService);
 
         long progress = 0;
+        var active = true;
         void Report(TimeSpan elapsed, bool acquired)
         {
-            output.WriteLine(JsonSerializer.Serialize(new
+            lock (writerGate)
             {
-                jsonrpc = "2.0", method = "notifications/progress",
-                @params = new { progressToken = token, progress = ++progress, message = Program.RecoveryLockMessage(elapsed, acquired) }
-            }, Program.JsonOptions));
-            output.Flush();
+                if (!active) return;
+                WriteResponse(output, new
+                {
+                    jsonrpc = "2.0", method = "notifications/progress",
+                    @params = new { progressToken = token, progress = ++progress, message = Program.RecoveryLockMessage(elapsed, acquired) }
+                });
+            }
         }
-        service.RecoveryLockProgress += Report;
-        try { return Dispatch(method, parameters); }
-        finally { service.RecoveryLockProgress -= Report; }
+        targetService.RecoveryLockProgress += Report;
+        try { return Dispatch(method, parameters, targetService); }
+        finally
+        {
+            lock (writerGate) active = false;
+            targetService.RecoveryLockProgress -= Report;
+        }
     }
 
-    private object Dispatch(string method, JsonElement parameters)
+    private object Dispatch(string method, JsonElement parameters, DeletionService targetService)
     {
         if (method == "ping") return new { };
         if (method == "initialize")
@@ -105,12 +160,12 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
         return method switch
         {
             "tools/list" => new { tools = Tools() },
-            "tools/call" => CallTool(parameters),
+            "tools/call" => CallTool(parameters, targetService),
             _ => throw new RpcException(-32601, $"Unknown method: {method}")
         };
     }
 
-    private object CallTool(JsonElement parameters)
+    private object CallTool(JsonElement parameters, DeletionService service)
     {
         var name = StringProperty(parameters, "name");
         var args = parameters.TryGetProperty("arguments", out var a) ? a : JsonSerializer.SerializeToElement(new { });

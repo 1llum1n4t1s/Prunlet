@@ -215,7 +215,7 @@ public sealed partial class DeletionService
         return bytes;
     }
 
-    private RecoveryCoordination AcquireRecoveryCoordination(bool create)
+    private RecoveryCoordination AcquireRecoveryCoordination(bool create, string[]? deletionTargets = null)
     {
         config.Validate();
         var root = PathPolicy.PinRecoveryDirectories(config.BackupDirectory);
@@ -234,7 +234,8 @@ public sealed partial class DeletionService
             {
                 try
                 {
-                    handle = create ? NativeFiles.OpenOrCreateLock(path) : NativeFiles.OpenLock(path);
+                    handle = deletionTargets is not null ? NativeFiles.OpenSharedCoordination(path)
+                        : create ? NativeFiles.OpenOrCreateLock(path) : NativeFiles.OpenLock(path);
                     break;
                 }
                 catch (FileNotFoundException) when (!create) { return new RecoveryCoordination(root, null); }
@@ -254,6 +255,35 @@ public sealed partial class DeletionService
             NativeFiles.VerifySingleLink(handle);
             NativeFiles.RejectNamedStreams(path);
             if (RandomAccess.GetLength(handle) != 0) throw new InvalidDataException("Recovery coordination lock is not empty.");
+            if (deletionTargets is not null)
+            {
+                // 同じtargetは排他、ancestorは共有。hash衝突は強いclaimへ統合し全batchを昇順で取得する。
+                var claims = new SortedDictionary<uint, bool>();
+                foreach (var target in deletionTargets)
+                {
+                    var current = target;
+                    var exclusive = true;
+                    while (!string.IsNullOrEmpty(current))
+                    {
+                        var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(current.TrimEnd('\\').ToUpperInvariant()));
+                        var slot = (uint)(hash[0] | hash[1] << 8);
+                        claims[slot] = exclusive || claims.GetValueOrDefault(slot);
+                        exclusive = false;
+                        current = Path.GetDirectoryName(current);
+                    }
+                }
+                foreach (var claim in claims)
+                    while (!NativeFiles.TryClaimCoordination(handle, claim.Key, claim.Value))
+                    {
+                        if (waiting.Elapsed >= nextReport)
+                        {
+                            RecoveryLockProgress?.Invoke(waiting.Elapsed, false);
+                            reported = true;
+                            nextReport = waiting.Elapsed + TimeSpan.FromSeconds(5);
+                        }
+                        Thread.Sleep(100);
+                    }
+            }
             if (reported) RecoveryLockProgress?.Invoke(waiting.Elapsed, true);
             return new RecoveryCoordination(root, handle);
         }

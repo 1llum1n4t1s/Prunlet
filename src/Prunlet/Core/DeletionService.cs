@@ -12,6 +12,8 @@ public sealed partial class DeletionService
 
     public DeletionService(PrunletConfig config) : this(config, null) { }
 
+    internal DeletionService CreateRequestService() => new(config, registrySession);
+
     internal DeletionService(PrunletConfig config, RegistrySessionContext? registrySession)
     {
         ArgumentNullException.ThrowIfNull(config);

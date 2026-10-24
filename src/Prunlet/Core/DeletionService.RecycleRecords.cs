@@ -93,6 +93,7 @@ public sealed partial class DeletionService
             {
                 var name = Path.GetFileName(member);
                 if (name is RecycleManifestName or "operation.lock") continue;
+                if (name.StartsWith("hardlink-", StringComparison.Ordinal) && operation.Manifest.HardlinkProtocol == 1) continue;
                 if (TryReadRecycleStage(operation, member, name)) continue;
                 if (name == "delete-result.json" || Regex.IsMatch(name, "^restore-result-[0-9a-f]{32}\\.json$", RegexOptions.CultureInvariant))
                 {
@@ -122,6 +123,7 @@ public sealed partial class DeletionService
                         || receipt.Pidl != recycled!.Pidl || receipt.PhysicalPath != recycled.PhysicalPath || receipt.Identity != recycled.Identity)
                         throw new InvalidDataException("Restore receipt does not match the immutable recycle receipt.");
             }
+            LoadHardlinkRecords(operation);
             ValidateRecycleStages(operation);
             return operation;
         }
@@ -135,6 +137,9 @@ public sealed partial class DeletionService
 
     private void ValidateRecycleManifest(RecycleManifest manifest, string operationId)
     {
+        if (manifest.HardlinkProtocol is not (0 or 1)) throw new InvalidDataException("Unknown hardlink recovery protocol.");
+        if (manifest.HardlinkProtocol == 1 && BuildHardlinkGroups(manifest).Count == 0)
+            throw new InvalidDataException("Hardlink recovery protocol has no shared objects.");
         if (manifest.Schema != 6 || manifest.OperationId != operationId || manifest.CreatedUtc == default
             || manifest.MetadataRoot != config.BackupDirectory || manifest.MachineName != Environment.MachineName
             || manifest.OwnerSid != VolumeRecoveryStore.OwnerSid || manifest.Entries is null || manifest.Entries.Count is 0 or > 256)
@@ -216,6 +221,7 @@ public sealed partial class DeletionService
         internal Dictionary<string, RecycleReceipt> Receipts { get; } = new(StringComparer.Ordinal);
         internal Dictionary<string, string> Hashes { get; } = new(StringComparer.Ordinal);
         internal Dictionary<string, RecycleStageReceipt> Stages { get; } = new(StringComparer.Ordinal);
+        internal List<HardlinkGroup> Hardlinks { get; set; } = [];
         public void Dispose() { foreach (var stream in Held) stream.Dispose(); operationLock.Dispose(); pin.Dispose(); }
     }
 }
