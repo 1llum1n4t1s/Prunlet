@@ -105,6 +105,8 @@ schema 1/2/3のコピー作成とschema 4の専用領域への新規移動を通
 
 Prunletの保持制御は既存schema 1〜4とレジストリschema 5だけを対象とし、既定7日・合計1 GiBを維持する。期限切れ、次いで必要容量に応じた古い操作を整理する。レジストリ削除前と`maintain --apply`が同じCoreを使う。定期タスクは毎日03:00とログオン時に保守専用`prunlet-maintenance.exe`を起動する。専用exeはWindows GUI subsystemで`--config <path> maintain --apply`だけを受理し、通常CLIはconsole subsystemを保つ。所有を確認した旧タスクはCommandだけを移行し、Triggers・Principals・Settingsを保つ。新規ファイル削除は旧データの整理を起動しない。schema 6はWindowsが保持・清掃し、Prunletはゴミ箱を空にしない。
 
+大量の記録でも検査を省略せず、重複した探索・複製を減らす。schema 4のreceipt組合せ検証は読込み済みのordinal辞書を直接照会し、entryごとの全receipt複製を避ける。schema 5の大きなJSON objectはordinal索引を一度だけ作り、配列は列挙で照合して、全field・要素の検査を保つ。専用領域のStoreKey計算は直前に物理解決したmetadataパスを再利用するが、SIDは呼出しごとに取得し、設定や実行主体をまたぐキャッシュを持たない。性能と保全の確認方法は[起動時保守の性能](docs/verification.md#起動時保守の性能)を参照する。
+
 共通`maintenance.lock`はschema 6の新規ファイル削除だけが読み取り共有で保持でき、hardlink検出時の再実行・復元・レジストリ・旧形式・purge・maintain・履歴圧縮は従来の読み書き排他handleで直列化する。共有削除の連続流入に対するwriter優先は保証しない。元対象の容量走査、整理前後の既存全体走査、移動直前・直後の照合で予算を検証する。通常の有効予算は`maxRecoveryBytes`。1回の入力合計がそれを超える場合だけ`max(maxRecoveryBytes, incomingBytes)`を有効予算とし、既存データを0バイトまで安全に整理できることを必要とする。設定は変更せず、次回の削除・maintainは通常予算を再適用する。
 
 中央記録と、利用可能なローカルボリュームの同じStoreKeyの実体を両側から照合する。中央記録を失った退避データや未知の領域内データ、計数できない領域、不正・破損・使用中・矛盾した記録を無視して上限達成とは判定しない。安全に容量を確保できなければ新しい移動を停止する。ハードリンクの外部別名など、Prunletの共通ロック外からの変更を不変コピーとして扱わない。

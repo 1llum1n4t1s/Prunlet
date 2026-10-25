@@ -37,6 +37,7 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 - 大量操作: ゴミ箱方式は`Verify-RecycleBin.ps1 -Large`で再帰rootのFile ID・内容と非上書き往復を確認する。schema 4の専用領域と旧schema 1/2/3の大規模記録は互換検証へ分離する。
 - 削除速度: 変更前exeと同条件で複数回比較し、安全性と内容・IDの保持、衝突時の非上書き、各試行・中央値を確認する。旧コピー方式の性能値を新方式へ流用しない。
 - 保持制御: schema 6の項目が期限・容量・purgeから除外されること、旧1〜4とレジストリ5の合算容量・整理前後走査・超過時予算・破損保全を確認する。定期タスクは所有者・既存設定保持・登録失敗時復旧も確認する。
+- 起動時保守の性能: 照合処理やパス解決を最適化した場合は、[専用検証](docs/verification.md#起動時保守の性能)の`Verify-MaintenancePerformance.ps1`へ今回のexeと変更前1.0.14の`BaselineExecutablePath`を渡す。同じ記録への交互計測、dry-runの不変更、apply後のschema 6保全と非上書き復元を確認し、保守CLIの計測を実ログオン全体の改善と混同しない。
 - 履歴圧縮: schema 4/5/6は理由付きretained、旧1/2/3は従来のNTFS圧縮、JSON内容一致・冪等性・ロック保全・容量集計分離を確認する。
 - レジストリ: `scripts/Verify-RegistryRecovery.ps1 -ExecutablePath <今回のexe> -OutputDirectory <外部絶対パス> -ReportPath <外部JSONパス>`を実行し、[専用検証手順](docs/verification.md#レジストリの削除と復元)に従って完全ACL・raw bytes・競合・曖昧な記録・混在予算・CLI/MCP/hookを確認する。native sessionは同手順に従い`scripts/Verify-RegistrySession.ps1`のPrepare・Start（`-AssertNativeWindows`）・Current・Runを実行し、current側の6801拒否時の保全と明示native側のCLI・MCP正常往復を同じ対象exeで確認する。通常・管理者の実際の起動tokenを区別し、MSIX仮想viewと通常Windowsの同名キーを同一視しない。権限・KTM・viewの未検証範囲を成功に数えない。
 
