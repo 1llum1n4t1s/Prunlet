@@ -206,7 +206,8 @@ internal static class NativeRegistry
         catch { current.Dispose(); throw; }
     }
 
-    private static SafeRegistryHandle OpenNative(Transaction? transaction, SafeRegistryHandle? parent, string name, uint access)
+    private static SafeRegistryHandle OpenNative(Transaction? transaction, SafeRegistryHandle? parent, string name, uint access,
+        string failureMessage = "Cannot open registry key without following links")
     {
         var text = Marshal.StringToHGlobalUni(name);
         var unicode = Marshal.AllocHGlobal(Marshal.SizeOf<UnicodeString>());
@@ -223,7 +224,7 @@ internal static class NativeRegistry
                 : NtOpenKeyTransactedEx(out handle, access, ref attributes, 8, transaction.Handle);
             if (status >= 0) return handle;
             handle.Dispose();
-            Throw((int)RtlNtStatusToDosError(status), "Cannot open registry key without following links");
+            Throw((int)RtlNtStatusToDosError(status), failureMessage);
             throw new IOException("Unreachable registry status.");
         }
         finally
@@ -385,6 +386,59 @@ internal static class NativeRegistry
             throw new InvalidDataException("Registry security descriptor is missing owner/group or self-relative format.");
     }
 
+    // dry-runも実削除と同じobject・accessでtransaction接続を確認する。書込みはstageせず保持handleから読む。
+    internal static RegistrySnapshot SnapshotForDeletionPreflight(Transaction transaction, RegistryTarget target, bool recursive)
+    {
+        SafeRegistryHandle root;
+        try { root = OpenPinnedOriginal(transaction, target, target.ValueName is null ? Delete : SetValue, target.ValueName is null); }
+        catch (FileNotFoundException ex) { throw new RegistryTargetMissingException(ex.Message); }
+        var snapshot = new RegistrySnapshot { Path = ActualTargetPath(root, target), View = target.View, ValueName = target.ValueName };
+        if (target.ValueName is not null)
+        {
+            _ = BindTransaction(transaction, target, root, SetValue);
+            try
+            {
+                snapshot.ValueName = ActualValueName(root, target.ValueName);
+                snapshot.Value = ReadValue(root, snapshot.ValueName);
+            }
+            catch (FileNotFoundException ex) { throw new RegistryTargetMissingException(ex.Message); }
+            snapshot.ContextSecurity = Security(root, full: false);
+            transaction.VerifyPinnedNames();
+            return snapshot;
+        }
+        var originals = new List<(string Path, SafeRegistryHandle Key)>();
+        var rootName = NtKeyName(root);
+        Preflight(root, "", 0);
+        var totalValues = 0;
+        long totalBytes = 0;
+        foreach (var original in originals)
+            snapshot.Keys.Add(ReadNode(original.Key, original.Path, ref totalValues, ref totalBytes, out _));
+        transaction.VerifyPinnedNames();
+        return snapshot;
+
+        void Preflight(SafeRegistryHandle original, string relative, int depth)
+        {
+            if (depth > MaximumDepth || originals.Count >= MaximumKeys) throw new IOException("Registry deletion key/depth limit exceeded.");
+            var expectedName = rootName + (relative.Length == 0 ? "" : "\\" + relative);
+            if (NtKeyName(original) != expectedName)
+                throw new IOException("Registry key name changed between enumeration and preflight; nothing was committed.");
+            transaction.PinName(original, expectedName);
+            var source = relative.Length == 0 ? target : new RegistryTarget(target.Path + "\\" + relative, target.Hive,
+                target.Segments.Concat(relative.Split('\\')).ToArray(), target.View, null);
+            transaction.PinNamespace(source, expectedName);
+            originals.Add((relative, original));
+            var children = ChildNames(original);
+            if (children.Count > 0 && !recursive) throw new ArgumentException("Registry keys with subkeys require explicit recursive deletion.");
+            foreach (var name in children)
+            {
+                var child = OpenChild(null, target, original, name, Delete, security: true);
+                transaction.HeldKeys.Add(child);
+                Preflight(child, relative.Length == 0 ? name : relative + "\\" + name, depth + 1);
+            }
+            _ = BindTransaction(transaction, target, original, Delete);
+        }
+    }
+
     // visibleな削除はcommitだけで行う。先に同じobjectへ削除をstageし、
     // その後nonTxの保持handleから元データを読み、snapshot後の外部変更をcommit競合にする。
     internal static RegistrySnapshot StageDeletionAndSnapshot(Transaction transaction, RegistryTarget target, bool recursive)
@@ -473,7 +527,8 @@ internal static class NativeRegistry
     private static SafeRegistryHandle BindTransaction(Transaction transaction, RegistryTarget target, SafeRegistryHandle original, uint extraAccess)
     {
         // 空の相対名は保持中の同じkey objectをtransactionへ結び、pathを再解決しない。
-        var key = OpenNative(transaction, original, "", Query | Enumerate | ReadControl | extraAccess | View(target));
+        var key = OpenNative(transaction, original, "", Query | Enumerate | ReadControl | extraAccess | View(target),
+            "Cannot attach the pinned registry key to the transaction");
         transaction.HeldKeys.Add(key);
         return key;
     }
@@ -651,7 +706,7 @@ internal static class NativeRegistry
         var inner = new Win32Exception(error);
         var description = $"{message} (Win32 {error}): {inner.Message}";
         if (error == 6801)
-            description += " The registry transaction resource manager is unavailable in this context. MSIX or other virtualized registry views can cause this; 6801 alone does not establish hive corruption. Another launch context may resolve the same path to a different key or no key; absence is not proof of successful cleanup. Prunlet does not fall back to nontransactional deletion.";
+            description += " The registry transaction resource manager is unavailable in this context. MSIX or other virtualized registry views can cause this; 6801 alone does not establish hive corruption. To explicitly target normal Windows instead, set registryScope to nativeWindows in the configuration and start prunlet --config <absolute-config-path> registry-session --minutes 15 --assert-native-windows from a normal Windows desktop terminal, then issue the request using that same configuration. Another launch context may resolve the same path to a different key or no key; absence is not proof of successful cleanup. Prunlet does not automatically retry, switch views, elevate, or fall back to nontransactional deletion.";
         if (error is 2 or 3) throw new FileNotFoundException(description, inner);
         if (error is 5 or 1314) throw new UnauthorizedAccessException(description, inner);
         throw new IOException(description, inner);

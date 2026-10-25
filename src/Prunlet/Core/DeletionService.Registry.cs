@@ -32,7 +32,7 @@ public sealed partial class DeletionService
             using var privileges = target.ValueName is null ? new NativeRegistry.PrivilegeScope(restore: false, requireEffectiveThreadToken: registrySession is not null) : null;
             using var transaction = new NativeRegistry.Transaction();
             RegistrySnapshot snapshot;
-            try { snapshot = dryRun ? NativeRegistry.Snapshot(null, target, request.Recursive)
+            try { snapshot = dryRun ? NativeRegistry.SnapshotForDeletionPreflight(transaction, target, request.Recursive)
                     : NativeRegistry.StageDeletionAndSnapshot(transaction, target, request.Recursive); }
             catch (RegistryTargetMissingException) { item.Status = "already_absent"; item.Size = 0; return result; }
             snapshot.Scope = registrySession?.Scope;

@@ -49,6 +49,12 @@ $config = Join-Path $env:USERPROFILE '.local\Prunlet\config.json'
 
 復元途中で停止した場合も、同じ操作IDを指定します。ready記録のあるstageは内容の識別情報・ACL・属性を照合して再開します。readyがないstageや照合不一致は保全して停止するため、結果の`backupPath`と操作記録を保持してください。別の削除方法でstageを消したり、元パスへ手動でマージしたりしないでください。
 
+## sandboxとゴミ箱へのアクセス
+
+削除元への書込みが許可されていても、ホストのsandbox内でWindowsゴミ箱への実効的な書込み権限を取得できるとは限りません。書込みルートの指定だけでゴミ箱へのアクセスを推定しないでください。ファイルの`delete --dry-run`は実際のShell移動を行わないため、成功してもゴミ箱への書込み許可までは確認できません。`COPYENGINE_E_ACCESS_DENIED_SRC`（`0x80270021`）だけから元対象のACL破損と判断せず、実行元のsandbox条件とゴミ箱へのアクセスも切り分けます。
+
+必要な範囲の許可はホストの正式な権限審査で取得します。対応するCodexの`exec_command`では、ファイル・フォルダーの実削除と復元を初回から`sandbox_permissions: "require_escalated"`で申請します。これはWindowsの管理者起動とは別の条件で、Prunlet自身による自動昇格や承認ポリシーの無効化は行いません。既に`ambiguous`となった操作は許可取得だけを根拠に再送せず、操作記録と元対象・ゴミ箱のFile ID、ACLを照合して状態を確認します。別shell・別APIへの付替えや永久削除へのfallbackは行いません。
+
 ## 使用中のファイルと同時実行
 
 同じ復元領域を使う操作が重なった場合、Prunletは`maintenance.lock`が解放されるまで待ち、取得後に処理を続けます。大量操作で60秒を超えても、待ち時間だけを理由に失敗しません。待機中は元対象と復元データを変更しません。保持プロセスが終了するとOSがロックを解放します。待機自体を中止する場合はCLIを通常の方法で終了できます。ロックファイルは通常運用でも残るため、競合の解消を目的に削除しないでください。
@@ -112,6 +118,8 @@ MCPの1行とhookの入力全体は、UTF-16の文字数で1,048,576文字まで
 
 `Win32 6801`（`ERROR_RM_NOT_ACTIVE`）は、その実行コンテキストでレジストリのtransaction resource managerを利用できないことを示します。MSIX等から継承した仮想viewでも発生し得るため、番号だけでhiveの破損と判断しません。仮想view内のtransactionが利用できない場合は停止し、非transaction削除へfallbackしません。通常Windowsのレジストリを操作する場合は、以下の明示セッションを最初から選びます。
 
+`registry-delete --dry-run`とMCPの`delete_registry`の`dryRun`も、実削除と同じ原本キー・権限・再帰範囲でtransactionへの接続を確認します。値やキーの削除をstageせず、書込み・commitは行いません。接続できない場合は`would_delete`を返さず失敗します。dry-run後の外部変更や、その後の実削除の成功までは保証しません。
+
 切分けは次の読取りだけで行います。
 
 1. 失敗した起動元・親process列・SID・hive・32/64 view・対象の正確な名前とnative pathを記録します。predefined hive handle、`APPMODEL_ERROR_NO_PACKAGE`、`TokenIsAppSilo=false`やtokenのvirtualization無効だけでは継承viewを区別できません。
@@ -139,7 +147,9 @@ MCPの1行とhookの入力全体は、UTF-16の文字数で1,048,576文字まで
 2. Codexから同じexe・設定で、通常の`registry-delete`・`restore`、またはMCPの`delete_registry`・`restore_registry`を使います。dry-runも同じセッションで行います。ファイル操作は従来どおり呼出元で実行します。
 3. 接続が切れた場合は、通知された`operationId`を保持してCLIの`registry-reconcile <operationId>`、またはMCPの`reconcile_registry`で記録を確認します。削除要求を自動で再送しません。
 
-セッションはlocal接続・同じログオン・同じexeに限定し、要求ごとに呼出元をimpersonateします。セッションとCLI・MCPは通常同士、または利用者が明示起動した管理者同士で使います。UACで別のログオン識別子になったプロセスは、同じSIDでも接続を拒否します。完全ACLの保全・復元に必要な権限が呼出元になければ拒否し、セッション自身の権限を貸しません。期限後は新しい要求を受け付けず、処理中のCoreは安全に完了またはrollbackして終了します。未接続・期限切れ・設定やscopeの不一致では停止し、呼出元の仮想viewへ切り替えません。
+起動元はパッケージ外のプロセスであることも必要です。Store版PowerShellはtransactionに接続できてもpackage identityを持つため、このセッションの起動条件を満たしません。`pwsh`という名前だけに頼らず、使用するPowerShell 7の実行ファイルを絶対パスで指定します。パッケージ化された親の実行環境を引き継ぐ場合は、Windowsの「ファイル名を指定して実行」から利用者がその実行ファイルを明示起動します。絶対パスやpackage identityの不在だけでnativeと判断せず、Softwareの実体とtransaction接続の検査も維持します。
+
+セッションはlocal接続・同じログオン・同じexeに限定し、要求ごとに呼出元をimpersonateします。管理者でのセッションやCLI・MCPの起動も利用者が明示的に行います。管理者セッションへ通常clientが接続した場合も、要求はそのclientのtokenで実行し、不足する権限を補いません。UACで別のログオン識別子になったプロセスは、同じSIDでも接続を拒否します。完全ACLの保全・復元に必要な権限が呼出元になければ拒否し、セッション自身の権限を貸しません。期限後は新しい要求を受け付けず、処理中のCoreは安全に完了またはrollbackして終了します。未接続・期限切れ・設定やscopeの不一致では停止し、呼出元の仮想viewへ切り替えません。
 
 native scopeのmachine・SID・32/64 viewを復元記録とsnapshotへ結び付け、復元も同じscopeに限定します。scopeのない旧記録をnativeと推定しません。`registryScope`を省略した設定は従来の呼出元viewを使い、native記録をそこで復元することはできません。
 
