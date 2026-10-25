@@ -51,7 +51,9 @@ Shell APIは旧ハンドルrenameと同じ原子的な対象名固定を文書�
 
 レジストリ操作も`Core`へ集約する。CLIは`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <single-key-path>`、MCPは`delete_registry`と`restore_registry`を提供する。共通CLIの`restore`はファイルとレジストリを振り分け、MCPの`restore_files`はファイル操作に限定する。削除要求はview必須、値名省略はキー、空文字は既定値であり、値削除の再帰指定を拒否する。
 
-schema 5の`registry-manifest`・snapshot・intent・receiptで、未知の値型も含め型のuint値と生バイト列、キーごとのOwner・Group・DACL・SACL（Mandatory Labelを含む）を保持する。実削除は非トランザクションの対象または親HKEYを保持し、その同じオブジェクトをRootDirectory・空の相対名で`NtOpenKeyTransactedEx`に渡す。まず削除をトランザクション内へstageし、外部には元データが見える状態で、保持した非トランザクションHKEYからsnapshotを取得する。snapshot・manifest・intentのflushとハッシュ検証を済ませてからcommitし、完了receiptを永続化する。したがって外部に削除が確定する前に保全データが永続化される。dry-runは削除をstageしない読取り検査である。
+schema 5の`registry-manifest`・snapshot・intent・receiptで、未知の値型も含め型のuint値と生バイト列、キーごとのOwner・Group・DACL・SACL（Mandatory Labelを含む）を保持する。実削除は非トランザクションの対象または親HKEYを保持し、その同じオブジェクトをRootDirectory・空の相対名で`NtOpenKeyTransactedEx`に渡す。まず削除をトランザクション内へstageし、外部には元データが見える状態で、保持した非トランザクションHKEYからsnapshotを取得する。snapshot・manifest・intentのflushとハッシュ検証を済ませてからcommitし、完了receiptを永続化する。したがって外部に削除が確定する前に保全データが永続化される。
+
+dry-runは`SnapshotForDeletionPreflight`で実削除と同じ原本オブジェクト・アクセス権・再帰範囲を使い、各対象のtransaction接続を確認してsnapshotを読み、保持した名前の一致も確認する。削除のstage・書込み・commitは行わない。transaction非対応のviewを読取りだけで通過させて`would_delete`とすることを防ぐが、その後の外部変更や実削除の成功までは保証しない。
 
 snapshotを先に読んでから削除をstageすると、その間の外部書込みが成功したまま失われるおそれがあるため、この順序へ戻さない。先行stage後も非トランザクションの外部書込みが受理される場合はあるが、競合したcommitは失敗し、外部の新データを含む元対象を保全する。KTM非対応時の非トランザクション削除は行わない。完全なキーACL取得には`SeSecurityPrivilege`が必要であり、現在のトークンに存在する場合のみ一時有効化し、自動昇格しない。権限不足やsnapshot失敗ではcommitせずロールバックする。値には独立ACLがなく、親ACLを変更しない。
 

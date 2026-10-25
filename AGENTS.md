@@ -12,6 +12,8 @@ Windowsのファイル・フォルダー・レジストリ削除は、配置済�
 
 Prunletの[保持制御](DESIGN.md#復元データの自動整理)は旧schema 1〜4とレジストリschema 5を対象とし、既定7日・合計1 GiB、事前容量走査・整理前後の再走査・共通ロック・単一超過時だけの予算を維持する。新schema 6の実体はWindows管理で、Prunletの容量・期限・purge対象にしない。新規filedeleteは旧保持制御を起動せず、レジストリ削除前・明示maintain・非表示の定期保守で旧データを整理する。手動整理はCLI明示適用のみ、MCPへpurgeは追加しない。
 
+対応するCodexの`exec_command`では、ファイル・フォルダーの実削除と復元を初回から`sandbox_permissions: "require_escalated"`で申請する。Windowsの管理者起動とは区別し、dry-runの成功をゴミ箱へのアクセス許可の証拠にしない。[sandboxとゴミ箱へのアクセス](docs/integration.md#sandboxとゴミ箱へのアクセス)に従い、不確かな結果は記録と実体を照合してから判断する。
+
 ## ビルドと検証
 
 Windows、.NET 10 SDK、PowerShell 7を使う。ビルドは`scripts/Publish-Prunlet.ps1`に外部の絶対出力先を渡す。直接の`dotnet build` / `dotnet publish`でリポジトリへ出力しない。
@@ -36,7 +38,7 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 - 削除速度: 変更前exeと同条件で複数回比較し、安全性と内容・IDの保持、衝突時の非上書き、各試行・中央値を確認する。旧コピー方式の性能値を新方式へ流用しない。
 - 保持制御: schema 6の項目が期限・容量・purgeから除外されること、旧1〜4とレジストリ5の合算容量・整理前後走査・超過時予算・破損保全を確認する。定期タスクは所有者・既存設定保持・登録失敗時復旧も確認する。
 - 履歴圧縮: schema 4/5/6は理由付きretained、旧1/2/3は従来のNTFS圧縮、JSON内容一致・冪等性・ロック保全・容量集計分離を確認する。
-- レジストリ: `scripts/Verify-RegistryRecovery.ps1 -ExecutablePath <今回のexe> -OutputDirectory <外部絶対パス> -ReportPath <外部JSONパス>`を実行し、[専用検証手順](docs/verification.md#レジストリの削除と復元)に従って完全ACL・raw bytes・競合・曖昧な記録・混在予算・CLI/MCP/hookを確認する。native sessionの往復と切断後照合は別途実プロセスで確認し、MSIX仮想viewと通常Windowsの同名キーを同一視しない。権限・KTM・viewの未検証範囲を成功に数えない。
+- レジストリ: `scripts/Verify-RegistryRecovery.ps1 -ExecutablePath <今回のexe> -OutputDirectory <外部絶対パス> -ReportPath <外部JSONパス>`を実行し、[専用検証手順](docs/verification.md#レジストリの削除と復元)に従って完全ACL・raw bytes・競合・曖昧な記録・混在予算・CLI/MCP/hookを確認する。native sessionは同手順に従い`scripts/Verify-RegistrySession.ps1`のPrepare・Current・Runを実行し、current側の6801拒否時の保全と明示native側のCLI・MCP正常往復を同じ対象exeで確認する。通常・管理者の実際の起動tokenを区別し、MSIX仮想viewと通常Windowsの同名キーを同一視しない。権限・KTM・viewの未検証範囲を成功に数えない。
 
 リポジトリおよびCodex homeへ`bin`・`obj`・一時物・検証出力・バックアップを作らない。TEMP/TMP・ビルド・fixture・レポートには外部絶対パスを渡し、レポートの親を事前に作る。検証後の保持と清掃は[検証手順](docs/verification.md)に従う。移行前提が合わないスクリプトの失敗・未実行は合格扱いせず、未検証範囲を報告する。
 
