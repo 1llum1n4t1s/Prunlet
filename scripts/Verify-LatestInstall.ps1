@@ -503,6 +503,10 @@ try {
         $binding = $bindingMatch.Groups[1].Value | ConvertFrom-Json
         Assert-True ($binding.executablePath -ceq (Join-Path $instructionInstall 'bin\prunlet.exe') -and $binding.configPath -ceq (Join-Path $instructionInstall 'config.json')) 'CLI binding does not refer to the installed product.'
         Assert-True ([IO.File]::ReadAllText($instructionGuide).Contains('--paths-file')) 'Guide omits literal paths-file input.'
+        $registeredGuide = [IO.File]::ReadAllText($instructionGuide)
+        Assert-True ($registeredGuide.Contains('初回から `sandbox_permissions: "require_escalated"`') -and $registeredGuide.Contains('login: false, sandbox_permissions: "require_escalated"')) 'Guide omits the initial formal sandbox permission request or its CMD example.'
+        Assert-True ($registeredGuide.Contains('WindowsのUAC昇格や管理者実行ではない') -and $registeredGuide.Contains('成功しても実処理に必要な権限を保証しない')) 'Guide omits the UAC distinction or dry-run permission limitation.'
+        Assert-True ($registeredGuide.Contains('同じ削除を自動再送しない') -and $registeredGuide.Contains('状態を照合') -and $registeredGuide.Contains('元の削除許可とホストの承認・管理ポリシーを守る')) 'Guide omits uncertain-state reconciliation or preserves no host policy boundary.'
         $withoutBlock = [regex]::Replace($agentText, '<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->\r\n[\s\S]*?\r\n<!-- END PRUNLET AGENT-INSTRUCTIONS -->\r\n', '')
         Assert-True ($withoutBlock -ceq $originalAgentText) 'Existing AGENTS body or newlines changed.'
         $bytes = [IO.File]::ReadAllBytes($instructionAgents)
@@ -734,7 +738,13 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
                         $errorText = $errorTask.GetAwaiter().GetResult()
                         Assert-True ($runner.ExitCode -eq 0) ('Registered hook failed under ' + $variant.name + '/' + $shell + ': ' + $errorText)
                         $parsed = $output | ConvertFrom-Json -Depth 20
-                        if ($command.StartsWith('del ')) { Assert-True ($parsed.hookSpecificOutput.permissionDecision -eq 'deny' -and !$parsed.hookSpecificOutput.updatedInput) ('Raw deletion was not denied under ' + $shell) }
+                        if ($command.StartsWith('del ')) {
+                            Assert-True ($parsed.hookSpecificOutput.permissionDecision -eq 'deny' -and !$parsed.hookSpecificOutput.updatedInput) ('Raw deletion was not denied under ' + $shell)
+                            $reason = $parsed.hookSpecificOutput.permissionDecisionReason
+                            Assert-True ($reason.Contains('sandbox_permissions="require_escalated"') -and $reason.Contains('first real file deletion or restore') -and $reason.Contains('not Windows UAC or administrator elevation')) 'Hook omits the formal initial sandbox permission request or its UAC distinction.'
+                            Assert-True ($reason.Contains('A dry-run does not prove real-operation permissions') -and $reason.Contains('reconcile uncertain results')) 'Hook omits dry-run limitations or uncertain-state reconciliation.'
+                            Assert-True ($reason.Contains('Existing host approvals and policies still apply') -and $reason.Contains('Do not retry a policy-rejected target through another route')) 'Hook no longer preserves host approval and policy boundaries.'
+                        }
                         else { Assert-True (!$parsed.hookSpecificOutput) ('Ordinary command was blocked under ' + $shell) }
                         Assert-True ((Get-FileHash -LiteralPath $sentinel).Hash -eq $sentinelHash) 'Hook caused a deletion or changed its sentinel.'
                     } finally { $runner.Dispose() }
