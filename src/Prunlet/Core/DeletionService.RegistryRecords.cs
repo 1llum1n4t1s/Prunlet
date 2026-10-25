@@ -200,9 +200,21 @@ public sealed partial class DeletionService
         {
             if (actual.ValueKind != JsonValueKind.Object || actual.EnumerateObject().Count() != canonical.EnumerateObject().Count())
                 throw new InvalidDataException("Registry metadata is missing required fields.");
+            // ACLの相対パス辞書は数万項目になる。各項目の線形探索を繰り返さず、
+            // 小さな固定field以外はordinal索引を一度だけ作り、全fieldの照合を維持する。
+            Dictionary<string, JsonElement>? indexed = null;
+            if (canonical.EnumerateObject().Count() > 16)
+            {
+                indexed = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+                foreach (var property in actual.EnumerateObject())
+                    if (!indexed.TryAdd(property.Name, property.Value))
+                        throw new InvalidDataException("Registry metadata contains duplicate properties.");
+            }
             foreach (var property in canonical.EnumerateObject())
             {
-                if (!actual.TryGetProperty(property.Name, out var found)) throw new InvalidDataException("Registry metadata is missing a required field.");
+                var present = indexed is null ? actual.TryGetProperty(property.Name, out var found)
+                    : indexed.TryGetValue(property.Name, out found);
+                if (!present) throw new InvalidDataException("Registry metadata is missing a required field.");
                 RequireRegistryFields(found, property.Value);
             }
         }
@@ -210,8 +222,12 @@ public sealed partial class DeletionService
         {
             if (actual.ValueKind != JsonValueKind.Array || actual.GetArrayLength() != canonical.GetArrayLength())
                 throw new InvalidDataException("Registry metadata array is invalid.");
-            var index = 0;
-            foreach (var child in canonical.EnumerateArray()) RequireRegistryFields(actual[index++], child);
+            var actualItems = actual.EnumerateArray();
+            foreach (var child in canonical.EnumerateArray())
+            {
+                if (!actualItems.MoveNext()) throw new InvalidDataException("Registry metadata array is invalid.");
+                RequireRegistryFields(actualItems.Current, child);
+            }
         }
         else if (actual.ValueKind != canonical.ValueKind)
             throw new InvalidDataException("Registry metadata scalar type is invalid.");

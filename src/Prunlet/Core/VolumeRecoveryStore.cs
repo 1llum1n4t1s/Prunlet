@@ -24,8 +24,13 @@ internal static class VolumeRecoveryStore
     internal static string StoreKey(string metadataRoot)
     {
         var canonical = PathPolicy.Resolve(metadataRoot, finalDirectory: true, allowMissing: false);
-        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical.ToUpperInvariant() + "\n" + OwnerSid)))[..32];
+        return StoreKeyFromResolvedRoot(canonical);
     }
+
+    // 呼出し元で直前に物理解決したパスだけを受け、同じ祖先を再度開く処理を省く。
+    // SIDは呼出しごとに取得し、設定や実行主体をまたぐキャッシュは持たない。
+    private static string StoreKeyFromResolvedRoot(string canonical) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical.ToUpperInvariant() + "\n" + OwnerSid)))[..32];
 
     internal static string ExpectedRoot(PrunletConfig config, string sourcePath) => Location(config, sourcePath).Root;
 
@@ -200,7 +205,7 @@ internal static class VolumeRecoveryStore
             throw new IOException("Recovery directory and source must belong to the same volume; copying is not permitted.");
         if (PathPolicy.Within(privateBase, metadata) || PathPolicy.Within(metadata, privateBase))
             throw new IOException("The volume recovery directory and central metadata directory must not contain each other.");
-        var storeKey = StoreKey(metadata);
+        var storeKey = StoreKeyFromResolvedRoot(metadata);
         return new StoreLocation(privateBase, Path.Combine(privateBase, storeKey), metadata, storeKey, volumeName);
     }
 

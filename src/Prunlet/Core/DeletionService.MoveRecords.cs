@@ -68,7 +68,7 @@ public sealed partial class DeletionService
             }
             foreach (var entry in operation.Manifest.Entries)
             {
-                ValidateMoveReceiptCombination(entry, operation.Streams.Keys);
+                ValidateMoveReceiptCombination(entry, operation.Streams.ContainsKey);
                 foreach (var action in new[] { "restore", "purge" })
                     if (operation.Streams.ContainsKey(ReceiptName(entry, action, "complete"))
                         && !operation.Streams.ContainsKey(ReceiptName(entry, action, "intent")))
@@ -209,14 +209,17 @@ public sealed partial class DeletionService
         MoveReceiptActions.Contains((action, phase));
 
     private static void ValidateMoveReceiptCombination(MoveEntry entry, IEnumerable<string> names)
+        => ValidateMoveReceiptCombination(entry, names.ToHashSet(StringComparer.Ordinal).Contains);
+
+    private static void ValidateMoveReceiptCombination(MoveEntry entry, Func<string, bool> contains)
     {
-        var receipts = names.ToHashSet(StringComparer.Ordinal);
-        if (receipts.Contains(ReceiptName(entry, "move", "cancelled"))
+        // 読取り中のordinal辞書はそのまま照会し、entryごとの全receipt複製を避ける。
+        if (contains(ReceiptName(entry, "move", "cancelled"))
             && MoveReceiptActions.Any(action => action != ("move", "cancelled")
-                && receipts.Contains(ReceiptName(entry, action.Action, action.Phase))))
+                && contains(ReceiptName(entry, action.Action, action.Phase))))
             throw new InvalidDataException("Cancelled move evidence conflicts with move, restore, or purge evidence.");
-        if (receipts.Contains(ReceiptName(entry, "restore", "complete"))
-            && (receipts.Contains(ReceiptName(entry, "purge", "intent")) || receipts.Contains(ReceiptName(entry, "purge", "complete"))))
+        if (contains(ReceiptName(entry, "restore", "complete"))
+            && (contains(ReceiptName(entry, "purge", "intent")) || contains(ReceiptName(entry, "purge", "complete"))))
             throw new InvalidDataException("Restore and purge completion evidence conflicts.");
     }
 
@@ -225,7 +228,7 @@ public sealed partial class DeletionService
         if (ReadMoveReceipt(operation, entry, "move", "cancelled") is null) return false;
         foreach (var action in MoveReceiptActions)
             if (action != ("move", "cancelled")) _ = ReadMoveReceipt(operation, entry, action.Action, action.Phase);
-        ValidateMoveReceiptCombination(entry, operation.Streams.Keys);
+        ValidateMoveReceiptCombination(entry, operation.Streams.ContainsKey);
         using var store = OpenRecordedMoveStore(operation, entry);
         if (InspectMoveLocation(MovePayloadPath(operation.Manifest, entry)) is not null)
             throw new InvalidDataException("A cancelled move still has a recovery payload; it was retained.");
