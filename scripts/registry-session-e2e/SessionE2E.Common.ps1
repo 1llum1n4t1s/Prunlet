@@ -1,4 +1,9 @@
-$ErrorActionPreference='Stop'
+﻿$ErrorActionPreference='Stop'
+if ([IO.File]::Exists((Join-Path $PSScriptRoot 'settings.json')) -and !$script:LaunchPins) {
+ . (Join-Path $PSScriptRoot 'SessionLaunch.ps1')
+ $script:LaunchPrepared=OpenPreparedPins (Join-Path $PSScriptRoot 'settings.json')
+}
+
 $utf8=[Text.UTF8Encoding]::new($false)
 $env:TEMP=Join-Path $PSScriptRoot 'temp';$env:TMP=$env:TEMP
 $env:RTK_TEE_DIR=Join-Path $PSScriptRoot 'temp';$env:RTK_LOG_DIR=$env:RTK_TEE_DIR
@@ -76,13 +81,15 @@ function McpStop($p){$p.StandardInput.Close();if(!$p.WaitForExit(15000)){$p.Kill
 function LoadFixture{
  if(!('PrunletRegistryE2E'-as[type])){Add-Type -Path (Join-Path $PSScriptRoot 'FixtureNative.cs')}
  if(!('SessionE2ENative'-as[type])){Add-Type -Path (Join-Path $PSScriptRoot 'SessionFixture.cs')}
+ if(!('SessionLaunchNative'-as[type])){Add-Type -Path (Join-Path $PSScriptRoot 'SessionLaunchNative.cs')}
  [PrunletRegistryE2E]::Configure($false,$script:RunRelative)
 }
 function NativeRequest([string]$Action,$Data=@{}){
+ if($script:LaunchPrepared){AssertLaunchLease $script:LaunchPrepared -RequirePermit}
  $id=[guid]::NewGuid().ToString('N');$request=Join-Path $PSScriptRoot ('request-'+$id+'.json');$reply=Join-Path $PSScriptRoot ('reply-'+$id+'.json')
  # 発行途中のJSONをcontrollerが読まないよう、完成した一意ファイルを公開する。
  $pending=Join-Path $PSScriptRoot ('pending-'+$id+'.json')
- SaveJson $pending @{action=$Action;data=$Data;id=$id};[IO.File]::Move($pending,$request)
+ SaveJson $pending @{action=$Action;data=$Data;id=$id;nonce=(ReadJson (Join-Path $PSScriptRoot 'settings.json')).nonce;expiresTicks=[DateTime]::UtcNow.AddMinutes(3).Ticks};[IO.File]::Move($pending,$request)
  $sw=[Diagnostics.Stopwatch]::StartNew();while(![IO.File]::Exists($reply)){if($sw.Elapsed.TotalSeconds-gt 200){throw 'Native controller timeout'};Start-Sleep -Milliseconds 150}
  $r=ReadJson $reply;Assert $r.success ('Native controller: '+$r.error);return $r.result
 }

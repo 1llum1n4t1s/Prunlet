@@ -1,4 +1,5 @@
-param([Parameter(Mandatory)][string]$SettingsPath)
+﻿param([Parameter(Mandatory)][string]$SettingsPath,[ValidatePattern('^[0-9a-f]{32}$')][string]$LaunchNonce)
+$script:AutomaticLaunchNonce=$LaunchNonce
 . (Join-Path $PSScriptRoot 'SessionE2E.Common.ps1')
 $settings=ReadJson $SettingsPath;$script:ExecutablePath=$settings.executablePath;$script:Config=$settings.highConfig;$script:RunRelative=$settings.runRelative
 AssertPreparedSettings $settings
@@ -10,19 +11,23 @@ function StartOwnedClient([switch]$Cleanup){
  $info=[Diagnostics.ProcessStartInfo]::new($powerShellHostPath)
  $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WorkingDirectory=$PSScriptRoot
  foreach($argument in @('-NoProfile','-File',(Join-Path $PSScriptRoot 'ElevatedClient.ps1'),'-SettingsPath',$SettingsPath)){$info.ArgumentList.Add($argument)}
+ if($script:AutomaticLaunchObserved-or$script:AutomaticLaunchNonce){
+  $info.ArgumentList.Add('-LaunchNonce');$info.ArgumentList.Add($settings.nonce)
+ }
  if($Cleanup){$info.ArgumentList.Add('-Cleanup')}
  $process=[Diagnostics.Process]::new();$process.StartInfo=$info;$null=$process.Start();return $process
 }
 $currentOperations=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 try{
  LoadFixture
- $tokenInfo=[SessionE2ENative]::TokenInfo()
+ $tokenInfo=[SessionE2ENative]::TokenInfo();AssertLaunchRole $settings $true
  $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
  Assert ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'Start this fixture controller explicitly from an administrator desktop shell'
  Assert (![SessionE2ENative]::Packaged()) 'Controller remains packaged; no fixture created'
  $existingRoot=[PrunletRegistryE2E]::Open($script:RunRelative,64)
  if($existingRoot){$existingRoot.Dispose();throw 'Prepared native run root already exists; no fixture mutation allowed'}
  $privilege=[PrunletRegistryE2E]::EnableSecurity();Assert $privilege 'Native fixture controller lacks SeSecurityPrivilege'
+ AssertLaunchLease $settings
  $session=Child @('registry-session','--minutes','30','--assert-native-windows')
  $stderr=$session.StandardError.ReadToEndAsync();$readyLine=$session.StandardOutput.ReadLineAsync()
  if(!$readyLine.Wait(30000)){throw 'Session readiness timeout'}
@@ -30,12 +35,18 @@ try{
  Assert ($ready.status-eq'registry_session_ready') ('Session readiness: '+$ready.error)
  $descriptor=ReadCapability (ReadJson $settings.highConfig).registrySessionFile
  Assert ($descriptor.authenticationId-ceq$tokenInfo.authenticationId) 'Administrator helper and session AuthID differ'
- SaveJson (Join-Path $PSScriptRoot 'controller-ready.json') @{success=$true;controllerPid=$PID;powerShellHostPath=$powerShellHostPath;tokenInfo=$tokenInfo;authenticationId=$descriptor.authenticationId;sessionPid=$session.Id;packaged=$false;securityPrivilege=$privilege;scope=$ready.scope;expiresUtc=$ready.expiresUtc;sessionFile=$ready.sessionFile}
+ SaveJson (Join-Path $PSScriptRoot 'controller-ready.json') @{success=$true;nonce=$settings.nonce;creationTicks=[Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks;controllerPid=$PID;powerShellHostPath=$powerShellHostPath;tokenInfo=$tokenInfo;authenticationId=$descriptor.authenticationId;sessionPid=$session.Id;packaged=$false;securityPrivilege=$privilege;scope=$ready.scope;expiresUtc=$ready.expiresUtc;sessionFile=$ready.sessionFile}
+ while([IO.File]::Exists((Join-Path $PSScriptRoot 'start-claim.json'))-and![IO.File]::Exists((Join-Path $PSScriptRoot 'run-permit.json'))){AssertLaunchLease $settings;WaitLaunchChange}
+ AssertLaunchLease $settings -RequirePermit
  $stop=$false
  while(!$stop){
+  AssertLaunchLease $settings -RequirePermit
+  if([IO.File]::Exists((Join-Path $PSScriptRoot 'stop-controller.json'))){break}
   foreach($file in [IO.Directory]::EnumerateFiles($PSScriptRoot,'request-*.json')){
    $request=ReadJson $file;$reply=Join-Path $PSScriptRoot ('reply-'+$request.id+'.json');if([IO.File]::Exists($reply)){continue}
    try{
+    AssertLaunchLease $settings -RequirePermit
+    Assert ($request.nonce-ceq$settings.nonce-and[long]$request.expiresTicks-gt[DateTime]::UtcNow.Ticks) 'Stale fixture request'
     $d=$request.data;$result=$null
     if($d.ContainsKey('leaf')){Assert ($d.leaf-match'^[a-z][a-z0-9-]{0,60}$') 'Unsafe fixture leaf'}
     switch($request.action){
@@ -92,11 +103,12 @@ try{
     SaveJson $reply @{success=$true;result=$result}
    }catch{SaveJson $reply @{success=$false;error=$_.Exception.Message}}
   }
-  if(!$stop){Start-Sleep -Milliseconds 100}
+  if(!$stop){WaitLaunchChange}
  }
 }catch{SaveJson (Join-Path $PSScriptRoot 'controller-error.json') @{success=$false;error=$_.Exception.Message;pid=$PID;powerShellHostPath=$powerShellHostPath;tokenInfo=$tokenInfo};exit 1}
 finally{
  if($adminClient){if(!$adminClient.HasExited){$adminClient.Kill($true);$adminClient.WaitForExit()};$adminClient.Dispose()}
  if($session){if(!$session.HasExited){$session.Kill($true);$session.WaitForExit()};$session.Dispose()}
+ ClosePreparedPins
  SaveJson (Join-Path $PSScriptRoot 'controller-stopped.json') @{sessionStopped=$true;controllerPid=$PID}
 }

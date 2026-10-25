@@ -1,9 +1,10 @@
-param(
+﻿param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
     [string]$MoveExecutablePath,
-    [ValidateSet('Prepare', 'Current', 'Run')][string]$Mode = 'Prepare',
+    [switch]$AssertNativeWindows,
+    [ValidateSet('Prepare', 'Start', 'Current', 'Run')][string]$Mode = 'Prepare',
     [ValidateSet(-1, 0, 6801)][int]$ExpectedCurrentSoftwareTransactionError = -1
 )
 $ErrorActionPreference = 'Stop'
@@ -46,7 +47,7 @@ if ($Mode -eq 'Prepare') {
         $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($principal, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit', [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
     }
     $null = [IO.FileSystemAclExtensions]::CreateDirectory($security, $OutputDirectory)
-    foreach ($name in @('SessionE2E.Common.ps1','SessionLockCases.ps1','Invoke-SessionE2E.ps1','NativeController.ps1','LimitedSession.ps1','ElevatedClient.ps1','FixtureNative.cs','SessionFixture.cs')) {
+    foreach ($name in @('SessionLaunch.ps1','SessionLaunchNative.cs','SessionE2E.Common.ps1','SessionLockCases.ps1','Invoke-SessionE2E.ps1','NativeController.ps1','LimitedSession.ps1','ElevatedClient.ps1','FixtureNative.cs','SessionFixture.cs')) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('registry-session-e2e\' + $name)) -Destination (Join-Path $OutputDirectory $name)
     }
     $null = [IO.Directory]::CreateDirectory((Join-Path $OutputDirectory 'temp'))
@@ -72,14 +73,25 @@ if ($Mode -eq 'Prepare') {
         $high = $normal.Clone(); $high.registrySessionFile = Join-Path $OutputDirectory 'native-high-session.json'
         $highConfigPath = Join-Path $OutputDirectory 'high-config.json'; SaveJson $highConfigPath $high
         $registryVerificationScriptPath = Join-Path $PSScriptRoot 'Verify-RegistryRecovery.ps1'
-        SaveJson $settingsPath @{executablePath=$ExecutablePath; executableSha256=(Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash; powerShellHostPath=$powerShellHostPath; moveExecutablePath=$MoveExecutablePath; moveExecutableSha256=$(if ($MoveExecutablePath) {(Get-FileHash -LiteralPath $MoveExecutablePath -Algorithm SHA256).Hash} else {$null}); registryVerificationScriptPath=$registryVerificationScriptPath; registryVerificationScriptSha256=(Get-FileHash -LiteralPath $registryVerificationScriptPath -Algorithm SHA256).Hash; config=$nativeConfigPath; highConfig=$highConfigPath; currentConfig=$currentConfigPath; runRelative=('Software\PrunletE2E\' + [guid]::NewGuid().ToString('N')); recovery=$recovery; reportPath=$ReportPath; expectedCurrentSoftwareTransactionError=$ExpectedCurrentSoftwareTransactionError}
+        if (!('SessionE2ENative' -as [type])) { Add-Type -Path (Join-Path $OutputDirectory 'SessionFixture.cs') }
+        SaveJson $settingsPath @{preparedToken=[SessionE2ENative]::TokenInfo();configFingerprints=@{config=[SessionE2ENative]::Fingerprint([IO.File]::ReadAllText($nativeConfigPath));highConfig=[SessionE2ENative]::Fingerprint([IO.File]::ReadAllText($highConfigPath))};executablePath=$ExecutablePath; executableSha256=(Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash; powerShellHostPath=$powerShellHostPath; moveExecutablePath=$MoveExecutablePath; moveExecutableSha256=$(if ($MoveExecutablePath) {(Get-FileHash -LiteralPath $MoveExecutablePath -Algorithm SHA256).Hash} else {$null}); registryVerificationScriptPath=$registryVerificationScriptPath; registryVerificationScriptSha256=(Get-FileHash -LiteralPath $registryVerificationScriptPath -Algorithm SHA256).Hash; config=$nativeConfigPath; highConfig=$highConfigPath; currentConfig=$currentConfigPath; runRelative=('Software\PrunletE2E\' + [guid]::NewGuid().ToString('N')); recovery=$recovery; reportPath=$ReportPath; expectedCurrentSoftwareTransactionError=$ExpectedCurrentSoftwareTransactionError}
     } finally { $env:TEMP = $oldTemp; $env:TMP = $oldTmp }
-    # 通常sessionと管理者controllerは利用者が別々に明示起動する。自動昇格・タスク登録をしない。
+    $preparedSettings = [IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json -AsHashtable
+    $preparedSettings.schema = 2; $preparedSettings.nonce = [guid]::NewGuid().ToString('N')
+    $preparedSettings.inputs = @()
+    $preparedInputs = @([IO.Directory]::EnumerateFiles($OutputDirectory) | Where-Object { [IO.Path]::GetExtension($_) -in @('.ps1','.cs') }) + @($PSCommandPath, (Join-Path $PSScriptRoot 'registry-session-e2e\SessionLaunch.ps1'), $registryVerificationScriptPath, (Join-Path $PSScriptRoot 'Verification-Common.ps1'), $ExecutablePath, $powerShellHostPath)
+    if ($MoveExecutablePath) { $preparedInputs += $MoveExecutablePath }
+    foreach ($preparedInput in ($preparedInputs | Select-Object -Unique)) {
+        $preparedSettings.inputs += @{path=[IO.Path]::GetFullPath($preparedInput);sha256=(Get-FileHash -LiteralPath $preparedInput -Algorithm SHA256).Hash}
+    }
+    SaveJson $settingsPath $preparedSettings
+    # manualコマンドは診断互換として保持する。通常の検証起動はStartで同一scopeへ限定する。
     $quote = { param($value) "'" + $value.Replace("'", "''") + "'" }
     $hostCommand = '& ' + (& $quote $powerShellHostPath)
     [ordered]@{
-        status='awaiting_explicit_desktop_sessions'
+        status='prepared';schema=2;startRequiresAssertNativeWindows=$true
         powerShellHostPath=$powerShellHostPath
+        startCommand=($hostCommand + ' -NoProfile -File ' + (& $quote $PSCommandPath) + ' -Mode Start -AssertNativeWindows -ExecutablePath ' + (& $quote $ExecutablePath) + ' -OutputDirectory ' + (& $quote $OutputDirectory) + ' -ReportPath ' + (& $quote $ReportPath))
         currentCommand=($hostCommand + ' -NoProfile -File ' + (& $quote $PSCommandPath) + ' -Mode Current -ExecutablePath ' + (& $quote $ExecutablePath) + ' -OutputDirectory ' + (& $quote $OutputDirectory) + ' -ReportPath ' + (& $quote $ReportPath))
         normalDesktopCommand=($hostCommand + ' -NoProfile -File ' + (& $quote (Join-Path $OutputDirectory 'LimitedSession.ps1')) + ' -SettingsPath ' + (& $quote $settingsPath))
         normalRunDialogCommand=('"' + $powerShellHostPath + '" -NoProfile -File "' + (Join-Path $OutputDirectory 'LimitedSession.ps1') + '" -SettingsPath "' + $settingsPath + '"')
@@ -91,8 +103,21 @@ if ($Mode -eq 'Prepare') {
     exit 0
 }
 if (![IO.File]::Exists($settingsPath)) { throw 'Run requires a successful Prepare.' }
-$settings = [IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json -AsHashtable
+. (Join-Path $PSScriptRoot 'registry-session-e2e\SessionLaunch.ps1')
+$script:LaunchScopeRoot = $OutputDirectory
+$settings = OpenPreparedPins $settingsPath
+$script:LaunchPrepared=$settings
+. (Join-Path $OutputDirectory 'SessionE2E.Common.ps1')
+AssertPreparedSettings $settings
+if (!('SessionE2ENative' -as [type])) { Add-Type -Path (Join-Path $OutputDirectory 'SessionFixture.cs') }
+if (!('SessionLaunchNative' -as [type])) { Add-Type -Path (Join-Path $OutputDirectory 'SessionLaunchNative.cs') }
+$script:LaunchScopeRoot = $OutputDirectory
 if ($settings.executablePath -cne $ExecutablePath -or $settings.reportPath -cne $ReportPath -or $settings.executableSha256 -cne (Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash) { throw 'Prepared executable/report changed.' }
+if ($Mode -eq 'Start') {
+    if (!$AssertNativeWindows) { throw 'Start requires explicit -AssertNativeWindows.' }
+    StartPreparedDesktopSessions $settings $OutputDirectory $settingsPath
+    exit 0
+}
 if ($Mode -eq 'Current') {
     $currentReport = Join-Path $OutputDirectory 'current-probes-report.json'
     if (Test-Path -LiteralPath $currentReport) { throw 'Current probes already ran; use a new prepared directory.' }
@@ -102,8 +127,14 @@ if ($Mode -eq 'Current') {
 foreach ($name in @('controller-ready.json','limited-ready.json')) {
     if (![IO.File]::Exists((Join-Path $OutputDirectory $name))) { throw "Missing explicit desktop session: $name. Run both prepared desktop commands first." }
 }
-if (Test-Path -LiteralPath (Join-Path $OutputDirectory 'run-started.json')) { throw 'Run directory already consumed; Prepare a new directory.' }
-[IO.File]::WriteAllText((Join-Path $OutputDirectory 'run-started.json'), '{"started":true}', $utf8)
+AssertLaunchReady $settings
+$runRecord=LaunchProcessRecord; $runRecord.nonce=$settings.nonce
+NewLaunchRecord (Join-Path $OutputDirectory 'run-started.json') $runRecord
+if ([IO.File]::Exists((Join-Path $OutputDirectory 'start-claim.json'))) {
+    AssertLaunchLease $settings
+    if (![IO.File]::Exists((Join-Path $OutputDirectory 'start-committed.json'))) { throw 'Start did not commit.' }
+    NewLaunchRecord (Join-Path $OutputDirectory 'run-permit.json') $runRecord
+}
 $oldTemp = $env:TEMP; $oldTmp = $env:TMP
 try {
     & (Join-Path $OutputDirectory 'Invoke-SessionE2E.ps1') -ExecutablePath $ExecutablePath -ReportPath $ReportPath -ExpectedCurrentSoftwareTransactionError $settings.expectedCurrentSoftwareTransactionError

@@ -6,7 +6,7 @@ Windowsのファイル・フォルダー・レジストリ削除は、配置済�
 
 削除対象フォルダーの許可リストは設けず、`allowedRoots`は互換入力として扱う。新規ファイル・フォルダーはschema 6でWindowsのゴミ箱へ移し、操作intent・PIDL・File ID・全項目のOwner/Group/DACLを永続化してCLI・MCPの非上書き復元へ結び付ける。復元時は[設計](DESIGN.md#削除と復元のデータフロー)に従い、同一ボリュームstageのintent・完全照合・ready・非上書き公開の順序を維持する。readyのない既存stageや公開済み原本へACL・属性を再適用しない。永久削除・独自退避へのfallback、自動昇格、リンク先の走査は追加しない。中央metadata・復元stage・既存のボリューム別専用領域を保護する。schema 1/2/3のコピーとschema 4の専用renameは既存記録の復元・整理の互換経路に限定する。フックはネイティブexeによる検査・拒否とCLI案内だけを担当し、ホストの承認・管理ポリシーを維持する。
 
-レジストリ変更では[レジストリの設計](DESIGN.md#レジストリの削除と復元)のstage・snapshot・永続化・commitの順序、完全なsecurity bytesの照合、schema 5の作成時からの非公開ACL、曖昧な状態の保全を維持する。非トランザクション削除へのfallbackや自動昇格は追加しない。native sessionは利用者の明示起動・scope選択を必要とし、切断時は同じ削除を再送せず`registry-reconcile <operation-id>`で照合する。
+レジストリ変更では[レジストリの設計](DESIGN.md#レジストリの削除と復元)のstage・snapshot・永続化・commitの順序、完全なsecurity bytesの照合、schema 5の作成時からの非公開ACL、曖昧な状態の保全を維持する。非トランザクション削除へのfallbackは追加しない。native sessionはscopeの明示選択を必要とする。検証用の起動は固定したPrepare入力に対する`Start -AssertNativeWindows`で行い、UACの同意を代行せず、実token・期限・入力固定・Run permitを検査する。切断時は同じ削除を再送せず`registry-reconcile <operation-id>`で照合する。
 
 並列削除・ハードリンク復元の変更では[削除と復元のデータフロー](DESIGN.md#削除と復元のデータフロー)のclaim取得順、全preflight完了後のmanifest公開、process共通worker上限、hardlink検出時の排他再実行を維持する。共有実体の復元はtransition chainと単一group-readyに従い、旧schema 6へ証拠を後付けしない。MCPの要求枠と削除worker枠を分け、レジストリのprivilege変更をfile workerと並行させない。
 
@@ -38,7 +38,7 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 - 削除速度: 変更前exeと同条件で複数回比較し、安全性と内容・IDの保持、衝突時の非上書き、各試行・中央値を確認する。旧コピー方式の性能値を新方式へ流用しない。
 - 保持制御: schema 6の項目が期限・容量・purgeから除外されること、旧1〜4とレジストリ5の合算容量・整理前後走査・超過時予算・破損保全を確認する。定期タスクは所有者・既存設定保持・登録失敗時復旧も確認する。
 - 履歴圧縮: schema 4/5/6は理由付きretained、旧1/2/3は従来のNTFS圧縮、JSON内容一致・冪等性・ロック保全・容量集計分離を確認する。
-- レジストリ: `scripts/Verify-RegistryRecovery.ps1 -ExecutablePath <今回のexe> -OutputDirectory <外部絶対パス> -ReportPath <外部JSONパス>`を実行し、[専用検証手順](docs/verification.md#レジストリの削除と復元)に従って完全ACL・raw bytes・競合・曖昧な記録・混在予算・CLI/MCP/hookを確認する。native sessionは同手順に従い`scripts/Verify-RegistrySession.ps1`のPrepare・Current・Runを実行し、current側の6801拒否時の保全と明示native側のCLI・MCP正常往復を同じ対象exeで確認する。通常・管理者の実際の起動tokenを区別し、MSIX仮想viewと通常Windowsの同名キーを同一視しない。権限・KTM・viewの未検証範囲を成功に数えない。
+- レジストリ: `scripts/Verify-RegistryRecovery.ps1 -ExecutablePath <今回のexe> -OutputDirectory <外部絶対パス> -ReportPath <外部JSONパス>`を実行し、[専用検証手順](docs/verification.md#レジストリの削除と復元)に従って完全ACL・raw bytes・競合・曖昧な記録・混在予算・CLI/MCP/hookを確認する。native sessionは同手順に従い`scripts/Verify-RegistrySession.ps1`のPrepare・Start（`-AssertNativeWindows`）・Current・Runを実行し、current側の6801拒否時の保全と明示native側のCLI・MCP正常往復を同じ対象exeで確認する。通常・管理者の実際の起動tokenを区別し、MSIX仮想viewと通常Windowsの同名キーを同一視しない。権限・KTM・viewの未検証範囲を成功に数えない。
 
 リポジトリおよびCodex homeへ`bin`・`obj`・一時物・検証出力・バックアップを作らない。TEMP/TMP・ビルド・fixture・レポートには外部絶対パスを渡し、レポートの親を事前に作る。検証後の保持と清掃は[検証手順](docs/verification.md)に従う。移行前提が合わないスクリプトの失敗・未実行は合格扱いせず、未検証範囲を報告する。
 

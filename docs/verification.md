@@ -45,9 +45,11 @@ TEMP/TMP・runtime展開・metadata・レポートは外部D絶対パスへ隔�
 
 最終書込み時刻・volatile寿命等の全状態保持を検証済みと扱わない。Codex実ホストでのフック読込み・共通guide選択・承認は、プロセスE2Eと分けて確認する。
 
-明示native sessionでは、Codex側の通常CLI・MCPを実際に起動して同じnative scopeの値を削除・復元する。通常clientと利用者が明示起動した管理者clientの結果を分け、セッションの実際の起動tokenも記録する。同じSIDでも別ログオン識別子からの接続は拒否する。管理者セッションでの検証を通常tokenで起動したセッションの検証に数えない。通常clientの完全ACL権限不足は正常往復の成功に数えない。RPC後の`kind`、`allowedRoots:null`とvolumeパスのslash・末尾区切りを含む設定照合、期限切れ・未接続・capability/peer/scope/config改変、scope欠落の旧記録、接続断後のoperationId照合、60秒超の共通ロック待機とMCP進捗を確認する。元のMSIX仮想viewをnativeの同名キーと同一視せず、清掃不能なprivate fixtureを新規作成しない。
+明示native sessionでは、Codex側の通常CLI・MCPを実際に起動して同じnative scopeの値を削除・復元する。通常clientと専用の管理者clientの結果を分け、セッションの実際の起動tokenも記録する。同じSIDでも別ログオン識別子からの接続は拒否する。管理者セッションでの検証を通常tokenで起動したセッションの検証に数えない。通常clientの完全ACL権限不足は正常往復の成功に数えない。RPC後の`kind`、`allowedRoots:null`とvolumeパスのslash・末尾区切りを含む設定照合、期限切れ・未接続・capability/peer/scope/config改変、scope欠落の旧記録、接続断後のoperationId照合、60秒超の共通ロック待機とMCP進捗を確認する。元のMSIX仮想viewをnativeの同名キーと同一視せず、清掃不能なprivate fixtureを新規作成しない。
 
-再現用の`scripts/Verify-RegistrySession.ps1`は、`-Mode Prepare -ExecutablePath <今回のexe> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSONパス>`で隔離設定と起動コマンドを準備する。完全な`-Mode Run`では、Prepare時に真正な変更前1.0.11の`-MoveExecutablePath`も渡す。管理者側で既定のHKCU検証とschema 4/5混在の保持制御を実行するためで、Current単独では省略できる。`-Mode Current`は同じ引数で、既存の仮想SoftwareへのCLI・MCPのdry-run拒否と原本・metadataの不変更、hook subprocessを確認する。新しいprivate fixtureは作成しない。通常Windows側は、準備時に示す通常用・管理者用のコマンドを利用者がデスクトップから別々に明示起動してから、`-Mode Run`で往復・競合・完全ACL・切断後照合を実行する。通常用は昇格せず、管理者用は明示起動した管理者ウィンドウで実行する。fixture作成前に実際のCodex clientと通常セッションのログオンIDも照合し、不一致ならキーを作成せず停止する。検証器はセッションの自動起動・昇格やタスク登録をしない。通常・管理者でログオンIDが異なる接続は拒否され、サーバーの権限を借りないことも確認する。
+再現用の`scripts/Verify-RegistrySession.ps1`は、`-Mode Prepare -ExecutablePath <今回のexe> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSONパス>`で隔離設定と起動入力を準備する。完全な`-Mode Run`では、Prepare時に真正な変更前1.0.11の`-MoveExecutablePath`も渡す。管理者側で既定のHKCU検証とschema 4/5混在の保持制御を実行するためで、Current単独では省略できる。同じexe・出力先・レポートを指定した`-Mode Start -AssertNativeWindows`をCodexから実行すると、desktop Explorer経由で固定した通常用・管理者用スクリプトを非表示起動する。UACが表示された場合だけ利用者が同意する。OSのUAC設定は変更せず、同意を代行しない。両helperとserverの実token・ログオンID・exe・作成時刻・期限・scope・設定を確認してStartを確定し、5分以内のRunへ引き渡す。入力のhashとread handle、原子的なclaim/permit、nonceと親プロセスの生存を検査し、Run permit前にはfixtureを作成しない。入力改変・二重Start/Run・期限切れ・取消・親の終了と遅延起動の拒否も確認する。UAC画面の実際の取消と、期限/取消記録を使う境界検証は区別する。手動desktop起動コマンドは診断互換である。
+
+`-Mode Current`は同じ引数で、既存の仮想SoftwareへのCLI・MCPのdry-run拒否と原本・metadataの不変更、hook subprocessを確認する。新しいprivate fixtureは作成しない。Start後の`-Mode Run`で往復・競合・完全ACL・切断後照合を実行する。fixture作成前に実際のCodex clientと通常セッションのログオンIDも照合し、不一致ならキーを作成せず停止する。通常・管理者でログオンIDが異なる接続は拒否され、サーバーの権限を借りないことも確認する。汎用brokerやタスクは登録しない。
 
 HKCUの修正を完了とするには、同じ対象exeによるcurrent側の6801拒否時の保全と、明示native側のCLI・MCP正常往復の両方を照合する。HKLMの成功、公開の成功、未検証一覧への記録でこの条件を代替しない。
 
@@ -88,7 +90,7 @@ GitHub応答を検証用アーカイブへ差し替え、実際のインスト�
 
 定期整理はTask Scheduler境界を隔離して、毎日03:00と現在のユーザーのログオンの両トリガー、有効状態、`StartWhenAvailable`、電池使用時の実行許可、既存タスク設定の保持をXMLで検証します。PCの電源断・スリープ・ログオフを伴う取り逃し回復の実動作は、この検証の対象外です。
 
-非表示起動は`scripts/Verify-MaintenanceTask.ps1 -ExecutablePath <今回のCLI exe> -OutputDirectory <新しい外部D作業領域> -ReportPath <外部JSONレポート>`で、実Task Schedulerと保守専用exeを検証します。同じpublishフォルダーに`prunlet-maintenance.exe`が必要です。CLIのconsole subsystemと保守exeのGUI subsystem、旧タスクからの設定を保つ移行、保守以外のコマンドの拒否、期限切れ整理・保持対象の復元、失敗終了コード、所有者検証を確認します。`-PauseForWindowInspection`は旧・新タスクを専用lockで待機させ、別途ウィンドウを観測するための指定です。配置後も同じ登録タスクを手動起動して表示と終了コードを確認し、実際のWindows再起動と区別します。
+非表示起動は`scripts/Verify-MaintenanceTask.ps1 -ExecutablePath <今回のCLI exe> -MoveExecutablePath <変更前1.0.11のexe> -OutputDirectory <新しい外部D作業領域> -ReportPath <外部JSONレポート>`で、実Task Schedulerと保守専用exeを検証します。同じpublishフォルダーに`prunlet-maintenance.exe`が必要です。CLIのconsole subsystemと保守exeのGUI subsystem、旧タスクからの設定を保つ移行、保守以外のコマンドの拒否、期限切れ整理・保持対象の復元、失敗終了コード、所有者検証を確認します。`-PauseForWindowInspection`は旧・新タスクを専用lockで待機させ、別途ウィンドウを観測するための指定です。配置後も同じ登録タスクを手動起動して表示と終了コードを確認し、実際のWindows再起動と区別します。
 
 `-CheckPublicHead`では実際のGitHubも参照します。リモートに必要な実装がまだない場合は、配置先を変更せず停止することを確認します。検証用アーカイブでの成功を、実GitHubからの導入成功として扱いません。公開後は実GitHubから導入し、`source-info.json`のリポジトリ・ブランチ・コミット、配置済みexeと登録先を照合してください。
 
@@ -145,3 +147,9 @@ pwsh -NoProfile -File .\scripts\Verify-Retention.ps1 -ExecutablePath <今回のe
 既定7日・1 GiB、旧設定、期限切れ・容量確保順、単一ファイル・複数入力合計・再帰ツリー・ADSの容量、dry-runの不変更を確認します。通常予算と単一超過時の`max(maxRecoveryBytes, incomingBytes)`、次回削除・maintainの通常上限、既存データが安全に0まで整理できない場合の新規移動拒否を区別します。
 
 既存schema 4と旧schema 1/2/3を混在させ、破損・未知項目・使用中・File IDやreceipt不一致を保全し、容量不明を成功扱いしないこと、整理前後の再走査と共通ロックによる並行削除の容量制御を確認します。`Verify-Retention.ps1`は新方式の保持関連ケースを選択します。`-LegacyCopyVerification`は旧exeの再現専用であり、新版の検証に使いません。定期登録・所有者検証・登録失敗時の復旧はlatestインストーラー検証で確認します。
+
+## 起動時保守の性能
+
+`scripts/Verify-MaintenancePerformance.ps1 -ExecutablePath <今回のexe> -BaselineExecutablePath <変更前1.0.14のexe> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSONレポート>`で、既定8,192ファイルのschema 6記録を作り、同一記録に対する旧版・新版の`maintain --dry-run`を交互に3回計測します。各試行・中央値と、CMDを含むprocess jobのCPU時間を保存します。dry-run時のmetadataと設定の不変更、applyを2回行ってもゴミ箱実体を保つこと、競合時の非上書きと全ファイルの内容・File ID・属性・Owner/Group/DACLの一致を確認します。
+
+性能確認のために安全性検査を省略したり、期限・容量整理を無効にしたりしません。履歴JSONの境界単体の計測、保守CLI全体の計測、配置版の実ログオン負荷は別の結果として扱います。ゴミ箱を空にしても、操作記録・未完了stageや旧方式の退避データが消えたとは扱いません。保持済みの証拠を削除して性能改善に見せず、既存の保全と照合を維持します。

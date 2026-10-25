@@ -1,4 +1,5 @@
-param([Parameter(Mandatory)][string]$SettingsPath,[switch]$Cleanup)
+﻿param([Parameter(Mandatory)][string]$SettingsPath,[switch]$Cleanup,[ValidatePattern('^[0-9a-f]{32}$')][string]$LaunchNonce)
+$script:AutomaticLaunchNonce=$LaunchNonce
 . (Join-Path $PSScriptRoot 'SessionE2E.Common.ps1')
 $s=ReadJson $SettingsPath;$script:ExecutablePath=$s.executablePath;$script:Config=$s.highConfig
 AssertPreparedSettings $s
@@ -6,6 +7,7 @@ $results=[Collections.Generic.List[object]]::new()
 function Check([string]$Name,[scriptblock]$Body){try{&$Body;$results.Add(@{name=$Name;passed=$true})}catch{$results.Add(@{name=$Name;passed=$false;error=$_.Exception.Message})}}
 try{
  $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent());Assert ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'Explicit client not admin'
+ AssertLaunchLease $s -RequirePermit
  if($Cleanup){
   $r=InvokePrunletCli @('registry-delete','--view','64','--recursive','--',('HKEY_CURRENT_USER\'+$s.runRelative))
   SaveJson (Join-Path $PSScriptRoot 'cleanup-result.json') $r
