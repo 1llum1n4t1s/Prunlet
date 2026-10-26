@@ -153,7 +153,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                 protocolVersion = SupportedVersions.Contains(requestedVersion) ? requestedVersion : SupportedVersions[0],
                 capabilities = new { tools = new { listChanged = false } },
                 serverInfo = new { name = "prunlet", title = "Prunlet", version = typeof(McpServer).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion },
-                instructions = "Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true for directory contents. File items go to the Windows Recycle Bin; Prunlet persists operation records for non-overwriting restore_files. Windows controls bin retention and users may empty it. Recycling failure never falls back to permanent deletion. Metadata and legacy volume recovery directories and their ancestors remain protected. Use dryRun for inspection. Links are handled without following their targets. Hard links share content with surviving aliases. Legacy schema 1-4 recovery operations remain restorable. Prunlet retention and capacity settings default to 7 days and 1 GiB for registry snapshots and legacy file recovery, never for the Windows bin. Use delete_registry for explicitly authorized local keys/values with required view 32 or 64, and restore_registry for their operationId. Empty valueName selects the default value; omitted valueName selects the key. Full key ACL snapshots require SeSecurityPrivilege; no automatic elevation or nontransactional fallback. Existing host approvals and policies still apply."
+                instructions = "Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true for directory contents. File items go to the Windows Recycle Bin without Prunlet operation records; restore them using Windows Recycle Bin. File results have no operationId. For ambiguous results, do not resend deletion; inspect the source and Windows Recycle Bin. Windows controls bin retention and users may empty it. Recycling failure never falls back to permanent deletion. Metadata and legacy volume recovery directories and their ancestors remain protected. Use dryRun for inspection. Links are handled without following their targets. Hard links share content with surviving aliases. Prunlet retention and capacity settings default to 7 days and 1 GiB for registry snapshots only, never for the Windows bin. list_operations lists registry recovery only. Use delete_registry for explicitly authorized local keys/values with required view 32 or 64, and restore_registry for their operationId. Empty valueName selects the default value; omitted valueName selects the key. Full key ACL snapshots require SeSecurityPrivilege; no automatic elevation or nontransactional fallback. Existing host approvals and policies still apply."
             };
         }
         if (!ready) throw new RpcException(-32600, "Initialize and send notifications/initialized first.");
@@ -170,7 +170,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
         var name = StringProperty(parameters, "name");
         var args = parameters.TryGetProperty("arguments", out var a) ? a : JsonSerializer.SerializeToElement(new { });
         if (args.ValueKind != JsonValueKind.Object) throw new RpcException(-32602, "Arguments must be an object.");
-        if (name is not "delete_files" and not "restore_files" and not "delete_registry" and not "restore_registry" and not "reconcile_registry" and not "list_operations")
+        if (name is not "delete_files" and not "delete_registry" and not "restore_registry" and not "reconcile_registry" and not "list_operations")
             throw new RpcException(-32602, $"Unknown tool: {name}");
         object result;
         try
@@ -188,10 +188,6 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                     if (args.TryGetProperty("recursive", out var recursive) && recursive.ValueKind is not JsonValueKind.True and not JsonValueKind.False)
                         throw new RpcException(-32602, "Recursive must be boolean.");
                     result = service.Delete(paths.EnumerateArray().Select(path => path.GetString()!).ToArray(), dryRun.ValueKind == JsonValueKind.True, recursive.ValueKind == JsonValueKind.True);
-                    break;
-                case "restore_files":
-                    RejectExtraProperties(args, "operationId");
-                    result = service.RestoreFiles(StringProperty(args, "operationId"));
                     break;
                 case "delete_registry":
                     RejectExtraProperties(args, "path", "view", "valueName", "recursive", "dryRun");
@@ -244,7 +240,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
         new
         {
             name = "delete_files", title = "Move files and folders to the Windows Recycle Bin",
-            description = "Move authorized absolute Windows files and empty directories to the Windows Recycle Bin after validating targets and persisting operation records. Set recursive=true for folder contents. Windows controls bin retention; Prunlet never permanently deletes an item when recycling is unavailable. Metadata and legacy recovery storage stay protected. Hard links retain their shared content. Does not expand wildcards or follow link targets.",
+            description = "Move authorized absolute Windows files and empty directories to the Windows Recycle Bin after validating targets, without persisting operation records. Restore files and folders using Windows Recycle Bin. Ambiguous results require inspecting the source and Windows Recycle Bin without resending deletion. Set recursive=true for folder contents. Windows controls bin retention; Prunlet never permanently deletes an item when recycling is unavailable. Metadata and legacy recovery storage stay protected. Hard links retain their shared content. Does not expand wildcards or follow link targets.",
             inputSchema = new
             {
                 type = "object", properties = new
@@ -256,17 +252,6 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                 required = new[] { "paths" }, additionalProperties = false
             },
             annotations = new { readOnlyHint = false, destructiveHint = true, idempotentHint = false, openWorldHint = false }
-        },
-        new
-        {
-            name = "restore_files", title = "Restore a file deletion operation",
-            description = "Restore a recorded Windows Recycle Bin item or legacy schema 1-4 recovery data by operationId. Refuses existing destinations without overwriting or merging. Windows bin items must still exist and match their recorded identity. Legacy copy records restore as independent snapshots.",
-            inputSchema = new
-            {
-                type = "object", properties = new { operationId = new { type = "string" } },
-                required = new[] { "operationId" }, additionalProperties = false
-            },
-            annotations = new { readOnlyHint = false, destructiveHint = false, idempotentHint = false, openWorldHint = false }
         },
         new
         {
@@ -308,8 +293,8 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
         },
         new
         {
-            name = "list_operations", title = "List recovery operations",
-            description = "List operation ids available in the configured recovery directory.",
+            name = "list_operations", title = "List registry recovery operations",
+            description = "List registry operation ids available in the configured recovery directory. File and folder deletions have no Prunlet operation records.",
             inputSchema = new { type = "object", properties = new { }, additionalProperties = false },
             annotations = new { readOnlyHint = true, destructiveHint = false, idempotentHint = true, openWorldHint = false }
         }

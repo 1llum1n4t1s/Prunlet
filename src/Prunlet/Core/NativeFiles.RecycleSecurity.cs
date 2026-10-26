@@ -14,6 +14,11 @@ internal static partial class NativeFiles
     internal static SafeFileHandle OpenRecycleSecurity(string path, bool writable = false) =>
         Open(path, 0x20080u | (writable ? 0x40000u : 0u), 7, 3, OpenReparse | BackupSemantics);
 
+    // GENERIC_READで共有制約を有効にし、commitまでrename/子差替え/データ書込みを共有しない。
+    // Sourceのデータは読まず、書込権限も要求しない。
+    internal static SafeFileHandle OpenOriginalPresentPin(string path) =>
+        Open(path, Read | 0x20080u, 1, 3, OpenReparse | BackupSemantics);
+
     // stage到着後、DACLの補正前にrootのDELETE権限を確保し、最後の非上書き移動まで同じhandleを使う。
     // 全nodeのsecurity handleと共存させるため、読取り・書込み・削除共有を許可する。
     internal static SafeFileHandle OpenRecycleRestoreRoot(string path) =>

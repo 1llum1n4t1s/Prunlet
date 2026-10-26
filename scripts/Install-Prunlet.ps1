@@ -155,7 +155,10 @@ $profileSnapshot = [Collections.Generic.List[object]]::new()
 $registrationStarted = $false
 $maintenanceState = $null
 $maintenanceStarted = $false
-$retiredOperations = [Collections.Generic.List[string]]::new()
+$retiredProductPaths = [Collections.Generic.List[string]]::new()
+$storageMigrationStarted = $false
+$storageMigration = $null
+$migrationJson = $null
 try {
     try { $mutexAcquired = $installationMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $mutexAcquired = $true }
     if (!$mutexAcquired) { throw 'Another Prunlet installation is already running for this directory.' }
@@ -195,12 +198,12 @@ try {
         & $exe @probeArgs | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'Prunlet rejected the initial configuration.' }
     } else {
-        & $exe --config $configPath operations | Out-Null
+        & $exe --config $configPath validate-config | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'Prunlet rejected the existing configuration; it was preserved.' }
     }
     $provenance = [ordered]@{ repository = $Repository; defaultBranch = $branch; commitSha = $sha; downloadUrl = $downloadUrl; archiveSha256 = $archiveHash; executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; maintenanceExecutableSha256 = (Get-FileHash -LiteralPath $maintenanceExe -Algorithm SHA256).Hash; installedUtc = [DateTimeOffset]::UtcNow.ToString('o'); runtime = $Runtime }
     $provenance | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $WorkDirectory 'source-info.json') -Encoding utf8NoBOM
-    # 製品ファイルを保全する。設定移行の原本は別途保存し、復元データは変更しない。
+    # 製品ファイルと設定原本を保全する。復元領域の移行は更新の最後にCoreへ委ねる。
     foreach ($relative in @($products + $retiredProducts)) {
         $target = Join-Path $InstallDirectory $relative
         [void](Assert-PlainPath $target 'Installed product path')
@@ -244,7 +247,7 @@ try {
             $settings['capacityDefaultMigrationVersion'] = [Text.Json.Nodes.JsonValue]::Create([int]1)
             $candidate = Join-Path $WorkDirectory 'migrated-config.json'
             [IO.File]::WriteAllText($candidate, $settings.ToJsonString(), [Text.UTF8Encoding]::new($false))
-            & $exe --config $candidate operations | Out-Null
+            & $exe --config $candidate validate-config | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Prunlet rejected the migrated configuration; the original was preserved.' }
             $originalHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($originalBytes))
             $migrationBackup = Join-Path $updateBackup 'config-before-capacity-migration.json'
@@ -302,46 +305,34 @@ try {
     [ordered]@{ purpose = 'Restore the owned maintenance task if this installation fails.'; installDirectory = $InstallDirectory; taskName = $maintenanceState.name; taskPath = '\'; existed = [bool]$maintenanceState.previousXml; previousXml = $(if ($maintenanceState.previousXml) { 'maintenance-task.xml' } else { $null }); restore = 'First verify current task ownership using maintenance-task.ps1; restore previous XML if existed, otherwise unregister only the owned task.' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $updateBackup 'maintenance-task-backup-info.json') -Encoding utf8NoBOM
     $maintenanceStarted = $true
     Register-PrunletMaintenanceTask $maintenanceState
-    # 廃止したバックエンドもCoreの同一ボリューム移動で退役する。
+    # 廃止したバックエンドも記録なしのCore経路でWindowsのゴミ箱へ渡す。
     foreach ($relative in $retiredProducts) {
         $target = Assert-PlainPath (Join-Path $InstallDirectory $relative) 'Retired product path'
         if (!(Test-Path -LiteralPath $target -PathType Leaf)) { continue }
-        $retirementConfig = Join-Path $updateBackup 'retirement-config.json'
-        $retirementBackup = Join-Path $updateBackup 'retired-recovery'
-        New-Item -ItemType Directory -Path $retirementBackup -Force | Out-Null
         $installedExe = Join-Path $InstallDirectory 'bin\prunlet.exe'
-        $retirementInitJson = & $installedExe --config $retirementConfig init --backup-directory $retirementBackup
-        if ($LASTEXITCODE -ne 0) { throw "Prunlet rejected the retired product configuration: $retirementInitJson" }
-        # metadataは退役専用に分離し、実体の配置先だけ利用者の設定を引き継ぐ。
-        # 元設定は変更せず、引継いだ設定全体をCoreで検証してから移動する。
-        $mainSettings = [IO.File]::ReadAllText($configPath) | ConvertFrom-Json -AsHashtable
-        $volumeMapPresent = $false
-        $volumeMap = $null
-        # CoreのWeb JSON読込みと同様に大文字小文字を無視し、出現順の最後を採用する。
-        foreach ($setting in $mainSettings.GetEnumerator()) {
-            if ($setting.Key -ieq 'volumeRecoveryDirectories') {
-                $volumeMapPresent = $true
-                $volumeMap = $setting.Value
-            }
-        }
-        if ($volumeMapPresent) {
-            $retirementSettings = [IO.File]::ReadAllText($retirementConfig) | ConvertFrom-Json -AsHashtable
-            $retirementSettings.volumeRecoveryDirectories = $volumeMap
-            [IO.File]::WriteAllText($retirementConfig, ($retirementSettings | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
-            & $installedExe --config $retirementConfig operations | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Prunlet rejected the inherited retirement volume recovery directories.' }
-        }
         [void]$changed.Add($relative)
-        $retirementJson = & $installedExe --config $retirementConfig delete -- $target
+        $retirementJson = & $installedExe --config $configPath delete -- $target
         if ($LASTEXITCODE -ne 0) { throw 'Prunlet could not retire the obsolete hook backend; recovery data was preserved.' }
-        $retirement = $retirementJson | ConvertFrom-Json
-        if (!$retirement.operationId -or @($retirement.items).Count -ne 1 -or @($retirement.items | Where-Object status -ne 'deleted').Count -or (Test-Path -LiteralPath $target)) { throw 'Retired product deletion was not confirmed.' }
-        $retiredOperations.Add([string]$retirement.operationId)
+        $retirement = $retirementJson | ConvertFrom-Json -AsHashtable
+        if (@($retirement.items).Count -ne 1 -or @($retirement.items | Where-Object status -ne 'recycled').Count -or (Test-Path -LiteralPath $target)) { throw 'Retired product recycling was not confirmed.' }
+        $retiredProductPaths.Add($target)
         $retirementJson | Set-Content -LiteralPath (Join-Path $updateBackup 'retired-products.json') -Encoding utf8NoBOM
     }
-    [ordered]@{ status = 'installed'; installDirectory = $InstallDirectory; configPath = $configPath; repository = $Repository; defaultBranch = $branch; commitSha = $sha; sourceInfoPath = (Join-Path $InstallDirectory 'source-info.json'); updateBackupDirectory = $updateBackup; maintenanceTaskName = $maintenanceState.name; retiredOperationIds = @($retiredOperations.ToArray()); codexRegistered = [bool]$RegisterCodex; agentInstructionsRegistered = [bool]$RegisterAgentInstructions; requiresHookTrust = [bool]$RegisterCodex } | ConvertTo-Json
+    # 移行開始後は旧exeへ戻さない。移行済み領域も同じ新版で再開できる状態を残す。
+    $storageMigrationStarted = $true
+    $migrationJson = & (Join-Path $InstallDirectory 'bin\prunlet.exe') --config $configPath migrate --apply --if-needed
+    $migrationExitCode = $LASTEXITCODE
+    $storageMigration = $migrationJson | ConvertFrom-Json -AsHashtable
+    if ($migrationExitCode -ne 0 -or !$storageMigration.registryReady -or @($storageMigration.operations | Where-Object status -eq 'failed').Count) {
+        throw 'Recovery storage migration is incomplete. Installed products were retained; resume with the installed CLI migrate --apply.'
+    }
+    if (!$storageMigration.complete) { Write-Warning 'Some legacy file recovery data was retained. Review the migration result before retrying migrate --apply; normal maintenance does not scan it.' }
+    [ordered]@{ status = 'installed'; installDirectory = $InstallDirectory; configPath = $configPath; repository = $Repository; defaultBranch = $branch; commitSha = $sha; sourceInfoPath = (Join-Path $InstallDirectory 'source-info.json'); updateBackupDirectory = $updateBackup; maintenanceTaskName = $maintenanceState.name; retiredProductPaths = @($retiredProductPaths.ToArray()); recoveryMigration = $storageMigration; codexRegistered = [bool]$RegisterCodex; agentInstructionsRegistered = [bool]$RegisterAgentInstructions; requiresHookTrust = [bool]$RegisterCodex } | ConvertTo-Json -Depth 12
 } catch {
     $originalError = $_
+    if ($storageMigrationStarted) {
+        throw "Installation reached recovery migration: $originalError. The updated executables, configuration, and registrations were preserved; retry the installed CLI migrate --apply. Migration result: $migrationJson"
+    }
     $rollbackErrors = [Collections.Generic.List[string]]::new()
     if ($migratedConfig) {
         try {

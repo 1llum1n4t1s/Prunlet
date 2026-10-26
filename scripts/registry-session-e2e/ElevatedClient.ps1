@@ -1,4 +1,4 @@
-﻿param([Parameter(Mandatory)][string]$SettingsPath,[switch]$Cleanup,[ValidatePattern('^[0-9a-f]{32}$')][string]$LaunchNonce)
+param([Parameter(Mandatory)][string]$SettingsPath,[switch]$Cleanup,[ValidatePattern('^[0-9a-f]{32}$')][string]$LaunchNonce)
 $script:AutomaticLaunchNonce=$LaunchNonce
 . (Join-Path $PSScriptRoot 'SessionE2E.Common.ps1')
 $s=ReadJson $SettingsPath;$script:ExecutablePath=$s.executablePath;$script:Config=$s.highConfig
@@ -46,7 +46,7 @@ try{
       $raw=@{dryrun=$dry;nonrecursive=$nonrecursive;delete=$d;restore=$r;again=$again}
      }
      $after=NativeRequest 'observe' @{leaf=$leaf};Assert (($before.snapshot-join"`n")-ceq($after.snapshot-join"`n")) 'Full owner/group/DACL/SACL/raw snapshot mismatch';Assert ($before.keyClass-ceq$after.keyClass) 'Registry key class mismatch'
-     Assert (![IO.File]::Exists((Join-Path $s.recovery ($id+'\registry-snapshot.json')))) 'Restored snapshot not consumed'
+     Assert (![IO.File]::Exists((Join-Path (Join-Path $s.recovery '.registry-records-v1') ($id+'\registry-snapshot.json')))) 'Restored snapshot not consumed'
      $rec=InvokePrunletCli @('registry-reconcile',$id);Assert ($rec.exitCode-eq 0-and$rec.json.items[0].status-eq'restored') 'Reconcile restored mismatch'
      SaveJson (Join-Path $PSScriptRoot ($leaf+'-result.json')) @{operationId=$id;raw=$raw;before=$before;after=$after;reconcile=$rec}
     }finally{if($p){McpStop $p}}
@@ -54,6 +54,7 @@ try{
   }
   Check 'administrator-default-hkcu-registry-recovery-suite' {
    Assert (![string]::IsNullOrWhiteSpace($s.moveExecutablePath)) 'Full default HKCU suite requires Prepare -MoveExecutablePath with the genuine schema4 baseline'
+   Assert (![string]::IsNullOrWhiteSpace($s.assemblyPath)-and![string]::IsNullOrWhiteSpace($s.legacyRegistryExecutablePath)) 'Full registry checkpoint suite requires the prepared candidate DLL and genuine schema5 baseline'
    $suiteOutput=Join-Path $PSScriptRoot 'registry-default';$suiteReport=Join-Path $PSScriptRoot 'registry-default-report.json'
    $hostPath=[IO.Path]::GetFullPath((Join-Path $PSHOME 'pwsh.exe'))
    Assert ($hostPath.Equals($s.powerShellHostPath,[StringComparison]::OrdinalIgnoreCase)) 'Administrator client host differs from Prepare'
@@ -61,6 +62,8 @@ try{
    $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true;$info.StandardOutputEncoding=$utf8;$info.StandardErrorEncoding=$utf8
    $info.Environment['TEMP']=$env:TEMP;$info.Environment['TMP']=$env:TMP
    foreach($argument in @('-NoProfile','-File',$s.registryVerificationScriptPath,'-ExecutablePath',$s.executablePath,'-MoveExecutablePath',$s.moveExecutablePath,'-RegistryFixtureRoot','HKCU\Software\PrunletE2E','-OutputDirectory',$suiteOutput,'-ReportPath',$suiteReport)){$info.ArgumentList.Add($argument)}
+   if($s.assemblyPath){$info.ArgumentList.Add('-AssemblyPath');$info.ArgumentList.Add($s.assemblyPath)}
+   if($s.legacyRegistryExecutablePath){$info.ArgumentList.Add('-LegacyRegistryExecutablePath');$info.ArgumentList.Add($s.legacyRegistryExecutablePath)}
    $suite=[Diagnostics.Process]::new();$suite.StartInfo=$info
    try{
     $null=$suite.Start();$stdout=$suite.StandardOutput.ReadToEndAsync();$stderr=$suite.StandardError.ReadToEndAsync()
@@ -69,7 +72,8 @@ try{
     [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'registry-default.stderr.log'),$stderr.GetAwaiter().GetResult(),$utf8)
     Assert ($suite.ExitCode-eq 0) 'Default HKCU registry suite process failed'
     $report=ReadJson $suiteReport
-    Assert ($report.failed-eq 0-and$report.skipped-eq 0-and$report.excludedCount-eq 0-and$report.passed-ge 25-and$report.passed-eq$report.results.Count) 'Default HKCU registry suite is incomplete or failed'
+    Assert ($report.failed-eq 0-and$report.skipped-eq 0-and$report.excludedCount-eq 0-and$report.passed-ge 37-and$report.passed-eq$report.results.Count) 'Default HKCU registry suite is incomplete or failed'
+    Assert (@($report.results|Where-Object {$_.name-like'registry-control-*'-or$_.name-like'registry-publication-*'}).Count-eq12) 'Registry crash/control coverage was incomplete'
     Assert ($report.registryFixtureRoot-ceq'HKEY_CURRENT_USER\Software\PrunletE2E'-and$report.createdFixture-and$report.cleanup.attempted-and!$report.cleanup.remainingRegistryPath-and!$report.cleanup.error) 'Default HKCU fixture/preflight/cleanup was not verified'
     Assert ($report.preflight.Count-eq 2-and@($report.preflight|Where-Object {!$_.Available}).Count-eq 0-and@($report.preflight|Where-Object {$_.View-eq 32}).Count-eq 1-and@($report.preflight|Where-Object {$_.View-eq 64}).Count-eq 1) 'Default HKCU transaction preflight failed'
    }finally{if(!$suite.HasExited){$suite.Kill($true);$suite.WaitForExit()};$suite.Dispose()}

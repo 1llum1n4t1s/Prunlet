@@ -74,7 +74,7 @@ function New-History([int]$Schema = 1, [int]$WarningCount = 1, [switch]$Live) {
     $manifest = [IO.File]::ReadAllText((Join-Path $operation 'manifest.json')) | ConvertFrom-Json
     Assert-True ($manifest.schema -eq $Schema) 'Fixture schema differs.'
     if (!$Live) {
-        $purged = Invoke-Cli @('purge', $deleted.Json.operationId, '--apply')
+        $purged = Finish-Cli (Start-Cli @('purge', $deleted.Json.operationId, '--apply') -Legacy)
         Assert-True ($purged.ExitCode -eq 0) 'Fixture purge failed.'
         $deleteResultPath = Join-Path $operation 'delete-result.json'
         $deleteResult = [IO.File]::ReadAllText($deleteResultPath) | ConvertFrom-Json

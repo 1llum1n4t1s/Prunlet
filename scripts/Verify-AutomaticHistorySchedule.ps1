@@ -45,7 +45,7 @@ $script:CliEnvironment = @{
 }
 . (Join-Path $PSScriptRoot 'HistoryVerification-Common.ps1')
 # 実装前に列挙した失敗: 登録権限不足、時刻トリガー不発火、CLI引数/環境変数の誤り、
-# タスク終了コードと実行時刻の不一致、圧縮せず成功扱い、JSON/SHA変更、物理削減なし、
+# タスク終了コードと実行時刻の不一致、終端整理せず成功扱い、原データ再作成、記録容量の回収なし、
 # 同名タスクとの衝突、所有確認なしの解除、失敗時のタスク解除漏れ。
 # 手動Start-ScheduledTaskは使わず、隔離した一回限りの時刻トリガーで確認する。
 $taskName = 'Prunlet-AutomaticHistory-E2E-' + [guid]::NewGuid().ToString('N')
@@ -61,13 +61,10 @@ try {
     Assert-CmdPath $commandInterpreter
     New-Case 'scheduled-maintain'
     $history = New-History
-    $hashes = @{}
-    foreach ($file in Get-ChildItem -LiteralPath $history.Directory -File) { $hashes[$file.Name] = Digest $file.FullName }
     $before = Snapshot $history.Directory
     $inspection = Invoke-Cli @('compact-history', '--dry-run')
     Assert-True ($inspection.ExitCode -eq 0 -and $inspection.Json.operations[0].status -eq 'eligible') 'Legacy fixture is not eligible.'
-    $physicalBefore = 0L
-    foreach ($file in $inspection.Json.operations[0].files) { $physicalBefore += $file.physicalBytesBefore }
+    $metadataBytesBefore = (Get-ChildItem -LiteralPath $history.Directory -File | Measure-Object Length -Sum).Sum
     Assert-True ((Snapshot $history.Directory) -ceq $before) 'Preparation dry-run changed history.'
     Assert-True (@(Get-ChildItem -LiteralPath $history.Directory -File | Where-Object { $_.Attributes -band [IO.FileAttributes]::Compressed }).Count -eq 0) 'Fixture is already compressed.'
     $stdoutPath = Join-Path $outputRoot 'scheduled-stdout.json'
@@ -106,22 +103,20 @@ try {
     Assert-True ($task.State -ne 'Running' -and $info.LastTaskResult -eq 0) "Scheduled task failed or is still running: $($info.LastTaskResult)"
     Assert-True ([IO.File]::Exists($stdoutPath)) 'Scheduled task did not write stdout.'
     $response = [IO.File]::ReadAllText($stdoutPath) | ConvertFrom-Json -Depth 50
-    $operations = @($response.historyCompaction.operations | Where-Object operationId -eq $history.Id)
-    Assert-True ($operations.Count -eq 1 -and $operations[0].status -eq 'compacted') 'Scheduled maintain did not compact fixture history.'
-    Assert-True (@($operations[0].files).Count -eq @($inspection.Json.operations[0].files).Count) 'Scheduled result did not account for every metadata file.'
-    $physicalAfter = 0L
-    foreach ($file in $operations[0].files) {
-        Assert-True ($file.sha256 -ceq $hashes[$file.name] -and (Digest (Join-Path $history.Directory $file.name)) -ceq $hashes[$file.name]) 'Scheduled compression changed metadata SHA-256.'
-        Assert-True ($null -ne $file.physicalBytesAfter -and $file.savedBytes -eq ($file.physicalBytesBefore - $file.physicalBytesAfter)) 'Physical byte accounting differs.'
-        Assert-True (((Get-Item -LiteralPath (Join-Path $history.Directory $file.name)).Attributes -band [IO.FileAttributes]::Compressed) -ne 0) 'Scheduled metadata is not compressed.'
-        $physicalAfter += $file.physicalBytesAfter
-    }
-    foreach ($name in $hashes.Keys) { Assert-True ((Digest (Join-Path $history.Directory $name)) -ceq $hashes[$name]) 'History member content changed.' }
-    Assert-True ($physicalBefore - $physicalAfter -gt 400000) 'Scheduled maintenance did not measurably reduce physical allocation.'
+    Assert-VerificationClosedRecord $script:Recovery $history.Id 1
+    Assert-True (!(Test-Path -LiteralPath $history.Source)) 'Scheduled retirement recreated the purged original.'
+    $closedFiles = @(Get-ChildItem -LiteralPath (Join-Path $script:Recovery '.closed-records-v1') -File | Where-Object Name -Like ($history.Id + '.*.json'))
+    $summaryFile = Get-Item -LiteralPath (Join-Path (Join-Path $script:Recovery '.closed-records-v1') ($history.Id + '.json'))
+    $metadataBytesAfter = $summaryFile.Length + ($closedFiles | Measure-Object Length -Sum).Sum
+    Assert-True ($metadataBytesBefore - $metadataBytesAfter -gt 400000) 'Scheduled retirement did not reclaim the large active audit metadata.'
+    $closedBefore = Snapshot $script:Recovery
+    $again = Invoke-Cli @('maintain', '--apply')
+    Assert-True ($again.ExitCode -eq 0 -and (Snapshot $script:Recovery) -ceq $closedBefore -and !(Test-Path -LiteralPath $history.Source)) 'Repeated scheduled-result maintenance changed terminal records or original data.'
+    Assert-VerificationClosedRecord $script:Recovery $history.Id 1
     $evidence.historyId = $history.Id
-    $evidence.physicalBytesBefore = $physicalBefore
-    $evidence.physicalBytesAfter = $physicalAfter
-    $evidence.savedBytes = $physicalBefore - $physicalAfter
+    $evidence.metadataBytesBefore = $metadataBytesBefore
+    $evidence.metadataBytesAfter = $metadataBytesAfter
+    $evidence.metadataBytesReclaimed = $metadataBytesBefore - $metadataBytesAfter
     $evidence.response = $response
     $casePassed = $true
 } catch {

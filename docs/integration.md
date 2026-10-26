@@ -26,44 +26,31 @@ RTKの共通指示と同様、エージェントのツール選択を案内す�
 
 ## 手動の設定準備
 
-以下は配置済みアプリを手動で設定・登録する場合の手順です。登録スクリプトと`configuration-common.ps1`は同じディレクトリに置きます。PowerShell 7の`pwsh`が必要です。
+通常はインストーラーが設定を作成します。手動の初期化は[README](../README.md#初期設定)を参照してください。`backupDirectory`は保護された共通metadata基点で、レジストリ記録を`.registry-records-v1/<operationId>`へ保存します。新しいファイル・フォルダー削除は操作記録やsnapshotを作りません。
 
-設定は中央metadataと旧コピーの保存先である`backupDirectory`から初期化します。そのディレクトリは事前に作成してください。削除対象フォルダーの事前登録は不要で、既存の設定ファイルは上書きしません。
+ファイルはWindowsのゴミ箱へ移し、復元はWindowsの画面で行います。CLIの`restore`（`registry-restore`の別名）とMCPの`restore_registry`はレジストリ専用です。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールです。`operations`と`list_operations`にもファイル削除を載せません。
 
-```powershell
-$exe = Join-Path $env:USERPROFILE '.local\Prunlet\bin\prunlet.exe'
-$config = Join-Path $env:USERPROFILE '.local\Prunlet\config.json'
-& $exe --config $config init --backup-directory 'D:\PrunletBackup'
-```
-
-設定の形式は次のとおりです。ローカルドライブ内の通常ファイル・フォルダーを扱い、復元データ保存先内は通常削除から保護します。旧`allowedRoots`・`--allowed-root`・`-AllowedRoot`は互換用に受理しますが、対象フォルダーを制限しません。
-
-```json
-{
-  "schema": 1,
-  "backupDirectory": "D:\\PrunletBackup"
-}
-```
-
-新規ファイル・フォルダーはWindowsのゴミ箱へ移し、Prunletは操作ID・Shell項目・File ID・元のOwner/Group/DACLを記録します。ゴミ箱へ移せない場合の永久削除や独自領域へのfallbackはありません。保持期間・容量はWindowsの設定に従います。`backupDirectory`は操作記録・レジストリsnapshot・旧コピーの保存先として残します。`volumeRecoveryDirectories`は既存schema 4の復元・整理に使い、schema 6の復元中はそのbaseに`.restore`を付けた別領域で元DACLを検証してから非上書き移動します。旧schema 1〜4と、ACL snapshotのない旧schema 6の互換復元も保持します。旧schema 6は元ACLを保証できない旨をwarningsに返します。[方式の設計](../DESIGN.md#削除と復元のデータフロー)を参照してください。
-
-復元途中で停止した場合も、同じ操作IDを指定します。ready記録のあるstageは内容の識別情報・ACL・属性を照合して再開します。readyがないstageや照合不一致は保全して停止するため、結果の`backupPath`と操作記録を保持してください。別の削除方法でstageを消したり、元パスへ手動でマージしたりしないでください。
+旧ファイルデータと旧レジストリ配置を扱うのは`migrate [--dry-run | --apply]`だけです。旧ファイルの復元互換は終了し、所有確認済みの旧退避rootと操作記録を本文の展開・hash・コピー・bundle化なしでWindowsゴミ箱へ破棄します。レジストリの完全保全と非上書き復元は維持します。インストーラーの`migrate --apply --if-needed`はpolicy 2評価済みの中央旧GUID走査を省き、更新時のonline owned store/restore rootの固定位置と小markerだけを確認します。通常削除・一覧・保守に旧ファイル走査を入れません。所有不明・registry signal・offline・拒否は警告して残し、file整理の未完了だけでregistry通常操作を止めません。中断gateは自動解除せず、元フォルダーとWindowsゴミ箱を確認後の`migrate --apply --retry-legacy-discard`だけで明示再評価します。設定検証は無走査・不変更の`validate-config`を使います。移行開始後の導入失敗では新exe・設定・登録を保持します。
 
 ## sandboxとゴミ箱へのアクセス
 
-削除元への書込みが許可されていても、ホストのsandbox内でWindowsゴミ箱への実効的な書込み権限を取得できるとは限りません。書込みルートの指定だけでゴミ箱へのアクセスを推定しないでください。ファイルの`delete --dry-run`は実際のShell移動を行わないため、成功してもゴミ箱への書込み許可までは確認できません。`COPYENGINE_E_ACCESS_DENIED_SRC`（`0x80270021`）だけから元対象のACL破損と判断せず、実行元のsandbox条件とゴミ箱へのアクセスも切り分けます。
+削除元への書込みが許可されても、ホストのsandbox内でWindowsゴミ箱への書込み権限を取得できるとは限りません。`delete --dry-run`はShell移動を行わないため、実処理の権限を保証しません。`COPYENGINE_E_ACCESS_DENIED_SRC`（`0x80270021`）だけから元対象のACL破損と判断せず、実行元のsandbox条件とゴミ箱へのアクセスも切り分けます。
 
-必要な範囲の許可はホストの正式な権限審査で取得します。対応するCodexの`exec_command`では、ファイル・フォルダーの実削除と復元を初回から`sandbox_permissions: "require_escalated"`で申請します。これはWindowsの管理者起動とは別の条件で、Prunlet自身による自動昇格や承認ポリシーの無効化は行いません。既に`ambiguous`となった操作は許可取得だけを根拠に再送せず、操作記録と元対象・ゴミ箱のFile ID、ACLを照合して状態を確認します。別shell・別APIへの付替えや永久削除へのfallbackは行いません。
+対応するCodexの`exec_command`では、実削除を初回から`sandbox_permissions: "require_escalated"`で申請します。Windowsの管理者起動とは別の条件であり、Prunletの自動昇格や承認ポリシーの無効化はありません。対応しないホストでは正式な承認経路に従います。拒否された対象を別shell・別APIへ付け替えません。
+
+ファイル結果は`recycled`・`would_recycle`・`already_absent`・`failed`・`ambiguous`です。`failed`・`ambiguous`は成功扱いにしません。`ambiguous`となった削除は、許可取得だけを根拠に再送せず、CLIのJSON・元対象・Windowsのゴミ箱を確認します。ファイルの操作ID・Prunlet復元記録による照合は提供しません。レジストリ切断後は操作IDを使う`registry-reconcile`で照合し、同じ削除を再送しません。
 
 ## 使用中のファイルと同時実行
 
-同じ復元領域を使う操作が重なった場合、Prunletは`maintenance.lock`が解放されるまで待ち、取得後に処理を続けます。大量操作で60秒を超えても、待ち時間だけを理由に失敗しません。待機中は元対象と復元データを変更しません。保持プロセスが終了するとOSがロックを解放します。待機自体を中止する場合はCLIを通常の方法で終了できます。ロックファイルは通常運用でも残るため、競合の解消を目的に削除しないでください。
+共通排他が必要な操作は`maintenance.lock`が解放されるまで待ち、取得後に続行します。この固定ロックは操作記録ではなく、競合解消のために削除しません。60秒を超える待機でも、時間だけを理由に失敗せず、待機中は元対象と復元データを保全します。保持プロセスが終了するとOSがロックを解放します。
 
-1秒以上待つ場合は、stderrへ待機中の経過時間を出し、以後5秒おきとロック取得時にも通知します。これは処理状況の案内で、失敗を意味しません。CLIのstdoutは最終結果のJSONだけなので、成否は終了コードと結果JSONで判断してください。MCPクライアントは`tools/call`の`params._meta.progressToken`に文字列・整数を指定すると、同じ状況を`notifications/progress`で受け取れます。表示方法はクライアントによります。
+1秒以上の待機はstderrへ経過時間を出し、以後5秒おきと取得時に通知します。CLIのstdoutは最終JSON専用です。MCPの`tools/call`に`params._meta.progressToken`を指定すると`notifications/progress`で受け取れます。最終応答後は通知を送りません。
 
-ロード中のDLLや使用中のファイルは、容量走査や移動用ハンドルの取得、renameをWindowsが拒む場合があります。新規操作はコピーを作らず、属性やアクセス権限を変更して拒否を回避しません。失敗時は結果と操作IDを確認し、中断して退避済みの実体がある場合はその記録を保持してください。旧コピー形式の整理にある削除保留の待機と、新規renameの可否は別の検証です。
+独立したファイル対象はprocess共通のworker上限内で処理します。同一対象・親子・共有ハードリンクの競合は排他し、MCP要求の並行数とfile worker数を区別します。registry privilege変更をfile workerと並行させません。
 
-.NETの一時領域を清掃する場合は、そのビルド処理が終わったことを確認してください。Prunletの標準ビルドは`-p:UseSharedCompilation=false`を指定し、共有コンパイラーによる一時DLLの保持を防ぎます。ほかの専用ビルドでも`-p:UseSharedCompilation=false -nodeReuse:false`を指定できます。共有ビルドサーバーを終了する場合は、他のビルドへの影響も確認してください。Prunletが利用プロセスを自動終了することはありません。
+使用中のDLLやファイルはWindowsが移動を拒否する場合があります。Prunletはコピー・属性やACLの変更・利用プロセスの終了で拒否を回避しません。失敗や不明状態は元対象とゴミ箱を確認してください。
+
+.NETの一時領域はビルド完了後に清掃します。標準ビルドは`-p:UseSharedCompilation=false`を指定します。共有ビルドサーバーを停止する場合は他のビルドへの影響を確認します。
 
 ## 登録
 
@@ -92,7 +79,7 @@ MCP登録の実行内容は次のとおりです。
 
 対応するtool名は`Bash`、`exec_command`、`functions.exec_command`です。入力は`tool_input.command`または`tool_input.cmd`を読みます。対象外toolや削除候補のないshell入力にはexe単体で`{}`を返します。認識した直接ファイル削除は理由とPrunlet CLI手順を付けて拒否し、入力の自動置換を行いません。
 
-登録するWindows hookコマンドは`<Systemのcmd.exe絶対パス> /d /c call "<exe>" --config "<config>" hook`です。Codexは環境の既定シェルをフックへ引き継ぐため、CMDを明示して`call`をCMD内で実行します。登録パスにCMD再展開文字やPowerShellの展開文字（ドル記号・バッククォート）が含まれる場合は、書込み前に自動登録を拒否します。旧`--hook-script <script>`は互換引数として受理するだけで、PowerShell backendを起動しません。更新で配置済み旧backendを退役させる際は、製品バックアップを保全してCoreによるバックアップ付き削除を使います。
+登録するWindows hookコマンドは`<Systemのcmd.exe絶対パス> /d /c call "<exe>" --config "<config>" hook`です。Codexは環境の既定シェルをフックへ引き継ぐため、CMDを明示して`call`をCMD内で実行します。登録パスにCMD再展開文字やPowerShellの展開文字（ドル記号・バッククォート）が含まれる場合は、書込み前に自動登録を拒否します。旧`--hook-script <script>`は互換引数として受理するだけで、PowerShell backendを起動しません。更新で配置済み旧backendを退役させる際は、製品バックアップを保全してCoreによるWindowsゴミ箱への削除を使います。
 
 | 入力 | 結果 |
 | --- | --- |
@@ -108,11 +95,11 @@ MCP登録の実行内容は次のとおりです。
 
 レジストリ限定の素通し例外はありません。認識した`Remove-Item`・既定alias、`Remove-ItemProperty`・`rp`と`reg[.exe] delete`を拒否します。`reg query`や`echo`の引数にある無関係なコマンド文字列は通過します。既存のwrapper・escape検出を維持します。`{}`は実行許可ではなく、他hookとホストの承認へ判断を委ねる応答です。
 
-拒否時は配置済みexe・設定で、ファイルには`delete --paths-file <absolute-json-file>`、レジストリには`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <single-key-path>`を最初からCMDで使う手順を案内します。成功した`operationId`を保持し、共通`restore <operationId>`で非上書き復元します。MCP代替入口は`delete_registry`・`restore_registry`です。view必須、既定値の空文字、完全ACLの権限とKTMの境界は[README](../README.md#レジストリの削除・復元)を参照してください。削除許可とホスト承認を維持し、拒否対象を別経路で再試行しません。hook自身は削除・自動置換・PowerShell backend起動を行いません。
+拒否時は配置済みexe・設定で、ファイルには`delete --paths-file <absolute-json-file>`、レジストリには`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <single-key-path>`を最初からCMDで使う手順を案内します。レジストリで成功した`operationId`を保持し、`registry-restore <operationId>`（`restore`もレジストリ専用の別名）で非上書き復元します。ファイル・フォルダーは操作IDを保存せず、Windowsのゴミ箱で復元します。MCP代替入口は`delete_registry`・`restore_registry`です。view必須、既定値の空文字、完全ACLの権限とKTMの境界は[README](../README.md#レジストリの削除復元)を参照してください。削除許可とホスト承認を維持し、拒否対象を別経路で再試行しません。hook自身は削除・自動置換・PowerShell backend起動を行いません。
 
 MCPの1行とhookの入力全体は、UTF-16の文字数で1,048,576文字まで受理します。MCPは空白だけの行を従来どおり無視します。それ以外の超過行は残りを改行まで読み捨ててエラーを返し、次の要求を処理します。hookは上限超過を検出するとEOFを待たず拒否します。読み取り中も保持する入力をこの上限までに抑えます。
 
-このhookは任意コードの全削除を検出する境界ではありません。動的なコマンド名、独自alias、.NETのファイルAPI、他言語のコード、外部スクリプト、エンコード済みコマンド、対話型shellへ後から送る入力などは検出対象外です。Prunletのローカル絶対パス検査・復元データ保存先の保護はCLIとMCPの入口で別途適用されます。通常の削除例とJSON一覧の制限は[README](../README.md#削除・復元)を参照してください。
+このhookは任意コードの全削除を検出する境界ではありません。動的なコマンド名、独自alias、.NETのファイルAPI、他言語のコード、外部スクリプト、エンコード済みコマンド、対話型shellへ後から送る入力などは検出対象外です。Prunletのローカル絶対パス検査・復元データ保存先の保護はCLIとMCPの入口で別途適用されます。通常の削除例とJSON一覧の制限は[README](../README.md#削除復元)を参照してください。
 
 ## レジストリの6801と起動コンテキスト
 

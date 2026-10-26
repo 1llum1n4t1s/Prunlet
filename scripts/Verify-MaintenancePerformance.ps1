@@ -1,6 +1,6 @@
 # 想定する失敗: 出力先の既存データ/リンクへの侵入、別版・別記録での比較、CLI失敗/timeout、
-# dry-runによるmetadata変更、保守によるschema 6実体消失、復元先の上書き、
-# 復元時の内容/File ID/属性/完全O/G/D bytesの変化、未計測CPUを成功扱いすること。
+# dry-run/通常保守による旧記録変更・走査、明示移行による既存ゴミ箱実体消失、
+# Windows Bin移動後の内容/File ID/属性/ADSの欠落、未計測CPUの成功扱い。
 # 固定の性能閾値は設けず、保守CLIの比較からログオン全体の改善を断定しない。
 [CmdletBinding()]
 param(
@@ -37,7 +37,7 @@ foreach ($path in @($ExecutablePath, $BaselineExecutablePath)) {
     if (![IO.File]::Exists($path)) { throw "Executable missing: $path" }
 }
 $baselineVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($BaselineExecutablePath).ProductVersion
-if ($baselineVersion -notmatch '^1\.0\.14(?:[.+-]|$)') { throw "Expected genuine installed 1.0.14 baseline; found $baselineVersion" }
+if ($baselineVersion -notmatch '^1\.0\.15(?:[.+-]|$)') { throw "Expected genuine 1.0.15 baseline; found $baselineVersion" }
 if ((Get-FileHash -LiteralPath $ExecutablePath).Hash -eq (Get-FileHash -LiteralPath $BaselineExecutablePath).Hash) { throw 'Executables must differ.' }
 $null = [IO.Directory]::CreateDirectory($outputRoot)
 $utf8 = [Text.UTF8Encoding]::new($false)
@@ -58,6 +58,9 @@ function Digest([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA
 $previousTemp = $env:TEMP; $previousTmp = $env:TMP
 try {
     $env:TEMP = $tempRoot; $env:TMP = $tempRoot
+    . (Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1')
+    $helperFiles = @('NativeShellFixture.cs', 'FixtureNative.cs', 'OwnedBinLocator.cs', 'PermissionFixture.cs') | ForEach-Object { Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $_ }
+    Add-Type -Path $helperFiles -CompilerOptions '/unsafe'
     Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -103,7 +106,7 @@ function Invoke-Cli([string[]]$CliArguments, [string]$Exe = $ExecutablePath) {
     $info.WorkingDirectory = $outputRoot
     $info.Environment['TEMP'] = $tempRoot; $info.Environment['TMP'] = $tempRoot
     $info.Environment['DOTNET_BUNDLE_EXTRACT_BASE_DIR'] = $runtimeRoot
-    $process = [Diagnostics.Process]::new(); $process.StartInfo = $info; $job = $null
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $info; $job = $null; $child = $null
     try {
         $null = $process.Start()
         $shellOut = $process.StandardOutput.ReadToEndAsync(); $shellErr = $process.StandardError.ReadToEndAsync()
@@ -114,18 +117,22 @@ function Invoke-Cli([string[]]$CliArguments, [string]$Exe = $ExecutablePath) {
         $timer = [Diagnostics.Stopwatch]::StartNew()
         $process.StandardInput.WriteLine($command)
         $process.StandardInput.WriteLine('exit %errorlevel%'); $process.StandardInput.Close()
+        while (!$child -and !$process.HasExited -and $timer.ElapsedMilliseconds -lt 5000) {
+            $child = [Prunlet.RecordlessE2E.PermissionFixture]::FindChild($process.Id, $Exe)
+            if (!$child) { [Threading.Thread]::Sleep(2) }
+        }
         if (!$process.WaitForExit(600000)) { $process.Kill($true); $process.WaitForExit(); throw "CLI timeout: $CliArguments" }
         $timer.Stop()
         $out = [IO.File]::ReadAllText($stdoutPath, $utf8); $err = [IO.File]::ReadAllText($stderrPath, $utf8)
         $call = @{ executable = $Exe; arguments = $CliArguments; exitCode = $process.ExitCode; elapsedMilliseconds = $timer.Elapsed.TotalMilliseconds
-            cpuMilliseconds = [PrunletMaintenanceEvidence]::CpuMilliseconds($job); cpuScope = 'CMD job including CLI child'; stdoutPath = $stdoutPath; stderrPath = $stderrPath
+            cpuMilliseconds = $(if ($child) { $child.TotalProcessorTime.TotalMilliseconds } else { $null }); cpuVerified = ($null -ne $child); actualCliPid = $(if ($child) { $child.Id } else { $null }); cpuScope = 'Actual CLI TotalProcessorTime'; jobCpuMilliseconds = [PrunletMaintenanceEvidence]::CpuMilliseconds($job); stdoutPath = $stdoutPath; stderrPath = $stderrPath
             shellStdout = $shellOut.GetAwaiter().GetResult(); shellStderr = $shellErr.GetAwaiter().GetResult() }
         $calls.Add($call)
         $json = $null; try { $json = $out | ConvertFrom-Json -AsHashtable -Depth 80 } catch { }
         return @{ ExitCode = $process.ExitCode; Json = $json; Stdout = $out; Stderr = $err; Measurement = $call }
     } finally {
         if (!$process.HasExited) { $process.Kill($true); $process.WaitForExit() }
-        if ($job) { $job.Dispose() }; $process.Dispose()
+        if ($child) { $child.Dispose() }; if ($job) { $job.Dispose() }; $process.Dispose()
     }
 }
 function Snapshot-Tree([string]$Root) {
@@ -144,77 +151,129 @@ function Snapshot-Hashes([string]$Root) {
     return (ConvertTo-Json -InputObject $hashes -Compress)
 }
 function Assert-Call($Call, [string]$Context) { Assert-True ($Call.ExitCode -eq 0 -and $null -ne $Call.Json) "$Context failed: $($Call.Stdout) $($Call.Stderr)" }
-function Delete-Tree([string]$Path) {
+function Delete-Tree([string]$Path, [string]$Producer = $ExecutablePath) {
     $list = Join-Path $outputRoot ('paths-' + [guid]::NewGuid().ToString('N') + '.json')
     Save-Json $list @($Path)
-    $deleted = Invoke-Cli @('delete', '--recursive', '--paths-file', $list)
+    $deleted = Invoke-Cli @('delete', '--recursive', '--paths-file', $list) $Producer
     Assert-Call $deleted 'Delete'
     Assert-True ($deleted.Json.items.Count -eq 1 -and $deleted.Json.items[0].path -ceq $Path -and $deleted.Json.items[0].status -eq 'deleted' -and !(Test-Path -LiteralPath $Path)) 'Delete did not confirm this fixture.'
-    $deletedReceipt = Read-Json (Join-Path (Join-Path $metadata $deleted.Json.operationId) 'recycle-0000-complete.json')
+    $deletedReceipt = Read-Json (Join-Path (Resolve-VerificationOperationDirectory $metadata $deleted.Json.operationId) 'recycle-0000-complete.json')
     $binPaths.Add($deletedReceipt.physicalPath)
     return $deleted.Json.operationId
 }
 function Median($Values) { $sorted = @($Values | Sort-Object); $n = $sorted.Count; if ($n % 2) { return $sorted[[int][Math]::Floor($n / 2)] }; return ($sorted[$n / 2 - 1] + $sorted[$n / 2]) / 2 }
+# 共通のnative snapshotでdata/全ADS/ID/属性/ACLを検査する。Windows Bin移動時の実ACLはWindowsに任せる。
+function Assert-R([bool]$Value, [string]$Message) { Assert-True $Value $Message }
+$script:observed = @{}
+function Add-Timing([string]$Variant, [int]$Iteration, $Call, [string]$Layout) {
+    $diagnostic = $Variant -ceq 'baseline-legacy-diagnostic'
+    if ($diagnostic) {
+        $j = $Call.Json
+        Assert-True ($Call.ExitCode -eq 1 -and $null -ne $j -and !$Call.Stderr.Trim()) 'Baseline expected namespace incompatibility response missing.'
+        $keys = @('dryRun','retentionDays','maxRecoveryBytes','retainedBytesBefore','retainedBytesAfter','purgedBytes','plannedPurgeBytes','capacityKnown','budgetSatisfied','complete','historyCompaction','operations','warnings')
+        Assert-True ((@($j.Keys | Sort-Object) -join '|') -ceq (@($keys | Sort-Object) -join '|')) 'Unexpected baseline DTO fields.'
+        Assert-True ($j.dryRun -and !$j.complete -and $j.capacityKnown -and $j.budgetSatisfied -and $j.retainedBytesBefore -eq $j.retainedBytesAfter -and $j.purgedBytes -eq 0 -and $j.plannedPurgeBytes -eq 0 -and @($j.operations).Count -eq 0) 'Baseline incompatibility changed maintenance semantics.'
+        Assert-True (@($j.warnings).Count -eq 1 -and $j.warnings[0] -ceq 'Unknown recovery member .registry-records-v1 was retained and counted against the budget.') 'Unexpected baseline top-level warning.'
+        $h = $j.historyCompaction
+        Assert-True ((@($h.Keys | Sort-Object) -join '|') -ceq 'dryRun|operations|warnings') 'Unexpected baseline history DTO fields.'
+        Assert-True ($h.dryRun -and @($h.operations).Count -eq 1 -and @($h.warnings).Count -eq 2) 'Unexpected baseline history shape.'
+        $o = $h.operations[0]
+        Assert-True ((@($o.Keys | Sort-Object) -join '|') -ceq 'error|files|operationId|status') 'Unexpected baseline history operation fields.'
+        Assert-True ($o.operationId -ceq $operationId -and $o.status -ceq 'retained' -and $null -eq $o.error -and @($o.files).Count -eq 0) 'Baseline did not retain this exact record.'
+        $expectedWarnings = @('Unknown recovery member was retained: .registry-records-v1', ('Recycle Bin history operation ' + $operationId + ' was retained; schema 6 receipts remain available for reconciliation.'))
+        Assert-True (($h.warnings -join '|') -ceq ($expectedWarnings -join '|')) 'Unexpected baseline history warning.'
+    } else { Assert-Call $Call "$Variant maintain dry-run" }
+    Assert-True $Call.Measurement.cpuVerified 'Actual CLI TotalProcessorTime was not captured.'
+    $timings.Add(@{ variant = $Variant; layout = $Layout; operationId = $operationId; iteration = $Iteration
+        elapsedMilliseconds = $Call.Measurement.elapsedMilliseconds; cpuMilliseconds = $Call.Measurement.cpuMilliseconds
+        diagnosticOnly = $diagnostic; normalSuccess = !$diagnostic; output = $Call.Json; process = $Call.Measurement })
+}
 try {
     $null = [IO.Directory]::CreateDirectory($metadata)
-    Assert-Call (Invoke-Cli @('init', '--backup-directory', $metadata)) 'Init'
+    Assert-Call (Invoke-Cli @('init', '--backup-directory', $metadata) $BaselineExecutablePath) 'Baseline init'
     $config = Read-Json $configPath
     $config.volumeRecoveryDirectories = @{ 'D:\' = (Join-Path $outputRoot 'volume-store') }
     Save-Json $configPath $config
+    # 旧file記録を作る前に空のregistry領域を正規初期化し、通常保守の実行条件を揃える。
+    $ready = Invoke-Cli @('migrate', '--apply'); Assert-Call $ready 'Empty registry readiness initialization'
+    Assert-True ($ready.Json.registryReady -and $ready.Json.complete) 'Empty registry was not initialized.'
     $null = [IO.Directory]::CreateDirectory($tree)
     for ($i = 0; $i -lt $FileCount; $i++) { [IO.File]::WriteAllText((Join-Path $tree ('file-{0:000000}.txt' -f $i)), "Prunlet maintenance fixture $i", $utf8) }
-    $before = Snapshot-Tree $tree; Save-Json (Join-Path $outputRoot 'before.json') $before
-    Assert-True ($before.Count -eq $FileCount + 1) 'Fixture file count differs.'
-    $operationId = Delete-Tree $tree
-    $operationRoot = Join-Path $metadata $operationId
+    [IO.File]::WriteAllText((Join-Path $tree 'file-000000.txt') + ':maintenance-stream', 'owned alternate stream', $utf8)
+    $before = Snapshot-R $tree; Save-Json (Join-Path $outputRoot 'before.json') $before
+    $operationId = Delete-Tree $tree $BaselineExecutablePath
+    $operationRoot = Resolve-VerificationOperationDirectory $metadata $operationId
     $manifest = Read-Json (Join-Path $operationRoot 'recycle-manifest.json')
     $receipt = Read-Json (Join-Path $operationRoot 'recycle-0000-complete.json')
-    Assert-True ($manifest.schema -eq 6 -and $manifest.entries.Count -eq 1 -and $manifest.entries[0].path -ceq $tree) 'Not this schema 6 fixture.'
+    Assert-True ($manifest.schema -eq 6 -and $manifest.entries.Count -eq 1 -and $manifest.entries[0].path -ceq $tree) 'Not this genuine schema 6 fixture.'
     Assert-True ($receipt.operationId -ceq $operationId -and $receipt.manifestSha256 -ieq (Digest (Join-Path $operationRoot 'recycle-manifest.json'))) 'Receipt binding differs.'
     $payload = $receipt.physicalPath
     Assert-True ([IO.Path]::IsPathFullyQualified($payload) -and ($payload.Split([char]92) -icontains '$Recycle.Bin')) 'Payload must be in Windows Recycle Bin.'
-    $payloadIdentity = [PrunletMaintenanceEvidence]::Snapshot($payload)[0]
-    Assert-True ($payloadIdentity -ceq $before[0].identity) 'Bin root identity differs.'
-    $hashes = Snapshot-Hashes $metadata; $configHash = Digest $configPath
+    Assert-True ($operationRoot -ceq (Join-Path $metadata $operationId)) 'Baseline must create genuine legacy-layout records.'
+    $binBefore = Snapshot-R $payload
+    $rawBefore = Snapshot-R $operationRoot
+    $configHash = Digest $configPath
+    $compatibilityHashes = Snapshot-Hashes $metadata
+    # 同一の真正な旧記録・ゴミ箱payloadで、順序を反転した対の比較を行う。
     for ($i = 1; $i -le $Iterations; $i++) {
         $order = if ($i % 2) { @('baseline', 'current') } else { @('current', 'baseline') }
         foreach ($label in $order) {
             $exe = if ($label -eq 'baseline') { $BaselineExecutablePath } else { $ExecutablePath }
-            $call = Invoke-Cli @('maintain', '--dry-run') $exe; Assert-Call $call "$label maintain dry-run"
-            $timings.Add(@{ variant = $label; iteration = $i; elapsedMilliseconds = $call.Measurement.elapsedMilliseconds; cpuMilliseconds = $call.Measurement.cpuMilliseconds; output = $call.Json; process = $call.Measurement })
-            Assert-True ((Snapshot-Hashes $metadata) -ceq $hashes -and (Digest $configPath) -ceq $configHash) 'Dry-run changed metadata/config.'
-            Assert-True (([PrunletMaintenanceEvidence]::Snapshot($payload)[0]) -ceq $payloadIdentity) 'Dry-run changed bin identity.'
+            $variant = if ($label -eq 'baseline') { 'baseline-legacy-diagnostic' } else { 'current-legacy-alternating' }
+            Add-Timing $variant $i (Invoke-Cli @('maintain', '--dry-run') $exe) 'same-genuine-schema6-record-and-bin-payload'
+            Assert-True ((Snapshot-Hashes $metadata) -ceq $compatibilityHashes -and (Digest $configPath) -ceq $configHash) 'Alternating dry-run changed metadata/config.'
         }
     }
-    $results.Add(@{ name = 'alternating-maintain-dry-run'; passed = $true })
-    $operationHashes = Snapshot-Hashes $operationRoot
-    for ($i = 1; $i -le 2; $i++) {
-        Assert-Call (Invoke-Cli @('maintain', '--apply')) 'Maintain apply'
-        Assert-True ((Snapshot-Hashes $operationRoot) -ceq $operationHashes -and ([PrunletMaintenanceEvidence]::Snapshot($payload)[0]) -ceq $payloadIdentity) 'Apply changed schema 6 record/bin identity.'
+    $null = Assert-SnapshotR $payload $binBefore
+    $null = Assert-SnapshotR $operationRoot $rawBefore
+    $results.Add(@{ name = 'alternating-same-legacy-operation-maintain-dry-run'; passed = $true; operationId = $operationId })
+    # LIST拒否を実証した旧ディレクトリで、通常一覧/保守が走査しないことを確認する。
+    $security = [Prunlet.RecordlessE2E.PermissionFixture]::Security($operationRoot)
+    try {
+        [Prunlet.RecordlessE2E.PermissionFixture]::DenyDataRead($operationRoot, $security)
+        $denied = [Convert]::ToBase64String([Prunlet.RecordlessE2E.PermissionFixture]::Security($operationRoot))
+        $enumerationFailed = $false
+        try { $null = @([IO.Directory]::EnumerateFileSystemEntries($operationRoot)) } catch { $enumerationFailed = $true }
+        Assert-True $enumerationFailed 'Old directory LIST denial was not established.'
+        foreach ($arguments in @(@('operations'), @('maintain', '--dry-run'), @('maintain', '--apply'))) {
+            $call = Invoke-Cli $arguments; Assert-Call $call 'Normal registry-only operation with denied legacy directory'
+            Assert-True ([Convert]::ToBase64String([Prunlet.RecordlessE2E.PermissionFixture]::Security($operationRoot)) -ceq $denied) 'Normal operation changed denied directory ACL.'
+        }
+    } finally { [Prunlet.RecordlessE2E.PermissionFixture]::SetDacl($operationRoot, $security) }
+    $null = Assert-SnapshotR $operationRoot $rawBefore
+    $null = Assert-SnapshotR $payload $binBefore
+    Assert-True ((Digest $configPath) -ceq $configHash) 'Normal operations changed config.'
+    $results.Add(@{ name = 'normal-operations-do-not-enumerate-or-change-legacy'; passed = $true; proof = 'Directory LIST denied and enumeration failure established; operations, maintain --dry-run/--apply succeed; native snapshots unchanged after ACL restoration.' })
+    $migration = Invoke-Cli @('migrate', '--apply'); Assert-Call $migration 'Explicit legacy migration'
+    $discarded = @($migration.Json.operations | Where-Object path -CEQ $operationRoot)
+    Assert-True ($migration.Json.registryReady -and $migration.Json.complete -and $discarded.Count -eq 1 -and $discarded[0].status -ceq 'recycled' -and $null -eq $discarded[0].schema -and !$discarded[0].operationId -and !(Test-Path -LiteralPath $operationRoot)) 'Explicit legacy metadata discard failed.'
+    $null = Assert-SnapshotR $payload $binBefore
+    $metadataItem = @([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($rawBefore[0].Id))
+    Assert-True ($metadataItem.Count -eq 1) 'Discarded metadata root must have one owned Windows Bin identity.'
+    $metadataBinBefore = Assert-SnapshotR $metadataItem[0].PhysicalPath $rawBefore -WindowsManagedBin
+    $binPaths.Add($metadataItem[0].PhysicalPath)
+    Save-Json (Join-Path $outputRoot 'after-discard-bin.json') @{ sourcePayload = (Snapshot-R $payload); discardedMetadata = $metadataBinBefore }
+    $results.Add(@{ name = 'explicit-legacy-metadata-root-discard-to-windows-bin'; passed = $true; path = $operationRoot; originalLegacyOperationId = $operationId; measurement = $migration.Measurement; metadataBin = $metadataItem[0]; policy = 'Owned old metadata root is recycled without parsing, hashing, decoding, restoration or bundle conversion. Existing file payload remains managed by Windows Bin.' })
+    $postHashes = Snapshot-Hashes $metadata
+    for ($i = 1; $i -le $Iterations; $i++) {
+        Add-Timing 'current-after-explicit-migration' $i (Invoke-Cli @('maintain', '--dry-run')) 'registry-only-after-legacy-discard'
+        Assert-True ((Snapshot-Hashes $metadata) -ceq $postHashes -and (Digest $configPath) -ceq $configHash) 'Post-migration dry-run changed metadata/config.'
     }
-    $results.Add(@{ name = 'maintain-apply-twice-retains-schema6'; passed = $true })
-    $null = [IO.Directory]::CreateDirectory($tree)
-    $conflictBefore = Snapshot-Tree $tree
-    $conflict = Invoke-Cli @('restore', $operationId)
-    Assert-True ($conflict.ExitCode -ne 0 -and (ConvertTo-Json -InputObject (Snapshot-Tree $tree) -Depth 10 -Compress) -ceq (ConvertTo-Json -InputObject $conflictBefore -Depth 10 -Compress)) 'Conflicting restore overwrote the target.'
-    Assert-True (([PrunletMaintenanceEvidence]::Snapshot($payload)[0]) -ceq $payloadIdentity) 'Conflicting restore lost bin root identity.'
-    $conflictOperationId = Delete-Tree $tree
-    $restored = Invoke-Cli @('restore', $operationId); Assert-Call $restored 'Restore'
-    Assert-True ($restored.Json.items[0].status -eq 'restored' -and !(Test-Path -LiteralPath $payload)) 'Restore result/payload differs.'
-    $after = Snapshot-Tree $tree; Save-Json (Join-Path $outputRoot 'after.json') $after
-    Assert-True ((ConvertTo-Json -InputObject $before -Depth 10 -Compress) -ceq (ConvertTo-Json -InputObject $after -Depth 10 -Compress)) 'Restored tree content/ID/attributes/full ACL differs.'
-    $results.Add(@{ name = 'non-overwriting-restore-full-tree'; passed = $true; operationId = $operationId; conflictOperationId = $conflictOperationId })
+    foreach ($round in 1..2) { Assert-Call (Invoke-Cli @('maintain', '--apply')) 'Post-migration maintain apply' }
+    $null = Assert-SnapshotR $payload $binBefore
+    $null = Assert-SnapshotR $metadataItem[0].PhysicalPath $metadataBinBefore
+    $results.Add(@{ name = 'post-migration-registry-only-maintenance'; passed = $true })
 } catch {
     $results.Add(@{ name = 'maintenance-performance'; passed = $false; error = $_.Exception.Message; location = $_.InvocationInfo.PositionMessage; stack = $_.ScriptStackTrace })
 } finally {
-    $medians = foreach ($label in @('baseline', 'current')) {
+    $medians = foreach ($label in @('baseline-legacy-diagnostic', 'current-legacy-alternating', 'current-after-explicit-migration')) {
         $samples = @($timings | Where-Object variant -EQ $label)
         if ($samples.Count) { @{ variant = $label; samples = $samples.Count; elapsedMilliseconds = Median $samples.elapsedMilliseconds; cpuMilliseconds = Median $samples.cpuMilliseconds } }
     }
     $report = @{ passed = @($results | Where-Object passed -EQ $true).Count; failed = @($results | Where-Object passed -EQ $false).Count
         executablePath = $ExecutablePath; executableSha256 = Digest $ExecutablePath; baselineExecutablePath = $BaselineExecutablePath; baselineSha256 = Digest $BaselineExecutablePath
         baselineVersion = $baselineVersion; fileCount = $FileCount; iterations = $Iterations; results = @($results); timings = @($timings); medians = @($medians); calls = @($calls)
-        retainedPaths = @($outputRoot, $ReportPath) + @($binPaths | Where-Object { Test-Path -LiteralPath $_ }); limitation = 'CPU includes CMD overhead; CLI timings do not measure total logon performance. Fixtures are retained for parent cleanup.' }
+        retainedPaths = @($outputRoot, $ReportPath) + @($binPaths | Where-Object { Test-Path -LiteralPath $_ }); comparisonMode = 'Alternating order per pair on the same genuine 1.0.15 schema6 record and configured-file-count bin payload. Empty registry readiness is initialized before creating the legacy record. Baseline exit1/completefalse is accepted only for the exact .registry-records-v1 incompatibility DTO and warnings, and is diagnostic timing, not normal successful maintenance; no normal speed ratio is inferred. Current normal operations are checked with old directory LIST denied. Explicit migrate --apply is measured separately, recycling the owned old metadata root itself while leaving the existing Windows Bin payload untouched. Both objects remain Windows-managed; no old-data restore or conversion is performed. Current post-migration medians form a separate boundary, without baseline comparison after migration.'; limitation = 'Wall time includes CMD dispatch and child discovery; CPU is actual CLI TotalProcessorTime, with CMD job CPU supplemental. Fresh CLI process, warmed OS caches, other verification processes may run concurrently; no fixed speed threshold; no measurement or claim of total startup/logon speed. Fixtures retained for parent cleanup.' }
     Save-Json $ReportPath $report
     $report | ConvertTo-Json -Depth 10
 }

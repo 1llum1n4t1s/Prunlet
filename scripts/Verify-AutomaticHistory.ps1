@@ -46,11 +46,6 @@ function History-Result($Response, [string]$Id) {
     Assert-True ($operations.Count -eq 1) 'History operation was not reported exactly once.'
     return $operations[0]
 }
-function Assert-Compressed([string]$Directory) {
-    $metadata = @(Get-ChildItem -LiteralPath $Directory -File | Where-Object Name -ne 'operation.lock')
-    Assert-True ($metadata.Count -gt 0) 'Metadata fixture is empty.'
-    foreach ($file in $metadata) { Assert-True (($file.Attributes -band [IO.FileAttributes]::Compressed) -ne 0) "Metadata was not compressed: $($file.Name)" }
-}
 function Assert-Retained($History, [string]$Before) {
     $response = Invoke-Cli @('maintain', '--apply')
     $operation = History-Result $response $History.Id
@@ -76,47 +71,42 @@ foreach ($schema in @(1, 2, 3)) {
             Assert-True ($operation.status -eq 'eligible') 'Legacy uncompressed history was not eligible.'
             Assert-True ((Snapshot $script:Recovery) -ceq $rootBefore) 'Dry-run changed recovery bytes, attributes, or members.'
         }
-        $hashes = @{}; foreach ($file in Get-ChildItem -LiteralPath $history.Directory -File) { $hashes[$file.Name] = Digest $file.FullName }
         $applied = Invoke-Cli @('maintain', '--apply')
-        $operation = History-Result $applied $history.Id
-        Assert-True ($applied.ExitCode -eq 0 -and $operation.status -eq 'compacted') 'Automatic history compression failed.'
-        $saved = 0L
-        foreach ($file in $operation.files) {
-            Assert-True ($file.sha256 -ceq $hashes[$file.name] -and $file.savedBytes -eq ($file.physicalBytesBefore - $file.physicalBytesAfter)) 'Metadata digest or physical byte accounting differs.'
-            Assert-True ((Digest (Join-Path $history.Directory $file.name)) -ceq $hashes[$file.name]) 'Metadata content changed.'
-            $saved += $file.savedBytes
-        }
-        Assert-True ($saved -gt 400000) 'History did not reduce physical allocation.'
-        Assert-True ($applied.Json.purgedBytes -eq 0 -and $applied.Json.retainedBytesBefore -eq 0 -and $applied.Json.retainedBytesAfter -eq 0) 'Metadata savings were counted as copy capacity.'
-        Assert-Compressed $history.Directory
-        $compressed = Snapshot $history.Directory
+        Assert-True ($applied.ExitCode -eq 0) 'Terminal history maintenance failed.'
+        Assert-VerificationClosedRecord $script:Recovery $history.Id $schema
+        Assert-True (!(Test-Path -LiteralPath $history.Source)) 'Retiring purged history recreated its original.'
+        Assert-True ($applied.Json.purgedBytes -eq 0 -and $applied.Json.retainedBytesBefore -eq 0 -and $applied.Json.retainedBytesAfter -eq 0) 'Metadata retirement was counted as copy capacity.'
+        $closed = Snapshot $script:Recovery
         $again = Invoke-Cli @('maintain', '--apply')
-        $operation = History-Result $again $history.Id
-        Assert-True ($again.ExitCode -eq 0 -and $operation.status -eq 'skipped_compressed' -and @($operation.files).Count -eq 0) 'Already compressed history did not take the automatic fast path.'
-        Assert-True ((Snapshot $history.Directory) -ceq $compressed) 'Repeated maintenance changed history.'
-        # 手動圧縮は既圧縮でも従来の完全検証を返す。
-        $manual = Invoke-Cli @('compact-history', '--apply')
-        Assert-True ($manual.ExitCode -eq 0 -and $manual.Json.operations[0].status -eq 'compacted' -and @($manual.Json.operations[0].files).Count -gt 0) 'Manual compaction lost its full validation result.'
+        Assert-True ($again.ExitCode -eq 0 -and (Snapshot $script:Recovery) -ceq $closed -and !(Test-Path -LiteralPath $history.Source)) 'Repeated maintenance changed terminal history or recreated its original.'
+        Assert-VerificationClosedRecord $script:Recovery $history.Id $schema
     }
 }
-Test-Case 'delete-compresses-newly-expired-only' {
+Test-Case 'delete-preserves-legacy-until-explicit-maintain' {
     $legacy = New-History
     $legacyBefore = Snapshot $legacy.Directory
     $live = New-History -Live
     Set-Expired $live
+    $liveBefore = Snapshot $live.Directory
     $next = Join-Path $script:CaseRoot 'next.txt'; [IO.File]::WriteAllText($next, 'next deletion')
     $deleted = Invoke-Cli @('delete', '--', $next)
     Assert-True ($deleted.ExitCode -eq 0 -and ![IO.File]::Exists($next)) 'Triggering delete failed.'
-    Assert-True (@(Get-ChildItem -LiteralPath $live.Directory -File -Filter '*.bak').Count -eq 0) 'Expired recovery payload was not purged.'
-    Assert-Compressed $live.Directory
-    Assert-True ((Snapshot $legacy.Directory) -ceq $legacyBefore) 'Ordinary delete scanned/compacted previously purged history.'
+    Assert-True ((Snapshot $live.Directory) -ceq $liveBefore -and (Snapshot $legacy.Directory) -ceq $legacyBefore) 'Schema 6 delete unexpectedly maintained legacy records.'
     $maintained = Invoke-Cli @('maintain', '--apply')
-    Assert-True ((History-Result $maintained $legacy.Id).status -eq 'compacted') 'Scheduled maintenance did not catch up legacy history.'
-    Assert-Compressed $legacy.Directory
+    Assert-True ($maintained.ExitCode -eq 0 -and $maintained.Json.purgedBytes -gt 0 -and !(Test-Path -LiteralPath $live.Source)) 'Explicit maintenance did not reclaim the expired payload.'
+    Assert-VerificationClosedRecord $script:Recovery $legacy.Id 1
+    Assert-VerificationClosedRecord $script:Recovery $live.Id 1
+    $restored = Invoke-Cli @('restore', $deleted.Json.operationId)
+    Assert-True ($restored.ExitCode -eq 0 -and [IO.File]::ReadAllText($next) -ceq 'next deletion') 'Legacy maintenance damaged the schema 6 fixture.'
 }
-Test-Case 'manual-purge-leaves-history-uncompressed' {
-    $history = New-History
-    Assert-True (@(Get-ChildItem -LiteralPath $history.Directory -File | Where-Object { $_.Attributes -band [IO.FileAttributes]::Compressed }).Count -eq 0) 'Manual purge immediately compressed history.'
+Test-Case 'manual-purge-closes-terminal-history' {
+    $history = New-History -Live
+    $purged = Invoke-Cli @('purge', $history.Id, '--apply')
+    Assert-True ($purged.ExitCode -eq 0 -and !(Test-Path -LiteralPath $history.Source)) 'Manual purge failed or recreated its original.'
+    Assert-VerificationClosedRecord $script:Recovery $history.Id 1
+    $before = Snapshot $script:Recovery
+    $again = Invoke-Cli @('purge', $history.Id, '--apply')
+    Assert-True ($again.ExitCode -eq 0 -and $again.Json.lifecycleState -eq 'closed' -and @($again.Json.items).Count -eq 1 -and $again.Json.items[0].status -eq 'closed' -and (Snapshot $script:Recovery) -ceq $before -and !(Test-Path -LiteralPath $history.Source)) 'Repeated purge did not explicitly preserve the closed operation.'
 }
 Test-Case 'live-payload-retained-and-restorable' {
     $history = New-History -Live
@@ -148,8 +138,8 @@ foreach ($kind in @('unknown-member', 'readonly', 'ads', 'hardlink', 'invalid-js
 foreach ($kind in @('unknown-member', 'ads', 'hardlink', 'readonly')) {
     Test-Case "already-compressed-$kind-still-validated" {
         $history = New-History
-        $first = Invoke-Cli @('maintain', '--apply')
-        Assert-True ((History-Result $first $history.Id).status -eq 'compacted') 'Could not prepare compressed fixture.'
+        $first = Invoke-Cli @('compact-history', '--apply')
+        Assert-True ($first.ExitCode -eq 0 -and @($first.Json.operations | Where-Object { $_.operationId -eq $history.Id -and $_.status -eq 'compacted' }).Count -eq 1) 'Could not explicitly prepare compressed fixture.'
         $path = Join-Path $history.Directory 'manifest.json'
         switch ($kind) {
             'unknown-member' { [IO.File]::WriteAllText((Join-Path $history.Directory 'unknown.json'), '{}') }
@@ -160,11 +150,12 @@ foreach ($kind in @('unknown-member', 'ads', 'hardlink', 'readonly')) {
         Assert-Retained $history (Snapshot $history.Directory)
     }
 }
-Test-Case 'mcp-delete-compresses-newly-expired-only' {
+Test-Case 'mcp-delete-preserves-legacy-until-explicit-maintain' {
     $legacy = New-History
     $legacyBefore = Snapshot $legacy.Directory
     $live = New-History -Live
     Set-Expired $live
+    $liveBefore = Snapshot $live.Directory
     $next = Join-Path $script:CaseRoot 'mcp-next.txt'; [IO.File]::WriteAllText($next, 'MCP deletion')
     $running = Start-Cli @('mcp') -Mcp
     $process = $running.Process
@@ -184,12 +175,17 @@ Test-Case 'mcp-delete-compresses-newly-expired-only' {
         Assert-True ($initialized.result.protocolVersion -eq '2025-11-25') 'MCP version negotiation failed.'
         $process.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
         $tools = Rpc @{jsonrpc='2.0'; id=2; method='tools/list'; params=@{}}
-        Assert-True ($tools.result.tools.Count -eq 3 -and @($tools.result.tools | Where-Object name -eq 'compact_history').Count -eq 0) 'MCP tool contract changed.'
+        $expectedTools = @('delete_files', 'restore_files', 'delete_registry', 'restore_registry', 'reconcile_registry', 'list_operations')
+        $actualTools = @($tools.result.tools | ForEach-Object name)
+        Assert-True ($actualTools.Count -eq $expectedTools.Count -and @(Compare-Object $expectedTools $actualTools).Count -eq 0) 'MCP tool contract changed.'
         $deleted = Rpc @{jsonrpc='2.0'; id=3; method='tools/call'; params=@{name='delete_files'; arguments=@{paths=@($next)}}}
         Assert-True (!$deleted.result.isError -and ![IO.File]::Exists($next)) 'MCP delete failed.'
-        Assert-True (@(Get-ChildItem -LiteralPath $live.Directory -File -Filter '*.bak').Count -eq 0) 'MCP did not purge the expired copy.'
-        Assert-Compressed $live.Directory
+        Assert-True ((Snapshot $live.Directory) -ceq $liveBefore) 'Schema 6 MCP delete maintained the legacy payload.'
         Assert-True ((Snapshot $legacy.Directory) -ceq $legacyBefore) 'MCP delete compacted old history.'
+        $maintained = Invoke-Cli @('maintain', '--apply')
+        Assert-True ($maintained.ExitCode -eq 0 -and $maintained.Json.purgedBytes -gt 0 -and !(Test-Path -LiteralPath $live.Source)) 'Explicit maintenance did not reclaim the expired MCP fixture.'
+        Assert-VerificationClosedRecord $script:Recovery $legacy.Id 1
+        Assert-VerificationClosedRecord $script:Recovery $live.Id 1
     } finally {
         $process.StandardInput.Close()
         if (!$process.WaitForExit(10000)) { $process.Kill($true); $process.WaitForExit() }

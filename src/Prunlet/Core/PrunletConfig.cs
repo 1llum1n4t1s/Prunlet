@@ -68,17 +68,6 @@ public sealed class PrunletConfig
                 foreach (var property in info.Properties.Where(property => property.Name == "registrySessionFile"))
                     property.ShouldSerialize = (value, _) => ((PrunletConfig)value).RegistrySessionFile is not null;
             }
-            // 通常属性が既定のschema 1は旧exeの厳密JSON読込との互換性を維持する。
-            if (info.Type == typeof(ManifestEntry))
-            {
-                foreach (var property in info.Properties.Where(property => property.Name is "kind" or "treeRoot"))
-                    property.ShouldSerialize = (value, _) => ((ManifestEntry)value).Schema2Wire;
-                foreach (var property in info.Properties.Where(property => property.Name is "streams" or "reparseTag" or "linkDirectory" or "caseSensitive"))
-                    property.ShouldSerialize = (value, _) => ((ManifestEntry)value).Schema3Wire;
-                foreach (var property in info.Properties.Where(property => property.Name == "attributes"))
-                    property.ShouldSerialize = (value, _) => ((ManifestEntry)value).Attributes is uint attributes
-                        && (((ManifestEntry)value).Schema2Wire || attributes != (uint)FileAttributes.Archive);
-            }
             if (info.Type == typeof(FileOperationResult))
                 foreach (var property in info.Properties.Where(property => property.Name == "kind"))
                     property.ShouldSerialize = (value, _) => ((FileOperationResult)value).Schema2Wire
@@ -103,6 +92,12 @@ public sealed class DeleteResult
 
 public sealed class RestoreResult
 {
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? LifecycleState { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public int? OriginalSchema { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? TerminalReason { get; set; }
     public string OperationId { get; set; } = string.Empty;
     public List<FileOperationResult> Items { get; set; } = [];
     public List<string> Warnings { get; set; } = [];
@@ -118,38 +113,4 @@ public sealed class FileOperationResult
     public string? BackupPath { get; set; }
     public string? Sha256 { get; set; }
     public long? Size { get; set; }
-}
-
-internal sealed class OperationManifest
-{
-    public int Schema { get; set; } = 1;
-    public string OperationId { get; set; } = string.Empty;
-    public DateTimeOffset CreatedUtc { get; set; } = DateTimeOffset.UtcNow;
-    public List<ManifestEntry> Items { get; set; } = [];
-}
-
-internal sealed class ManifestEntry
-{
-    internal bool Schema2Wire { get; set; }
-    internal bool Schema3Wire { get; set; }
-    public List<ManifestStream>? Streams { get; set; }
-    public uint? ReparseTag { get; set; }
-    public bool LinkDirectory { get; set; }
-    public bool CaseSensitive { get; set; }
-    public string Kind { get; set; } = "file";
-    public string? TreeRoot { get; set; }
-    public string Path { get; set; } = string.Empty;
-    public string State { get; set; } = "pending";
-    public string? Sha256 { get; set; }
-    public long? Size { get; set; }
-    public DateTime? LastWriteUtc { get; set; }
-    public uint? Attributes { get; set; }
-}
-
-internal sealed class ManifestStream
-{
-    public string Name { get; set; } = string.Empty;
-    public long Offset { get; set; }
-    public long Size { get; set; }
-    public string Sha256 { get; set; } = string.Empty;
 }

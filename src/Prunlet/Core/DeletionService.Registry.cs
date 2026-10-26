@@ -20,6 +20,7 @@ public sealed partial class DeletionService
             throw new InvalidOperationException("Native registry execution requires a verified session context.");
         var target = NativeRegistry.Target(request);
         using var coordination = AcquireRecoveryCoordination(create: !dryRun);
+        RequireRegistryStorageReady(create: false);
         var result = new DeleteResult { DryRun = dryRun };
         var item = RegistryItem(target);
         result.Items.Add(item);
@@ -48,16 +49,16 @@ public sealed partial class DeletionService
             if (dryRun) return result;
             var incoming = bytes.LongLength;
             var operationBudget = Math.Max(config.MaxRecoveryBytes, incoming);
-            var maintenance = MaintainAllRecoveryCore(apply: true, incomingBytes: incoming);
+            var maintenance = MaintainRegistryOnlyCore(apply: true, incomingBytes: incoming);
             if (!maintenance.CapacityKnown || !maintenance.BudgetSatisfied || maintenance.RetainedBytesAfter > operationBudget - incoming)
                 throw new IOException("Recovery capacity could not be safely reserved; registry target was retained. " + string.Join(" ", maintenance.Warnings));
             result.Warnings.AddRange(maintenance.Warnings);
             if (incoming > config.MaxRecoveryBytes)
                 result.Warnings.Add("This single registry snapshot exceeds the configured recovery budget; it receives the same one-operation exception as file recovery. The next operation uses the normal budget.");
-            using var operation = NewOperationLease.Create(config.BackupDirectory, privateRegistry: true, requestedOperationId);
+            using var operation = NewOperationLease.Create(config.BackupDirectory, requestedOperationId);
             result.OperationId = operation.OperationId;
             var snapshotPath = Path.Combine(operation.Directory, RegistrySnapshotName);
-            var payload = PublishRegistryJson(snapshotPath, operation.OperationId, snapshot, held);
+            var payload = PublishRegistryJson(snapshotPath, operation.OperationId, snapshot, held, result.Warnings);
             item.BackupPath = snapshotPath;
             item.Sha256 = HashStream(payload);
             item.Size = payload.Length;
@@ -70,13 +71,13 @@ public sealed partial class DeletionService
             };
             ValidateRegistryManifest(manifest, operation.OperationId);
             ValidateRegistrySnapshot(manifest, snapshot);
-            var manifestStream = PublishRegistryJson(Path.Combine(operation.Directory, RegistryManifestName), operation.OperationId, manifest, held);
+            var manifestStream = PublishRegistryJson(Path.Combine(operation.Directory, RegistryManifestName), operation.OperationId, manifest, held, result.Warnings);
             var manifestHash = HashStream(manifestStream);
-            WriteRegistryReceipt(operation.Directory, manifest, manifestHash, "delete", "intent", held);
+            WriteRegistryReceipt(operation.Directory, manifest, manifestHash, "delete", "intent", held, result.Warnings);
             intentPublished = true;
             transaction.Commit();
             commitConfirmed = true;
-            WriteRegistryReceipt(operation.Directory, manifest, manifestHash, "delete", "complete", held);
+            WriteRegistryReceipt(operation.Directory, manifest, manifestHash, "delete", "complete", held, result.Warnings);
             item.Status = "deleted";
             return result;
         }
@@ -93,8 +94,17 @@ public sealed partial class DeletionService
         finally { foreach (var stream in held) stream.Dispose(); }
     }
 
-    public RestoreResult RestoreRegistry(string operationId) => RestoreOperation(operationId, expectedRegistry: true);
-    public RestoreResult RestoreFiles(string operationId) => RestoreOperation(operationId, expectedRegistry: false);
+    public RestoreResult RestoreRegistry(string operationId)
+    {
+        ValidateMoveOperationId(operationId);
+        if (registrySession is null && config.RegistryScope == "nativeWindows")
+            return RegistrySessionClient.Restore(config, operationId, RecoveryLockProgress);
+        using var coordination = AcquireRecoveryCoordination(create: true);
+        EnsureRegistryOperationAvailable(operationId);
+        var result = RestoreRegistryCore(operationId);
+        if (result.Items.All(item => item.Status is not ("failed" or "conflict"))) CaptureRegistryTerminal(operationId, result.Warnings);
+        return result;
+    }
 
     private RestoreResult RestoreRegistryCore(string operationId)
     {
@@ -127,12 +137,12 @@ public sealed partial class DeletionService
             using var transaction = new NativeRegistry.Transaction();
             // conflictも内容検証失敗もcommit前にrollbackできる。非上書き作成の検証後にintentを保存する。
             NativeRegistry.Restore(transaction, target, record.Snapshot);
-            WriteRegistryReceipt(record.Directory, manifest, record.ManifestHash, "restore", "intent", record.Held);
+            WriteRegistryReceipt(record.Directory, manifest, record.ManifestHash, "restore", "intent", record.Held, result.Warnings);
             record.Receipts.Add(RegistryReceiptName("restore", "intent"));
             intentPublished = true;
             transaction.Commit();
             committed = true;
-            WriteRegistryReceipt(record.Directory, manifest, record.ManifestHash, "restore", "complete", record.Held);
+            WriteRegistryReceipt(record.Directory, manifest, record.ManifestHash, "restore", "complete", record.Held, result.Warnings);
             record.Receipts.Add(RegistryReceiptName("restore", "complete"));
             ConsumeRegistrySnapshot(record);
             item.Status = "restored";
@@ -160,7 +170,8 @@ public sealed partial class DeletionService
     {
         if (registrySession is null && config.RegistryScope == "nativeWindows")
             return RegistrySessionClient.Reconcile(config, operationId, RecoveryLockProgress);
-        using var coordination = AcquireRecoveryCoordination(create: false);
+        using var coordination = AcquireRecoveryCoordination(create: true);
+        EnsureRegistryOperationAvailable(operationId);
         using var record = OpenRegistryRecord(operationId);
         RegistryScopeIdentity.RequireExecutionMatch(record.Manifest.Scope, registrySession?.Scope);
         var target = NativeRegistry.Target(new RegistryDeleteRequest { Path = record.Manifest.Path, View = record.Manifest.View, ValueName = record.Manifest.ValueName });

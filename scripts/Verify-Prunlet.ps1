@@ -5,16 +5,17 @@ param(
     [Parameter(Mandatory)][string]$ReportPath,
     [string]$LegacyExecutablePath,
     [string]$MoveExecutablePath,
+    [string]$BaselineExecutablePath,
+    [ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBaselineSha256,
+    [ValidateNotNullOrEmpty()][string[]]$CaseFilter = @('*'),
     [string]$SecondaryVolumeDirectory,
     [switch]$LegacyCopyVerification
 )
 $ErrorActionPreference = 'Stop'
 # 新規削除はWindowsごみ箱方式で検証する。旧コピー生成の検証は過去exeの再現専用に隔離する。
 if (!$LegacyCopyVerification) {
-    $moveArguments = @{ ExecutablePath = $ExecutablePath; OutputDirectory = $OutputDirectory; ReportPath = $ReportPath }
-    if ($LegacyExecutablePath) { $moveArguments.LegacyExecutablePath = $LegacyExecutablePath }
-    if ($MoveExecutablePath) { $moveArguments.MoveExecutablePath = $MoveExecutablePath }
-    & (Join-Path $PSScriptRoot 'Verify-RecycleBin.ps1') @moveArguments
+    $fileArguments = @{ ExecutablePath = $ExecutablePath; OutputDirectory = $OutputDirectory; ReportPath = $ReportPath; CaseFilter = $CaseFilter }
+    & (Join-Path $PSScriptRoot 'Verify-RecordlessFiles.ps1') @fileArguments
     exit $LASTEXITCODE
 }
 if (-not [IO.Path]::IsPathFullyQualified($OutputDirectory) -or -not [IO.Path]::IsPathFullyQualified($ReportPath)) { throw 'Verification paths must be absolute.' }

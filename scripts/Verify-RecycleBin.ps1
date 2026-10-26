@@ -6,6 +6,9 @@ param(
     [string]$LegacyExecutablePath,
     [string]$MoveExecutablePath,
     [string]$RecycleLegacyExecutablePath,
+    [string]$BaselineExecutablePath,
+    [ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBaselineSha256,
+    [switch]$RetainPublicationFailureFixture,
     [switch]$Large,
     [ValidateRange(32769, 1000000)][int]$LargeFileCount = 32769,
     [ValidateNotNullOrEmpty()][string[]]$CaseFilter = @('*'),
@@ -22,7 +25,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
-foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath, $LegacyExecutablePath, $MoveExecutablePath, $RecycleLegacyExecutablePath) | Where-Object { $_ }) {
+foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath, $LegacyExecutablePath, $MoveExecutablePath, $RecycleLegacyExecutablePath, $BaselineExecutablePath) | Where-Object { $_ }) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'All executable and verification paths must be absolute.' }
 }
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
@@ -34,8 +37,15 @@ foreach ($path in @($outputRoot, $ReportPath)) {
     if (Test-Path -LiteralPath $path) { throw 'OutputDirectory and ReportPath must be new.' }
     if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) { throw 'Create external output/report parents first.' }
 }
-foreach ($path in @($ExecutablePath, $LegacyExecutablePath, $MoveExecutablePath, $RecycleLegacyExecutablePath) | Where-Object { $_ }) {
+foreach ($path in @($ExecutablePath, $LegacyExecutablePath, $MoveExecutablePath, $RecycleLegacyExecutablePath, $BaselineExecutablePath) | Where-Object { $_ }) {
     if (![IO.File]::Exists($path)) { throw "Executable missing: $path" }
+}
+if ($BaselineExecutablePath -and @($CaseFilter | Where-Object { 'retention-and-budget-exclude-windows-bin' -like $_ }).Count) {
+    $baselineVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($BaselineExecutablePath).ProductVersion
+    if (($baselineVersion -split '\+')[0] -notin @('1.0.15','1.0.15.0')) { throw 'BaselineExecutablePath must be the genuine pre-locator 1.0.15 fixture producer.' }
+    $baselineHash = (Get-FileHash -LiteralPath $BaselineExecutablePath).Hash
+    if ($baselineHash -ceq (Get-FileHash -LiteralPath $ExecutablePath).Hash) { throw 'The aging producer must differ from the current executable.' }
+    if ($ExpectedBaselineSha256 -and $baselineHash -ine $ExpectedBaselineSha256) { throw 'BaselineExecutablePath SHA differs from ExpectedBaselineSha256.' }
 }
 $null = [IO.Directory]::CreateDirectory($outputRoot)
 $utf8 = [Text.UTF8Encoding]::new($false)
@@ -97,6 +107,19 @@ using System.Security.Cryptography;
 using System.Threading;
 using Microsoft.Win32.SafeHandles;
 public static class PrunletVolumeMoveVerificationIdentity {
+    [DllImport("ntdll.dll")] static extern int NtSetSecurityObject(SafeFileHandle h, uint information, byte[] descriptor);
+    // 検証専用。既知のDACL改変・復帰だけに用い、読取り証拠とは分離する。
+    public static void FixtureDacl(string path, byte[] bytes) {
+        var descriptor = new System.Security.AccessControl.RawSecurityDescriptor(bytes, 0);
+        if ((descriptor.ControlFlags & System.Security.AccessControl.ControlFlags.DiscretionaryAclAutoInherited) != 0)
+            descriptor.SetFlags(descriptor.ControlFlags | System.Security.AccessControl.ControlFlags.DiscretionaryAclAutoInheritRequired);
+        byte[] input = new byte[descriptor.BinaryLength]; descriptor.GetBinaryForm(input, 0);
+        using (var handle = CreateFileW(ExtendedPath(path), 0x60000, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+            if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+            int status = NtSetSecurityObject(handle, 4, input);
+            if (status < 0) throw new IOException("Fixture DACL mutation NTSTATUS " + status);
+        }
+    }
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -394,8 +417,16 @@ function Read-SharedJson([string]$Path) {
     $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
     try { $reader = [IO.StreamReader]::new($stream, $utf8); try { return $reader.ReadToEnd() | ConvertFrom-Json -AsHashtable -Depth 80 } finally { $reader.Dispose() } } finally { $stream.Dispose() }
 }
-function Start-BoundaryRestore($Operation, [switch]$Ready) {
-    $expected = if ($Ready) { Join-Path $Operation.Root 'recycle-stage-0000-ready.json' } else { '' }
+function Get-SharedRecordDigest([string]$Path) {
+    # immutable記録のflush直後で停止したwriterと共存する。対象CLIはGateで停止済み。
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+    try { return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)) } finally { $stream.Dispose() }
+}
+function Start-BoundaryRestore($Operation, [switch]$Ready, [string]$PublicationName) {
+    $expected = if ($PublicationName) {
+        $key = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes($PublicationName))).ToLowerInvariant().Substring(0, 32)
+        Join-Path (Join-Path (Join-Path $script:Recovery '.recycle-records-v1') ('.publication-' + $Operation.Id + '-' + $key)) 'ready.json'
+    } elseif ($Ready) { Join-Path $Operation.Root 'recycle-stage-0000-ready.json' } else { '' }
     # 実ファイル通知で今回起動したCLIだけを停止する。製品へのhookや記録のhash改変は行わない。
     # 検証configのvolumeRecoveryDirectoriesは旧storeを指し、復元専用stageはその.restore側を使う。
     $gate = [PrunletRestoreBoundaryGate]::new($script:CaseRoot, $expected, $script:Store + '.restore')
@@ -437,7 +468,8 @@ function New-Case([string]$Name) {
 function Test-Case([string]$Name, [scriptblock]$Body, [string]$RequiredExe) {
     if (!@($CaseFilter | Where-Object { $Name -like $_ }).Count) { $script:ExcludedCount++; return }
     if ($RequiredExe -and !((Get-Variable -Name $RequiredExe -ValueOnly))) {
-        $results.Add(@{ name = $Name; passed = $null; skipped = $true; note = "$RequiredExe not supplied; compatibility unverified." }); return
+        $note = if ($RequiredExe -eq 'BaselineExecutablePath') { 'RequiresBaseline: genuine pre-locator 1.0.15 not supplied; aged retention compatibility unverified.' } else { "$RequiredExe not supplied; compatibility unverified." }
+        $results.Add(@{ name = $Name; passed = $null; skipped = $true; note = $note }); return
     }
     $timer = [Diagnostics.Stopwatch]::StartNew(); $script:CaseNote = $null; $script:CaseObserved = $null; $script:CaseSkipped = $false
     try {
@@ -449,7 +481,7 @@ function Test-Case([string]$Name, [scriptblock]$Body, [string]$RequiredExe) {
     }
 }
 function Assert-Bin([string]$Id, [string]$Source) {
-    $root = Join-Path $script:Recovery $Id
+    $root = Resolve-VerificationOperationDirectory $script:Recovery $Id
     $manifestPath = Join-Path $root 'recycle-manifest.json'
     $manifest = Read-Json $manifestPath
     Assert-True ($manifest.schema -eq 6 -and $manifest.entries.Count -eq 1 -and $manifest.entries[0].path -ceq $Source) 'Expected one schema 6 original-path entry.'
@@ -510,6 +542,9 @@ Test-Case 'unrecyclable-oversized-sparse-preserves-source' {
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
 using Microsoft.Win32.SafeHandles;
 public static class PrunletSparseE2E {
     // shellapi.h applies pshpack1 only when !_WIN64.
@@ -527,6 +562,186 @@ public static class PrunletSparseE2E {
     static extern uint GetCompressedFileSizeW(string path, out uint high);
     [DllImport("kernel32.dll")]
     static extern void SetLastError(uint error);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetFileInformationByHandleEx(SafeFileHandle file, int field, byte[] bytes, uint length);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool GetKernelObjectSecurity(SafeFileHandle file, uint information, byte[] bytes, uint length, out uint needed);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetFinalPathNameByHandleW(SafeFileHandle file, StringBuilder name, uint length, uint flags);
+    public sealed class SparseProof {
+        public string Id { get; set; }
+        public string SecurityBase64 { get; set; }
+        public int Attributes { get; set; }
+        public long Length { get; set; }
+        public long AllocationSize { get; set; }
+        public long CompressedSize { get; set; }
+        public uint NumberOfLinks { get; set; }
+        public string FinalPath { get; set; }
+        public string[] Streams { get; set; }
+    }
+    public sealed class AllocatedRange {
+        public long Offset { get; set; }
+        public long Length { get; set; }
+    }
+    public sealed class SparseFinalizationResult {
+        public bool Success { get; set; }
+        public string Error { get; set; }
+        public string Path { get; set; }
+        public long ExpectedLogicalLength { get; set; }
+        public string PrefixBase64 { get; set; }
+        public bool MutationStarted { get; set; }
+        public bool AlreadyTiny { get; set; }
+        public bool TailWasZero { get; set; }
+        public long BytesChecked { get; set; }
+        public SparseProof Before { get; set; }
+        public SparseProof After { get; set; }
+        public SparseProof PostClose { get; set; }
+        public AllocatedRange[] AllocatedRangesBefore { get; set; }
+        public AllocatedRange[] AllocatedRangesAfter { get; set; }
+    }
+    static byte[] Info(SafeFileHandle file, int field, int size) {
+        var bytes = new byte[size];
+        if (!GetFileInformationByHandleEx(file, field, bytes, (uint)bytes.Length)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return bytes;
+    }
+    static string FinalPath(SafeFileHandle file) {
+        var buffer = new StringBuilder(32768);
+        uint count = GetFinalPathNameByHandleW(file, buffer, (uint)buffer.Capacity, 0);
+        if (count == 0 || count >= buffer.Capacity) throw new IOException("Cannot bind the sparse handle to its complete DOS path.");
+        var path = buffer.ToString();
+        if (path.StartsWith(@"\\?\", StringComparison.Ordinal)) path = path.Substring(4);
+        return System.IO.Path.GetFullPath(path);
+    }
+    static List<SafeFileHandle> PinParents(string path) {
+        var parents = new Stack<string>();
+        for (var directory = System.IO.Path.GetDirectoryName(path); !string.IsNullOrEmpty(directory); directory = System.IO.Path.GetDirectoryName(directory)) parents.Push(directory);
+        var pins = new List<SafeFileHandle>();
+        try {
+            while (parents.Count != 0) {
+                var directory = parents.Pop();
+                var handle = CreateFileW(directory, 0x80, 3, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+                if (handle.IsInvalid) { handle.Dispose(); throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                pins.Add(handle);
+                var attributes = BitConverter.ToUInt32(Info(handle, 0, 40), 32);
+                if ((attributes & 0x10) == 0 || (attributes & 0x400) != 0) throw new IOException("Sparse fixture parent is not an ordinary pinned directory.");
+            }
+            return pins;
+        } catch { foreach (var pin in pins) pin.Dispose(); throw; }
+    }
+    static SafeFileHandle OpenExclusive(string path, bool writable) {
+        var handle = CreateFileW(path, writable ? 0xC0020000u : 0x80020000u, 0, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
+        if (handle.IsInvalid) { handle.Dispose(); throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        return handle;
+    }
+    static SparseProof ReadProof(SafeFileHandle handle, string path) {
+        var basic = Info(handle, 0, 40); var standard = Info(handle, 1, 24); var compression = Info(handle, 8, 16);
+        if (standard[20] != 0 || standard[21] != 0 || BitConverter.ToInt64(standard, 0) < 0 || BitConverter.ToInt64(standard, 8) < 0 || BitConverter.ToInt64(compression, 0) < 0 || BitConverter.ToUInt16(compression, 8) != 0)
+            throw new IOException("Sparse fixture has an unknown directory/delete/compression state.");
+        GetKernelObjectSecurity(handle, 7, null, 0, out uint needed);
+        if (needed == 0 || needed > 1048576) throw new IOException("Sparse security descriptor length is unknown.");
+        var security = new byte[needed];
+        if (!GetKernelObjectSecurity(handle, 7, security, needed, out uint used) || used != needed) throw new Win32Exception(Marshal.GetLastWin32Error());
+        var streamBytes = Info(handle, 7, 65536); var streams = new List<string>(); int offset = 0;
+        while (true) {
+            if (offset < 0 || offset > streamBytes.Length - 24) throw new IOException("Sparse stream inventory is incomplete.");
+            uint next = BitConverter.ToUInt32(streamBytes, offset); uint length = BitConverter.ToUInt32(streamBytes, offset + 4);
+            if (length == 0 || (length & 1) != 0 || length > streamBytes.Length - offset - 24) throw new IOException("Sparse stream inventory is malformed.");
+            var name = Encoding.Unicode.GetString(streamBytes, offset + 24, (int)length); streams.Add(name);
+            if (name != "::" + (char)36 + "DATA" || BitConverter.ToInt64(streamBytes, offset + 8) != BitConverter.ToInt64(standard, 8)) throw new IOException("Sparse fixture has an unknown named stream or stream length.");
+            if (next == 0) break;
+            if (next < 24 || next > streamBytes.Length - offset || streams.Count >= 64) throw new IOException("Sparse stream inventory did not advance.");
+            offset += (int)next;
+        }
+        if (streams.Count != 1) throw new IOException("Sparse fixture is not a single unnamed data stream.");
+        var final = FinalPath(handle);
+        if (!string.Equals(final, path, StringComparison.OrdinalIgnoreCase)) throw new IOException("Sparse fixture handle no longer names its recorded path.");
+        return new SparseProof { Id = Convert.ToHexString(Info(handle, 18, 24)), SecurityBase64 = Convert.ToBase64String(security), Attributes = (int)BitConverter.ToUInt32(basic, 32),
+            Length = BitConverter.ToInt64(standard, 8), AllocationSize = BitConverter.ToInt64(standard, 0), CompressedSize = BitConverter.ToInt64(compression, 0), NumberOfLinks = BitConverter.ToUInt32(standard, 16), FinalPath = final, Streams = streams.ToArray() };
+    }
+    public static SparseProof CaptureProof(string path) {
+        path = System.IO.Path.GetFullPath(path);
+        var pins = PinParents(path);
+        try { using var handle = OpenExclusive(path, false); return ReadProof(handle, path); }
+        finally { foreach (var pin in pins) pin.Dispose(); }
+    }
+    static void MatchProof(SparseProof proof, string id, string security, int attributes, long length, ulong maximum) {
+        if (proof.Id != id || proof.SecurityBase64 != security || proof.Attributes != attributes || proof.Length != length || proof.NumberOfLinks != 1)
+            throw new IOException("Sparse fixture identity, complete O/G/D, attributes, length or link count differs from its recorded proof.");
+        const int forbidden = 0x10 | 0x40 | 0x400 | 0x800 | 0x1000 | 0x4000 | 0x40000 | 0x400000;
+        if ((proof.Attributes & 0x200) == 0 || (proof.Attributes & forbidden) != 0 || (ulong)proof.AllocationSize > maximum || (ulong)proof.CompressedSize > maximum)
+            throw new IOException("Sparse fixture allocation or file state is not understood; it was retained.");
+    }
+    // winioctl.h: FSCTL_QUERY_ALLOCATED_RANGES = CTL_CODE(9,51,METHOD_NEITHER,FILE_READ_DATA),
+    // FILE_ALLOCATED_RANGE_BUFFER はFileOffset/Lengthのsigned LARGE_INTEGER二つ。返却範囲以外はsparse hole。
+    static AllocatedRange[] QueryRanges(SafeFileHandle file, long queryLength, ulong maximum) {
+        if (queryLength <= 0) throw new IOException("Sparse allocation query length is invalid.");
+        var ranges = new List<AllocatedRange>(); long cursor = 0; ulong total = 0;
+        IntPtr input = Marshal.AllocHGlobal(16), output = Marshal.AllocHGlobal(65536);
+        try {
+            while (cursor < queryLength) {
+                Marshal.WriteInt64(input, 0, cursor); Marshal.WriteInt64(input, 8, queryLength - cursor);
+                bool complete = DeviceIoControl(file, 0x000940CF, input, 16, output, 65536, out uint returned, IntPtr.Zero);
+                int error = complete ? 0 : Marshal.GetLastWin32Error();
+                if ((!complete && error != 234) || returned > 65536 || (returned & 15) != 0) throw new IOException("Sparse allocated-range query failed or returned an incomplete record (Win32 " + error + ").");
+                long previous = cursor;
+                for (int index = 0; index < returned; index += 16) {
+                    long start = Marshal.ReadInt64(output, index), length = Marshal.ReadInt64(output, index + 8);
+                    if (start < previous || length <= 0 || start > queryLength || length > queryLength - start || ranges.Count >= 4096) throw new IOException("Sparse allocated ranges are overlapping, unbounded or malformed.");
+                    total = checked(total + (ulong)length); if (total > maximum) throw new IOException("Sparse allocated ranges exceed the bounded verification budget.");
+                    ranges.Add(new AllocatedRange { Offset = start, Length = length }); previous = checked(start + length);
+                }
+                if (complete) return ranges.ToArray();
+                if (returned == 0 || previous <= cursor || previous >= queryLength) throw new IOException("Sparse allocated-range pagination did not make bounded progress.");
+                cursor = previous;
+            }
+            throw new IOException("Sparse allocated-range query did not certify completion.");
+        } finally { Marshal.FreeHGlobal(input); Marshal.FreeHGlobal(output); }
+    }
+    static void CheckPrefix(FileStream stream, byte[] prefix) {
+        stream.Position = 0; var actual = new byte[prefix.Length]; stream.ReadExactly(actual);
+        if (!actual.AsSpan().SequenceEqual(prefix)) throw new IOException("Sparse ordinary-stream prefix differs from its recorded bytes.");
+    }
+    public static SparseFinalizationResult RestoreTiny(string path, string expectedId, string expectedSecurityBase64, int expectedAttributes, long expectedLogicalLength, byte[] prefix, ulong maximumAllocation) {
+        var result = new SparseFinalizationResult { Path = path, ExpectedLogicalLength = expectedLogicalLength, PrefixBase64 = prefix == null ? null : Convert.ToBase64String(prefix) };
+        List<SafeFileHandle> parents = null;
+        try {
+            if (!System.IO.Path.IsPathFullyQualified(path) || prefix == null || prefix.Length == 0 || expectedLogicalLength < prefix.Length || maximumAllocation == 0 || maximumAllocation > 1048576 || string.IsNullOrEmpty(expectedId) || string.IsNullOrEmpty(expectedSecurityBase64)) throw new IOException("Sparse finalization requires complete original evidence and a bounded allocation budget.");
+            path = System.IO.Path.GetFullPath(path); result.Path = path; parents = PinParents(path);
+            using (var handle = OpenExclusive(path, true))
+            using (var stream = new FileStream(handle, FileAccess.ReadWrite, 1, false)) {
+                result.Before = ReadProof(handle, path);
+                result.AlreadyTiny = result.Before.Length == prefix.Length;
+                MatchProof(result.Before, expectedId, expectedSecurityBase64, expectedAttributes, result.AlreadyTiny ? prefix.Length : expectedLogicalLength, maximumAllocation);
+                CheckPrefix(stream, prefix);
+                result.AllocatedRangesBefore = QueryRanges(handle, expectedLogicalLength, maximumAllocation);
+                var buffer = new byte[65536];
+                foreach (var range in result.AllocatedRangesBefore) {
+                    long position = Math.Max(range.Offset, prefix.Length), end = Math.Min(checked(range.Offset + range.Length), result.Before.Length);
+                    stream.Position = position;
+                    while (position < end) {
+                        int length = (int)Math.Min(buffer.Length, end - position); stream.ReadExactly(buffer.AsSpan(0, length)); result.BytesChecked = checked(result.BytesChecked + length);
+                        if ((ulong)result.BytesChecked > maximumAllocation) throw new IOException("Sparse tail verification exceeded its allocation budget.");
+                        for (int index = 0; index < length; index++) if (buffer[index] != 0) throw new IOException("Unknown nonzero sparse tail at offset " + (position + index) + "; the file was retained.");
+                        position += length;
+                    }
+                }
+                result.TailWasZero = true;
+                // 割当範囲を読み終えるまではサイズを変えない。同じexclusive handleで直前証拠も再照合する。
+                MatchProof(ReadProof(handle, path), expectedId, expectedSecurityBase64, expectedAttributes, result.Before.Length, maximumAllocation); CheckPrefix(stream, prefix);
+                if (!result.AlreadyTiny) { result.MutationStarted = true; stream.SetLength(prefix.Length); stream.Flush(true); }
+                result.After = ReadProof(handle, path); MatchProof(result.After, expectedId, expectedSecurityBase64, expectedAttributes, prefix.Length, maximumAllocation); CheckPrefix(stream, prefix);
+                result.AllocatedRangesAfter = QueryRanges(handle, expectedLogicalLength, maximumAllocation);
+            }
+            // close後も別のexclusive handleで同一ID/OGD/属性/prefix/長さを再検証する。
+            using (var handle = OpenExclusive(path, false))
+            using (var stream = new FileStream(handle, FileAccess.Read, 1, false)) { result.PostClose = ReadProof(handle, path); MatchProof(result.PostClose, expectedId, expectedSecurityBase64, expectedAttributes, prefix.Length, maximumAllocation); CheckPrefix(stream, prefix); }
+            result.Success = true;
+        } catch (Exception error) { result.Error = error.ToString(); }
+        finally { if (parents != null) foreach (var parent in parents) parent.Dispose(); }
+        return result;
+    }
     public static void MakeSparse(SafeFileHandle file) {
         if (!DeviceIoControl(file, 0x000900C4, IntPtr.Zero, 0, IntPtr.Zero, 0, out uint returned, IntPtr.Zero))
             throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -557,19 +772,29 @@ public static class PrunletSparseE2E {
 "@
         } finally { $env:TEMP = $oldTemp; $env:TMP = $oldTmp }
     }
+    $sparseTargets = [Collections.Generic.List[object]]::new()
     function New-SparseTarget([string]$Path, [byte[]]$Prefix, [long]$Length) {
         [IO.File]::WriteAllBytes($Path, $Prefix)
+        $registered = @{ path = [IO.Path]::GetFullPath($Path); expectedLogicalLength = $Length; prefixBase64 = [Convert]::ToBase64String($Prefix); proofEstablished = $false }
+        $sparseTargets.Add($registered)
         $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read)
         try {
             [PrunletSparseE2E]::MakeSparse($stream.SafeFileHandle)
             $stream.SetLength($Length); $stream.Flush($true)
         } finally { $stream.Dispose() }
+        $proof = [PrunletSparseE2E]::CaptureProof($Path)
+        $registered.id = $proof.Id; $registered.nativeSecurityBase64 = $proof.SecurityBase64; $registered.attributes = $proof.Attributes
+        $registered.creationProof = $proof; $registered.proofEstablished = $true
         $allocation = [PrunletSparseE2E]::Allocation($Path)
         Assert-True ($allocation -le 1MB) 'Sparse fixture allocated more than 1 MiB; delete verification was not started.'
         $attributes = [IO.File]::GetAttributes($Path)
         Assert-True (($attributes -band [IO.FileAttributes]::SparseFile) -ne 0 -and [IO.FileInfo]::new($Path).Length -eq $Length) 'Sparse fixture shape invalid.'
-        return @{ id = File-Id $Path; attributes = $attributes; allocation = $allocation }
+        $registered.allocation = $allocation
+        Assert-True ($proof.Id -ceq (File-Id $Path) -and $proof.Length -eq $Length -and $proof.Attributes -eq [int]$attributes -and $proof.NumberOfLinks -eq 1) 'Sparse creation proof changed before test entry.'
+        return $registered
     }
+    $sparseBodyFailure = $null
+    try {
     $prefix = [Text.Encoding]::UTF8.GetBytes('Prunlet sparse refusal fixture: small prefix only')
     Assert-True ($prefix.Length -eq 49) 'Sparse fixture prefix must be 49 bytes.'
     $drive = [IO.DriveInfo]::new($fixtureDrive)
@@ -695,7 +920,38 @@ public static class PrunletSparseE2E {
         Assert-True ([Convert]::ToBase64String($actualPrefix) -ceq [Convert]::ToBase64String($prefix)) 'Refused oversized folder changed sparse stream prefix.'
         Assert-True (@(Get-ChildItem -LiteralPath $script:Recovery -Recurse -File -Filter 'recycle-*-complete.json').Count -eq 0 -and !(Test-Path -LiteralPath $script:Store)) 'Refused oversized folder created a completion receipt or fallback store.'
     }
-    $script:CaseNote = "CLI and MCP file refusal, plus recursive folder outcome ($($observed.folderOutcome)) verified. Logical length=$logicalLength; allocated bytes=$allocation; prefix bytes=$($prefix.Length). Sparse fixture retained for inspection."
+    $script:CaseNote = "CLI and MCP file refusal, plus recursive folder outcome ($($observed.folderOutcome)) verified at logical length=$logicalLength; allocated bytes=$allocation; prefix bytes=$($prefix.Length)."
+    } catch {
+        $sparseBodyFailure = $_
+        throw
+    } finally {
+        $finalizers = [Collections.Generic.List[object]]::new()
+        foreach ($target in $sparseTargets) {
+            try {
+                if (!$target.proofEstablished) { throw 'Sparse creation did not establish complete original evidence; the fixture was preserved.' }
+                Assert-VerificationDestination $target.path @()
+                $finalized = [PrunletSparseE2E]::RestoreTiny($target.path, $target.id, $target.nativeSecurityBase64, [int]$target.attributes, [long]$target.expectedLogicalLength, [Convert]::FromBase64String($target.prefixBase64), [ulong]1MB)
+                $finalizers.Add($finalized)
+            } catch {
+                $finalizers.Add(@{ Success = $false; Path = $target.path; Error = $_.Exception.Message; MutationStarted = $false; ExpectedLogicalLength = $target.expectedLogicalLength })
+            }
+        }
+        if ($null -eq $script:CaseObserved) { $script:CaseObserved = [ordered]@{} }
+        $script:CaseObserved.sparseFixtures = @($sparseTargets)
+        $script:CaseObserved.sparseFinalizers = @($finalizers)
+        $script:CaseObserved.sparseBodyAssertionsCompleted = ($null -eq $sparseBodyFailure)
+        $script:CaseObserved.sparseBodyFailure = $(if ($sparseBodyFailure) { $sparseBodyFailure.Exception.Message } else { $null })
+        $failedFinalizers = @($finalizers | Where-Object { !$_.Success })
+        $script:CaseObserved.sparseFinalizerFailed = ($failedFinalizers.Count -ne 0)
+        if ($failedFinalizers.Count) {
+            $script:CaseObserved.sparseFinalizerErrors = @($failedFinalizers | ForEach-Object { @{ path = $_.Path; error = $_.Error } })
+            if (!$sparseBodyFailure) { throw ('Sparse finalizer failed; unknown fixture state was retained: ' + (($failedFinalizers | ForEach-Object Path) -join ', ')) }
+            # 本体例外を上書きせず、独立したfinalizer失敗はobservedへ残す。
+            Write-Warning 'Sparse body failed and one or more sparse finalizers also failed; both failures are retained in the case evidence.'
+        } elseif ($sparseTargets.Count) {
+            $script:CaseNote += ' Afterwards, the finally block verified exact native identity/O/G/D/attributes, a single unnamed stream and bounded zero allocated tails, then restored each owned fixture to its tiny prefix length. No 1 TB stream read was performed.'
+        }
+    }
 }
 Test-Case 'default-recovery-budget-cli-and-mcp' {
     $oneGiB = [long]1073741824
@@ -744,7 +1000,7 @@ Test-Case 'file-and-folder-exact-roundtrip' {
         Assert-Tree $op.Payload $snapshot -MovedRoot
         Restore-Entry $op $path; Assert-Tree $path $snapshot -RestoredRecycle
         $again = Invoke-RecycleCli @('restore', $op.Id)
-        Assert-True ($again.ExitCode -eq 0 -and $again.Json.items[0].status -eq 'already_restored') 'Restore is not consumptive/idempotent.'
+        Assert-VerificationRepeatedRestore $again $op.Id 1; Assert-Tree $path $snapshot -RestoredRecycle
     }
 }
 Test-Case 'interrupted-unready-stage-refuses-alias-acl-change' {
@@ -813,12 +1069,35 @@ Test-Case 'stage-ready-conflict-resume-and-published-acl-guard' {
     Assert-True ($resumed.ExitCode -eq 0 -and $resumed.Json.items[0].status -eq 'restored' -and !(Test-Path -LiteralPath $stage)) 'Verified stage-ready payload did not resume and publish.'
     $after = Assert-NativeTree $tree $before
     Save-Json (Join-Path $script:CaseRoot 'native-resumed-restored.json') $after
-    Assert-True ((Digest $readyPath) -ceq $readyHash -and (Digest $intentPath) -ceq $intentHash) 'Stage resume rewrote its immutable journals.'
-    # 以下は本物のcrashとは別の欠落complete fixture。既存の正規receiptを隔離し、hashは変更しない。
+    Assert-VerificationClosedRecord $script:Recovery $op.Id 6
+    # 完了後の記録改変を避け、別の実プロセスで公開後・complete永続化前の失敗を作る。
+    $op = Delete-Entry $tree -Recursive
+    $session = Start-BoundaryRestore $op -PublicationName 'restore-0000-complete.json'
+    $intentPath = Join-Path $op.Root 'recycle-stage-0000-intent.json'
+    $readyPath = Join-Path $op.Root 'recycle-stage-0000-ready.json'
     $completePath = Join-Path $op.Root 'restore-0000-complete.json'
-    $retainedComplete = Join-Path $script:CaseRoot 'retained-published-restore-complete.json'
-    Assert-True (Test-Path -LiteralPath $completePath) 'Completed restore has no receipt to isolate.'
-    [IO.File]::Move($completePath, $retainedComplete, $false)
+    $priorMetadataAcl = $null
+    try {
+        Assert-True ($session.Gate.Wait(60000) -and $session.Gate.Suspended -and !$session.Gate.Error) 'Receipt failure fixture missed completion-publication ready boundary.'
+        $intent = Read-SharedJson $intentPath; $stage = Join-Path $intent.stageOperationPath '0000.entry'
+        Assert-True ((Test-Path -LiteralPath $tree) -and !(Test-Path -LiteralPath $stage) -and !(Test-Path -LiteralPath $op.Payload) -and !(Test-Path -LiteralPath $completePath)) 'Completion publication fixture did not reach the already-published source boundary.'
+        $readyHash = Get-SharedRecordDigest $readyPath; $intentHash = Get-SharedRecordDigest $intentPath
+        $priorMetadataAcl = [PrunletVolumeMoveVerificationIdentity]::ReadSecurity($op.Root)
+        $metadataAcl = Get-Acl -LiteralPath $op.Root; $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $metadataAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::WriteData, [Security.AccessControl.AccessControlType]::Deny))
+        [PrunletVolumeMoveVerificationIdentity]::FixtureDacl($op.Root, $metadataAcl.GetSecurityDescriptorBinaryForm())
+        $session.Gate.Resume()
+        Assert-True ($session.Process.WaitForExit($ProcessTimeoutSeconds * 1000)) 'Completion failure fixture timed out.'
+        $failed = $session.Stdout.GetAwaiter().GetResult() | ConvertFrom-Json -AsHashtable -Depth 80
+        Assert-True ($session.Process.ExitCode -ne 0 -and (Test-Path -LiteralPath $tree) -and !(Test-Path -LiteralPath $completePath) -and $failed.items[0].status -notin @('restored', 'already_restored')) 'Fixture did not fail receipt persistence after source publication.'
+    } finally {
+        Close-BoundaryRestore $session 'published-completion-failure'
+        if ($priorMetadataAcl) {
+            [PrunletVolumeMoveVerificationIdentity]::FixtureDacl($op.Root, $priorMetadataAcl)
+            Assert-True ([Convert]::ToBase64String([PrunletVolumeMoveVerificationIdentity]::ReadSecurity($op.Root)) -ceq [Convert]::ToBase64String($priorMetadataAcl)) 'Metadata ACL fixture rollback changed native bytes.'
+        }
+    }
+    $null = Assert-NativeTree $tree $before
     $acl = Get-Acl -LiteralPath $file; $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
     $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::ExecuteFile, [Security.AccessControl.AccessControlType]::Deny))
     Set-Acl -LiteralPath $file -AclObject $acl
@@ -828,8 +1107,25 @@ Test-Case 'stage-ready-conflict-resume-and-published-acl-guard' {
     Assert-True ($refused.ExitCode -ne 0 -and @($refused.Json.items | Where-Object status -In @('failed', 'ambiguous', 'error')).Count -gt 0) 'Missing-complete recovery accepted changed published ACLs.'
     $null = Assert-NativeTree $tree $publishedChanged
     Assert-True (!(Test-Path -LiteralPath $completePath) -and !(Test-Path -LiteralPath $stage) -and !(Test-Path -LiteralPath $op.Payload) -and (Digest $readyPath) -ceq $readyHash -and (Digest $intentPath) -ceq $intentHash) 'Published ACL refusal reapplied ACLs, recreated payloads, completed, or changed journals.'
-    $script:CaseNote = 'Ready conflict used a real suspended CLI; missing complete was modeled separately by isolating its genuine receipt, without hash edits. Published ACL modification and fixture evidence are retained.'
-    $script:CaseObserved = @{ operationId = $op.Id; readyConflictRealProcess = $true; resumedNativeExact = $true; missingCompleteFixture = $true; retainedComplete = $retainedComplete; publishedAclRetained = $true; refusalItems = @($refused.Json.items) }
+    if ($RetainPublicationFailureFixture) {
+        $script:CaseNote = 'Fixture generation only: receipt publication failed after source publication; changed source ACL was refused. Normal recovery is intentionally left for the publication lifecycle verifier.'
+        $script:CaseObserved = @{ fixtureGenerationOnly = $true; operationId = $op.Id; configPath = $script:Config; recovery = $script:Recovery; operationDirectory = $op.Root; tree = $tree; changedFile = $file; originalSnapshot = (Join-Path $script:CaseRoot 'native-original.json'); readyPath = $readyPath; intentPath = $intentPath; completionPath = $completePath; completionWriteFailure = $failed; publishedAclRetained = $true }
+        return
+    }
+    # 拒否確認後、今回のfixtureで加えたDACLだけを元のnative bytesへ戻し、通常経路の再開と回収まで確認する。
+    $originalLeaf = @($before | Where-Object { $_.relative.TrimStart('\') -ceq 'group\0000.bin' })
+    Assert-True ($originalLeaf.Count -eq 1) 'Published ACL recovery fixture lacks its original native descriptor.'
+    [PrunletVolumeMoveVerificationIdentity]::FixtureDacl($file, [Convert]::FromBase64String($originalLeaf[0].nativeSecurityBase64))
+    $null = Assert-NativeTree $tree $before
+    $finished = Invoke-RecycleCli @('restore', $op.Id)
+    Assert-True ($finished.ExitCode -eq 0 -and $finished.Json.items[0].status -in @('restored', 'already_restored')) 'Valid published source could not resume after the fixture ACL was restored.'
+    $null = Assert-NativeTree $tree $before
+    Assert-VerificationClosedRecord $script:Recovery $op.Id 6
+    Assert-True (@(Get-ChildItem -LiteralPath $script:Recovery -File -Filter 'recycle-pending-*').Count -eq 0) 'Authority publication left an unowned flat pending after normal recovery.'
+    $publicationRoot = Join-Path $script:Recovery '.recycle-records-v1'
+    Assert-True (@(Get-ChildItem -LiteralPath $publicationRoot -Directory -Filter ('.publication-' + $op.Id + '-*')).Count -eq 0) 'Completed recovery retained its publication control attempts.'
+    $script:CaseNote = 'Ready conflict and missing completion used suspended CLI processes. Modified published ACLs were refused; restoring only the fixture ACL allowed normal recovery and terminal control collection.'
+    $script:CaseObserved = @{ operationId = $op.Id; readyConflictRealProcess = $true; resumedNativeExact = $true; missingCompleteFixture = $true; completionWriteFailure = $failed; publishedAclRetained = $true; refusalItems = @($refused.Json.items); recoveredAfterFixtureAclReset = $true; publicationControlsCollected = $true }
 }
 Test-Case 'protected-descendant-native-security-roundtrip' {
     $tree = New-Directory (Join-Path $script:Scope 'protected-tree')
@@ -1131,18 +1427,61 @@ Test-Case 'directory-link-preserves-target' {
     Assert-True ((File-Id $link) -ceq $linkId) 'Link identity changed.'; Assert-Tree $target $before
 }
 Test-Case 'retention-and-budget-exclude-windows-bin' {
-    $file = New-File 'old-bin' 4096; $op = Delete-Entry $file; $id = File-Id $op.Payload
+    $file = New-File 'old-bin' 4096; $before = Snapshot-NativeTree $file
+    # bound hint生成前の真正旧版で作り、日時fixtureを初回新版評価より前に完成させる。
+    $legacyConfigValue = Read-Json $script:Config; $null = $legacyConfigValue.Remove('capacityDefaultMigrationVersion')
+    $legacyConfig = Join-Path $script:CaseRoot 'pre-locator-config.json'; Save-Json $legacyConfig $legacyConfigValue
+    $paths = Join-Path $script:CaseRoot 'pre-locator-paths.json'; Save-Json $paths @($file)
+    $deleted = Invoke-RecycleCli @('delete', '--paths-file', $paths) -Exe $BaselineExecutablePath -ConfigPath $legacyConfig
+    $script:CaseObserved = @{ fixtureExecutable = $BaselineExecutablePath; fixtureExecutableSha256 = (Digest $BaselineExecutablePath); fixtureVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($BaselineExecutablePath).ProductVersion; producer = 'genuine pre-locator 1.0.15'; deleteExitCode = $deleted.ExitCode; operationId = $deleted.Json.operationId; originalNative = $before }
+    Assert-True ($deleted.ExitCode -eq 0 -and $deleted.Json.items[0].status -ceq 'deleted' -and !(Test-Path -LiteralPath $file)) 'Pre-locator producer did not recycle the aging fixture.'
+    $op = Assert-Bin $deleted.Json.operationId $file; $id = File-Id $op.Payload
+    $bin = Assert-NativeTree $op.Payload $before -WindowsOwnedSecurity
+    $request = Join-Path (Join-Path $script:Recovery '.closed-records-v1') ($op.Id + '.request.json')
+    $script:CaseObserved.hintAbsentBeforeAging = !(Test-Path -LiteralPath $request); $script:CaseObserved.binNative = $bin
+    Assert-True (!(Test-Path -LiteralPath $request)) 'Aging fixture already has a bound retirement hint.'
     # 有効な期限fixtureとして、全receiptのmanifest hashとrestore→recycle hash連結も更新する。
     Set-RecycleFixtureAge $op 30
+    $null = Assert-NativeTree $op.Payload $bin
+    $script:CaseObserved.agedCreatedUtc = (Read-Json $op.ManifestPath).createdUtc
     $config = Read-Json $script:Config; $config.maxRecoveryBytes = 1; $config.retentionDays = 1; Save-Json $script:Config $config
     foreach ($argsList in @(@('maintain', '--dry-run'), @('maintain', '--apply'), @('purge', $op.Id, '--apply'))) {
         $result = Invoke-RecycleCli $argsList
+        $op = Assert-Bin $op.Id $file
+        $null = Assert-NativeTree $op.Payload $bin
         Assert-True ($result.ExitCode -eq 0 -and (File-Id $op.Payload) -ceq $id -and [IO.File]::Exists($op.ManifestPath)) "Retention/purge touched bin item: $($result.Stdout) $($result.Stderr)"
         if ($argsList[0] -eq 'purge') { Assert-True ($result.Json.items[0].status -eq 'retained') 'Purge did not explicitly retain bin item.' }
     }
     $other = New-File 'next-bin' 8192; $next = Delete-Entry $other
+    $null = Assert-NativeTree $op.Payload $bin
     Assert-True ((File-Id $op.Payload) -ceq $id) 'Budget reclaimed previous bin item.'
     Restore-Entry $next $other; Restore-Entry $op $file
+    $null = Assert-NativeTree $file $before
+    $script:CaseObserved.restoredNative = Snapshot-NativeTree $file
+    $script:CaseObserved.nativeIdentityBytesAclPreserved = $true
+} 'BaselineExecutablePath'
+Test-Case 'current-retention-budget-and-purge-exclude-windows-bin' {
+    $file = New-File 'current-bin' 4096; $before = Snapshot-NativeTree $file
+    $op = Delete-Entry $file; $bin = Assert-NativeTree $op.Payload $before -WindowsOwnedSecurity
+    $script:CaseObserved = @{ producer = 'current executable, unchanged current timestamps'; operationId = $op.Id; originalNative = $before; binNative = $bin; operations = [Collections.Generic.List[object]]::new() }
+    $config = Read-Json $script:Config; $config.maxRecoveryBytes = 1; $config.retentionDays = 1; Save-Json $script:Config $config
+    foreach ($arguments in @(@('maintain','--dry-run'),@('maintain','--apply'),@('purge',$op.Id,'--apply'))) {
+        $r = Invoke-RecycleCli $arguments; $script:CaseObserved.operations.Add(@{ arguments = $arguments; exitCode = $r.ExitCode; json = $r.Json; stderr = $r.Stderr })
+        $op = Assert-Bin $op.Id $file; $null = Assert-NativeTree $op.Payload $bin
+        Assert-True ($r.ExitCode -eq 0) "Current valid bin exclusion failed: $($r.Stdout) $($r.Stderr)"
+        if ($arguments[0] -eq 'purge') { Assert-True ($r.Json.items[0].status -ceq 'retained') 'Current bin purge was not explicitly retained.' }
+    }
+    $other = New-File 'current-next-bin' 8192; $otherBefore = Snapshot-NativeTree $other; $next = Delete-Entry $other
+    $null = Assert-NativeTree $op.Payload $bin
+    $null = New-File 'current-bin' 17; $collision = Snapshot-NativeTree $file
+    $conflict = Invoke-RecycleCli @('restore',$op.Id); $script:CaseObserved.conflict = @{ exitCode = $conflict.ExitCode; json = $conflict.Json; stderr = $conflict.Stderr }
+    Assert-True ($conflict.Json.items[0].status -ceq 'conflict') 'Current exclusion fixture did not refuse overwriting an existing original.'
+    $null = Assert-NativeTree $file $collision; $null = Assert-NativeTree $op.Payload $bin
+    [IO.File]::Move($file,(Join-Path $script:Scope 'retained-current-collision'))
+    Restore-Entry $next $other; Restore-Entry $op $file
+    $null = Assert-NativeTree $other $otherBefore; $null = Assert-NativeTree $file $before
+    $script:CaseObserved.restoredNative = Snapshot-NativeTree $file
+    $script:CaseObserved.nativeIdentityBytesAclPreserved = $true
 }
 foreach ($tamper in @('owner', 'identity', 'pidl', 'physicalPath', 'unknownMember')) {
     Test-Case "tampered-record-$tamper-fails-closed" {
@@ -1299,7 +1638,8 @@ foreach ($schema in @(1, 2, 3, 4)) {
                     } else { $result = Invoke-RecycleCli @('purge', $deleted.Json.operationId, '--apply') }
                     Assert-True ($result.ExitCode -eq 0) "Legacy $action failed."
                     if ($schema -eq 4) { Assert-True (!(Test-Path -LiteralPath $payload)) "Legacy schema 4 $action retained payload." }
-                    else { Assert-True (@(Get-ChildItem -LiteralPath $root -File -Filter '*.bak').Count -eq 0) "Legacy $action retained copies." }
+                    else { Assert-True (![IO.Directory]::Exists($root) -or @(Get-ChildItem -LiteralPath $root -File -Filter '*.bak').Count -eq 0) "Legacy $action retained copies." }
+                    Assert-VerificationClosedRecord $script:Recovery $deleted.Json.operationId $schema
                 }
             }
         } $required
@@ -1325,7 +1665,7 @@ if ($Large) {
         [IO.Directory]::Move($tree, (Join-Path $script:Scope 'retained-large-current'))
         Restore-Entry $op $tree; Assert-Tree $tree $snapshot -RestoredRecycle
         $again = Invoke-RecycleCli @('restore', $op.Id)
-        Assert-True ($again.ExitCode -eq 0 -and $again.Json.items[0].status -eq 'already_restored') 'Large restore was not consumptive/idempotent.'
+        Assert-VerificationRepeatedRestore $again $op.Id 1; Assert-Tree $tree $snapshot -RestoredRecycle
     }
 }
 if (!$results.Count) { $results.Add(@{ name = 'case-filter-matched-no-cases'; passed = $false; skipped = $false; error = 'CaseFilter matched no cases (large cases require -Large).' }) }
@@ -1334,7 +1674,7 @@ $skipped = @($results | Where-Object skipped).Count
 $failed = $results.Count - $passed - $skipped
 Save-Json $ReportPath @{
     schema = 1; timestampUtc = [DateTimeOffset]::UtcNow.ToString('O'); executablePath = $ExecutablePath
-    legacyExecutablePath = $LegacyExecutablePath; moveExecutablePath = $MoveExecutablePath; recycleLegacyExecutablePath = $RecycleLegacyExecutablePath
+    legacyExecutablePath = $LegacyExecutablePath; moveExecutablePath = $MoveExecutablePath; recycleLegacyExecutablePath = $RecycleLegacyExecutablePath; baselineExecutablePath = $BaselineExecutablePath
     large = [bool]$Large; largeFileCount = $LargeFileCount
     passed = $passed; failed = $failed; skipped = $skipped; excludedCount = $script:ExcludedCount
     results = @($results); retainedDirectory = $outputRoot

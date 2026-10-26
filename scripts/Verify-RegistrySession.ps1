@@ -3,6 +3,8 @@
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
     [string]$MoveExecutablePath,
+    [string]$AssemblyPath,
+    [string]$LegacyRegistryExecutablePath,
     [switch]$AssertNativeWindows,
     [ValidateSet('Prepare', 'Start', 'Current', 'Run')][string]$Mode = 'Prepare',
     [ValidateSet(-1, 0, 6801)][int]$ExpectedCurrentSoftwareTransactionError = -1
@@ -67,6 +69,8 @@ if ($Mode -eq 'Prepare') {
         $current.volumeRecoveryDirectories = @{'D:/' = ((Join-Path $OutputDirectory 'volume-store') + '\')}
         $current.backupDirectory = $recovery.Replace('\', '/') + '/'; $current.allowedRoots = $null
         SaveJson $currentConfigPath $current
+        $migration = InvokePrunletCli @('migrate','--apply')
+        Assert ($migration.exitCode -eq 0 -and $migration.json.registryReady -and $migration.json.complete) 'Fresh registry namespace preparation failed'
         $normal = $current.Clone(); $normal.registryScope = 'nativeWindows'; $normal.registrySessionFile = Join-Path $OutputDirectory 'native-session.json'
         $nativeConfigPath = Join-Path $OutputDirectory 'config.json'; SaveJson $nativeConfigPath $normal
         # 通常clientと管理者clientはそれぞれ同じAuthIDの明示sessionだけへ接続する。
@@ -78,8 +82,21 @@ if ($Mode -eq 'Prepare') {
     } finally { $env:TEMP = $oldTemp; $env:TMP = $oldTmp }
     $preparedSettings = [IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json -AsHashtable
     $preparedSettings.schema = 2; $preparedSettings.nonce = [guid]::NewGuid().ToString('N')
+    $preparedSettings.assemblyPath = $AssemblyPath
+    $preparedSettings.assemblySha256 = if ($AssemblyPath) { (Get-FileHash -LiteralPath $AssemblyPath).Hash } else { $null }
+    $preparedSettings.legacyRegistryExecutablePath = $LegacyRegistryExecutablePath
+    $preparedSettings.legacyRegistryExecutableSha256 = if ($LegacyRegistryExecutablePath) { (Get-FileHash -LiteralPath $LegacyRegistryExecutablePath).Hash } else { $null }
     $preparedSettings.inputs = @()
     $preparedInputs = @([IO.Directory]::EnumerateFiles($OutputDirectory) | Where-Object { [IO.Path]::GetExtension($_) -in @('.ps1','.cs') }) + @($PSCommandPath, (Join-Path $PSScriptRoot 'registry-session-e2e\SessionLaunch.ps1'), $registryVerificationScriptPath, (Join-Path $PSScriptRoot 'Verification-Common.ps1'), $ExecutablePath, $powerShellHostPath)
+    # registry runnerが実際に読むWindowsごみ箱検証の依存も同じPrepare入力へ固定する。
+    foreach ($name in @('Common.ps1','NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs','PermissionFixture.cs','RegistryCheckpointHost.ps1')) {
+        $preparedInputs += Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $name
+    }
+    $preparedInputs += Join-Path $PSScriptRoot 'registry-session-e2e/RegistryControlCases.ps1'
+    foreach ($dependency in @($AssemblyPath,$LegacyRegistryExecutablePath) | Where-Object { $_ }) {
+        if (![IO.Path]::IsPathFullyQualified($dependency) -or ![IO.File]::Exists($dependency)) { throw 'Checkpoint dependency must be an existing absolute candidate/baseline path.' }
+        $preparedInputs += $dependency
+    }
     if ($MoveExecutablePath) { $preparedInputs += $MoveExecutablePath }
     foreach ($preparedInput in ($preparedInputs | Select-Object -Unique)) {
         $preparedSettings.inputs += @{path=[IO.Path]::GetFullPath($preparedInput);sha256=(Get-FileHash -LiteralPath $preparedInput -Algorithm SHA256).Hash}
@@ -109,6 +126,9 @@ $settings = OpenPreparedPins $settingsPath
 $script:LaunchPrepared=$settings
 . (Join-Path $OutputDirectory 'SessionE2E.Common.ps1')
 AssertPreparedSettings $settings
+if ($Mode -in @('Start', 'Run') -and [string]::IsNullOrWhiteSpace($settings.moveExecutablePath)) {
+    throw 'Full native validation requires Prepare -MoveExecutablePath with the genuine schema4 baseline. No desktop session was launched.'
+}
 if (!('SessionE2ENative' -as [type])) { Add-Type -Path (Join-Path $OutputDirectory 'SessionFixture.cs') }
 if (!('SessionLaunchNative' -as [type])) { Add-Type -Path (Join-Path $OutputDirectory 'SessionLaunchNative.cs') }
 $script:LaunchScopeRoot = $OutputDirectory

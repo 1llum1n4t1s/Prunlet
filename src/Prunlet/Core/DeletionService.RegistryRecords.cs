@@ -12,20 +12,12 @@ public sealed partial class DeletionService
     private static readonly JsonSerializerOptions RegistryJsonOptions = new(PrunletConfig.JsonOptions)
         { PropertyNameCaseInsensitive = false, NumberHandling = JsonNumberHandling.Strict };
 
-    private bool IsRegistryOperation(string operationId)
-    {
-        ValidateMoveOperationId(operationId);
-        var directory = Path.Combine(config.BackupDirectory, operationId);
-        using var pin = PathPolicy.PinRecoveryDirectories(directory);
-        return Directory.EnumerateFileSystemEntries(directory).Any(path => Path.GetFileName(path) == RegistryManifestName);
-    }
-
     private static string RegistryReceiptName(string action, string phase) => $"registry-{action}-{phase}.json";
 
-    private RegistryRecordLease OpenRegistryRecord(string operationId)
+    private RegistryRecordLease OpenRegistryRecord(string operationId, string? migrationDirectory = null)
     {
         ValidateMoveOperationId(operationId);
-        var directory = Path.Combine(config.BackupDirectory, operationId);
+        var directory = migrationDirectory ?? RegistryOperationDirectory(operationId, allowLegacy: false);
         var pin = PathPolicy.PinRecoveryDirectories(directory);
         SafeFileHandle? operationLock = null;
         RegistryRecordLease? record = null;
@@ -53,6 +45,8 @@ public sealed partial class DeletionService
             foreach (var name in names)
             {
                 if (name is RegistryManifestName or RegistrySnapshotName or "operation.lock") continue;
+                var publication = RegistryPublicationFinalName(name);
+                if (publication is not null) { _ = InspectRegistryPublication(directory, operationId, publication); continue; }
                 var match = System.Text.RegularExpressions.Regex.Match(name, @"^registry-(delete|restore|purge)-(intent|complete)\.json$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
                 if (!match.Success) throw new InvalidDataException($"Unknown registry recovery member was retained: {name}");
                 var receipt = ReadRegistryJson<RegistryReceipt>(HoldRegistryFile(Path.Combine(directory, name), record.Held));
@@ -233,37 +227,8 @@ public sealed partial class DeletionService
             throw new InvalidDataException("Registry metadata scalar type is invalid.");
     }
 
-    private FileStream PublishRegistryJson<T>(string finalPath, string operationId, T value, List<FileStream> held)
-    {
-        var pending = Path.Combine(config.BackupDirectory, $"registry-pending-{operationId}-{Guid.NewGuid():N}.json");
-        var handle = NativeFiles.CreatePrivateRegistryFile(pending);
-        FileStream? stream = null;
-        try
-        {
-            NativeFiles.Verify(handle, pending); NativeFiles.VerifySingleLink(handle); NativeFiles.RejectNamedStreams(pending);
-            stream = new FileStream(handle, FileAccess.ReadWrite);
-            JsonSerializer.Serialize(stream, value, RegistryJsonOptions);
-            stream.Flush(true);
-            _ = ReadRegistryJson<T>(stream);
-            NativeFiles.RenameHandle(handle, finalPath);
-            NativeFiles.Verify(handle, finalPath);
-            NativeFiles.VerifyPrivateRegistrySecurity(handle);
-            stream.Flush(true);
-            held.Add(stream);
-            return stream;
-        }
-        catch
-        {
-            // 今回作成した未公開fileだけ同じhandleで除去する。公開後の記録は失敗時も保持する。
-            try
-            {
-                if (NativeFiles.FinalPath(handle) == pending) NativeFiles.DeleteOriginalHandle(handle);
-            }
-            catch (Exception cleanup) when (IsOperational(cleanup)) { }
-            if (stream is null) handle.Dispose(); else stream.Dispose();
-            throw;
-        }
-    }
+    private FileStream PublishRegistryJson<T>(string finalPath, string operationId, T value, List<FileStream> held, List<string>? warnings = null)
+        => PublishRegistryOwnedJson(finalPath, operationId, value, held, warnings);
 
     private static FileStream HoldRegistryFile(string path, List<FileStream> held)
     {
@@ -272,14 +237,15 @@ public sealed partial class DeletionService
         return stream;
     }
 
-    private void WriteRegistryReceipt(string directory, RegistryManifest manifest, string hash, string action, string phase, List<FileStream> held)
+    private void WriteRegistryReceipt(string directory, RegistryManifest manifest, string hash, string action, string phase, List<FileStream> held, List<string>? warnings = null)
     {
         PublishRegistryJson(Path.Combine(directory, RegistryReceiptName(action, phase)), manifest.OperationId,
-            new RegistryReceipt { OperationId = manifest.OperationId, ManifestSha256 = hash, Action = action, Phase = phase }, held);
+            new RegistryReceipt { OperationId = manifest.OperationId, ManifestSha256 = hash, Action = action, Phase = phase }, held, warnings);
     }
 
     private sealed class RegistryRecordLease(string directory, DirectoryLease pin, SafeFileHandle operationLock) : IDisposable
     {
+        internal SafeFileHandle Lock => operationLock;
         internal string Directory { get; } = directory;
         internal List<FileStream> Held { get; } = [];
         internal RegistryManifest Manifest { get; set; } = null!;

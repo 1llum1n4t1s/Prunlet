@@ -42,7 +42,7 @@ function TestMcpLock {
 }
 function TestDisconnectedClient {
  $leaf='disconnected-client';$f=NativeRequest 'create' @{leaf=$leaf};$before=NativeRequest 'observe' @{leaf=$leaf}
- $existing=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase);foreach($dir in [IO.Directory]::EnumerateDirectories($recovery)){$null=$existing.Add($dir)}
+ $existing=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase);foreach($dir in (RegistryOperationDirectories $recovery)){$null=$existing.Add($dir)}
  $lock=[IO.File]::Open((Join-Path $recovery 'maintenance.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None);$p=$null
  try{
   $p=Child @('registry-delete','--view','64','--value-name=binary','--',$f.path);$out=$p.StandardOutput.ReadToEndAsync();$err=$p.StandardError.ReadToEndAsync();$p.StandardInput.Close()
@@ -51,7 +51,7 @@ function TestDisconnectedClient {
   Assert (Same $before (NativeRequest 'observe' @{leaf=$leaf})) 'Disconnect changed source before lock release';$lock.Dispose();$lock=$null
   $sw=[Diagnostics.Stopwatch]::StartNew();$new=@();$opRoot=$null
   while($sw.Elapsed.TotalSeconds-lt 30){
-   $new=@([IO.Directory]::EnumerateDirectories($recovery)|Where-Object {!$existing.Contains($_)})
+   $new=@((RegistryOperationDirectories $recovery)|Where-Object {!$existing.Contains($_)})
    if($new.Count-eq 1-and[IO.File]::Exists((Join-Path $new[0] 'registry-delete-complete.json'))){$observed=NativeRequest 'observe' @{leaf=$leaf};if(!$observed.values.ContainsKey('binary')){$opRoot=$new[0];break}}
    Start-Sleep -Milliseconds 150
   }

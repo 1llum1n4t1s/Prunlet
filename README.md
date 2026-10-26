@@ -2,25 +2,15 @@
 
 Prunletは、`blocked by policy`による清掃の停止を減らすために、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約するWindows用ツールです。許可された削除を最初からPrunletへ任せる使い方に揃えます。
 
-指定したファイル・フォルダーをWindowsのゴミ箱へ移し、操作IDを使ってCLI・MCPから元へ戻せます。実体の保管・清掃はWindowsに任せ、Prunletは安全な復元に必要な記録を保持します。レジストリのキー・値は専用snapshotとトランザクションで保全して削除します。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
+指定したファイル・フォルダーをWindowsのゴミ箱へ移します。Prunletはファイルの操作記録・操作ID・復元用snapshotを保存せず、復元と保持期間の管理はWindowsのゴミ箱で行います。レジストリのキー・値は専用snapshotとトランザクションで保全し、操作IDによる非上書き復元を提供します。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
 
-対応するCodexホストでは、ファイル・フォルダーの実削除と復元を初回から正式なsandbox権限申請付きで実行します。dry-runの成功だけではゴミ箱へのアクセス許可を保証できません。[sandboxとゴミ箱へのアクセス](docs/integration.md#sandboxとゴミ箱へのアクセス)を参照してください。
+ファイルと空フォルダーを扱い、`--recursive`を明示するとフォルダー全体を削除できます。リンク先を辿らず、ゴミ箱へ移せない場合に永久削除や独自退避へ切り替えることはありません。ハードリンクは生存する別名と内容を共有するため、保存時点の不変コピーではありません。
 
-互いに重ならない削除は1つのPrunletプロセスで最大4件を並行処理し、MCPも複数の削除要求を受け付けます。同じ実体を共有するハードリンクの別名もまとめて指定でき、元の権限を検証したうえで上書きせずに復元できます。並行操作でロックを待つ間は、経過時間とロック取得を通知します。CLI・MCPでの確認方法は[使用中のファイルと同時実行](docs/integration.md#使用中のファイルと同時実行)を参照してください。
-
-ファイルと空フォルダーを扱い、`--recursive`を明示するとフォルダー全体を削除できます。シンボリックリンク・ジャンクションはリンク自体を削除し、リンク先を辿りません。ワイルドカード・ネットワークパス・未知のreparseタグ・リンク自体がADSを持つ場合は扱いません。通常の削除であり、ディスク上のデータを復元不能にする消去機能はありません。
-
-ゴミ箱項目の識別情報とFile IDを記録し、復元時に現在の実体と照合します。復元先に同名のファイル・フォルダーがあれば上書きもマージもせず停止します。ハードリンクの外部別名からの書込みは保管中の実体にも反映されるため、保存時点の不変コピーではありません。
-
-新しい記録では元の所有者・グループ・DACLも保存し、CLI・MCPの復元時に完全一致を確認します。復元途中で止まった場合の再開条件と、ACL情報のない旧記録の制限は[連携手順](docs/integration.md#手動の設定準備)を参照してください。
-
-通常のローカル絶対パスに加え、`C:/...`表記、`\\?\C:\...`形式、8.3短縮名、CodexのMSIXによるAppData転送を扱います。通常ファイル・フォルダーの実体と祖先を確認して実体パスへ揃えるため、保存場所の転送や表記の違いだけを理由に追加の許可を求めません。結果の`path`と新しい復元記録には実体パスを保存します。
-
-大文字小文字を区別するディレクトリも属性と正確な名前を同じオブジェクトのまま保持します。旧コピー形式の復元では属性の再設定が必要になる場合があります。[保存形式と互換性](DESIGN.md#旧コピー形式の互換性)を参照してください。
+対応するCodexホストでは、実削除を初回から正式なsandbox権限申請付きで実行します。dry-runはゴミ箱へのアクセス許可を保証しません。[連携手順](docs/integration.md)で入力形式・権限・ロック通知を確認してください。
 
 ## `blocked by policy`対策としての使い方
 
-AIが生成した`Remove-Item`や`rm`などの削除コマンドで清掃が止まりやすい環境では、許可された削除を最初からPrunlet CLIへ任せます。対象の検証、Windowsのゴミ箱への移動、操作IDによる非上書き復元を専用ツールへ集約できます。
+AIが生成した`Remove-Item`や`rm`などの削除コマンドで清掃が止まりやすい環境では、許可された削除を最初からPrunlet CLIへ任せます。対象の検証とWindowsのゴミ箱への移動を専用ツールへ集約できます。
 
 Codexでは、次の順序で利用します。
 
@@ -60,7 +50,7 @@ pwsh -NoProfile -File $installer -RegisterCodex -RegisterAgentInstructions
 
 共通指示を登録した導入の更新でも、同じ`-RegisterAgentInstructions`を指定してください。指定しない更新では共通指示に書き込みません。その間に配置済みguideだけが更新されると、古い共通指示を利用者の編集と区別できず、後の自動更新・解除が停止することがあります。詳細は[エージェント共通指示](docs/integration.md#エージェント共通指示)を参照してください。
 
-更新時は最新版のインストーラーを再取得して実行します。[保持容量の一度だけの移行](#復元データの保持と自動整理)を除き、既存の`config.json`と復元データを保持します。削除対象フォルダーの事前登録は不要です。旧`-AllowedRoot`は互換引数として受理しますが、削除範囲を制限しません。配置先は`-InstallDirectory`で変更できます。利用者のクローンパスをCodex設定へ登録することはありません。
+更新時は最新版のインストーラーを再取得して実行します。既存の`config.json`は保持容量の一度だけの移行を除いて保持します。旧復元データは[明示移行](#旧ファイル復元データの移行)で扱います。削除対象フォルダーの事前登録は不要です。旧`-AllowedRoot`は互換引数として受理しますが、削除範囲を制限しません。配置先は`-InstallDirectory`で変更できます。利用者のクローンパスをCodex設定へ登録することはありません。
 
 取得したbootstrapファイルは一時物です。導入結果を確認して、そのbootstrap専用ディレクトリだけを清掃してください。アプリの配置先と復元用データは清掃対象に含めません。
 
@@ -70,7 +60,7 @@ MSIX環境でAppDataが別の実体へ転送される場合は、`-UpdateBackupR
 
 ## 初期設定
 
-操作記録・レジストリsnapshot・既存の退避データの保存先を指定し、そのディレクトリを事前に作成します。対象はローカルドライブ内の通常ファイル・フォルダーで、対象フォルダーの許可リストはありません。保存先は通常削除から保護します。新しいファイル実体はWindowsのゴミ箱に置き、Prunletの7日・1 GiB設定の対象から外します。
+インストーラーを利用した場合は初期化済みです。手動ではレジストリ復元データの保存先を指定します。`init`は既存設定を上書きしません。
 
 ```powershell
 $config = Join-Path $env:USERPROFILE '.local\Prunlet\config.json'
@@ -78,11 +68,13 @@ $backup = Join-Path $env:USERPROFILE '.local\Prunlet\recovery'
 New-Item -ItemType Directory -Path (Split-Path $config), $backup -Force | Out-Null
 $exe = Join-Path $env:USERPROFILE '.local\Prunlet\bin\prunlet.exe'
 & $exe --config $config init --backup-directory $backup
+& $exe --config $config migrate --dry-run
+& $exe --config $config migrate --apply
 ```
 
-`backupDirectory`は中央の操作記録、レジストリsnapshot、旧コピーの保存先です。既存schema 4の退避実体は既定で各ボリュームの`<volumeRoot>\.Prunlet-Recovery-<SID>\<storeKey>\<operationId>\0000.entry`にあります。任意の`volumeRecoveryDirectories`でボリューム別専用baseを指定できますが、必ず対象と同じボリュームに置きます。異なるボリュームへのコピーfallbackはありません。schema 6の復元中に使う一時領域を含む配置と保護の詳細は[設計](DESIGN.md#ボリューム別の復元領域)を参照してください。
+`backupDirectory`はレジストリsnapshotと移行前の旧データを置く保護領域です。新しいファイル削除の記録・内容は保存しません。レジストリ記録は専用の`.registry-records-v1`配下へ保存します。設定の`allowedRoots`と旧`--allowed-root`は互換入力であり、削除範囲の許可リストには使いません。
 
-インストーラーを利用した場合は初期化済みです。手動の`init`も既存設定を上書きしません。旧`--allowed-root`と設定の`allowedRoots`はschema 1との互換用に受理しますが、削除範囲の判定には使いません。`allowedRoots`を省略・空配列・nullにした設定や、記録された旧ルートが存在しなくなった設定も使用できます。
+手動の`init`は設定作成だけを行います。レジストリを使う前に`migrate --dry-run`で対象を確認し、`migrate --apply`を実行してください。未移行ならレジストリの通常操作は`migration_required`で停止し、旧ファイル領域を自動探索しません。ファイル削除はレジストリの移行状況に依存しません。
 
 ```json
 {
@@ -98,27 +90,21 @@ $exe = Join-Path $env:USERPROFILE '.local\Prunlet\bin\prunlet.exe'
 ```cmd
 C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete --dry-run --paths-file C:\work\delete-paths.json
 C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete --paths-file C:\work\delete-paths.json
-C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json operations
-C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json restore 0123456789abcdef0123456789abcdef
 ```
 
-例のexe・設定は実際の配置済み絶対パスへ、復元のIDは削除結果の`operationId`へ置き換えてください。Codexのshell toolは`cmd.exe`、`login: false`を指定します。空白・Unicode・多数・長い対象パスはコマンドへ展開せず、絶対パスのUTF-8 JSONファイルへ入れます。`--paths-file`は1〜256件の文字列配列、最大1 MiBを受け付け、ファイルを読み取って通常のパス検証を適用します。
+exe・設定は配置済みの絶対パスへ置き換えてください。Codexでは`cmd.exe`・`login: false`を指定します。空白・Unicode・多数・長い対象パスはshellへ展開せず、UTF-8 JSON配列の絶対パスで渡します。`--paths-file`は1〜256件、最大1 MiBです。
 
 ```json
 ["C:\\work\\project\\unused.txt", "C:\\work\\project\\other.txt"]
 ```
 
-空フォルダーは通常の`delete`、内容があるフォルダーは`delete --recursive --paths-file <絶対JSONパス>`でゴミ箱へ移します。ゴミ箱へ移せない場合は、永久削除や独自退避への切替を行わず失敗とします。復元はゴミ箱項目を消費し、既存のファイル・フォルダーには上書きもマージもせず`conflict`を返します。同一オブジェクトの復元を確認できる再実行は`already_restored`です。
+空フォルダーは通常の`delete`、内容があるフォルダーは`delete --recursive --paths-file <絶対JSONパス>`で扱います。単純なパスは`delete [--dry-run] [--recursive] -- <絶対パス> [...]`でも渡せます。ワイルドカード・ネットワークパス・未知のreparseタグは扱いません。リンクはリンク自体を削除し、リンク先を走査しません。
 
-Windowsのゴミ箱が容量や元パスの長さを受け付けない場合は、元データを残して失敗を返します。`--dry-run`は入力・実体の検査であり、実際のゴミ箱移動の成功を保証するものではありません。
+結果は`dryRun`・`items`・`warnings`です。各項目の`path`・`kind`・`status`と任意の`error`を確認します。状態は`recycled`・`would_recycle`・`already_absent`・`failed`・`ambiguous`で、ファイルの操作ID・backupPath・hash・sizeは返しません。`failed`と`ambiguous`は成功扱いになりません。
 
-対象や子フォルダーを他のアプリが使用している場合も移動できません。共有違反ではHRESULTと使用中の案内を返します。該当アプリを終了し、元の場所とゴミ箱に残った実体を確認してから明示的に再実行してください。
+復元はWindowsのゴミ箱から行います。Prunletにはファイル復元コマンド・MCPツールがありません。Windows側で完全削除された項目は復元できません。ゴミ箱の復元先に既存項目がある場合は、Windowsの画面で競合を確認し、上書きしないでください。
 
-単純なパスは`delete [--dry-run] [--recursive] -- <絶対パス> [...]`でも指定できます。長い対象パスも通常のローカル絶対パスで指定でき、`\\?\C:\...`形式も受け付けます。元の削除がホストに拒否された場合、別shellやPrunletへ付け替えて再試行しません。
-
-出力はJSONです。削除結果の`operationId`と各ファイルの`status`を確認してください。欠損ファイルは`already_absent`として返します。復元先に項目が存在するときは上書きせず、退避実体を保持します。失敗時は終了コードが0以外になります。
-
-既存schema 1/2/3のコピー形式とschema 4の専用領域も、同じCLI・MCPから復元できます。旧形式の記録をゴミ箱形式へ自動変換しません。[互換経路の設計](DESIGN.md#旧コピー形式の互換性)を参照してください。
+使用中・権限不足・容量・パス制限などで移動できない場合は結果を確認してください。`ambiguous`は元対象とWindowsのゴミ箱を確認し、同じ削除を自動再送しません。dry-runの成功は実移動の成功を保証しません。
 
 ## レジストリの削除・復元
 
@@ -128,7 +114,7 @@ Windowsのゴミ箱が容量や元パスの長さを受け付けない場合は�
 prunlet --config <絶対パス> registry-delete --view 64 --dry-run -- HKCU:\Software\Example
 prunlet --config <絶対パス> registry-delete --view 64 --recursive -- HKCU:\Software\Example
 prunlet --config <絶対パス> registry-delete --view 32 --value-name= -- HKCU:\Software\Example
-prunlet --config <絶対パス> restore <operation-id>
+prunlet --config <絶対パス> registry-restore <operation-id>
 ```
 
 schema 5の退避データ・記録・ロックは最初の書込みから現在のユーザーとSYSTEMだけがアクセスできるACLで作成し、ACL改変を検出した記録は復元・整理せず保全します。キーは未知の値型も含め型のuint値・生バイト列とOwner・Group・DACL・SACL（Mandatory Labelを含む）を保存します。完全なACL取得には`SeSecurityPrivilege`が必要で、トークンにある場合だけ一時有効化します。不足時は削除前に停止し、自動昇格しません。KTMトランザクションに対応しない環境へのfallbackはありません。値には独立したACLがなく、値の復元では親キーのACLを変更しません。
@@ -143,41 +129,23 @@ MSIX由来の仮想viewで6801になる場合は、[通常Windowsの明示セッ
 
 ## 復元データの保持と自動整理
 
-新しいファイル・フォルダーの保持期間・容量・完全削除はWindowsのゴミ箱設定やストレージセンサー、利用者の操作に従います。Windows側で完全削除された項目はPrunletから復元できません。Prunletの`maintain`・`purge`はゴミ箱項目を消しません。
+`retentionDays`（既定7日）と`maxRecoveryBytes`（既定1 GiB）はレジストリsnapshotだけに適用します。Windowsのゴミ箱はWindowsが保持・清掃し、Prunletは容量・期限・purgeの対象にしません。
 
-レジストリsnapshotと既存schema 1〜4の退避データには、従来の保持制御を維持します。既定は操作作成から7日・合計1 GiBです。正式インストーラーでの次回更新時に、既存設定も一度だけ`maxRecoveryBytes`を1 GiBへ移行します。移行済みを`capacityDefaultMigrationVersion: 1`として保存し、以後の明示的な容量変更を保持します。新規`init`も移行済みで作成します。設定読込・dry-runだけでは設定の変更や整理を行わず、移行後の整理は通常のレジストリ削除・明示`maintain --apply`・定期保守で行います。`retentionDays`は1〜36,500日の整数、`maxRecoveryBytes`は正の整数（バイト数）です。期限切れ、次いで必要容量に応じた古い操作を整理します。元対象の事前走査と整理前後の再走査、入力合計が上限を超える1操作だけの例外予算は、このPrunlet管理データに適用します。
+旧設定で容量上限の移行印が未設定、または1未満の場合、latest導入時に一度だけ`maxRecoveryBytes`を1 GiBへ更新します。移行後の利用者による容量変更は再更新でも保持します。
 
-インストーラーは、現在のWindowsユーザーで毎日03:00とログオン時に`maintain --apply`を実行するタスクを登録します。コンソールを持たない保守専用`prunlet-maintenance.exe`が同じCoreを実行するため、起動時にターミナルを表示しません。03:00にPCの電源が入っていない場合も、次にそのユーザーがログオンした後に整理します。ログオン中のスリープなどで予定時刻を逃した場合は、`StartWhenAvailable`により実行可能になった後に繰り越します。実行時刻にはWindowsタスクスケジューラーの遅延があり、PCを整理のために起こす設定は行いません。管理者権限やパスワードは使用しません。更新時は、既知の旧CLI登録の実行先だけを移行し、利用者による時刻変更や無効化、権限設定を保持します。移行済みのタスクは再登録しません。CLIとMCPのレジストリ削除前にも同じ保持方針を適用します。dry-run、復元、操作一覧、hook入力の検査では自動整理しません。
+`operations`はレジストリ操作IDを一覧し、`purge <registry-operation-id> [--dry-run | --apply]`と`maintain [--dry-run | --apply] [--audit-records]`もレジストリ専用です。省略時は検査のみです。削除前と明示・定期保守では、保護された記録を検査して保持条件を適用します。曖昧な記録や検証できないsnapshotは保全します。
 
-定期整理タスクはレジストリと旧退避データのために残し、Codex連携の解除だけでは削除しません。[タスクの解除手順](docs/integration.md#解除と復元)を参照してください。解除後もレジストリ削除前の自動整理は行われます。新規ファイル削除は旧退避データの整理を起動しません。
+Windowsのゴミ箱にある間のアクセス権と、復元先の親からの権限継承もWindowsの動作に従います。ハードリンクは内容だけでなくACLも共有するため、ゴミ箱への移動時の権限変更が、生存する別名にも反映されます。
 
-```text
-prunlet --config <絶対パス> maintain
-prunlet --config <絶対パス> maintain --apply
-```
+## 旧ファイル復元データの移行
 
-`maintain`と`--dry-run`は検査のみです。`--apply`で期限と容量に従って整理します。整理では旧schema 4の実体IDと記録、旧コピーのサイズ・ハッシュ、レジストリsnapshotの整合性を検証してから復元データを削除し、操作の記録・ロックを残します。整理後はその操作を復元できません。
+`migrate [--dry-run | --apply]`は、旧ファイルの退避データと操作記録を整理し、旧レジストリ記録を専用namespaceへ移します。**旧ファイルの復元互換は終了します。** 所有を確認できる旧ファイル領域は、形式の展開・内容hash検査・コピー・bundle化をせず、そのままWindowsのゴミ箱へ送ります。既にゴミ箱にあるファイルはWindows管理のままです。旧データを復元用に変換する処理や、元権限の参照ファイルは作りません。
 
-更新後は、同じ復元領域を使う旧Prunlet CLI・MCPを終了し、新版で起動してください。旧プロセスが書き込んでいる間は容量上限を厳密には保証できません。
+通常のファイル削除・一覧・保守は旧操作ディレクトリを走査しません。インストーラーは登録と旧backend退役後に`migrate --apply --if-needed`を実行し、policy 2で評価済みの中央旧領域は再走査しません。後からオンラインになった所有済みstoreを拾うため、更新時は固定位置と小さな所有markerだけを確認します。
 
-特定の旧退避・レジストリ操作を期限前に整理するには、`purge <operationId>`で検査し、`purge <operationId> --apply`で適用します。失敗項目に紐づく途中コピーも検証して整理し、中断後は同じ操作IDで再開できます。専用領域を手動削除せず、CLIから整理してください。
+レジストリの保全・完全ACL・非上書き復元は維持します。レジストリの痕跡がある領域、所有を確認できない領域、オフラインや権限不足の領域は警告付きで残し、ファイル整理の未完了だけでレジストリ通常操作を止めません。
 
-## 操作履歴の物理容量を減らす
-
-復元データを整理した後も、監査と中断再開に使うJSON・ロックは残ります。この履歴は復元データの容量上限には含まれません。schema 4の移動記録・schema 5のレジストリ記録・schema 6のゴミ箱記録は当面圧縮対象外で、理由付き`retained`となります。以下は旧schema 1/2/3のコピー形式の履歴についての説明です。NTFS上では、毎日03:00・ログオン時の既存の定期整理が、正常にpurge済みの履歴JSONも自動圧縮します。CLI・MCPのレジストリ削除前にも、その回で復元コピーを自動整理した操作の履歴を圧縮します。
-
-定期・明示`maintain --apply`の結果は`historyCompaction`で確認できます。手動`purge`で残った履歴も次回の定期・明示maintainで圧縮します。自動処理の`skipped_compressed`は既に圧縮済みという意味で、JSONの内容を再検証した結果ではありません。検証範囲と自動処理の設計は[操作履歴の圧縮](DESIGN.md#操作履歴の圧縮)を参照してください。
-
-全履歴を内容から検証して検査・圧縮する場合は、次を実行します。
-
-```text
-prunlet --config <絶対パス> compact-history
-prunlet --config <絶対パス> compact-history --apply
-```
-
-既定と`--dry-run`は検査のみです。`--apply`は、コピーが残っておらず、正常なpurge結果を持つ操作の既知JSONだけをNTFS圧縮します。ファイル名・JSONの内容・ロック・既存の操作IDは保持し、ファイルを削除・置換しません。圧縮前後のSHA-256と長さを照合し、結果の`physicalBytesBefore`・`physicalBytesAfter`でファイルシステムが報告する物理容量を確認できます。論理サイズは変わらず、検査だけでは圧縮後の容量を見積もりません。
-
-復元コピーが残る操作、使用中の操作、不正な記録、未知の項目、リンク・ADS・読み取り専用属性などがある操作は、理由を警告へ返して保持します。非NTFSの保存先には適用しません。自動整理の保持期間・容量上限や定期タスクは変更しません。
+中断・結果不明のファイル整理は自動再送せず、固定の空gateで停止します。元フォルダーとWindowsゴミ箱を確認した後だけ、`migrate --apply --retry-legacy-discard`で明示的に再評価してください。インストーラーはこのackを自動指定しません。移行開始後に導入が失敗した場合も、新しいexe・設定・登録を保持し、旧binaryへ戻しません。
 
 ## MCP
 
@@ -186,11 +154,10 @@ prunlet --config <絶対パス> compact-history --apply
 | ツール | 引数 | 用途 |
 | --- | --- | --- |
 | `delete_files` | `paths`、任意の`dryRun`・`recursive` | ファイル・空フォルダー、明示再帰で内容も削除 |
-| `restore_files` | `operationId` | 上書きしない復元 |
 | `delete_registry` | `path`・`view`（`"32"`/`"64"`）、任意の`valueName`・`recursive`・`dryRun` | キーまたは値を保全して削除。空の`valueName`は既定値 |
 | `restore_registry` | `operationId` | レジストリ操作を非上書きで復元 |
 | `reconcile_registry` | `operationId` | 切断後に保存済みの結果を読取り確認。削除・復元を再送しない |
-| `list_operations` | なし | 保存された操作IDの一覧（復元可否は復元時に検証） |
+| `list_operations` | なし | レジストリ操作IDの一覧（復元可否は復元時に検証） |
 
 サーバーは削除ツールの用途を`instructions`で通知します。通常入口はCLIで、MCPは配置済みexe・設定をCMDで安全に表現できない場合などの代替入口です。purgeは明示CLI操作です。
 

@@ -5,15 +5,15 @@ param(
     [Parameter(Mandatory)][string]$ReportPath,
     [string]$LegacyExecutablePath,
     [string]$MoveExecutablePath,
+    [string]$BaselineExecutablePath,
+    [ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBaselineSha256,
     [switch]$LegacyCopyVerification
 )
 $ErrorActionPreference = 'Stop'
-# ごみ箱項目の整理除外と旧記録の期限・明示整理を検証する。
+# 通常入口はregistry保持制御。Windowsごみ箱の除外はrecordless file suiteで検証する。
 if (!$LegacyCopyVerification) {
-    $verificationArguments = @{ ExecutablePath = $ExecutablePath; OutputDirectory = $OutputDirectory; ReportPath = $ReportPath; CaseFilter = @('*retention*', '*legacy-schema-*-maintain*', '*legacy-schema-*-purge*') }
-    if ($LegacyExecutablePath) { $verificationArguments.LegacyExecutablePath = $LegacyExecutablePath }
-    if ($MoveExecutablePath) { $verificationArguments.MoveExecutablePath = $MoveExecutablePath }
-    & (Join-Path $PSScriptRoot 'Verify-RecycleBin.ps1') @verificationArguments
+    $verificationArguments = @{ ExecutablePath = $ExecutablePath; OutputDirectory = $OutputDirectory; ReportPath = $ReportPath; CaseFilter = @('operations-explicit-purge-and-expiry','capacity-single-oversized-then-normal-budget') }
+    & (Join-Path $PSScriptRoot 'Verify-RegistryRecovery.ps1') @verificationArguments
     exit $LASTEXITCODE
 }
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))

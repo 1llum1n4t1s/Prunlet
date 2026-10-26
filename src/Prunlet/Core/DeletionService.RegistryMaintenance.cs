@@ -3,9 +3,11 @@ namespace Prunlet.Core;
 public sealed partial class DeletionService
 {
     // 呼出し元は共通lockとoperation lockを保持。内容検証済みの同じsnapshot以外を削除しない。
-    private static void ConsumeRegistrySnapshot(RegistryRecordLease record)
+    private void ConsumeRegistrySnapshot(RegistryRecordLease record)
     {
         if (!record.PayloadPresent) return;
+        if (!CleanupRegistryPublication(record.Directory, record.Manifest.OperationId, RegistrySnapshotName, warnings: null))
+            throw new IOException("Owned registry snapshot publication cleanup is pending; the snapshot was retained.");
         if (!record.Has("restore", "complete") && !record.Has("purge", "intent"))
             throw new InvalidDataException("Registry snapshot consumption has no persisted authorization.");
         var path = Path.Combine(record.Directory, RegistrySnapshotName);
@@ -43,7 +45,7 @@ public sealed partial class DeletionService
             if (!record.PayloadPresent)
             {
                 if (apply && record.Has("purge", "intent") && !record.Has("purge", "complete"))
-                    WriteRegistryReceipt(record.Directory, record.Manifest, record.ManifestHash, "purge", "complete", record.Held);
+                    WriteRegistryReceipt(record.Directory, record.Manifest, record.ManifestHash, "purge", "complete", record.Held, result.Warnings);
                 item.Status = record.Has("restore", "complete") ? "already_restored" : "already_purged";
                 return result;
             }
@@ -52,13 +54,13 @@ public sealed partial class DeletionService
             // 完了済みrestoreの残存snapshotはrestoreによる消費を続行し、競合するpurge記録を作らない。
             if (!record.Has("restore", "complete") && !record.Has("purge", "intent"))
             {
-                WriteRegistryReceipt(record.Directory, record.Manifest, record.ManifestHash, "purge", "intent", record.Held);
+                WriteRegistryReceipt(record.Directory, record.Manifest, record.ManifestHash, "purge", "intent", record.Held, result.Warnings);
                 record.Receipts.Add(RegistryReceiptName("purge", "intent"));
             }
             ConsumeRegistrySnapshot(record);
             result.PurgedBytes = record.Manifest.Size;
             if (!record.Has("restore", "complete") && !record.Has("purge", "complete"))
-                WriteRegistryReceipt(record.Directory, record.Manifest, record.ManifestHash, "purge", "complete", record.Held);
+                WriteRegistryReceipt(record.Directory, record.Manifest, record.ManifestHash, "purge", "complete", record.Held, result.Warnings);
             item.Status = "purged";
         }
         catch (Exception ex) when (IsOperational(ex) || ex is OverflowException)

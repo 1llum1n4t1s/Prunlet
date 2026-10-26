@@ -120,7 +120,7 @@ try{
  Check 'value-restore-conflict-preserves-existing-and-snapshot' {
   $leaf='restore-conflict';$f=NativeRequest 'create' @{leaf=$leaf};$before=NativeRequest 'observe' @{leaf=$leaf}
   $d=InvokePrunletCli @('registry-delete','--view','64','--value-name=binary','--',$f.path);Assert ($d.exitCode-eq 0-and$d.json.operationId) 'Conflict setup delete failed';$id=$d.json.operationId
-  $payload=Join-Path $recovery ($id+'\registry-snapshot.json');$digest=(Get-FileHash -LiteralPath $payload -Algorithm SHA256).Hash
+  $payload=Join-Path (Join-Path $recovery '.registry-records-v1') ($id+'\registry-snapshot.json');$digest=(Get-FileHash -LiteralPath $payload -Algorithm SHA256).Hash
   $null=NativeRequest 'set-collision' @{leaf=$leaf;valueName='binary'};$collision=NativeRequest 'observe' @{leaf=$leaf}
   $r=InvokePrunletCli @('restore',$id);Assert ($r.exitCode-ne 0) 'Conflict restore accepted';Assert (Same $collision (NativeRequest 'observe' @{leaf=$leaf})) 'Conflict restore changed existing native value';Assert ((Get-FileHash -LiteralPath $payload -Algorithm SHA256).Hash-ceq$digest) 'Conflict restore consumed/changed backup'
   $drop=InvokePrunletCli @('registry-delete','--view','64','--value-name=binary','--',$f.path);Assert ($drop.exitCode-eq 0-and$drop.json.operationId) 'Collision cleanup by new Core failed'
@@ -130,7 +130,7 @@ try{
  Check 'value-payload-tamper-refused-without-consumption' {
   $leaf='payload-tamper';$f=NativeRequest 'create' @{leaf=$leaf};$before=NativeRequest 'observe' @{leaf=$leaf}
   $d=InvokePrunletCli @('registry-delete','--view','64','--value-name=binary','--',$f.path);Assert ($d.exitCode-eq 0-and$d.json.operationId) 'Tamper setup delete failed';$id=$d.json.operationId
-  $payload=Join-Path $recovery ($id+'\registry-snapshot.json');$original=[IO.File]::ReadAllBytes($payload);$absent=NativeRequest 'observe' @{leaf=$leaf}
+  $payload=Join-Path (Join-Path $recovery '.registry-records-v1') ($id+'\registry-snapshot.json');$original=[IO.File]::ReadAllBytes($payload);$absent=NativeRequest 'observe' @{leaf=$leaf}
   try{
    $bytes=[byte[]]::new($original.Length+1);[Array]::Copy($original,$bytes,$original.Length);$bytes[-1]=32;[IO.File]::WriteAllBytes($payload,$bytes)
    $r=InvokePrunletCli @('restore',$id);Assert ($r.exitCode-ne 0) 'Changed payload accepted';Assert (Same $absent (NativeRequest 'observe' @{leaf=$leaf})) 'Rejected tamper changed source';Assert ([IO.File]::Exists($payload)) 'Rejected tamper consumed payload'
@@ -148,7 +148,7 @@ try{
  }
  Check 'old-current-record-native-session-restore-rejected' {
   $leaf='oldscope-record';$null=NativeRequest 'create' @{leaf=$leaf};$before=NativeRequest 'observe' @{leaf=$leaf}
-  $d=NativeRequest 'current-delete' @{leaf=$leaf};$id=$d.json.operationId;$absent=NativeRequest 'observe' @{leaf=$leaf};$opRoot=Join-Path $recovery $id
+  $d=NativeRequest 'current-delete' @{leaf=$leaf};$id=$d.json.operationId;$absent=NativeRequest 'observe' @{leaf=$leaf};$opRoot=Join-Path (Join-Path $recovery '.registry-records-v1') $id
   $manifest=ReadJson (Join-Path $opRoot 'registry-manifest.json');$snapshot=ReadJson (Join-Path $opRoot 'registry-snapshot.json');Assert ($null-eq$manifest.scope-and$null-eq$snapshot.scope) 'Current-scope fixture unexpectedly has native scope'
   $digests=@{};foreach($file in [IO.Directory]::EnumerateFiles($opRoot)){$digests[[IO.Path]::GetFileName($file)]=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash}
   $r=InvokePrunletCli @('restore',$id);Assert ($r.exitCode-ne 0-and$r.stdout-match'scope differs') 'Old unknown scope accepted in native session or unrelated rejection';Assert (Same $absent (NativeRequest 'observe' @{leaf=$leaf})) 'Native old-scope refusal changed source'
@@ -174,9 +174,9 @@ try{
     'offline'{$descriptor.pipeName='prunlet-registry-'+[guid]::NewGuid().ToString('N')}
    }
    SavePrivateJson $testData.registrySessionFile $descriptor
-   $count=@([IO.Directory]::EnumerateDirectories($recovery)).Count
+   $count=@((RegistryOperationDirectories $recovery)).Count
    $r=InvokePrunletCli @('registry-delete','--view','64','--value-name=binary','--',$f.path) $testConfig
-   Assert ($r.exitCode-ne 0) ('Negative descriptor accepted: '+$negative);Assert (Same $before (NativeRequest 'observe' @{leaf=$leaf})) 'Negative descriptor changed native fixture';Assert (@([IO.Directory]::EnumerateDirectories($recovery)).Count-eq$count) 'Rejected session created a recovery operation'
+   Assert ($r.exitCode-ne 0) ('Negative descriptor accepted: '+$negative);Assert (Same $before (NativeRequest 'observe' @{leaf=$leaf})) 'Negative descriptor changed native fixture';Assert (@((RegistryOperationDirectories $recovery)).Count-eq$count) 'Rejected session created a recovery operation'
    $expectedReason=switch($negative){
     'expired'{'Registry session is expired or its scope, executable, or Windows logon differs'}
     'badnonce-size'{'Registry session capability has an invalid size'}

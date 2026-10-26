@@ -26,28 +26,34 @@ internal static class Program
             if (args.Length == 0 || args is ["--help"] or ["help"])
             {
                 Console.WriteLine("""
-                    Prunlet — Windows file deletion with per-volume recovery moves.
+                    Prunlet — Windows Recycle Bin deletion and registry recovery.
                     prunlet --config <absolute-json-path> init --backup-directory <directory>
+                    prunlet --config <absolute-json-path> validate-config
                     prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]
                     prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>
                     prunlet --config <absolute-json-path> registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <registry-key-path>
                     prunlet --config <absolute-json-path> registry-session --minutes <1..60> --assert-native-windows
                     prunlet --config <absolute-json-path> registry-reconcile <operation-id>
-                    prunlet --config <absolute-json-path> restore <operation-id>
+                    prunlet --config <absolute-json-path> registry-restore <operation-id>
+                    prunlet --config <absolute-json-path> restore <registry-operation-id>
                     prunlet --config <absolute-json-path> purge <operation-id> [--dry-run | --apply]
-                    prunlet --config <absolute-json-path> maintain [--dry-run | --apply]
-                    prunlet --config <absolute-json-path> compact-history [--dry-run | --apply]
+                    prunlet --config <absolute-json-path> maintain [--dry-run | --apply] [--audit-records]
                     prunlet --config <absolute-json-path> operations
+                    prunlet --config <absolute-json-path> migrate [--dry-run | --apply]
                     prunlet --config <absolute-json-path> mcp
                     prunlet --config <absolute-json-path> hook [--hook-script <legacy-path>]
                     Legacy --allowed-root <directory> options are accepted but do not restrict target directories.
                     Metadata and volume recovery directories are protected.
-                    Files and folders move into the Windows Recycle Bin; Prunlet keeps operation records.
+                    Files and folders move into the Windows Recycle Bin without Prunlet operation records.
+                    Restore files and folders using Windows Recycle Bin; no CLI or MCP file restore is provided.
                     Windows controls Recycle Bin retention; unavailable recycling fails without permanent-delete fallback.
-                    Registry snapshots and legacy file backups retain the configured 7-day / 1 GiB defaults.
-                    Maintain manages those Prunlet backups, never the Windows Recycle Bin; inspection is the default.
-                    Restore uses the operation ID, consumes recycled items, and never overwrites or merges destinations.
-                    Moved hard links share content with surviving aliases; legacy copies restore as independent snapshots.
+                    Registry snapshots retain the configured 7-day / 1 GiB defaults.
+                    Maintain and purge manage registry recovery only; inspection is the default.
+                    Migrate discards owned legacy file recovery data through Windows Recycle Bin; registry recovery stays protected.
+                    After checking an interrupted discard, use migrate --apply --retry-legacy-discard to explicitly acknowledge retry.
+                    Restore and registry-restore accept registry operation IDs and never overwrite existing keys or values.
+                    Recycled hard links share content with surviving aliases.
+                    For ambiguous file results, inspect the source and Windows Recycle Bin; do not resend deletion.
                     Empty directories are supported; deleting directory contents requires --recursive.
                     Wildcard expansion is unsupported. Links are deleted without following their targets.
                     Registry view is required. Omit value-name for a key; an empty value-name selects the default value.
@@ -88,6 +94,19 @@ internal static class Program
             object result;
             switch (command)
             {
+                case "validate-config":
+                    if (commandArgs.Length != 0) throw new ArgumentException("Validate-config accepts no arguments.");
+                    result = new { valid = true };
+                    break;
+                case "migrate":
+                    if (commandArgs.Length > 3 || commandArgs.Distinct(StringComparer.Ordinal).Count() != commandArgs.Length
+                        || commandArgs.Any(arg => arg is not ("--dry-run" or "--apply" or "--if-needed" or "--retry-legacy-discard"))
+                        || commandArgs.Contains("--dry-run") && commandArgs.Contains("--apply")
+                        || commandArgs.Contains("--if-needed") && !commandArgs.Contains("--apply")
+                        || commandArgs.Contains("--retry-legacy-discard") && (!commandArgs.Contains("--apply") || commandArgs.Contains("--if-needed")))
+                        throw new ArgumentException("Use migrate [--dry-run | --apply]. After checking the source and Windows Recycle Bin, use migrate --apply --retry-legacy-discard to acknowledge an interrupted legacy file discard. Installer may use migrate --apply --if-needed.");
+                    result = service.MigrateRecoveryStorage(commandArgs.Contains("--apply"), commandArgs.Contains("--if-needed"), commandArgs.Contains("--retry-legacy-discard"));
+                    break;
                 case "delete":
                     var dryRun = false;
                     var recursive = false;
@@ -117,8 +136,9 @@ internal static class Program
                     result = service.ReconcileRegistry(commandArgs[0]);
                     break;
                 case "restore":
-                    if (commandArgs.Length != 1) throw new ArgumentException("Restore requires exactly one operation id.");
-                    result = service.Restore(commandArgs[0]);
+                case "registry-restore":
+                    if (commandArgs.Length != 1) throw new ArgumentException("Registry restore requires exactly one registry operation id. Restore files with Windows Recycle Bin.");
+                    result = service.RestoreRegistry(commandArgs[0]);
                     break;
                 case "purge":
                     if (commandArgs.Length is < 1 or > 2
@@ -131,14 +151,11 @@ internal static class Program
                     result = ListOperations(config);
                     break;
                 case "maintain":
-                    if (commandArgs.Length > 1 || (commandArgs.Length == 1 && commandArgs[0] is not ("--dry-run" or "--apply")))
-                        throw new ArgumentException("Use maintain [--dry-run | --apply]. Maintenance inspects only unless --apply is specified.");
-                    result = service.MaintainRecovery(commandArgs.Length == 1 && commandArgs[0] == "--apply");
-                    break;
-                case "compact-history":
-                    if (commandArgs.Length > 1 || (commandArgs.Length == 1 && commandArgs[0] is not ("--dry-run" or "--apply")))
-                        throw new ArgumentException("Use compact-history [--dry-run | --apply]. History compression inspects only unless --apply is specified.");
-                    result = service.CompactHistory(commandArgs.Length == 1 && commandArgs[0] == "--apply");
+                    if (commandArgs.Length > 2 || commandArgs.Distinct(StringComparer.Ordinal).Count() != commandArgs.Length
+                        || commandArgs.Any(arg => arg is not ("--dry-run" or "--apply" or "--audit-records"))
+                        || commandArgs.Contains("--dry-run") && commandArgs.Contains("--apply"))
+                        throw new ArgumentException("Use maintain [--dry-run | --apply] [--audit-records]. Maintenance inspects only unless --apply is specified.");
+                    result = service.MaintainRecovery(commandArgs.Contains("--apply"), commandArgs.Contains("--audit-records"));
                     break;
                 case "mcp":
                     if (commandArgs.Length != 0) throw new ArgumentException("MCP accepts no arguments.");
@@ -254,19 +271,17 @@ internal static class Program
         config.Validate();
         return new OperationsResult
         {
-            Operations = Directory.EnumerateDirectories(config.BackupDirectory)
-                .Where(p => Guid.TryParseExact(Path.GetFileName(p), "N", out _))
-                .Select(p => new OperationSummary { OperationId = Path.GetFileName(p) })
-                .OrderBy(p => p.OperationId, StringComparer.Ordinal).ToArray()
+            Operations = new DeletionService(config).ListRecoveryOperations()
         };
     }
 
     internal static bool HasErrors(object result)
     {
         if (result is OperationsResult) return false;
-        if (result is HistoryCompactionResult history)
-            return history.Operations.Any(operation => operation.Status == "failed" || !string.IsNullOrEmpty(operation.Error)
-                || operation.Files.Any(file => file.Status == "failed" || !string.IsNullOrEmpty(file.Error)));
+        if (result is RecoveryMigrationResult migration)
+            return !migration.DryRun && !migration.RegistryReady || migration.Operations.Any(operation => operation.Status is "failed" or "ambiguous");
+        if (result is FileDeleteResult files)
+            return files.Items.Any(item => !string.IsNullOrEmpty(item.Error) || item.Status is "failed" or "ambiguous");
         if (result is RecoveryMaintenanceResult maintenance)
             return !maintenance.Complete || !maintenance.CapacityKnown || !maintenance.BudgetSatisfied || maintenance.Operations.Any(HasErrors);
         var typedItems = result switch
@@ -287,7 +302,7 @@ internal static class Program
 
     private sealed class OperationsResult
     {
-        public OperationSummary[] Operations { get; init; } = [];
+        public RecoveryOperationSummary[] Operations { get; init; } = [];
     }
 
     private sealed class OperationSummary

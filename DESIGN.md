@@ -1,55 +1,37 @@
 # Prunletの設計
 
-PrunletはWindowsのファイル・フォルダーをWindowsのゴミ箱へ移し、操作IDで非上書き復元するツールである。実体の保管・清掃はWindowsが管理し、Prunletは識別情報と操作記録を保持する。レジストリのキー・値はsnapshotとKTMトランザクションで保全する。CLIとstdio MCPは同じCoreを使い、フックは直接削除を検査・拒否してCLIを案内する。利用手順は[README](README.md)、開発規約は[AGENTS.md](AGENTS.md)を参照する。
+現在の通常経路は、記録を残さないWindowsゴミ箱へのファイル削除と、snapshot・トランザクションを使うレジストリ削除・復元である。利用手順は[README](README.md)、連携は[docs/integration.md](docs/integration.md)、検証は[docs/verification.md](docs/verification.md)を参照する。
 
 ## 構成と責務
 
-| 実装 | 責務と境界 |
-| --- | --- |
-| `Program.cs` / `Protocol/McpServer.cs` | CLI・JSON出力、stdio JSON-RPCと6つのMCPツール |
-| `Core/DeletionService.Recycle*.cs` / `Core/RecycleOperation.cs` / `Core/NativeRecycleBin.cs` | schema 6のゴミ箱操作、Shell識別情報とFile ID照合、非上書き復元 |
-| `Core/DeletionService.Moves.cs` / `Core/NativeFiles.Moves.cs` | 既存schema 4の同一ボリューム・非上書き復元 |
-| `Core/MoveOperation.cs` / `Core/DeletionService.MoveRecords.cs` | schema 4の中央manifest、追記するreceiptの永続化と照合、中断状態の検証 |
-| `Core/VolumeRecoveryStore.cs` | ボリューム別専用領域、所有者ACL・marker・ボリュームとFile IDの照合 |
-| `Core/DeletionService.Registry*.cs` / `Core/RegistryOperation.cs` / `Core/NativeRegistry.cs` / `Core/NativeFiles.RegistrySecurity.cs` | schema 5のsnapshot・receipt、KTMによる削除と復元、完全ACLと非公開保存の検証、snapshotの消費・整理 |
-| `Core/RegistrySession*.cs` | 明示native sessionの接続・認証・scope識別と要求委任 |
-| `Core/DeletionService.MoveMaintenance.cs` | schema 4と旧コピーの容量集計・保持制御・明示purgeの統合 |
-| `Core/DeletionService.Metadata.cs` / `Core/DeletionService.Retention.cs` / `Core/DeletionService.Purge.cs` | schema 1/2/3の読込み・コピー検証・復元・整理の互換経路 |
-| `Core/DeletionService.HistoryCompaction.cs` / `Core/HistoryCompactionResult.cs` | 旧コピー形式の整理済み履歴のNTFS圧縮 |
-| `Core/PrunletConfig.cs` / `Core/PathPolicy.cs` / `Core/NativeFiles.cs` | 設定と実体パス検証、祖先の固定、旧コピー形式を含むWin32処理 |
-| `Protocol/HookRouter.cs` / `Protocol/BoundedInputReader.cs` | 入力検査と直接削除の拒否・CLI案内。削除・自動置換をしない |
-| `integration/` / `scripts/Install-Prunlet.ps1` | 所有範囲に限定した登録・解除、GitHub最新HEADからの導入 |
-| `scripts/Publish-Prunlet.ps1` / `scripts/Verify-*.ps1` | 外部絶対パスへのビルドと別プロセスE2E |
+- `Core/DeletionService`がファイル削除・レジストリ削除と復元・保守・明示移行を担当する。CLI・MCP・hookに別の削除方式を実装しない。
+- `Program`はCLIの入力検証とJSON出力、`Protocol/McpServer`はstdio JSON-RPCを担当する。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールである。
+- hookは認識した直接削除を検査・拒否し、配置済みCLIを案内する。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
+- Windows Shellがゴミ箱への移動とファイル復元を担当する。Prunletのファイル復元API・通常の履歴圧縮入口は提供しない。
 
 ## 削除と復元のデータフロー
 
-1. 1〜256件のローカル絶対パスを検証する。重複・祖先重複、中央metadataと旧専用領域、その祖先を拒否する。リンク先を辿らず、非空フォルダーには明示`recursive`を必要とする。
-2. 共通`maintenance.lock`を読み取り共有で保持し、正規化した全対象と祖先のclaimを取得してから対象・元親のFile IDと種類を検査する。対象は排他、祖先は共有で、大文字化したパスのUTF-8 SHA-256から65,536個のEOF以降のbyte slotへ割り当てる。衝突は強いclaimへ統合し、全batchを昇順で取得する。同じ対象と親子の削除を排他し、別対象は並行できる。ファイル長は0のまま、handle終了でclaimも解放する。dry-runは読取りのみで、ゴミ箱・操作記録・ロックを変更しない。新規削除は専用payload領域を作らず、Prunletの容量予算を消費しない。
-3. `backupDirectory`のGUID操作フォルダーに`operation.lock`とschema 6の`recycle-manifest.json`を置く。machine・ユーザーSID・対象と元親の128-bit File ID・種類に加え、リンク先を辿らず全項目の相対名・ID・Owner/Group/DACLのnative bytesを記録する。全項目のREAD_CONTROL・WRITE_DACを確認し、`recycle_intent`を永続化してからShellを呼ぶ。直前にも構成・ID・ACLを照合する。上限は1対象65,536項目・descriptorごと1 MiB・記録128 MiBで、超過は移動前に拒否する。
-4. 専用STAで対象親の`ITransferSource::RecycleItem`だけを呼ぶ。永久削除の`RemoveItem`や高位の削除fallbackを呼ぶ経路は持たない。UI・自動昇格を使わず、返却された項目を現在のゴミ箱namespaceの実体・File IDと照合してcanonical PIDLを完了receiptへ永続化する。正常情報値`COPYENGINE_S_DONT_PROCESS_CHILDREN`は非NULL実体とID一致を条件に扱う。callback失敗、項目不一致、完了記録欠損は成功と推定しない。
-5. `operationId`と項目ごとの成否を入力順で返す。preflightは全workerの完了を待ち、1件でも失敗したら全対象を保持する。manifest公開とhash確定後に各項目を並行実行する。preflightとShell実処理はprocess共通で最大4workerとし、専用STAへの実効token継承を維持する。snapshotの全nodeを同じhandleから調べ、複数hardlinkを持つfileがあればmanifest作成前に全pin・共有claimを解放し、排他lockで正規化・全preflightから取り直してbatchを逐次実行する。ShellのACL変更を共有する別名を並行処理せず、snapshotの照合条件も緩和しない。複数入力全体は一括トランザクションではなく、途中失敗でも完了項目と記録を保持する。
+ファイル・フォルダーは入力パスを正規化し、対象・祖先・保護領域・リンクを検証する。全対象のpreflightを終えてからWindowsゴミ箱へ移す。永久削除・独自退避・別ボリュームへのコピーへのfallbackを加えない。再帰指定のない非空フォルダーは拒否し、リンク先を走査しない。
 
-stdio MCPは解析・initialize・通知をreader順で処理し、`delete_files`は最大4要求を並行実行する。他のtoolは受理済み削除の完了を待ってからreaderで同期実行し、レジストリのprocess privilege変更をfile workerへ持ち込まない。引数を複製し、要求専用serviceへ進捗を購読する。全出力を同じwriter gateで直列化し、完了後の進捗を抑止する。EOFでも受理済み要求の完了を待つ。要求枠と削除worker枠は別で、4要求のbatchを受けてもShell実処理はprocess全体で4件までとなる。
+新規ファイル削除では、操作ID・PIDL・File ID・内容hash・size・ACL snapshotを復元用に永続化しない。manifest・monitor・index・retirement・復元stageも作成しない。処理中の安全確認に使う情報と永続的な操作記録を区別する。共通の`maintenance.lock`は排他制御用の固定ファイルであり、操作記録ではない。
 
-削除完了receiptにはゴミ箱到着時の全項目のIDとOwner/Group/DACLも記録する。復元前はこのreceiptと現在のゴミ箱実体を照合し、外部ハードリンク等からACLが変更されていたら書き戻さず停止する。
+`Delete`は`FileDeleteResult`を返し、`dryRun`・`items`・`warnings`を持つ。項目は`path`・`kind`・`status`・任意の`error`だけであり、状態は`recycled`・`would_recycle`・`already_absent`・`failed`・`ambiguous`である。`failed`・`ambiguous`はCLIの非ゼロ終了とMCPの`isError`へ反映する。結果不明時は同じ削除を再送せず、元対象とWindowsのゴミ箱を確認する。
 
-同一batchの異なるentryが同じVolume/File IDを共有する場合、新規manifestだけが`hardlinkProtocol:1`を記録する。全snapshot nodeから共有IDを介するentryの連結成分を導出し、共有IDの元Owner/Group/DACL・種類・属性が全entryで一致することを確認する。元snapshotは変更しない。共有IDを持つcomponentは排他lock内で逐次削除し、直前の照合には元snapshotと、そのcomponentの完了済みShell操作が証明した共有IDの状態だけを用いる。
+復元と保持期間の管理はWindowsのゴミ箱で行う。Windowsが完全削除した実体をPrunletが復元できるとは扱わない。ハードリンクの別名は実体を共有し、生存する外部別名からの書込みがゴミ箱内にも反映される。通常属性・ADS・case-sensitiveな名前とACLはWindowsが移す同じオブジェクトの状態であり、Prunletが保存時点の不変コピーやACL再適用を提供するものではない。
 
-共有状態は`hardlink-<leader>-<sequence>-intent/proof/complete.json`の順で永続化する。intentは前completeのhashと実行前の厳密な共有状態、proofは実行したentry・action・移動先・実測snapshotと原因receiptのhash、completeはintent/proofのhashを結び付ける。削除proofは既存のimmutable recycle完了receipt、stage到着proofは既存のstage intentへ結び付ける。読込時は連続sequence・許可ID集合・前状態・File ID・原因proofを照合し、最新ACLだけから正当な変更を推定しない。未完了・曖昧な操作・receipt保存失敗では同componentの後続を停止し、独立componentだけを続行できる。従来のschema 6記録へ共有状態の証拠を後付けしない。
+対象のclaim取得順・process共通worker上限・重複/親子の排他・全preflight完了後の実行を維持する。ハードリンクの共有を検出した場合は排他的な実行へ切り替える。MCP要求枠とfile worker枠を分け、registry privilege変更をfile workerと並行させない。
 
-共有componentの復元では全Bin/PIDL・親・stage・原本と共有状態を先に照合し、初期の復元先競合が1件でもあればcomponent全体を保持する。全entryを非公開stageへ移してから全Owner/Group/DACL・属性を元snapshotへ戻し、全件を厳密照合する。各stage-readyに加え、それらのhashと最終transitionのhashを結び付けた単一の`hardlink-<leader>-ready.json`を非上書きで永続化した後、各entryを非上書き公開する。これにより後続Shell移動が公開済み別名のACLを変える順序を作らない。group-readyのない既存stageはACLを再補正せず保持する。group-ready後の公開途中だけは、全原本・残stageを再照合してShellやACL補正を繰り返さず再開できる。外部別名のOGD変更やhash不整合は拒否する。API境界間での外部変更を完全に識別する保証やSACLの追加保証は持ち込まない。
+## 保存領域と保護
 
-復元はmanifest・receipt、現在のゴミ箱namespaceへの所属、元親と実体のIDを照合する。元パスが空いていることを確認し、同一ボリュームの復元用stageのID・場所をintentへ先行永続化する。ゴミ箱の`ITransferSource::MoveItem`へ`TSF_FAIL_EXIST`を指定してstageへ移し、全項目のWRITE_DACハンドルと同一ID・Owner/Groupを確認した後、元DACLを復元する。native bytes・ID・属性の完全一致を検証してreadyを永続化し、最後にハンドル指定の非上書きrenameで元パスへ公開する。公開後の再照合まで通ってから完了receiptを書く。既存ファイル・フォルダーへ上書きもマージもせず`conflict`とし、ゴミ箱またはstageの実体を保持する。成功時は`restored`、同一オブジェクトの復元を確認できる再実行は`already_restored`となる。元親がなくなった場合やIDが変わった場合は停止する。
+`backupDirectory`は保護されたmetadataの基点である。manifestの`MetadataRoot`は従来の共通基点を維持する。レジストリの通常記録は`<backupDirectory>/.registry-records-v1/<operationId>`へ分離し、通常の一覧・保守・復元はそのnamespaceを対象にする。
 
-stageにreadyがある場合は元snapshotとの完全一致を条件に再開できる。既存stageにreadyがない場合は途中停止と後発のACL変更を区別できないため、ACL・属性を補正せず保全して停止する。公開済み原本の完了記録が欠けてもACL・属性を再適用せず、完全一致した場合だけ完了できる。snapshotのない旧schema 6はWindowsのACL動作に従う互換復元を残し、元ACLを保証できない旨を結果のwarningsへ返す。
+旧flat記録・旧schema 4のボリューム専用領域・旧schema 6の制御領域は、移行が終わるまで保護する。通常のファイル削除・一覧・保守が、旧ファイルの操作ディレクトリを探索・監視・再評価する経路は持たない。新しいファイル削除のためにボリューム専用領域を作らない。
 
-中断・欠損・ID不一致は記録を保全して停止し、削除を自動再送しない。ゴミ箱項目を元パスや名前だけで補完しない。Windowsや利用者が完全削除した項目は復元できず、`missing`を返す。操作一覧は操作IDの列挙であり、復元可能性を保証しない。
-
-Shell APIは旧ハンドルrenameと同じ原子的な対象名固定を文書化していない。呼出前後のFile ID照合で取り違えを検出し、不一致は`ambiguous`として保持する。schema 1〜4は既存記録の復元・整理専用とし、新規作成へ戻さない。
+手動`init`は設定だけを作り、明示`migrate --apply`が専用namespaceと全体のレジストリ準備を確定する。準備前の通常レジストリ削除・一覧・保守は`migration_required`で軽量拒否する。既知IDのrestore/reconcileによる個別旧記録の移行は、全体の準備完了とは扱わない。ファイル削除はレジストリ準備を要求しない。
 
 ## レジストリの削除と復元
 
-レジストリ操作も`Core`へ集約する。CLIは`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <single-key-path>`、MCPは`delete_registry`と`restore_registry`を提供する。共通CLIの`restore`はファイルとレジストリを振り分け、MCPの`restore_files`はファイル操作に限定する。削除要求はview必須、値名省略はキー、空文字は既定値であり、値削除の再帰指定を拒否する。
+レジストリ操作も`Core`へ集約する。CLIは`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <single-key-path>`、MCPは`delete_registry`と`restore_registry`を提供する。CLIの`restore`と`registry-restore`、MCPの`restore_registry`はレジストリ専用である。削除要求はview必須、値名省略はキー、空文字は既定値であり、値削除の再帰指定を拒否する。
 
 schema 5の`registry-manifest`・snapshot・intent・receiptで、未知の値型も含め型のuint値と生バイト列、キーごとのOwner・Group・DACL・SACL（Mandatory Labelを含む）を保持する。実削除は非トランザクションの対象または親HKEYを保持し、その同じオブジェクトをRootDirectory・空の相対名で`NtOpenKeyTransactedEx`に渡す。まず削除をトランザクション内へstageし、外部には元データが見える状態で、保持した非トランザクションHKEYからsnapshotを取得する。snapshot・manifest・intentのflushとハッシュ検証を済ませてからcommitし、完了receiptを永続化する。したがって外部に削除が確定する前に保全データが永続化される。
 
@@ -63,96 +45,45 @@ schema 5の原文bytesはpendingファイルの最初の書込み時点から、
 
 復元はトランザクション内で新規作成だけを許し、既存キー・値・空の既定値を上書きもマージもしない。値復元は先に書込みをstageしてから、保持した非トランザクション親HKEYで同名値の不存在を確認する。既存値ならロールバックし、競合する外部書込みがあればcommitを失敗させて外部値を保全する。Owner/SACLの適用権限不足もロールバックしsnapshotを保全する。commitとreceipt永続化の間の中断は`ambiguous`としてpayloadを保持し、推測した復元・自動整理を拒否する。キーのclassも保存するが、最終書込み時刻は復元せず、volatileキーも非volatileキーとして復元する。
 
-対象はローカルHKCU/HKLM/HKUの絶対キーで、`Registry::`およびmodule prefixを許容する。ルート自体、mergedなHKCR/HKCC、remote、relative、レジストリリンク、未知のschema・metadataや検証できない復元記録は拒否する。保持期間7日・容量1 GiBの既定値はschema 4および旧schema 1/2/3と合算し、共通ロック・事前走査・整理前後の再走査・単一超過時だけの例外予算を共有する。明示整理は既存CLIの`purge`・`maintain`を使い、MCPにpurgeは追加しない。
+対象はローカルHKCU/HKLM/HKUの絶対キーで、`Registry::`およびmodule prefixを許容する。ルート自体、mergedなHKCR/HKCC、remote、relative、レジストリリンク、未知のschema・metadataや検証できない復元記録は拒否する。保持期間7日・容量1 GiBの既定値はレジストリschema 5だけを対象とし、共通ロック・事前走査・整理前後の再走査・単一超過時だけの例外予算を共有する。明示整理は既存CLIの`purge`・`maintain`を使い、MCPにpurgeは追加しない。
 
 MSIX由来の仮想viewでtransactionが利用できない場合も、非transaction操作へ切り替えない。通常Windows側の操作には、通常デスクトップの期限付きnative sessionを用意し、`registryScope=nativeWindows`と専用接続情報を明示選択したCLI・MCPから同じCoreへ委任する。検証では`Verify-RegistrySession.ps1`のPrepareで固定したscopeと入力に限り、`Start -AssertNativeWindows`からdesktop Explorerの通常起動とWindowsの`runas`で起動できる。管理者起動の同意はOSのUACポリシーに従い、エージェントは同意を代行しない。入力のread handle・hash、nonce、原子的な開始claim、親の生存・期限、通常/管理者の実token、両者のreadyとRun permitを照合し、遅延起動や曖昧な開始を拒否する。手動のdesktop起動は診断互換として残す。job・silo制約を転送する方式ではなく、通常Windows scopeへの明示委任であり、汎用コマンドbroker・サービス・タスク登録・仮想viewからのfallbackは追加しない。要求ごとのeffective tokenを使用し、session固有の権限を呼出元へ貸さない。sessionはlocal・同じログオン・同じexeに限定し、期限後は新規受付を停止するが進行中のCoreを強制終了しない。
 
 native scopeの識別はmanifestとsnapshotのhash内に保存し、machine・SID・viewの一致を復元前に確認する。scope欠落の旧記録をnativeと推定せず、異なるscopeからの復元を拒否する。restoreのIPC分岐は共通ロックの取得前に行い、server側だけでCoreの共通ロックを取得する。deleteのoperationIdはclientで先に決め、応答喪失時は同じ削除を再送せず、read-onlyの`registry-reconcile`で記録を確認する。接続・scope・認証の不一致は元対象と復元データを保持して停止する。起動・設定の手順は[連携手順](docs/integration.md#通常windowsのレジストリを明示して操作する)を参照する。
 
-## ボリューム別の復元領域
+## 旧ファイル復元データの明示移行
 
-この節は既存schema 4の互換経路である。`backupDirectory`は全schemaの中央metadata、レジストリsnapshotと旧コピーの保存先である。schema 4のpayloadは`<volumeRoot>\.Prunlet-Recovery-<SID>\<storeKey>\<operationId>\0000.entry`にある。新規ゴミ箱操作はこの専用領域を作らない。
+旧ファイルの復元互換を維持せず、Coreの明示`migrate`で所有確認済みの旧退避データ・操作記録をWindowsのゴミ箱へ破棄する。旧schema 1〜4/6のdecode・内容hash・ACL snapshot・コピー・bundle・sidecar・file restoreは実装しない。既存のWindowsゴミ箱項目を走査・再移動しない。
 
-schema 6の復元中だけは別の`<volumeRoot>\.Prunlet-Restore-<SID>\<storeKey>\<stageId>`を使う。`volumeRecoveryDirectories`指定時は設定baseへ`.restore`を付けた同一ボリュームの場所を使う。親領域は作成時から本人・SYSTEM限定のACLと所有markerで検証し、中央metadataとともに通常削除から保護する。stageの実体は旧データの容量予算・自動整理に含めない。これは復元中の一時移動であり、新規削除の退避fallbackではない。対象自身の明示ACLや外部ハードリンクによるアクセスまで隔離する機構ではない。
+volume側は8 KiB以内のstore markerでSID・metadata root・StoreKey・volume・root identityとprivate ACLを検証した専用StoreKey/restore rootだけを扱う。privateBase・custom設定dir・他StoreKeyを丸ごと処分しない。中央GUID操作は直下の正規file marker名で分類し、本文が破損・未完了でも処分できる。registry manifest・pending・publication・namespace/controlのsignalは先に保護する。typed file rootは正規layout、既存bundle/journalは予約prefixとprivate metadata所有範囲で限定し、本文の任意Pathへ削除範囲を広げない。
 
-任意設定`volumeRecoveryDirectories`は`D:\`などのローカルドライブルートから専用baseへの対応である。フォルダーマウントやreparse祖先を通常パスとして通さない。テスト・管理時も必ず移動元と同じボリュームへ置き、中央metadataと専用baseは相互に包含できない。別ボリュームへのコピーfallbackは行わない。専用領域を作成できない、ファイルシステムや権限が必要な検証・renameに対応しない場合は元対象を残す。
+所有inventoryのpinを解放してからdispatchし、直前にpath・root identity・marker・非reparseを再確認する。通常削除と同じ`NativeRecycleBin.RecycleUnrecorded`を使い、永久削除・copy fallback・任意対象の保護解除フラグを追加しない。結果はPathと`recycled`・`would_recycle`・`already_absent`・`retained`・`failed`・`ambiguous`であり、file操作ID・復元記録を新設しない。
 
-StoreRootは本人・SYSTEM・Administratorsだけに許可するACLを検証し、所有marker、volume GUID、ボリュームserialと128-bit File IDを照合する。既存の不明なディレクトリや別操作の領域を流用しない。中央metadataと各ボリュームの専用領域は通常削除から保護する。
+移行全体で固定のprivate空ファイル`.legacy-file-discard-in-progress`を1個だけ使う。これは対象Path・ID・hash・ACL本文を持たない実行gateであり、CreateNew・Flush・検証後にdispatchし、確認済み成功時だけ除去する。存在または不正形はfile discardだけを停止し、registry処理は続ける。installerは解除せず、元フォルダーとWindowsゴミ箱の確認後の`migrate --apply --retry-legacy-discard`だけが、正規の空private gateを解除して再評価する。dry-runとif-neededにackを組み合わせない。
 
-## フォルダーの削除と復元
-
-新規操作はschema 6でフォルダーごとWindowsのゴミ箱へ移す。非空フォルダーには明示`recursive`が必要で、復元先へマージしない。既存schema 4のroot renameによる非上書き復元も維持する。
-
-## 通常属性の保存と復元
-
-Windowsゴミ箱での属性・ACL・ADS・File ID・case-sensitive属性の保持は実プロセスE2Eで確認する。ゴミ箱内の継承DACLはWindowsが管理する。snapshot付きschema 6の復元成功にはOwner/Group/DACLのnative bytesと全control flagの完全一致を要求する。DACLは同一IDを確認したハンドルへ`NtSetSecurityObject`で戻し、Owner/Groupは変更しない。SACLはこのsnapshotの対象外で、完全SACLの保全検証とは区別する。noncanonical DACLの転送中の挙動は未検証である。Shellが扱えない対象を直接削除へ切り替えない。以下のrename後の属性調整はschema 4と6の復元に適用する。schema 4の既存検証では継承ACEの明示化や同値Allow ACEの統合は権限変更と区別し、復元後のSDDLは元と完全一致で比較する。
-
-通常ファイルのrenameはDELETEハンドルを閉じる際にArchive属性を付ける。Archiveのない対象だけは移動前に属性変更権限を確保し、ハンドルを閉じてから元属性へ戻す。権限を確保できない対象は移動前に拒否する。復元intentにも移動直前の属性を永続化する。Windowsがrenameを拒否した場合に、読み取り専用属性やアクセス権限を緩めて再試行することはない。
-
-## 特殊対象の保存と復元
-
-ADSは元オブジェクトに付随して移動し、`Zone.Identifier`や正確なstream名も保持する。シンボリックリンク・ジャンクションはリンク自体を移動し、リンク先を辿らない。未知のreparseタグ・ADS付きリンク・ネットワークパス・ワイルドカードは拒否する。
-
-ハードリンクでは指定した名前だけが移動する。外部に残る別名と同じ実体を共有するため、別名からの書込みは保管中の内容にも反映される。新方式は保存時点の不変コピーではない。復元後も同じリンク関係を保持する。
-
-## 旧コピー形式の互換性
-
-schema 1/2/3のコピー作成とschema 4の専用領域への新規移動を通常経路から外し、既存操作のrestore・purge・maintainに必要な読込みと検証を残す。schema 1はfile、2はflat tree、3はADS・reparse情報付きコピーである。既存記録をschema 6へ書き換えない。
-
-旧形式の`manifest.json`・`0000.bak`等はサイズ・SHA-256・型・実体・単一リンクを検証して扱う。`backup_ready`はコピー準備状態であり、削除成功を意味しない。復元は新規作成と内容検証を行い、既存ファイルを上書きしない。旧ツリー復元は既存の通常ディレクトリを利用でき、旧コピーは復元成功後も残る。旧ハードリンクの復元は独立コピーで、属性を持たない旧記録は元属性を再現しない。case-sensitive属性の変更が必要ならWindowsの必要権限を要求し、失敗時はコピーを保持する。
+registryの旧記録は専用namespaceへ移し、ID・snapshot・完全ACL・scope・共通MetadataRootを保持する。file処理の未完了はRegistryReadyから分離する。policy version 2は未指定0の旧stateを読める形で保存し、installerの`--apply --if-needed`では中央旧GUID走査を省略する。オンラインvolumeの所有済みstore/restore rootの少数存在・小marker検査は更新時に続け、後から接続された領域を回収する。通常file delete/list/maintainへ旧領域走査を加えない。移行開始後は旧binaryへrollbackせず、新exe・設定・登録を保持する。
 
 ## 復元データの自動整理
 
-Prunletの保持制御は既存schema 1〜4とレジストリschema 5だけを対象とし、既定7日・合計1 GiBを維持する。期限切れ、次いで必要容量に応じた古い操作を整理する。レジストリ削除前と`maintain --apply`が同じCoreを使う。定期タスクは毎日03:00とログオン時に保守専用`prunlet-maintenance.exe`を起動する。専用exeはWindows GUI subsystemで`--config <path> maintain --apply`だけを受理し、通常CLIはconsole subsystemを保つ。所有を確認した旧タスクはCommandだけを移行し、Triggers・Principals・Settingsを保つ。新規ファイル削除は旧データの整理を起動しない。schema 6はWindowsが保持・清掃し、Prunletはゴミ箱を空にしない。
+保持制御はレジストリschema 5専用で、既定7日・合計1 GiBである。事前容量走査・整理前後の再走査・共通ロック・単一超過時だけの予算を維持する。Windowsゴミ箱のファイル実体と移行待ちの旧ファイルは容量・期限・purgeの対象に含めない。
 
-大量の記録でも検査を省略せず、重複した探索・複製を減らす。schema 4のreceipt組合せ検証は読込み済みのordinal辞書を直接照会し、entryごとの全receipt複製を避ける。schema 5の大きなJSON objectはordinal索引を一度だけ作り、配列は列挙で照合して、全field・要素の検査を保つ。専用領域のStoreKey計算は直前に物理解決したmetadataパスを再利用するが、SIDは呼出しごとに取得し、設定や実行主体をまたぐキャッシュを持たない。性能と保全の確認方法は[起動時保守の性能](docs/verification.md#起動時保守の性能)を参照する。
+レジストリ削除前・明示`maintain`・非表示の定期保守でレジストリ復元データを整理する。ファイル削除はレジストリの容量保守や旧root走査を起動しない。`operations`とMCPの`list_operations`はレジストリ一覧、`purge`と`maintain`もレジストリ専用である。手動整理はCLIの明示適用だけとし、MCPへpurgeを追加しない。
 
-共通`maintenance.lock`はschema 6の新規ファイル削除だけが読み取り共有で保持でき、hardlink検出時の再実行・復元・レジストリ・旧形式・purge・maintain・履歴圧縮は従来の読み書き排他handleで直列化する。共有削除の連続流入に対するwriter優先は保証しない。元対象の容量走査、整理前後の既存全体走査、移動直前・直後の照合で予算を検証する。通常の有効予算は`maxRecoveryBytes`。1回の入力合計がそれを超える場合だけ`max(maxRecoveryBytes, incomingBytes)`を有効予算とし、既存データを0バイトまで安全に整理できることを必要とする。設定は変更せず、次回の削除・maintainは通常予算を再適用する。
+検証できないACL・snapshot・未確定commitは保全し、自動整理で捨てない。`maintain --audit-records`の完全監査と通常容量走査を区別する。旧ファイルの型別index・終了履歴・外部不在判定を、新しいファイル通常経路の管理機構として復活させない。
 
-中央記録と、利用可能なローカルボリュームの同じStoreKeyの実体を両側から照合する。中央記録を失った退避データや未知の領域内データ、計数できない領域、不正・破損・使用中・矛盾した記録を無視して上限達成とは判定しない。安全に容量を確保できなければ新しい移動を停止する。ハードリンクの外部別名など、Prunletの共通ロック外からの変更を不変コピーとして扱わない。
+### 容量上限の一度だけの移行
 
-移動拒否やrollback成功でpayloadがないことを確定できた対象は、`move-<index>-cancelled.json`を永続化する。元パスの後日の削除・置換を根拠に容量不明へ戻さない。中断した未移動intentの確定はapplyだけが行い、dry-runでは記録を変更しない。purge intent以降の対象は、一部の子が既に消えている可能性があるため復元を拒否する。
-
-ロック競合は解放まで待機し、1秒以上で経過時間、以後5秒おきと取得後にも通知する。CLIはstderrへ即時通知しstdoutを結果JSON用に保つ。MCPは文字列・整数の`params._meta.progressToken`を持つ要求だけに同じtokenの`notifications/progress`を送り、最終応答後は送らない。利用プロセスの強制終了や別方式への切替は行わない。
-
-## 操作履歴の圧縮
-
-`compact-history [--dry-run | --apply]`は既定検査のみで、旧schema 1/2/3の正常なpurge済み履歴JSONをNTFS圧縮する。JSONの内容・名前・ロック・操作IDを保持し、圧縮前後のSHA-256と長さを照合する。コピーが残る操作、未知項目、不正記録、使用中などは理由付きで保持する。
-
-schema 4の移動記録、schema 5のレジストリ記録、schema 6のゴミ箱記録は履歴圧縮から外し、理由付き`retained`として保持する。metadataとpayloadの容量集計は分離する。
-
-## 復元データの明示整理
-
-`purge <operationId>`は検査のみ、`--apply`で適用する。schema 4はmarker・manifest・receipt・File IDを照合し、purge intentの永続化後に退避実体を整理する。処理後のreceiptを残し、矛盾や欠損を推測で削除しない。中央記録・ロックは保持する。MCPへpurgeは追加しない。
-
-旧schema 1/2/3は従来の検証済みコピーと、失敗・欠損項目に対応する正規名の途中コピーを扱う。途中コピーを含むpurge intentのschema 2はサイズ・SHA-256を`incompleteTargets`へ記録し、検証済みコピーは`targets`へ残す。旧intentのschema 1も読み、サイズ・hash不一致を途中コピーへ格下げしない。intentを永続化してから削除し、未知ファイル・不正記録・リンクを保全する。
+latest導入時に`capacityDefaultMigrationVersion`が欠落または1未満の既存設定だけを対象に、`maxRecoveryBytes`を1 GiB、移行印を1へ一度だけ更新する。移行済み印と移行後の利用者変更を尊重し、未知の設定・ACLを保持する。設定読込やdry-runへ設定書込みを持ち込まない。詳細の動作検証は[導入検証](docs/verification.md#latestインストーラー)を参照する。
 
 ## 不変条件と設計判断
 
-- 対象フォルダーの許可リストは設けない。旧`allowedRoots`・`--allowed-root`・`-AllowedRoot`は互換入力だけに使用する。呼出し側の削除許可・ホストの承認・管理ポリシーを維持する。
-- slash表記・拡張長ローカルパス・8.3短縮名・MSIX転送を実体へ揃え、新記録は実体パスを保存する。祖先リンク・UNC・未対応デバイス構文・検証不能な実体は停止する。
-- 新規操作はShell項目とFile IDを照合する。既存schema 4は対象・親・専用領域の保持ハンドルも照合する。復元先を上書き・マージしない。
-- 中断時は先行永続化した記録と実体を照合し、確定できないものを保持する。
-
-## 大量操作の記録
-
-schema 4は入力rootごとに記録するため、再帰ツリーの全子項目をmanifestへ展開しない。容量・安全性の事前走査は省かない。旧schema 1/2/3のmanifest・結果・purge intentは総件数・総バイト数の旧固定上限を設けず増分読込みし、構造・重複property・型・個々の値を検証する。旧32,768件・8 MiBを超える記録も互換経路で扱う。
+拒否された削除を別shell・別API・別exeへ付け替えない。ゴミ箱失敗時に永久削除せず、処理不明時は確認せず再送しない。保護領域・祖先・リンク先を通常削除で破壊しない。レジストリの完全ACL・raw bytes・transaction・非上書き復元を維持する。
 
 ## 導入と検証の境界
 
-インストーラーはGitHubの既定ブランチ最新HEADを解決し、そのSHAのアーカイブを検査・ビルドして配置する。ローカルクローンへのフォールバックはしない。`source-info.json`に取得元・ブランチ・SHAとアーカイブ・exeのハッシュを記録する。更新対象の製品ファイルを検証済みバックアップへ保全する。既存設定は`capacityDefaultMigrationVersion`未設定または0の場合だけ、容量を1 GiBへ変更してversion 1を保存する。新規`init`もversion 1とし、以後の明示的な容量変更と他の設定・復元データを保持する。読込・dry-runでは移行せず、容量移行そのものは整理を起動しない。移行は同一ディレクトリの一時ファイルから原子的に置換し、インストール失敗時は移行後に利用者変更がない場合だけ設定の元バイト列へ戻す。未知の設定は従来どおり拒否して変更しない。失敗時は変更済み製品と登録設定の復旧を試み、復旧失敗時は保存先を報告する。
+利用者向け導入はGitHubの既定ブランチ最新HEADを解決し、取得元・ブランチ・commitを`source-info.json`へ記録する。開発クローン・ローカルビルドをlatest導入の代用にしない。設定の検証には`validate-config`を使い、設定読込とservice構築だけで走査・変更しない。共通指示の生成元は`integration/PRUNLET.md`で、配置済み共通指示の更新とソース変更は別の結果として扱う。
 
-定期整理タスクの識別子は現在のユーザーSID・exe・設定の絶対パスから導出する。所有マーカー・ユーザー・実行先が一致する既存タスクは再登録せず、時刻や無効化を保持する。不一致は製品ファイルの変更前に拒否する。更新バックアップには既存タスクのXMLと復旧情報も保存し、登録の復旧に失敗した場合は残った登録先の製品ファイルを保持する。Codex連携の解除ではタスクを残し、専用の解除入口で所有を検証して解除する。
-
-登録・解除は所有部分だけを変更する。既存の同名登録、明示的なhook無効化、変更対象のTOMLを安全に扱えない構文は自動更新を拒否する。設定保持を優先するため、手動登録が必要な場合がある。
-
-hookの起動はシステムの`cmd.exe /d /c call`を明示し、Codexが引き継ぐ既定shellに依存せずネイティブexeへ到達させる。CMD・PowerShellの展開文字を含む登録パスは書込み前に拒否する。既知の旧起動経路は所有handlerの内容が一致する場合だけ移行し、利用者の編集や他handlerを保持する。登録はhookの信頼を付与せず、`requiresHookTrust`で利用者の確認が必要なことを通知する。具体的な登録コマンドと信頼操作は[連携手順](docs/integration.md#登録)を参照する。
-
-`-RegisterAgentInstructions`は`-RegisterCodex`と併用し、共通AGENTSから専用の`PRUNLET.md`を読む経路と配置済みexe・設定の絶対パスを明示登録する。初回からCMDのCLIを選ぶ指示であり、exe・設定をCMDで安全に表現できない場合は事前に同じCoreのMCPを選ぶ。登録・解除は管理マーカー・参照ブロック・guideのハッシュで所有範囲を限定し、既存本文と利用者の編集を保護する。旧MCP優先ブロックの移行は既知の正確な内容・ハッシュに一致する場合だけ行う。オプションを省略すると共通指示は変更しない。登録途中の失敗ではMCP・hookと同様に指示ファイルも復旧対象にする。
-
-配置済みの旧PowerShell backendは、更新バックアップを検証してから同じCoreでゴミ箱へ移して退役させる。退役専用設定のmetadataは通常設定から分離し、復元用の操作IDを保持する。通常経路に旧backendを残さない。
-
-検証は実exe・stdio・hook・登録スクリプトを別プロセスで動かし、外部JSONレポートへ結果を残す。latest導入のE2Eは検証用アーカイブと実GitHubの確認を区別する。Codex自身のhook読込・拒否・承認、共通指示の読込とCLI選択は別途実ホストで確認する。[検証手順](docs/verification.md)を参照する。
+ビルド・fixture・TEMP/TMP・reportは外部絶対パスへ分離する。CLI・stdio MCP・hookの実プロセス、終了コード・JSON・passed/failedを読み、未実行・skip・部分ケースを全件成功にしない。Windowsのゴミ箱全体を空にせず、今回のfixtureだけを扱う。新規recordless削除・レジストリ復元・旧データ移行を別の検証範囲として報告する。
 
 ## 依存更新の境界
 

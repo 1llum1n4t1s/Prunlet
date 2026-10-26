@@ -91,7 +91,7 @@ function Assert-Snapshot($Snapshot) {
 function Assert-Deleted($Result, [string[]]$Paths) {
     Assert-True ($Result.ExitCode -eq 0) "Delete failed: $($Result.Stderr) $($Result.Stdout)"
     Assert-True ($Result.Json.items.Count -eq $Paths.Count) 'Result count differs.'
-    $root = Join-Path $script:Recovery $Result.Json.operationId
+    $root = Resolve-VerificationOperationDirectory $script:Recovery $Result.Json.operationId
     $manifestPath = Join-Path $root 'recycle-manifest.json'; $manifest = Read-Json $manifestPath
     $hash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
     for ($i = 0; $i -lt $Paths.Count; $i++) {
@@ -105,7 +105,7 @@ function Assert-Deleted($Result, [string[]]$Paths) {
 }
 function Restore-Result($Result) {
     $restore = Invoke-Cli @('restore', $Result.Json.operationId)
-    Assert-True ($restore.ExitCode -eq 0 -and @($restore.Json.items | Where-Object status -ne 'restored').Count -eq 0) "Restore failed: $($restore.Stdout) $($restore.Stderr)"
+    Assert-True ($restore.ExitCode -eq 0 -and @($restore.Json.items).Count -eq @($Result.Json.items).Count -and @($restore.Json.items | Where-Object status -ne 'restored').Count -eq 0) "Restore failed: $($restore.Stdout) $($restore.Stderr)"
 }
 function Test-Case([string]$Name, [scriptblock]$Body) {
     if (!@($CaseFilter | Where-Object { $Name -like $_ }).Count) { $script:ExcludedCount++; return }
@@ -413,13 +413,13 @@ foreach ($transport in @('cli', 'mcp')) {
             $fixture = New-HardlinkFixture $shape $(if ($shape -eq 'files-3') { 3 } else { 2 })
             $deleted = Invoke-HardlinkTool $transport 'delete_files' @{ paths = $fixture.Paths; recursive = $true }
             Assert-Deleted $deleted $fixture.Paths; Assert-ExternalFacts $fixture
-            $manifest = Read-Json (Join-Path (Join-Path $script:Recovery $deleted.Json.operationId) 'recycle-manifest.json')
+            $manifest = Read-Json (Join-Path (Resolve-VerificationOperationDirectory $script:Recovery $deleted.Json.operationId) 'recycle-manifest.json')
             Assert-True (($manifest.hardlinkProtocol -eq 1) -eq ($shape -ne 'same-tree')) 'Cross-entry shared-ID opt-in differs from fixture shape.'
             $restored = Invoke-HardlinkTool $transport 'restore_files' @{ operationId = $deleted.Json.operationId }
-            Assert-True ($restored.ExitCode -eq 0 -and @($restored.Json.items | Where-Object status -ne 'restored').Count -eq 0) "Batch restore failed: $($restored.Stdout)"
+            Assert-True ($restored.ExitCode -eq 0 -and @($restored.Json.items).Count -eq $fixture.Paths.Count -and @($restored.Json.items | Where-Object status -ne 'restored').Count -eq 0) "Batch restore failed: $($restored.Stdout)"
             Assert-HardlinkFixture $fixture
             $again = Invoke-HardlinkTool $transport 'restore_files' @{ operationId = $deleted.Json.operationId }
-            Assert-True ($again.ExitCode -eq 0 -and @($again.Json.items | Where-Object status -ne 'already_restored').Count -eq 0) 'Repeated restore was not idempotent.'
+            Assert-VerificationRepeatedRestore $again $deleted.Json.operationId $fixture.Paths.Count
             Assert-HardlinkFixture $fixture
         }
     }
@@ -444,7 +444,7 @@ Test-Case 'hardlink-batch-initial-conflict-component-and-independent-progress' {
     Assert-True ($restored.ExitCode -eq 0) 'Conflict retry did not restore component.'
     Assert-HardlinkFixture $fixture; Assert-Snapshot $independentBefore
     $again = Invoke-Cli @('restore', $deleted.Json.operationId)
-    Assert-True ($again.ExitCode -eq 0 -and @($again.Json.items | Where-Object status -ne 'already_restored').Count -eq 0) 'Partial restore retry was not idempotent.'
+    Assert-VerificationRepeatedRestore $again $deleted.Json.operationId $paths.Count; Assert-HardlinkFixture $fixture; Assert-Snapshot $independentBefore
 }
 Test-Case 'hardlink-batch-external-acl-tamper-rejected' {
     $fixture = New-HardlinkFixture 'files-2'
@@ -480,7 +480,7 @@ Test-Case 'hardlink-batch-unready-stage-acl-not-reapplied' {
     $fixture = New-HardlinkFixture 'files-2'
     $deleted = Complete-Child (Start-Delete $fixture.Paths); Assert-Deleted $deleted $fixture.Paths
     $stage = Interrupt-OwnedRestore $deleted $script:CaseRoot '0000.entry'
-    $operationRoot = Join-Path $script:Recovery $deleted.Json.operationId
+    $operationRoot = Resolve-VerificationOperationDirectory $script:Recovery $deleted.Json.operationId
     Assert-True ([IO.File]::Exists($stage) -and ![IO.File]::Exists((Join-Path $operationRoot 'recycle-stage-0000-ready.json'))) 'Unready boundary already passed or stage missing.'
     Add-FixtureDenyWrite $stage
     $tampered = Snapshot $stage
@@ -502,10 +502,10 @@ Test-Case 'hardlink-batch-ready-restart-and-partial-publish' {
     Assert-True ($retry.ExitCode -eq 0) 'Ready partial-publication restart failed.'
     Assert-Snapshot $publishedBefore; Assert-HardlinkFixture $fixture
     $again = Invoke-Cli @('restore', $deleted.Json.operationId)
-    Assert-True ($again.ExitCode -eq 0 -and @($again.Json.items | Where-Object status -ne 'already_restored').Count -eq 0) 'Publication restart was not idempotent.'
+    Assert-VerificationRepeatedRestore $again $deleted.Json.operationId $fixture.Paths.Count; Assert-HardlinkFixture $fixture
 }
 function Existing-StageSnapshots([string]$OperationId) {
-    $root = Join-Path $script:Recovery $OperationId
+    $root = Resolve-VerificationOperationDirectory $script:Recovery $OperationId
     return @(Get-ChildItem -LiteralPath $root -Filter 'recycle-stage-*-intent.json' | ForEach-Object {
         $intent = Read-Json $_.FullName
         $path = Join-Path $intent.stageOperationPath ('{0:D4}.entry' -f [int]$intent.index)
@@ -515,7 +515,7 @@ function Existing-StageSnapshots([string]$OperationId) {
 Test-Case 'hardlink-batch-incomplete-ready-component-not-corrected' {
     $fixture = New-HardlinkFixture 'files-3' 3
     $deleted = Complete-Child (Start-Delete $fixture.Paths); Assert-Deleted $deleted $fixture.Paths
-    $root = Join-Path $script:Recovery $deleted.Json.operationId
+    $root = Resolve-VerificationOperationDirectory $script:Recovery $deleted.Json.operationId
     $null = Interrupt-OwnedRestore $deleted $root 'recycle-stage-0000-ready.json'
     $ready = @(Get-ChildItem -LiteralPath $root -Filter 'recycle-stage-*-ready.json')
     Assert-True ($ready.Count -gt 0 -and $ready.Count -lt 3) 'Partial-ready boundary was not observed.'
@@ -531,7 +531,7 @@ Test-Case 'hardlink-batch-incomplete-ready-component-not-corrected' {
 Test-Case 'hardlink-batch-all-ready-publication-conflict-retry' {
     $fixture = New-HardlinkFixture 'files-3' 3
     $deleted = Complete-Child (Start-Delete $fixture.Paths); Assert-Deleted $deleted $fixture.Paths
-    $root = Join-Path $script:Recovery $deleted.Json.operationId
+    $root = Resolve-VerificationOperationDirectory $script:Recovery $deleted.Json.operationId
     $null = Interrupt-OwnedRestore $deleted $root 'hardlink-0000-ready.json'
     Assert-True ([IO.File]::Exists((Join-Path $root 'hardlink-0000-ready.json')) -and @(Get-ChildItem -LiteralPath $root -Filter 'recycle-stage-*-ready.json').Count -eq 3 -and @($fixture.Paths | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0) 'All-ready prepublication boundary was not observed.'
     [IO.File]::WriteAllText($fixture.Paths[0], 'occupant after ready', $utf8)
@@ -581,7 +581,7 @@ Test-Case 'hardlink-batch-unrelated-node-acl-tamper-rejected' {
     $other = New-File 'entry-0\unrelated.txt'; [IO.File]::WriteAllText($other + ':concurrent', 'unrelated ADS', $utf8)
     $otherOriginal = Snapshot $other
     $deleted = Complete-Child (Start-Delete $fixture.Paths -Recursive); Assert-Deleted $deleted $fixture.Paths
-    $receipt = Read-Json (Join-Path (Join-Path $script:Recovery $deleted.Json.operationId) 'recycle-0000-complete.json')
+    $receipt = Read-Json (Join-Path (Resolve-VerificationOperationDirectory $script:Recovery $deleted.Json.operationId) 'recycle-0000-complete.json')
     $binOther = Join-Path $receipt.physicalPath 'unrelated.txt'
     $priorAcl = [PrunletConcurrentNative]::Security($binOther)
     Add-FixtureDenyWrite $binOther; $tampered = Snapshot $binOther
@@ -599,7 +599,7 @@ foreach ($damage in @('missing', 'truncated', 'modified')) {
     Test-Case ("hardlink-batch-ledger-$damage-rejected") {
         $fixture = New-HardlinkFixture 'files-2'
         $deleted = Complete-Child (Start-Delete $fixture.Paths); Assert-Deleted $deleted $fixture.Paths
-        $root = Join-Path $script:Recovery $deleted.Json.operationId
+        $root = Resolve-VerificationOperationDirectory $script:Recovery $deleted.Json.operationId
         $ledgers = @(Get-ChildItem -LiteralPath $root -File | Where-Object { $_.Name -match '(?i)(shared|hardlink|ledger)' } | Sort-Object LastWriteTimeUtc, Name)
         Assert-True ($ledgers.Count -gt 0) 'New-format shared-ID ledger record was not found.'
         $ledger = $ledgers[-1].FullName; $bytes = [IO.File]::ReadAllBytes($ledger)
@@ -625,7 +625,7 @@ foreach ($removal in @('last-transition', 'all-transitions')) {
     Test-Case ("hardlink-batch-ledger-$removal-missing-rejected") {
         $fixture = New-HardlinkFixture 'files-2'
         $deleted = Complete-Child (Start-Delete $fixture.Paths); Assert-Deleted $deleted $fixture.Paths
-        $root = Join-Path $script:Recovery $deleted.Json.operationId
+        $root = Resolve-VerificationOperationDirectory $script:Recovery $deleted.Json.operationId
         $records = @(Get-ChildItem -LiteralPath $root -File | Where-Object { $_.Name -match '^hardlink-0000-[0-9]{4}-(intent|proof|complete)\.json$' } | Sort-Object Name)
         Assert-True ($records.Count -eq 6) 'Expected two complete three-record delete transitions.'
         $lastIntent = Read-Json (Join-Path $root 'hardlink-0000-0001-intent.json')
@@ -649,7 +649,7 @@ foreach ($removal in @('last-transition', 'all-transitions')) {
 Test-Case 'hardlink-batch-ready-missing-restore-intent-rejected' {
     $fixture = New-HardlinkFixture 'files-2'
     $deleted = Complete-Child (Start-Delete $fixture.Paths); Assert-Deleted $deleted $fixture.Paths
-    $root = Join-Path $script:Recovery $deleted.Json.operationId
+    $root = Resolve-VerificationOperationDirectory $script:Recovery $deleted.Json.operationId
     $null = Interrupt-OwnedRestore $deleted $root 'hardlink-0000-ready.json'
     Assert-True (@($fixture.Paths | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0) 'Prepublication group-ready boundary was not observed.'
     $stages = Existing-StageSnapshots $deleted.Json.operationId
@@ -669,7 +669,7 @@ Test-Case 'hardlink-batch-ready-missing-restore-intent-rejected' {
 Test-Case 'hardlink-batch-ready-unbound-stage-member-rejected' {
     $fixture = New-HardlinkFixture 'files-2'
     $deleted = Complete-Child (Start-Delete $fixture.Paths); Assert-Deleted $deleted $fixture.Paths
-    $root = Join-Path $script:Recovery $deleted.Json.operationId
+    $root = Resolve-VerificationOperationDirectory $script:Recovery $deleted.Json.operationId
     $null = Interrupt-OwnedRestore $deleted $root 'hardlink-0000-ready.json'
     Assert-True (@($fixture.Paths | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0) 'Prepublication group-ready boundary was not observed.'
     $stages = Existing-StageSnapshots $deleted.Json.operationId
@@ -690,7 +690,7 @@ Test-Case 'hardlink-batch-ready-unbound-stage-member-rejected' {
 Test-Case 'hardlink-batch-published-receipt-write-failure-not-success' {
     $fixture = New-HardlinkFixture 'files-2'
     $deleted = Complete-Child (Start-Delete $fixture.Paths); Assert-Deleted $deleted $fixture.Paths
-    $root = Join-Path $script:Recovery $deleted.Json.operationId
+    $root = Resolve-VerificationOperationDirectory $script:Recovery $deleted.Json.operationId
     $gate = [PrunletConcurrentGate]::new($root, 'hardlink-0000-ready.json')
     $priorAcl = $null
     try {
@@ -886,7 +886,7 @@ foreach ($transport in @('cli', 'mcp')) {
                 }
             } finally {
                 # 共有ACLの履歴を巻き戻すため、後の実削除receiptから逆順に復元する。
-                $ordered = @($operations | Where-Object { $_.Json.operationId } | Sort-Object { [IO.File]::GetLastWriteTimeUtc((Join-Path (Join-Path $script:Recovery $_.Json.operationId) 'recycle-0000-complete.json')).Ticks } -Descending)
+                $ordered = @($operations | Where-Object { $_.Json.operationId } | Sort-Object { [IO.File]::GetLastWriteTimeUtc((Join-Path (Resolve-VerificationOperationDirectory $script:Recovery $_.Json.operationId) 'recycle-0000-complete.json')).Ticks } -Descending)
                 $script:Evidence.restoreOperationOrder = @($ordered | ForEach-Object { $_.Json.operationId })
                 foreach ($operation in $ordered) { Restore-Result $operation }
                 foreach ($snapshot in $snapshots) { Assert-Snapshot $snapshot }

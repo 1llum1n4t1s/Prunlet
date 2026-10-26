@@ -2,6 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Alias('BaselineMoveExecutablePath')][string]$MoveExecutablePath,
+    [string]$AssemblyPath,
+    [string]$LegacyRegistryExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
     [ValidateSet('HKCU\Software\PrunletE2E','HKEY_CURRENT_USER\Software\PrunletE2E','HKLM\SYSTEM\PrunletE2E','HKEY_LOCAL_MACHINE\SYSTEM\PrunletE2E')]
@@ -15,7 +17,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
-foreach ($path in @($ExecutablePath, $MoveExecutablePath, $OutputDirectory, $ReportPath) | Where-Object { $_ }) {
+foreach ($path in @($ExecutablePath, $MoveExecutablePath, $AssemblyPath, $LegacyRegistryExecutablePath, $OutputDirectory, $ReportPath) | Where-Object { $_ }) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Executable/output/report paths must be absolute.' }
 }
 $ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath)
@@ -83,6 +85,8 @@ function New-Case([string]$Name) {
     $init = Invoke-RegistryCli @('init', '--backup-directory', $script:Recovery)
     Assert-True ($init.ExitCode -eq 0) "Init failed: $($init.Stderr)"
     $config = Read-Json $script:Config; $config.volumeRecoveryDirectories = @{ 'D:\' = (Join-Path $script:CaseRoot 'volume-store') }; Save-Json $script:Config $config
+    $migration = Invoke-RegistryCli @('migrate','--apply')
+    Assert-True ($migration.ExitCode -eq 0 -and $migration.Json.registryReady -and $migration.Json.complete) 'Fresh registry namespace preparation failed.'
     $script:Relative = $runRelative + '\' + $Name; $script:Path = $fixtureHive + '\' + $script:Relative
 }
 function Case([string]$Name, [scriptblock]$Body, [switch]$RequiresMove) {
@@ -269,7 +273,7 @@ function Snapshot([int]$View = 64) { [PrunletRegistryE2E]::Snapshot($script:Rela
 function Delete-Registry([string[]]$Options = @('--recursive'), [int]$View = 64) {
     $r = Invoke-RegistryCli (@('registry-delete','--view',"$View")+$Options+@('--',$script:Path))
     Assert-True ($r.ExitCode -eq 0 -and $r.Json.operationId) "Registry delete failed: $($r.Stdout) $($r.Stderr)"
-    $root = Join-Path $script:Recovery $r.Json.operationId
+    $root = Join-Path (Join-Path $script:Recovery '.registry-records-v1') $r.Json.operationId
     return @{ Id = $r.Json.operationId; Root = $root; Manifest = (Join-Path $root 'registry-manifest.json'); Payload = (Join-Path $root 'registry-snapshot.json'); Result = $r.Json }
 }
 function Restore([object]$Op) { $r = Invoke-RegistryCli @('restore',$Op.Id); Assert-True ($r.ExitCode -eq 0) "Restore failed: $($r.Stdout) $($r.Stderr)"; return $r }
@@ -512,67 +516,52 @@ Case 'capacity-single-oversized-then-normal-budget' {
     $maintained = Invoke-RegistryCli @('maintain','--apply')
     Assert-True ($maintained.ExitCode -eq 0 -and ![IO.File]::Exists($second.Payload)) 'Maintenance retained previous oversized exception.'
 }
-Case 'mixed-file-registry-capacity-order-and-restore-type-guards' -RequiresMove {
-    $file = Join-Path $script:CaseRoot 'mixed-file.bin'
-    [IO.File]::WriteAllBytes($file,[byte[]](0..255)*16)
-    $fileHash = Digest $file; $fileBytes = [IO.FileInfo]::new($file).Length
+Case 'recordless-files-excluded-from-registry-capacity-and-restore-type-guards' {
+    . (Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1')
+    $script:observed = @{}
+    if (!('Prunlet.RecordlessE2E.FixtureNative' -as [type])) {
+        Add-Type -Path @('NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs' | ForEach-Object { Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $_ }) -CompilerOptions '/unsafe'
+    }
+    $file = Join-Path $script:CaseRoot 'mixed-file.bin'; [IO.File]::WriteAllBytes($file,[byte[]](0..255)*16)
+    $fileBefore = [Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($file)
+    $priorPidls = [string[]]@([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($fileBefore[0].Id) | ForEach-Object Pidl)
     Fixture; $registryBefore = Snapshot
-    # 保持予算を持つ旧schema 4だけを変更前exeで作り、新版MCPで復元と型境界を検証する。
-    $p = Start-Child @('mcp'); $mcpCompleted = $false
+    $deleted = Invoke-RegistryCli @('delete','--',$file)
+    Assert-True ($deleted.ExitCode -eq 0 -and !$deleted.Json.PSObject.Properties['operationId'] -and $deleted.Json.items[0].status -ceq 'recycled' -and ![IO.File]::Exists($file)) 'Current file deletion must recycle without an operation record.'
+    $bin = [Prunlet.RecordlessE2E.OwnedBinLocator]::FindNew($fileBefore[0].Id,$priorPidls)
+    $binBefore = [Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($bin.PhysicalPath)
+    $registryOp = Delete-Registry; $registryHash = Digest $registryOp.Payload; $registryBytes = [IO.FileInfo]::new($registryOp.Payload).Length
+    foreach ($mode in @('--dry-run','--apply')) {
+        $config = Read-Json $script:Config; $config.maxRecoveryBytes = $registryBytes; Save-Json $script:Config $config
+        $inspection = Invoke-RegistryCli @('maintain',$mode)
+        Assert-True ($inspection.ExitCode -eq 0 -and $inspection.Json.capacityKnown -and $inspection.Json.retainedBytesBefore -eq $registryBytes -and $inspection.Json.retainedBytesAfter -eq $registryBytes) 'Registry capacity included Windows-managed file bytes.'
+        Assert-True ((Digest $registryOp.Payload) -ceq $registryHash -and ![IO.File]::Exists($file)) 'Registry-only retention changed either source or snapshot.'
+        $binAfter = [Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($bin.PhysicalPath)
+        Assert-True (($binAfter | ConvertTo-Json -Depth 20 -Compress) -ceq ($binBefore | ConvertTo-Json -Depth 20 -Compress)) 'Registry maintenance changed owned Bin native data/security.'
+    }
+    $p = Start-Child @('mcp'); $completed = $false
     try {
         $stderrTask = $p.StandardError.ReadToEndAsync()
         function Mixed-Rpc([object]$Request) {
             $p.StandardInput.WriteLine(($Request | ConvertTo-Json -Depth 30 -Compress)); $p.StandardInput.Flush()
-            for ($i=0; $i -lt 64; $i++) {
-                $read = $p.StandardOutput.ReadLineAsync(); if (!$read.Wait(15000)) { throw 'Mixed-retention MCP response timeout.' }
-                $line = $read.GetAwaiter().GetResult(); if (!$line) { throw 'Mixed-retention MCP output closed.' }
-                $reply = $line | ConvertFrom-Json -Depth 80
-                if ($reply.id -eq $Request.id) { return $reply }
-            }; throw 'Too many mixed-retention MCP notifications.'
+            for ($i=0; $i -lt 64; $i++) { $read=$p.StandardOutput.ReadLineAsync(); if(!$read.Wait(15000)){throw 'Mixed MCP timeout'}; $line=$read.GetAwaiter().GetResult(); if(!$line){throw 'Mixed MCP EOF'}; $reply=$line|ConvertFrom-Json -Depth 80; if($reply.id-eq$Request.id){return $reply} }; throw 'Too many mixed MCP notifications.'
         }
-        $init = Mixed-Rpc @{ jsonrpc='2.0'; id=1; method='initialize'; params=@{ protocolVersion='2024-11-05'; capabilities=@{}; clientInfo=@{name='mixed-retention-e2e';version='1'} } }
-        Assert-True ($null -ne $init.result) 'Mixed-retention MCP initialize failed.'
-        $p.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}'); $p.StandardInput.Flush()
-        $first = Invoke-RegistryCli @('delete','--',$file) -LegacyMove
-        Assert-True ($first.ExitCode -eq 0 -and ![IO.File]::Exists($file)) 'Mixed-retention legacy file deletion failed.'
-        $firstId = $first.Json.operationId
-        $wrongRegistry = Mixed-Rpc @{ jsonrpc='2.0'; id=3; method='tools/call'; params=@{name='restore_registry';arguments=@{operationId=$firstId}} }
-        Assert-True ($wrongRegistry.result.isError -and ![IO.File]::Exists($file)) 'Registry restore accepted a file operation.'
-        $restoredFile = Mixed-Rpc @{ jsonrpc='2.0'; id=4; method='tools/call'; params=@{name='restore_files';arguments=@{operationId=$firstId}} }
-        Assert-True (!$restoredFile.result.isError -and [IO.File]::Exists($file) -and (Digest $file) -ceq $fileHash) 'File restore after type rejection changed content.'
-        $deletedFile = Invoke-RegistryCli @('delete','--',$file) -LegacyMove
-        Assert-True ($deletedFile.ExitCode -eq 0 -and ![IO.File]::Exists($file)) 'Mixed-retention second legacy file deletion failed.'
-        $fileId = $deletedFile.Json.operationId
-        $fileManifest = Read-Json (Join-Path (Join-Path $script:Recovery $fileId) 'move-manifest.json')
-        Assert-True ($fileManifest.schema -eq 4 -and $fileManifest.entries.Count -eq 1) 'Mixed-retention file operation did not use schema 4 root rename.'
-        $entry = $fileManifest.entries[0]
-        $filePayload = Join-Path (Join-Path $entry.storeRoot $fileId) $entry.payloadName
-        $config = Read-Json $script:Config
-        Assert-True ($filePayload.StartsWith($config.volumeRecoveryDirectories['D:\']+'\',[StringComparison]::OrdinalIgnoreCase) -and [IO.File]::Exists($filePayload) -and (Digest $filePayload) -ceq $fileHash) 'Mixed-retention file payload escaped the isolated D: store or changed content.'
-        $registryOp = Delete-Registry; $registryHash = Digest $registryOp.Payload
-        $registryBytes = [IO.FileInfo]::new($registryOp.Payload).Length
-        $wrongFile = Mixed-Rpc @{ jsonrpc='2.0'; id=6; method='tools/call'; params=@{name='restore_files';arguments=@{operationId=$registryOp.Id}} }
-        Assert-True ($wrongFile.result.isError -and !(Exists) -and (Digest $registryOp.Payload) -ceq $registryHash) 'File restore accepted a registry operation or changed its backup.'
-        $totalBytes = $fileBytes + $registryBytes
-        $inspection = Invoke-RegistryCli @('maintain','--dry-run')
-        Assert-True ($inspection.ExitCode -eq 0 -and $inspection.Json.capacityKnown -and $inspection.Json.retainedBytesBefore -eq $totalBytes -and $inspection.Json.retainedBytesAfter -eq $totalBytes) 'Capacity inspection did not sum schema 4 file and schema 5 registry payloads.'
-        Assert-True ([IO.File]::Exists($filePayload) -and (Digest $registryOp.Payload) -ceq $registryHash) 'Capacity dry run changed mixed recovery data.'
-        $config.maxRecoveryBytes = $registryBytes; Save-Json $script:Config $config
-        $maintenance = Invoke-RegistryCli @('maintain','--apply')
-        Assert-True ($maintenance.ExitCode -eq 0 -and $maintenance.Json.capacityKnown -and $maintenance.Json.budgetSatisfied -and $maintenance.Json.retainedBytesBefore -eq $totalBytes -and $maintenance.Json.retainedBytesAfter -eq $registryBytes -and $maintenance.Json.purgedBytes -eq $fileBytes) 'Mixed-retention maintenance did not rescan the combined capacity after eviction.'
-        Assert-True (![IO.File]::Exists($filePayload) -and ![IO.File]::Exists($file) -and !(Exists) -and (Digest $registryOp.Payload) -ceq $registryHash) 'Mixed retention failed to purge only the older file and preserve the newer registry snapshot.'
-        $restoredRegistry = Mixed-Rpc @{ jsonrpc='2.0'; id=7; method='tools/call'; params=@{name='restore_registry';arguments=@{operationId=$registryOp.Id}} }
-        Assert-True (!$restoredRegistry.result.isError -and (Snapshot) -ceq $registryBefore -and ![IO.File]::Exists($registryOp.Payload)) 'Registry restore after mixed eviction changed content or failed to consume its snapshot.'
-        $empty = Invoke-RegistryCli @('maintain','--apply')
-        Assert-True ($empty.ExitCode -eq 0 -and $empty.Json.capacityKnown -and $empty.Json.retainedBytesBefore -eq 0 -and $empty.Json.retainedBytesAfter -eq 0) 'Consumed mixed operations remained in retained capacity.'
-        $mcpCompleted = $true
-    } finally {
-        $p.StandardInput.Close()
-        if (!$p.WaitForExit(15000)) { $p.Kill($true); $p.WaitForExit() }
-        [IO.File]::WriteAllText((Join-Path $script:CaseRoot 'mcp.stderr.txt'),$stderrTask.GetAwaiter().GetResult(),$utf8)
-        $exitCode = $p.ExitCode; $p.Dispose()
-        if ($mcpCompleted) { Assert-True ($exitCode -eq 0) "Mixed-retention MCP shutdown failed: $exitCode" }
+        $init=Mixed-Rpc @{jsonrpc='2.0';id=1;method='initialize';params=@{protocolVersion='2024-11-05';capabilities=@{};clientInfo=@{name='registry-only-capacity';version='1'}}};Assert-True ($null-ne$init.result) 'Mixed MCP init failed'
+        $p.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}');$p.StandardInput.Flush()
+        $removed=Mixed-Rpc @{jsonrpc='2.0';id=2;method='tools/call';params=@{name='restore_files';arguments=@{operationId=$registryOp.Id}}}
+        Assert-True ($removed.error -or $removed.result.isError) 'Removed file restore tool is still callable.'
+        Assert-True ((Digest $registryOp.Payload)-ceq$registryHash-and!(Exists)) 'Removed tool changed registry backup/source.'
+        $restored=Mixed-Rpc @{jsonrpc='2.0';id=3;method='tools/call';params=@{name='restore_registry';arguments=@{operationId=$registryOp.Id}}}
+        Assert-True (!$restored.result.isError-and(Snapshot)-ceq$registryBefore-and![IO.File]::Exists($registryOp.Payload)) 'Registry non-overwrite restore changed raw data/security.'
+        $p.StandardInput.Close();Assert-True ($p.WaitForExit(30000)-and$p.ExitCode-eq0) 'Mixed MCP shutdown failed';$completed=$true
+    } finally {if(!$p.HasExited){$p.Kill($true);$p.WaitForExit()};if($stderrTask){$null=$stderrTask.GetAwaiter().GetResult()};$p.Dispose()}
+    $null = Restore-WindowsVerbR $bin $file $script:CaseRoot
+    $after = Assert-SnapshotR $file $fileBefore -WindowsManagedRestore
+    Save-Json (Join-Path $script:CaseRoot 'windows-file-restore.json') @{
+        policy = 'Windows standard Restore verb; native identity, attributes and all stream bytes are compared; Windows-managed O/G/D is observed.'
+        route = $script:observed.restoreRoute; before = $fileBefore; bin = $binBefore; restored = $after
     }
+    $empty=Invoke-RegistryCli @('maintain','--dry-run');Assert-True ($empty.ExitCode-eq0-and$empty.Json.retainedBytesBefore-eq0) 'Consumed registry snapshot remains in capacity.'
 }
 Case 'mcp-schema-errors-roundtrip-and-iserror' {
     Fixture; $before = Snapshot; $p = Start-Child @('mcp')
@@ -592,7 +581,7 @@ Case 'mcp-schema-errors-roundtrip-and-iserror' {
         $p.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}'); $p.StandardInput.Flush()
         $list = Rpc @{ jsonrpc = '2.0'; id = 2; method = 'tools/list'; params = @{} }
         $names = @($list.result.tools.name)
-        Assert-True ($names.Count -eq 6 -and $names -contains 'delete_files' -and $names -contains 'restore_files' -and $names -contains 'delete_registry' -and $names -contains 'restore_registry' -and $names -contains 'reconcile_registry' -and $names -contains 'list_operations' -and !($names -match 'purge')) 'MCP tool contract changed.'
+        Assert-True ($names.Count -eq 5 -and $names -contains 'delete_files' -and $names -notcontains 'restore_files' -and $names -contains 'delete_registry' -and $names -contains 'restore_registry' -and $names -contains 'reconcile_registry' -and $names -contains 'list_operations' -and !($names -match 'purge')) 'MCP tool contract changed.'
         $reconcileTool = $list.result.tools | Where-Object name -EQ 'reconcile_registry'
         Assert-True ($reconcileTool.annotations.readOnlyHint -and $reconcileTool.annotations.idempotentHint -and !$reconcileTool.inputSchema.additionalProperties -and @($reconcileTool.inputSchema.required) -contains 'operationId') 'Registry reconciliation must advertise a strict read-only schema.'
         $tool = $list.result.tools | Where-Object name -EQ 'delete_registry'
@@ -610,7 +599,7 @@ Case 'mcp-schema-errors-roundtrip-and-iserror' {
         $deleted = Rpc @{ jsonrpc = '2.0'; id = $rpcId++; method = 'tools/call'; params = @{ name = 'delete_registry'; arguments = @{ path = $script:Path; view = '64'; recursive = $true } } }
         Assert-True (!$deleted.result.isError -and !(Exists)) 'MCP delete failed.'
         $id = $deleted.result.structuredContent.operationId
-        $operationDirectory = Join-Path $script:Recovery $id
+        $operationDirectory = Join-Path (Join-Path $script:Recovery '.registry-records-v1') $id
         $metadataBefore = @(Get-ChildItem -LiteralPath $operationDirectory -File | Sort-Object Name | ForEach-Object { $_.Name + ':' + (Digest $_.FullName) }) -join "`n"
         $reconciled = Rpc @{ jsonrpc = '2.0'; id = $rpcId++; method = 'tools/call'; params = @{ name = 'reconcile_registry'; arguments = @{ operationId = $id } } }
         $metadataAfter = @(Get-ChildItem -LiteralPath $operationDirectory -File | Sort-Object Name | ForEach-Object { $_.Name + ':' + (Digest $_.FullName) }) -join "`n"
@@ -627,6 +616,7 @@ Case 'mcp-schema-errors-roundtrip-and-iserror' {
         if ($mcpCompleted) { Assert-True ($exitCode -eq 0) "MCP process failed at shutdown: $exitCode" }
     }
 }
+. (Join-Path $PSScriptRoot 'registry-session-e2e/RegistryControlCases.ps1')
 if (!$results.Count) { $results.Add(@{ name='case-filter-matched-no-cases'; passed=$false; error='CaseFilter matched no cases.' }) }
 # 清掃も今回exeを一度だけ利用する。拒否は別APIへ付け替えず残存パスを報告する。
 $cleanup = @{ attempted = $false; remainingRegistryPath = $runPath; operations = @() }
@@ -645,7 +635,7 @@ if ($createdFixture) {
 }
 $passed = @($results | Where-Object passed).Count; $skipped = @($results | Where-Object skipped).Count; $failed = $results.Count - $passed - $skipped
 $unverified = @('Native registry link rejection and exact privilege-deficient token behavior require separate native probes.','KTM concurrency and crash timing require separate integration probes.','Distinct WOW64 view isolation requires separate views; SYSTEM shared views do not verify isolation. See view-observation.json.')
-if (!@($results | Where-Object { $_.name -eq 'mixed-file-registry-capacity-order-and-restore-type-guards' -and $_.passed }).Count) { $unverified += 'Mixed file/registry retention was not verified because its case was excluded, skipped, or failed.' }
+if (!@($results | Where-Object { $_.name -eq 'recordless-files-excluded-from-registry-capacity-and-restore-type-guards' -and $_.passed }).Count) { $unverified += 'Windows-managed file exclusion from registry retention was not verified because its case was excluded, skipped, or failed.' }
 if ($machineFixture) { $unverified += 'Normal HKCU roundtrip was not verified by this HKLM SYSTEM run; HKCU ERROR_RM_NOT_ACTIVE preservation requires a separate probe.' }
 Save-Json $ReportPath @{ schema=1; timestampUtc=[DateTimeOffset]::UtcNow.ToString('O'); executablePath=$ExecutablePath; moveExecutablePath=$MoveExecutablePath; passed=$passed; failed=$failed; skipped=$skipped; excludedCount=$excluded; results=@($results); preflight=$preflight; createdFixture=$createdFixture; securityPrivilegeEnabled=$securityPrivilege; registryFixtureRoot=$RegistryFixtureRoot; registryFixture=$runPath; cleanup=$cleanup; retainedDirectory=$OutputDirectory; unverified=$unverified }
 [ordered]@{ passed=$passed; failed=$failed; skipped=$skipped; excludedCount=$excluded; reportPath=$ReportPath; remainingRegistryPath=$cleanup.remainingRegistryPath } | ConvertTo-Json

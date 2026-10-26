@@ -11,8 +11,9 @@ public sealed partial class DeletionService
         internal string OperationId { get; } = operationId;
         internal string Directory { get; } = directory;
 
-        internal static NewOperationLease Create(string backupDirectory, bool privateRegistry = false, string? requestedOperationId = null)
+        internal static NewOperationLease Create(string backupDirectory, string? requestedOperationId = null)
         {
+            backupDirectory = EnsureRecordRoot(backupDirectory, RegistryRecordsDirectory, create: true);
             var storage = PathPolicy.PinRecoveryDirectories(backupDirectory);
             DirectoryLease? directories = null;
             SafeFileHandle? operationLock = null;
@@ -21,11 +22,9 @@ public sealed partial class DeletionService
                 var operationId = requestedOperationId ?? Guid.NewGuid().ToString("N");
                 ValidateMoveOperationId(operationId);
                 var directory = Path.Combine(backupDirectory, operationId);
-                using var createdDirectory = privateRegistry ? NativeFiles.CreatePrivateRegistryDirectory(directory) : null;
-                if (!privateRegistry) NativeFiles.CreateDirectory(directory);
+                using var createdDirectory = NativeFiles.CreatePrivateRegistryDirectory(directory);
                 directories = PathPolicy.PinRecoveryDirectories(directory);
-                operationLock = privateRegistry ? NativeFiles.CreatePrivateRegistryFile(Path.Combine(directory, "operation.lock"))
-                    : NativeFiles.CreateDestination(Path.Combine(directory, "operation.lock"));
+                operationLock = NativeFiles.CreatePrivateRegistryFile(Path.Combine(directory, "operation.lock"));
                 NativeFiles.Verify(operationLock, Path.Combine(directory, "operation.lock"));
                 return new NewOperationLease(storage, directories, operationLock, operationId, directory);
             }

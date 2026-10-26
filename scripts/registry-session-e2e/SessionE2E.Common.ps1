@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference='Stop'
+$ErrorActionPreference='Stop'
 if ([IO.File]::Exists((Join-Path $PSScriptRoot 'settings.json')) -and !$script:LaunchPins) {
  . (Join-Path $PSScriptRoot 'SessionLaunch.ps1')
  $script:LaunchPrepared=OpenPreparedPins (Join-Path $PSScriptRoot 'settings.json')
@@ -8,7 +8,18 @@ $utf8=[Text.UTF8Encoding]::new($false)
 $env:TEMP=Join-Path $PSScriptRoot 'temp';$env:TMP=$env:TEMP
 $env:RTK_TEE_DIR=Join-Path $PSScriptRoot 'temp';$env:RTK_LOG_DIR=$env:RTK_TEE_DIR
 $env:DOTNET_BUNDLE_EXTRACT_BASE_DIR=Join-Path $PSScriptRoot 'runtime-cache'
-function SaveJson([string]$Path,$Data){$pending=$Path+'.'+[guid]::NewGuid().ToString('N')+'.pending';[IO.File]::WriteAllText($pending,($Data|ConvertTo-Json -Depth 90),$utf8);[IO.File]::Move($pending,$Path,$true)}
+function SaveJson([string]$Path,$Data){
+ $pending=$Path+'.'+[guid]::NewGuid().ToString('N')+'.pending';$stage='write'
+ try{[IO.File]::WriteAllText($pending,($Data|ConvertTo-Json -Depth 90),$utf8);$stage='publish';[IO.File]::Move($pending,$Path,$true)}
+ catch{
+  # 一意replyの初回公開でも失敗し得るため、対象が不明な共有違反をreader競合と決め付けない。
+  # 本文やcapabilityは記録せず、元pendingを保全して次の原因切分けに必要な位置だけ返す。
+  $failure=$_;$cause=$failure.Exception;while($cause.InnerException){$cause=$cause.InnerException}
+  function PublicationFileState([string]$File){try{$info=[IO.FileInfo]::new($File);if($info.Exists){return 'present,length='+$info.Length};return 'absent'}catch{return 'unavailable:'+ $_.Exception.GetType().Name}}
+  $detail='Session JSON publication failed; stage='+$stage+'; source='+$pending+'; destination='+$Path+'; hresult='+$cause.HResult+'; win32='+($cause.HResult-band 0xffff)+'; sourceState='+(PublicationFileState $pending)+'; destinationState='+(PublicationFileState $Path)+'; stack='+$failure.ScriptStackTrace+'; error='+$cause.Message
+  throw [IO.IOException]::new($detail,$cause)
+ }
+}
 function ReadJson([string]$Path){[IO.File]::ReadAllText($Path)|ConvertFrom-Json -AsHashtable -Depth 90}
 function ReadCapability([string]$Path){$f=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite-bor[IO.FileShare]::Delete));try{$r=[IO.StreamReader]::new($f);return ($r.ReadToEnd()|ConvertFrom-Json -AsHashtable -Depth 20)}finally{$f.Dispose()}}
 function SavePrivateJson([string]$Path,$Data){
@@ -31,6 +42,7 @@ function AssertPreparedSettings($Settings){
  Assert ([IO.Path]::IsPathFullyQualified($Settings.registryVerificationScriptPath)-and[IO.File]::Exists($Settings.registryVerificationScriptPath)) 'Registry verification script missing'
  Assert ($Settings.registryVerificationScriptSha256-ceq(Get-FileHash -LiteralPath $Settings.registryVerificationScriptPath -Algorithm SHA256).Hash) 'Registry verification script changed after Prepare'
  if($Settings.moveExecutablePath){Assert ([IO.Path]::IsPathFullyQualified($Settings.moveExecutablePath)-and[IO.File]::Exists($Settings.moveExecutablePath)) 'Move baseline executable missing';Assert ($Settings.moveExecutableSha256-ceq(Get-FileHash -LiteralPath $Settings.moveExecutablePath -Algorithm SHA256).Hash) 'Move baseline executable changed after Prepare'}
+ foreach($dependency in @(@{path=$Settings.assemblyPath;hash=$Settings.assemblySha256},@{path=$Settings.legacyRegistryExecutablePath;hash=$Settings.legacyRegistryExecutableSha256})){if($dependency.path){Assert ([IO.Path]::IsPathFullyQualified($dependency.path)-and[IO.File]::Exists($dependency.path)) 'Prepared registry checkpoint dependency missing';Assert ($dependency.hash-ceq(Get-FileHash -LiteralPath $dependency.path -Algorithm SHA256).Hash) 'Prepared registry checkpoint dependency changed'}}
  Assert ($Settings.runRelative-match'^Software\\PrunletE2E\\[0-9a-f]{32}$') 'Unsafe prepared fixture scope'
  foreach($name in @('config','highConfig','currentConfig','recovery')){
   $path=[IO.Path]::GetFullPath($Settings[$name]);Assert ($path.StartsWith($PSScriptRoot.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)) 'Prepared path escaped run directory'
@@ -93,3 +105,5 @@ function NativeRequest([string]$Action,$Data=@{}){
  $sw=[Diagnostics.Stopwatch]::StartNew();while(![IO.File]::Exists($reply)){if($sw.Elapsed.TotalSeconds-gt 200){throw 'Native controller timeout'};Start-Sleep -Milliseconds 150}
  $r=ReadJson $reply;Assert $r.success ('Native controller: '+$r.error);return $r.result
 }
+
+function RegistryOperationDirectories([string]$Root){$namespace=Join-Path $Root '.registry-records-v1';if([IO.Directory]::Exists($namespace)){return @([IO.Directory]::EnumerateDirectories($namespace))};return @()}

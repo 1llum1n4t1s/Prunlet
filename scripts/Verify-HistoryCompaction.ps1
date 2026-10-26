@@ -85,7 +85,7 @@ foreach ($schema in @(1, 2, 3)) {
         Assert-True ($restore.ExitCode -eq 1 -and $restore.Json.error -match 'scheduled for purge') 'Old ID restore no longer reports its original purge state.'
         $purgeAgain = Invoke-Cli @('purge', $history.Id, '--apply')
         Assert-True ($purgeAgain.ExitCode -eq 0) 'Old ID purge no longer works.'
-        foreach ($name in $hashes.Keys) { Assert-True ((Digest (Join-Path $history.Directory $name)) -ceq $hashes[$name]) 'Existing audit metadata changed after purge.' }
+        Assert-VerificationClosedRecord $script:Recovery $history.Id $schema
     }
 }
 Test-Case 'live-payload-retained-and-restorable' {

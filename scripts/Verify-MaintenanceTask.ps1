@@ -7,18 +7,33 @@ param(
     [switch]$PauseForWindowInspection
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Verification-Common.ps1')
 # 想定する失敗: PE種別の誤り、GUIからの通常削除、shell解釈、所有外タスクの変更、
-# 移行時の設定消失、保守の未実行、期限内データの喪失、終了コードの欠落、fixture外への書込み。
+# 移行時の設定消失、保守の未実行、通常保守によるゴミ箱内の検証物変更、終了コードの欠落、fixture外への書込み。
 $utf8 = [Text.UTF8Encoding]::new($false)
 $results = [Collections.Generic.List[object]]::new()
 $states = [Collections.Generic.List[object]]::new()
 $taskExitCodes = [ordered]@{}
 $invocation = 0
+$fixtureEvidence = [ordered]@{}
+$script:observed = @{}
 $oldTemp = $env:TEMP; $oldTmp = $env:TMP
 function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { throw $Message } }
 function Save-Json([string]$Path, $Value) { [IO.File]::WriteAllText($Path, (ConvertTo-Json -InputObject $Value -Depth 80), $utf8) }
 function Read-Json([string]$Path) { [IO.File]::ReadAllText($Path) | ConvertFrom-Json -AsHashtable -Depth 80 }
 function Digest([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
+function Get-MaintenanceFileProof([string]$Path) {
+    Assert-NoReparse $Path
+    $nodes=[Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($Path)
+    Assert-True ($nodes.Count-eq1-and!$nodes[0].Directory) 'Maintenance native proof expects one ordinary file'
+    $node=$nodes[0]
+    return [ordered]@{id=$node.Id;nativeOgd=$node.SecurityBase64;attributes=$node.Attributes;streams=@($node.Streams|ForEach-Object {[ordered]@{name=$_.Name;length=$_.Length;sha256=$_.Sha256}})}
+}
+function Assert-MaintenanceFileProof([string]$Path, $Expected) {
+    $actual = Get-MaintenanceFileProof $Path
+    Assert-True (($actual | ConvertTo-Json -Depth 10 -Compress) -ceq ($Expected | ConvertTo-Json -Depth 10 -Compress)) "Native file identity/streams/O/G/D/attributes changed: $Path"
+    return $actual
+}
 function Assert-NoReparse([string]$Path) {
     $cursor = [IO.Path]::GetFullPath($Path)
     while ($cursor) {
@@ -39,7 +54,10 @@ function Invoke-Binary([string]$Binary, [string[]]$Arguments) {
     $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
     $info.RedirectStandardInput = $true; $info.WorkingDirectory = $OutputDirectory
     $info.Environment['TEMP'] = $env:TEMP; $info.Environment['TMP'] = $env:TMP
-    foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
+    if (($Arguments -contains 'delete' -or $Arguments -contains 'migrate') -and ($Binary -ceq $ExecutablePath -or $Binary -ceq $MoveExecutablePath)) {
+        foreach($value in @($Binary)+$Arguments){Assert-True ($value-notmatch'["%!^\r\n]') 'Unsafe CMD deletion argument'}
+        $info.FileName='cmd.exe';$info.Arguments='/d /s /c ""'+$Binary+'" '+(($Arguments|ForEach-Object {'"'+$_+'"'})-join' ')+'"'
+    } else { foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) } }
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
     try {
         $null = $process.Start(); $process.StandardInput.Close()
@@ -64,7 +82,10 @@ function Get-Subsystem([string]$Path) {
 }
 function New-Operation([string]$Name, [string]$Content, [switch]$LegacyMove) {
     $path = Join-Path $fixture $Name; [IO.File]::WriteAllText($path, $Content, $utf8)
-    # 期限整理の対象だけは変更前exeでschema 4を作る。新版の新規削除は常にごみ箱方式。
+    $originalProof = Get-MaintenanceFileProof $path
+    $recordlessBefore=[Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($path)
+    $prior=[string[]]@([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($recordlessBefore[0].Id)|ForEach-Object Pidl)
+    # 破棄移行対象は真正な旧exeでschema 4を作る。新版の新規削除は記録なし方式。
     $generator = if ($LegacyMove) { $MoveExecutablePath } else { $ExecutablePath }
     $generatorConfig = $config
     if ($LegacyMove) {
@@ -73,10 +94,17 @@ function New-Operation([string]$Name, [string]$Content, [switch]$LegacyMove) {
         $generatorConfig = Join-Path $fixture 'legacy-config.json'
         Save-Json $generatorConfig $legacySettings
     }
-    $deleted = Invoke-Binary $generator @('--config', $generatorConfig, 'delete', '--', $path)
+    $pathsFile=Join-Path $fixture ('paths-'+[guid]::NewGuid().ToString('N')+'.json');Save-Json $pathsFile @($path)
+    $deleted = Invoke-Binary $generator @('--config', $generatorConfig, 'delete', '--paths-file', $pathsFile)
     Assert-True ($deleted.exitCode -eq 0 -and ![IO.File]::Exists($path)) "Delete failed: $($deleted.stderr)"
-    $id = ($deleted.stdout | ConvertFrom-Json).operationId
-    $root = Join-Path $metadata $id
+    $wire=$deleted.stdout|ConvertFrom-Json -AsHashtable -Depth 80
+    if(!$LegacyMove){
+        Assert-True (!$wire.ContainsKey('operationId')-and$wire.items[0].status-ceq'recycled') 'Current file deletion requires no Prunlet operation record'
+        $item=[Prunlet.RecordlessE2E.OwnedBinLocator]::FindNew($recordlessBefore[0].Id,$prior)
+        return @{source=$path;content=$Content;payload=$item.PhysicalPath;binItem=$item;originalProof=$originalProof;recordlessBefore=$recordlessBefore;payloadProof=(Get-MaintenanceFileProof $item.PhysicalPath)}
+    }
+    $id=$wire.operationId
+    $root = Resolve-VerificationOperationDirectory $metadata $id
     $manifestPath = Join-Path $root ($(if ($LegacyMove) { 'move-manifest.json' } else { 'recycle-manifest.json' }))
     $manifest = Read-Json $manifestPath
     Assert-True ($manifest.schema -eq $(if ($LegacyMove) { 4 } else { 6 }) -and $manifest.entries.Count -eq 1) 'Unexpected recovery schema or entry count.'
@@ -84,23 +112,19 @@ function New-Operation([string]$Name, [string]$Content, [switch]$LegacyMove) {
     if ($LegacyMove) {
         $payload = Join-Path (Join-Path $entry.storeRoot $id) $entry.payloadName
         Assert-True ($payload.StartsWith($store + '\', [StringComparison]::OrdinalIgnoreCase) -and [IO.File]::Exists($payload)) 'Legacy payload escaped fixture or is missing.'
-    } else {
-        $receipt = Read-Json (Join-Path $root 'recycle-0000-complete.json')
-        $payload = $receipt.physicalPath
-        Assert-True ($receipt.schema -eq 6 -and $receipt.operationId -ceq $id -and $receipt.manifestSha256 -ieq (Digest $manifestPath) -and $receipt.pidl -and $receipt.identity.fileId -ieq $entry.identity.fileId) 'Invalid bin completion receipt.'
-        Assert-True ([IO.Path]::IsPathFullyQualified($payload) -and ($payload.Split([char]92) -icontains '$Recycle.Bin') -and [IO.File]::Exists($payload)) 'Windows bin item missing.'
     }
-    return @{ id = $id; root = $root; manifestPath = $manifestPath; payload = $payload; source = $path; content = $Content }
+    $payloadProof = Get-MaintenanceFileProof $payload
+    Assert-True ($originalProof.id -ceq $payloadProof.id -and ($originalProof.streams | ConvertTo-Json -Depth 5 -Compress) -ceq ($payloadProof.streams | ConvertTo-Json -Depth 5 -Compress)) 'Fixture generation changed native identity or stream bytes.'
+    return @{ id = $id; root = $root; manifestPath = $manifestPath; payload = $payload; source = $path; content = $Content; originalProof = $originalProof; payloadProof = $payloadProof; rawRootId = [Prunlet.RecordlessE2E.FixtureNative]::Identity($root); storeRoot = $entry.storeRoot }
 }
-function Set-Age($Operation, [int]$Days) {
-    $manifest = Read-Json $Operation.manifestPath; $manifest.createdUtc = [DateTimeOffset]::UtcNow.AddDays(-$Days).ToString('O')
-    Assert-True ($manifest.schema -eq 4) 'Only legacy move fixtures may be aged for expiration.'
-    Save-Json $Operation.manifestPath $manifest
-    foreach ($file in Get-ChildItem -LiteralPath $Operation.root -File -Filter '*.json') {
-        if ($file.Name -match '^(move|restore|purge)-\d{4}-(intent|complete)\.json$') {
-            $receipt = Read-Json $file.FullName; $receipt.manifestSha256 = Digest $Operation.manifestPath; Save-Json $file.FullName $receipt
-        }
+function Restore-WindowsTaskFixture($Operation){$item=$Operation.binItem;$null=[Prunlet.RecordlessE2E.FixtureNative]::RestoreOwned($item.Pidl,$item.PhysicalPath,$item.NativeId,$Operation.source,$fixture);return ,(Assert-SnapshotR $Operation.source $Operation.recordlessBefore -WindowsSecurity)}
+function Assert-LegacyTaskDiscard(){
+    $proofs = foreach($discarded in $script:LegacyDiscardedRoots){
+        $now=[Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($discarded.item.PhysicalPath)
+        Assert-True (($now|ConvertTo-Json -Depth 30 -Compress)-ceq($discarded.proof|ConvertTo-Json -Depth 30 -Compress)) 'Registry-only task changed an owned discarded legacy root in Windows Bin'
+        @{path=$discarded.path;item=$discarded.item;proof=$now}
     }
+    return ,@($proofs)
 }
 function Export-FixtureTask($State) { Export-ScheduledTask -TaskPath '\' -TaskName $State.name -ErrorAction Stop }
 function Set-FixtureSetting([xml]$Document, [string]$Name, [string]$Value) {
@@ -184,20 +208,34 @@ try {
     $null = [IO.Directory]::CreateDirectory($metadata)
     $helper = Join-Path ([IO.Path]::GetDirectoryName($ExecutablePath)) 'prunlet-maintenance.exe'
     . (Join-Path $repo 'integration/maintenance-task.ps1')
+    . (Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1')
+    if(!('Prunlet.RecordlessE2E.FixtureNative'-as[type])){Add-Type -Path @('NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs'|ForEach-Object {Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $_}) -CompilerOptions '/unsafe'}
     Run-Case 'pe-subsystems' { Assert-True ((Get-Subsystem $ExecutablePath) -eq 3) 'CLI must use console subsystem.'; Assert-True ((Get-Subsystem $helper) -eq 2) 'Maintenance helper must use GUI subsystem.' }
     Run-Case 'cli-init-roundtrip' {
         $init = Invoke-Cli @('init', '--backup-directory', $metadata); Assert-True ($init.exitCode -eq 0) "Init failed: $($init.stderr)"
-        $settings = Read-Json $config; $settings.volumeRecoveryDirectories = @{ 'D:\' = $store }; $settings.retentionDays = 7; $settings.maxRecoveryBytes = 10737418240; Save-Json $config $settings
-        # 旧exeに未知のschema 6記録を読ませないよう、期限整理fixtureを最初に生成する。
-        $script:ExpiredLegacy = New-Operation 'expired.txt' 'expired content' -LegacyMove
-        $roundtrip = New-Operation '往復 & file.txt' 'CLI roundtrip 日本語'
-        $restored = Invoke-Cli @('restore', $roundtrip.id)
-        Assert-True ($restored.exitCode -eq 0 -and [IO.File]::ReadAllText($roundtrip.source) -ceq $roundtrip.content -and ![IO.File]::Exists($roundtrip.payload)) 'CLI roundtrip failed.'
+        $settings = Read-Json $config; $settings.volumeRecoveryDirectories = @{ 'D:\' = $store }; $settings.retentionDays = 30; $settings.maxRecoveryBytes = 10737418240; Save-Json $config $settings
+        $script:LegacyFixture = New-Operation 'legacy-discard.txt' 'owned legacy discard content' -LegacyMove
+        $legacyRoots = @($script:LegacyFixture.storeRoot, $script:LegacyFixture.root)
+        $beforeRoots = @{};foreach($path in $legacyRoots){$beforeRoots[$path]=[Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($path)}
+        $migration=Invoke-Cli @('migrate','--apply');$fixtureEvidence.explicitMigration=$migration
+        $migrationResult=$migration.stdout|ConvertFrom-Json -AsHashtable -Depth 80
+        Assert-True ($migration.exitCode-eq0-and$migrationResult.registryReady-and$migrationResult.complete) 'Initial registry readiness/legacy discard incomplete'
+        $script:LegacyDiscardedRoots = foreach($path in $legacyRoots){
+            $operation=@($migrationResult.operations|Where-Object path -CEQ $path)
+            Assert-True ($operation.Count-eq1-and$operation[0].status-ceq'recycled'-and!$operation[0].operationId-and$null-eq$operation[0].schema-and!(Test-Path -LiteralPath $path)) 'Owned legacy storage/metadata root was not recycled'
+            $item=@([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($beforeRoots[$path][0].Id))
+            Assert-True ($item.Count-eq1) 'Discarded legacy root must have one owned Windows Bin identity'
+            $proof=Assert-SnapshotR $item[0].PhysicalPath $beforeRoots[$path] -WindowsManagedBin
+            @{path=$path;item=$item[0];proof=$proof}
+        }
+        $fixtureEvidence.legacyDiscardedRoots=$script:LegacyDiscardedRoots
+        $roundtrip=New-Operation '往復 & file.txt' 'CLI roundtrip 日本語'
+        $fixtureEvidence.initialWindowsRoundtrip=Restore-WindowsTaskFixture $roundtrip
     }
     Run-Case 'gui-rejects-other-commands' {
         $sentinel = Join-Path $fixture 'sentinel.txt'; [IO.File]::WriteAllText($sentinel, 'unchanged', $utf8); $before = Digest $sentinel
         $configHash = Digest $config
-        foreach ($command in @('delete', 'registry-delete', 'mcp', 'registry-session', 'purge', 'init', 'compact-history', 'restore', 'status')) {
+        foreach ($command in @('delete', 'migrate', 'registry-delete', 'mcp', 'registry-session', 'purge', 'init', 'compact-history', 'restore', 'status')) {
             $lastArgument = if ($command -in @('delete', 'restore')) { $sentinel } else { '--apply' }
             $call = Invoke-Binary $helper @('--config', $config, $command, $lastArgument)
             Assert-True ($call.exitCode -eq 2 -and (Digest $sentinel) -ceq $before -and (Digest $config) -ceq $configHash) "GUI accepted/changed data for $command"
@@ -222,6 +260,8 @@ try {
         $script:baseline = [xml](Export-FixtureTask $state)
         $enabled = [xml]$script:baseline.OuterXml; Set-FixtureSetting $enabled 'Enabled' 'true'; Set-FixtureTask $state $enabled
         Run-LockedTask $state 'legacy-console' $ExecutablePath
+        $fixtureEvidence.afterInitialConsole=Assert-LegacyTaskDiscard
+        Assert-True ((Read-Json $config).retentionDays-eq30) 'Initial task changed retention configuration'
         Set-FixtureTask $state $script:baseline
     }
     Run-Case 'migration-preserves-task-definition' {
@@ -251,14 +291,16 @@ try {
             }
         }
     }
-    Run-Case 'gui-task-retention-and-fresh-restore' {
-        $fresh = New-Operation 'fresh & file.txt' 'fresh content 日本語'; $expired = $script:ExpiredLegacy
-        Set-Age $expired 8
-        $enabled = [xml](Export-FixtureTask $state); Set-FixtureSetting $enabled 'Enabled' 'true'; Set-FixtureTask $state $enabled
+    Run-Case 'gui-task-registry-only-maintenance-and-windows-restore' {
+        $fresh=New-Operation 'fresh & file.txt' 'fresh content 日本語'
+        $fixtureEvidence.beforeGuiLegacyDiscard=Assert-LegacyTaskDiscard
+        $settings=Read-Json $config;Assert-True ($settings.retentionDays-eq30) 'Pre-GUI retention changed';$settings.retentionDays=7;Save-Json $config $settings
+        $enabled=[xml](Export-FixtureTask $state);Set-FixtureSetting $enabled 'Enabled' 'true';Set-FixtureTask $state $enabled
         Run-LockedTask $state 'gui-maintenance' $helper
-        Assert-True (![IO.File]::Exists($expired.payload) -and [IO.File]::Exists($fresh.payload)) 'GUI task did not enforce retention safely.'
-        $restored = Invoke-Cli @('restore', $fresh.id)
-        Assert-True ($restored.exitCode -eq 0 -and [IO.File]::ReadAllText($fresh.source) -ceq $fresh.content -and ![IO.File]::Exists($fresh.payload)) 'Fresh payload restore failed after maintenance.'
+        $fixtureEvidence.afterGuiLegacyDiscard=Assert-LegacyTaskDiscard
+        $fixtureEvidence.afterGuiFresh=Assert-MaintenanceFileProof $fresh.payload $fresh.payloadProof
+        $fixtureEvidence.restoredFresh=Restore-WindowsTaskFixture $fresh
+        Assert-True ([IO.File]::ReadAllText($fresh.source)-ceq$fresh.content-and![IO.File]::Exists($fresh.payload)) 'Windows fixture restore failed after registry-only task'
     }
     Run-Case 'gui-missing-config-exit-code' {
         $missingConfig = Join-Path $fixture ('absent-' + [guid]::NewGuid().ToString('N') + '.json')
@@ -289,7 +331,7 @@ finally {
         foreach ($binary in @($ExecutablePath, $MoveExecutablePath, $helper)) { if ($binary -and [IO.File]::Exists($binary)) { $binaryHashes[$binary] = Digest $binary } }
         $passed = @($results | Where-Object passed).Count; $failed = @($results | Where-Object { !$_.passed }).Count
         if ($failure -and $failed -eq 0) { $failed = 1 }
-        Save-Json $ReportPath @{ passed = $passed; failed = $failed; error = $failure; results = @($results.ToArray()); binarySha256 = $binaryHashes; taskExitCodes = $taskExitCodes; windowInspectionRequested = [bool]$PauseForWindowInspection; unverified = @('Real Windows restart/logon', 'ARM64 execution'); retained = $OutputDirectory }
+        Save-Json $ReportPath @{ passed = $passed; failed = $failed; error = $failure; results = @($results.ToArray()); binarySha256 = $binaryHashes; taskExitCodes = $taskExitCodes; fixtureEvidence = $fixtureEvidence; windowInspectionRequested = [bool]$PauseForWindowInspection; unverified = @('Real Windows restart/logon', 'ARM64 execution'); retained = $OutputDirectory }
         Write-Host "passed=$passed failed=$failed report=$ReportPath"
     }
 }
