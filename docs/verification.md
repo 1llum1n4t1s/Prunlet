@@ -6,6 +6,8 @@ Windows・.NET 10 SDK・PowerShell 7で実行する。ビルドは`scripts/Publi
 
 ## 通常E2Eの検証範囲
 
+フックのshell文字列解析は`scripts/Verify-HookParsing.ps1`に今回のexeと未使用の外部出力先・reportを渡して確認する。Mac向けSSH送信のヒアストリングを含む入力は実行せず、hookプロセスのstdinへJSONとして送り、許可・拒否、stdout/stderr、終了コードとfixture不変更を照合する。明示PowerShell、CMD、shell不明、wrapper、文字列前後の削除、ローカル展開、既存のファイル・レジストリ拒否を区別し、SSH先での実削除を成功条件へ置き換えない。
+
 新しいファイル経路は、操作記録を作らずWindowsゴミ箱へ移す経路として検証する。旧schema 1〜4/6の復元・圧縮・終了履歴runnerを、新版通常経路の必須成功条件として使わない。旧版exeで作ったデータは下記の明示移行検証だけに使用する。
 
 - CLIの単一・複数・Unicode・長いパス・`--paths-file`・空フォルダー・明示再帰とdry-run、MCPの入力型・余剰property・1〜256件上限を実プロセスで確認する。

@@ -29,7 +29,7 @@ internal static class HookRouter
             var command = arguments.TryGetProperty("command", out var text) ? text
                 : arguments.TryGetProperty("cmd", out text) ? text : default;
             if (command.ValueKind != JsonValueKind.String) throw new ArgumentException("Hook command must be a string.");
-            if (!ContainsDirectDeletion(command.GetString()!)) return Pass();
+            if (!ContainsDirectDeletion(command.GetString()!, mode: ExecutionMode(name.GetString()!, arguments))) return Pass();
 
             var executable = Environment.ProcessPath ?? "prunlet.exe";
             return Deny($"Direct shell deletion is blocked. For explicitly authorized targets, use the installed Prunlet CLI from the start with shell=cmd.exe and login=false: {CmdPath(executable)} --config {CmdPath(configPath)} delete --paths-file <absolute-json-file>; for registry keys/values use {CmdPath(executable)} --config {CmdPath(configPath)} registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <registry-key-path>. File and folder deletions have no Prunlet operation record; restore them using Windows Recycle Bin. Keep registry operationId and use {CmdPath(executable)} --config {CmdPath(configPath)} registry-restore <operationId>. On hosts supporting exec_command sandbox permissions, request sandbox_permissions=\"require_escalated\" from the first real file deletion because Recycle Bin access may be restricted. This is a formal host permission request, not Windows UAC or administrator elevation. A dry-run does not prove real-operation permissions. Existing host approvals and policies still apply. Do not retry a policy-rejected target through another route or automatically resend a failed deletion; check uncertain file results using the source and Windows Recycle Bin; reconcile registry results using registry-reconcile <operationId> before deciding next steps.");
@@ -43,11 +43,29 @@ internal static class HookRouter
 
     private static string CmdPath(string value) => value.Any(char.IsWhiteSpace) ? "\"" + value + "\"" : value;
 
-    private static bool ContainsDirectDeletion(string script, int depth = 0)
+    private static EscapeMode? ExecutionMode(string tool, JsonElement arguments)
+    {
+        // Bashの追加propertyや既定shellは実行器の根拠にしない。
+        if (tool is not ("exec_command" or "functions.exec_command")
+            || !arguments.TryGetProperty("shell", out var shell) || shell.ValueKind != JsonValueKind.String)
+            return null;
+        return WindowsShellMode(CommandLeaf(shell.GetString()!));
+    }
+
+    private static EscapeMode? WindowsShellMode(string name) => name.ToLowerInvariant() switch
+    {
+        "pwsh" or "powershell" => EscapeMode.PowerShell,
+        "cmd" => EscapeMode.Cmd,
+        // Windowsホストには未知shellをCMDで実行するものもある。Posixとは推測しない。
+        _ => null
+    };
+
+    private static bool ContainsDirectDeletion(string script, int depth = 0, EscapeMode? mode = null)
     {
         if (depth > 4) return false;
-        foreach (var mode in new[] { EscapeMode.Cmd, EscapeMode.PowerShell, EscapeMode.Posix })
-            if (ContainsDirectDeletion(script, depth, mode)) return true;
+        if (mode is { } known) return ContainsDirectDeletion(script, depth, known);
+        foreach (var candidate in new[] { EscapeMode.Cmd, EscapeMode.PowerShell, EscapeMode.Posix })
+            if (ContainsDirectDeletion(script, depth, candidate)) return true;
         return false;
     }
 
@@ -103,7 +121,7 @@ internal static class HookRouter
             var body = words.Count == i + 2 && words[i + 1].Quoted
                 ? words[i + 1].Text
                 : string.Join(" ", words.Skip(i + 1).Select(QuoteToken));
-            return ContainsDirectDeletion(body, depth + 1);
+            return ContainsDirectDeletion(body, depth + 1, WindowsShellMode(name));
         }
         // -Fileや外部scriptの内容、動的な名前、他言語のコードは検査しない。
         return false;
@@ -165,7 +183,15 @@ internal static class HookRouter
                 else text.Append(c);
                 continue;
             }
-            if (c is '\'' or '"') { quote = c; quoted = true; continue; }
+            if (mode == EscapeMode.PowerShell && c == '@' && i + 1 < script.Length && script[i + 1] is '\'' or '"')
+            {
+                var body = ReadPowerShellHereString(script, ref i, script[i + 1]);
+                text.Append(body);
+                quoted = true;
+                continue;
+            }
+            // CMDでは単引用符は通常の文字で、内部の & 等も実行境界になる。
+            if (c == '"' || (c == '\'' && mode != EscapeMode.Cmd)) { quote = c; quoted = true; continue; }
             if (c == '#' && text.Length == 0)
             {
                 while (i < script.Length && script[i] is not ('\r' or '\n')) i++;
@@ -184,6 +210,37 @@ internal static class HookRouter
             else text.Append(c);
         }
         if (text.Length > 0 || quoted) yield return new ShellToken(text.ToString(), false, quoted);
+    }
+
+    private static string ReadPowerShellHereString(string script, ref int position, char quote)
+    {
+        var start = position + 2;
+        while (start < script.Length && script[start] is ' ' or '\t') start++;
+        if (start >= script.Length || script[start] is not ('\r' or '\n'))
+            throw new InvalidDataException("PowerShell here-string header must end with a newline.");
+        if (script[start++] == '\r' && start < script.Length && script[start] == '\n') start++;
+        for (var end = start; end + 1 < script.Length; end++)
+        {
+            // 終端は行頭だけ。終端直後のローカルコマンドは通常の字句検査へ戻す。
+            if ((end == start || script[end - 1] is '\r' or '\n')
+                && script[end] == quote && script[end + 1] == '@')
+            {
+                var body = script[start..end];
+                if (quote == '"')
+                {
+                    for (var i = 0; i + 1 < body.Length; i++)
+                    {
+                        if (body[i] == '\u0060') { i++; continue; }
+                        // 展開式はローカルで実行される。限定lexerでは許可せずliteral形式を案内する。
+                        if (body[i] == '$' && body[i + 1] == '(')
+                            throw new InvalidDataException("PowerShell expandable here-string subexpressions cannot be inspected; use a single-quoted literal here-string for remote script data.");
+                    }
+                }
+                position = end + 1;
+                return body;
+            }
+        }
+        throw new InvalidDataException("PowerShell here-string has no valid closing marker.");
     }
 
     private readonly record struct ShellToken(string Text, bool Boundary, bool Quoted);

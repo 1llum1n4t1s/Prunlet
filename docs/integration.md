@@ -79,6 +79,10 @@ MCP登録の実行内容は次のとおりです。
 
 対応するtool名は`Bash`、`exec_command`、`functions.exec_command`です。入力は`tool_input.command`または`tool_input.cmd`を読みます。対象外toolや削除候補のないshell入力にはexe単体で`{}`を返します。認識した直接ファイル削除は理由とPrunlet CLI手順を付けて拒否し、入力の自動置換を行いません。
 
+`exec_command`系で`tool_input.shell`が`pwsh`・`powershell`・`cmd`（`.exe`や絶対パスを含む）と明示された場合は、その文字列規則を使います。`Bash`への追加property、shell未指定・未知・`bash`等の指定だけでは実行器を推測せず、複数の規則で安全側に検査します。Windowsのホストには未知shellをCMDで実行するものがあるためです。
+
+SSHでMac等へ送るPowerShellのスクリプト文字列には、`exec_command`の` shell: "pwsh" `を明示し、単引用ヒアストリング（`@'`と行頭の`'@`）を使ってください。文字列内の引用符や`rm`をローカルの削除と混同せず、終端の前後にあるローカル削除は検査します。二重引用ヒアストリングの`$()`はローカルで展開されるため、限定検査で安全に扱えず拒否します。未終端・不正なヒアストリングも拒否します。SSHの存在や接続先の名前を使った削除の素通し例外は設けません。
+
 登録するWindows hookコマンドは`<Systemのcmd.exe絶対パス> /d /c call "<exe>" --config "<config>" hook`です。Codexは環境の既定シェルをフックへ引き継ぐため、CMDを明示して`call`をCMD内で実行します。登録パスにCMD再展開文字やPowerShellの展開文字（ドル記号・バッククォート）が含まれる場合は、書込み前に自動登録を拒否します。旧`--hook-script <script>`は互換引数として受理するだけで、PowerShell backendを起動しません。更新で配置済み旧backendを退役させる際は、製品バックアップを保全してCoreによるWindowsゴミ箱への削除を使います。
 
 | 入力 | 結果 |
