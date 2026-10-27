@@ -41,6 +41,8 @@ snapshotを先に読んでから削除をstageすると、その間の外部書�
 
 schema 5の原文bytesはpendingファイルの最初の書込み時点から、Ownerを現在のユーザーSID、アクセス主体を現在のユーザーSIDとSYSTEMだけとするprotected DACLを指定してatomicに作成する。操作ディレクトリ・metadata・ロックも同じ非公開ACLで作成し、後からACLを締める公開期間を設けない。読取り・復元・整理でもACLを検証し、改変を検出した記録は処理せず保持する。
 
+manifest・snapshot・intent・receiptの公開は`RegistryPublication`が担当する。空のpendingを作成し、親と本文のidentity・公開先名・長さ・hashを結び付けた所有予約をflushしてから本文を書き、flush・検証後に同じhandleで正式名へrenameする。未公開本文を正式receiptへ昇格してcommit結果を推測しない。正式callerが原本とACLを再検証し、予約した完全bytesと既存prefixが一致した場合だけ書込みを再開できる。公開済み本文のidentity・長さ・hashを確認できれば所有予約を清掃できるが、pendingと正式名の共存、所有不明、改変は保全する。
+
 キーの生セキュリティ記述子は`BACKUP_SECURITY_INFORMATION`（0x10000）で取得し、Owner・Group・DACL・SACLとMandatory Labelを含めて保持する。Owner/Group/DACL/SACLだけの取得フラグ（0xF）ではMandatory Label ACEが欠落するため使用しない。復元時は完全な記述子を指定して全キーを作成してから、必要なauto-inherited bitだけを要求するsetterを適用し、同じ完全取得方法で再読して生bytesを完全一致で比較する。親のsetterを子の作成前に適用すると、SACL実体がない子のauto-inherited bitが失われるため、この順序を維持する。比較を緩和せず、保持できない場合はロールバックしてsnapshotを保全する。
 
 復元はトランザクション内で新規作成だけを許し、既存キー・値・空の既定値を上書きもマージもしない。値復元は先に書込みをstageしてから、保持した非トランザクション親HKEYで同名値の不存在を確認する。既存値ならロールバックし、競合する外部書込みがあればcommitを失敗させて外部値を保全する。Owner/SACLの適用権限不足もロールバックしsnapshotを保全する。commitとreceipt永続化の間の中断は`ambiguous`としてpayloadを保持し、推測した復元・自動整理を拒否する。キーのclassも保存するが、最終書込み時刻は復元せず、volatileキーも非volatileキーとして復元する。
@@ -70,6 +72,10 @@ registryの旧記録は専用namespaceへ移し、ID・snapshot・完全ACL・sc
 レジストリ削除前・明示`maintain`・非表示の定期保守でレジストリ復元データを整理する。ファイル削除はレジストリの容量保守や旧root走査を起動しない。`operations`とMCPの`list_operations`はレジストリ一覧、`purge`と`maintain`もレジストリ専用である。手動整理はCLIの明示適用だけとし、MCPへpurgeを追加しない。
 
 検証できないACL・snapshot・未確定commitは保全し、自動整理で捨てない。`maintain --audit-records`の完全監査と通常容量走査を区別する。旧ファイルの型別index・終了履歴・外部不在判定を、新しいファイル通常経路の管理機構として復活させない。
+
+レジストリの復元・purge完了後は、snapshotが消費済みで正式完了receiptがある記録から、残存memberのidentity・security bytes・長さ・hashを束縛する`<id>.terminal.json`を作る。完了時点から保持期間を過ぎた記録だけを整理し、先にterminalのhashに結び付けた`<id>.terminal-cleanup.json`を永続化する。途中でmanifestが消えても保存済みinventoryで残存memberを検証して再開し、未知memberや差替えは保全する。これらはレジストリ専用であり、ファイルの終了履歴を作る機構ではない。
+
+移行・terminal・terminal-cleanupの制御記録は`RegistryControlPublication`が扱う。中断したpendingの再公開には、呼出元が同じ記録の証拠から本文を再構成し、既存prefixとの一致を検証する必要がある。pending本文だけを権威にせず、正式名との共存や不一致は保全する。この再構成方式はsnapshot・receiptの公開には一般化しない。
 
 ### 容量上限の一度だけの移行
 
