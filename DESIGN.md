@@ -1,6 +1,6 @@
 # Prunletの設計
 
-現在の通常経路は、記録を残さないWindowsゴミ箱へのファイル削除と、snapshot・トランザクションを使うレジストリ削除・復元である。利用手順は[README](README.md)、連携は[docs/integration.md](docs/integration.md)、検証は[docs/verification.md](docs/verification.md)を参照する。
+現在の通常経路は、記録を残さないファイル削除と、snapshot・トランザクションを使うレジストリ削除・復元である。ファイルはWindowsゴミ箱へ移し、明示的なサイズ超過時だけ実体を再照合して元名の永久削除を試みる。利用手順は[README](README.md)、連携は[docs/integration.md](docs/integration.md)、検証は[docs/verification.md](docs/verification.md)を参照する。
 
 ## 構成と責務
 
@@ -59,7 +59,7 @@ manifest・snapshot・intent・receiptの公開は`RegistryPublication`が担当
 
 復元はトランザクション内で新規作成だけを許し、既存キー・値・空の既定値を上書きもマージもしない。値復元は先に書込みをstageしてから、保持した非トランザクション親HKEYで同名値の不存在を確認する。既存値ならロールバックし、競合する外部書込みがあればcommitを失敗させて外部値を保全する。Owner/SACLの適用権限不足もロールバックしsnapshotを保全する。commitとreceipt永続化の間の中断は`ambiguous`としてpayloadを保持し、推測した復元・自動整理を拒否する。キーのclassも保存するが、最終書込み時刻は復元せず、volatileキーも非volatileキーとして復元する。
 
-対象はローカルHKCU/HKLM/HKUの絶対キーで、`Registry::`およびmodule prefixを許容する。ルート自体、mergedなHKCR/HKCC、remote、relative、レジストリリンク、未知のschema・metadataや検証できない復元記録は拒否する。保持期間7日・容量1 GiBの既定値はレジストリschema 5だけを対象とし、共通ロック・事前走査・整理前後の再走査・単一超過時だけの例外予算を共有する。明示整理は既存CLIの`purge`・`maintain`を使い、MCPにpurgeは追加しない。
+対象はローカルHKCU/HKLM/HKUの絶対キーで、`Registry::`およびmodule prefixを許容する。ルート自体、mergedなHKCR/HKCC、remote、relative、レジストリリンク、未知のschema・metadataや検証できない復元記録は拒否する。保持条件と整理の責務は[復元データの自動整理](#復元データの自動整理)にまとめる。
 
 MSIX由来の仮想viewでtransactionが利用できない場合も、非transaction操作へ切り替えない。通常Windows側の操作には、通常デスクトップの期限付きnative sessionを用意し、`registryScope=nativeWindows`と専用接続情報を明示選択したCLI・MCPから同じCoreへ委任する。検証では`Verify-RegistrySession.ps1`のPrepareで固定したscopeと入力に限り、`Start -AssertNativeWindows`からdesktop Explorerの通常起動とWindowsの`runas`で起動できる。管理者起動の同意はOSのUACポリシーに従い、エージェントは同意を代行しない。入力のread handle・hash、nonce、原子的な開始claim、親の生存・期限、通常/管理者の実token、両者のreadyとRun permitを照合し、遅延起動や曖昧な開始を拒否する。手動のdesktop起動は診断互換として残す。job・silo制約を転送する方式ではなく、通常Windows scopeへの明示委任であり、汎用コマンドbroker・サービス・タスク登録・仮想viewからのfallbackは追加しない。要求ごとのeffective tokenを使用し、session固有の権限を呼出元へ貸さない。sessionはlocal・同じログオン・同じexeに限定し、期限後は新規受付を停止するが進行中のCoreを強制終了しない。
 
@@ -101,7 +101,7 @@ latest導入時に`capacityDefaultMigrationVersion`が欠落または1未満の�
 
 利用者向け導入はGitHubの既定ブランチ最新HEADを解決し、取得元・ブランチ・commitを`source-info.json`へ記録する。開発クローン・ローカルビルドをlatest導入の代用にしない。設定の検証には`validate-config`を使い、設定読込とservice構築だけで走査・変更しない。共通指示の生成元は`integration/PRUNLET.md`で、配置済み共通指示の更新とソース変更は別の結果として扱う。
 
-ビルド・fixture・TEMP/TMP・reportは外部絶対パスへ分離する。CLI・stdio MCP・hookの実プロセス、終了コード・JSON・passed/failedを読み、未実行・skip・部分ケースを全件成功にしない。Windowsのゴミ箱全体を空にせず、今回のfixtureだけを扱う。新規recordless削除・レジストリ復元・旧データ移行を別の検証範囲として報告する。
+ビルドと検証の実行規約・必須コマンドは[AGENTS.md](AGENTS.md#ビルドと検証)、各経路の検証範囲とfixtureの保持・清掃は[検証手順](docs/verification.md)を正本とする。
 
 ## 依存更新の境界
 
