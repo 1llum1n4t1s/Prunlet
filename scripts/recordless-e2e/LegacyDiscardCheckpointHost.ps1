@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$AssemblyPath,[Parameter(Mandatory)][string]$ExpectedAssemblySha256,[Parameter(Mandatory)][string]$ConfigPath,[ValidateSet('Checkpoint','CreateTypedRoots','CreateRestoreRoot')][string]$Action='Checkpoint',[string]$Checkpoint,[string]$TargetPath,[string]$SignalPath)
+param([Parameter(Mandatory)][string]$AssemblyPath,[Parameter(Mandatory)][string]$ExpectedAssemblySha256,[Parameter(Mandatory)][string]$ConfigPath,[ValidateSet('Checkpoint','Swap','CreateTypedRoots','CreateRestoreRoot')][string]$Action='Checkpoint',[string]$Checkpoint,[string]$TargetPath,[string]$SignalPath)
 $ErrorActionPreference='Stop'
 if((Get-FileHash -LiteralPath $AssemblyPath).Hash-cne$ExpectedAssemblySha256){throw 'Prepared candidate assembly changed'}
 # 失敗モデルは公開移行APIのgate flush後/Shell帰還後の強制終了。typed fixtureは現候補Coreの所有境界モデルであり真正旧版互換の証拠にはしない。
@@ -36,11 +36,11 @@ public static class LegacyDiscardCheckpointHost {
     Console.WriteLine(JsonSerializer.Serialize(roots));return;
    }
   }
-  if(!Path.IsPathFullyQualified(target)||!Path.IsPathFullyQualified(signalPath)||(phase!="gate.flushed"&&phase!="shell.returned"))throw new ArgumentException("Fixed checkpoint input missing.");
+  if(!Path.IsPathFullyQualified(target)||!Path.IsPathFullyQualified(signalPath)||(phase!="gate.flushed"&&phase!="shell.returned"&&phase!="shell.ready")||(action=="Swap"&&phase!="shell.ready"))throw new ArgumentException("Fixed checkpoint input missing.");
   var checkpoint=serviceType.GetEvent("LegacyDiscardCheckpoint",BindingFlags.NonPublic|BindingFlags.Static);if(checkpoint==null)throw new MissingMemberException("Actual discard checkpoint event missing");
-  Action<string,string> handler=(observed,path)=>{if(observed!=phase||!string.Equals(path,target,StringComparison.OrdinalIgnoreCase))return;using(var file=new FileStream(signalPath+".writing",FileMode.CreateNew,FileAccess.Write,FileShare.None)){var bytes=System.Text.Encoding.UTF8.GetBytes(observed+"\n"+path+"\n"+Environment.ProcessId);file.Write(bytes);file.Flush(true);}File.Move(signalPath+".writing",signalPath);Thread.Sleep(Timeout.Infinite);};
+  Action<string,string> handler=(observed,path)=>{if(observed!=phase||!string.Equals(path,target,StringComparison.OrdinalIgnoreCase))return;using(var file=new FileStream(signalPath+".writing",FileMode.CreateNew,FileAccess.Write,FileShare.None)){var bytes=System.Text.Encoding.UTF8.GetBytes(observed+"\n"+path+"\n"+Environment.ProcessId);file.Write(bytes);file.Flush(true);}File.Move(signalPath+".writing",signalPath);if(action!="Swap")Thread.Sleep(Timeout.Infinite);var deadline=DateTime.UtcNow.AddSeconds(60);while(!File.Exists(signalPath+".continue")){if(DateTime.UtcNow>=deadline)throw new TimeoutException("Swap fixture continuation not received");Thread.Sleep(25);}};
   checkpoint.GetAddMethod(true).Invoke(null,new object[]{handler});
-  try {serviceType.GetMethod("MigrateRecoveryStorage",new[]{typeof(bool),typeof(bool),typeof(bool)}).Invoke(service,new object[]{true,false,false});throw new InvalidOperationException("Public migration ended without selected checkpoint");}
+  try {var result=serviceType.GetMethod("MigrateRecoveryStorage",new[]{typeof(bool),typeof(bool),typeof(bool)}).Invoke(service,new object[]{true,false,false});if(action=="Swap"){Console.WriteLine(JsonSerializer.Serialize(result,new JsonSerializerOptions{PropertyNamingPolicy=JsonNamingPolicy.CamelCase}));return;}throw new InvalidOperationException("Public migration ended without selected checkpoint");}
   finally {checkpoint.GetRemoveMethod(true).Invoke(null,new object[]{handler});}
  }
 }

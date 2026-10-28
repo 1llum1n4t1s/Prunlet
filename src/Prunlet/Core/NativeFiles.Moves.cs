@@ -21,6 +21,25 @@ internal static partial class NativeFiles
     internal static SafeFileHandle OpenShellInspection(string path) =>
         Open(path, 0x80, 7, 3, OpenReparse | BackupSemantics);
 
+    // 共有hardlinkを複数回固定削除するときだけ、通常ストリームへの書込みを抑止する。
+    // 属性や別ストリームの変更まで排他するものではない。
+    internal static SafeFileHandle OpenHardlinkReadGuard(string path) =>
+        Open(path, 0x81, 5, 3, OpenReparse | BackupSemantics);
+
+    internal static SafeFileHandle OpenHardlinkExecuteGuard(string path) =>
+        Open(path, 0xa0, 5, 3, OpenReparse | BackupSemantics);
+
+    internal static SafeFileHandle OpenHardlinkStreamGuard(string path, string name, bool execute)
+    {
+        ValidateStreamName(name);
+        var handle = CreateFileW(Win32Path(path) + ":" + name + ":$DATA", execute ? 0xa0u : 0x81u, 5,
+            IntPtr.Zero, 3, OpenReparse | BackupSemantics, IntPtr.Zero);
+        if (!handle.IsInvalid) return handle;
+        handle.Dispose();
+        ThrowLastError("Cannot retain an alternate hardlink stream");
+        throw new InvalidOperationException();
+    }
+
     // DELETEハンドルと共存し、renameのclose時に付くArchiveだけを元属性へ戻す。
     internal static SafeFileHandle OpenMoveAttributeGuard(string path) =>
         Open(path, 0x180, 5, 3, OpenReparse | BackupSemantics);
@@ -46,7 +65,8 @@ internal static partial class NativeFiles
         MemoryMarshal.Write(bytes[..8], in id.FileIdLow);
         MemoryMarshal.Write(bytes[8..], in id.FileIdHigh);
         return new MoveEntryIdentity(id.VolumeSerialNumber, Convert.ToHexString(bytes),
-            (tag.Attributes & (uint)FileAttributes.Directory) != 0, tag.ReparseTag, tag.Attributes);
+            (tag.Attributes & (uint)FileAttributes.Directory) != 0,
+            (tag.Attributes & (uint)FileAttributes.ReparsePoint) != 0 ? tag.ReparseTag : 0, tag.Attributes);
     }
 
     internal static void MoveNoReplace(SafeFileHandle handle, SafeFileHandle parentHandle, string leafName)

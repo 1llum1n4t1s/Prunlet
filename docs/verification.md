@@ -6,12 +6,15 @@ Windows・.NET 10 SDK・PowerShell 7で実行する。ビルドは`scripts/Publi
 
 ## 通常E2Eの検証範囲
 
-フックのshell文字列解析は`scripts/Verify-HookParsing.ps1`に今回のexeと未使用の外部出力先・reportを渡して確認する。Mac向けSSH送信のヒアストリングを含む入力は実行せず、hookプロセスのstdinへJSONとして送り、許可・拒否、stdout/stderr、終了コードとfixture不変更を照合する。明示PowerShell、CMD、shell不明、wrapper、文字列前後の削除、ローカル展開、既存のファイル・レジストリ拒否を区別し、SSH先での実削除を成功条件へ置き換えない。
+フックのshell文字列解析は`scripts/Verify-HookParsing.ps1`に今回のexeと未使用の外部出力先・reportを渡して確認する。Mac向けSSH送信のヒアストリングを含む入力は実行せず、hookプロセスのstdinへJSONとして送り、許可・拒否、stdout/stderr、終了コードとfixture不変更を照合する。Codexの`Bash`とshell欠落、単独EncodedCommandの復号、認識した別名・不正値・外側wrapperの拒否、復号本文の直接削除と解析不能な展開、明示PowerShell、CMD、shell不明を区別する。SSH先での実削除を成功条件へ置き換えない。
 
-新しいファイル経路は、操作記録を作らずWindowsゴミ箱へ移す経路として検証する。旧schema 1〜4/6の復元・圧縮・終了履歴runnerを、新版通常経路の必須成功条件として使わない。旧版exeで作ったデータは下記の明示移行検証だけに使用する。
+新しいファイル経路は、操作記録を作らずWindowsゴミ箱へ移す経路と、Windowsのサイズ超過判定後に対象名を固定して削除する経路として検証する。旧schema 1〜4/6の復元・圧縮・終了履歴runnerを、新版通常経路の必須成功条件として使わない。旧版exeで作ったデータは下記の明示移行検証だけに使用する。
 
 - CLIの単一・複数・Unicode・長いパス・`--paths-file`・空フォルダー・明示再帰とdry-run、MCPの入力型・余剰property・1〜256件上限を実プロセスで確認する。
-- ファイル結果が`dryRun`・`items`・`warnings`で、項目が`path`・`kind`・`status`・任意`error`だけを返すことを確認する。`recycled`・`would_recycle`・`already_absent`・`failed`・`ambiguous`と終了コード/MCP `isError`を照合し、operationId・backupPath・hash・sizeを返さないことを確認する。
+- ファイル結果が`dryRun`・`items`・`warnings`で、項目が`path`・`kind`・`status`・任意`error`だけを返すことを確認する。`recycled`・`permanently_deleted`・`would_recycle`・`already_absent`・`failed`・`ambiguous`と終了コード/MCP `isError`を照合し、operationId・backupPath・hash・sizeを返さないことを確認する。dry-runでは永久削除になるか予測できない旨を確認する。
+- 実際の容量超過を起こす専用sparse fixtureをCLI・MCPで検証し、ファイル・フォルダーの元名の消失と今回分のゴミ箱項目、混合batch・生存hardlink・部分失敗の扱いを確認する。サイズ超過以外の失敗では永久削除せず、旧既定と設定済みの退避先を保護する。Shellの直前とサイズ超過の通知後での差し替え・ロックを別々に確認し、Shellが別実体を移した場合は`ambiguous`を返すこととWindows側の副作用を区別する。
+- `Verify-OversizeRaces.ps1`・`Verify-BeforeRecycleRace.ps1`・`Verify-BeforeRecycleSmallRace.ps1`は、同じ候補のexe・assembly・assembly SHA-256と未使用の外部D出力先を受け取る。実ShellとCore内部の境界を再現し、CLI・MCPの実プロセス検証とは区別する。証拠が一致したfixtureだけを清掃候補として残し、指定された経路で清掃する。
+- 共有ハードリンクのサイズ超過は`Verify-RecordlessFiles.ps1`のCLI・MCPとassembly指定の競合ケースで確認する。`Verify-OversizeMixedHardlinks.ps1`・`Verify-OversizeHardlinkPermissions.ps1`は通常Shellとの混合、単一・同一root・別rootのアクセス権不足を確認する。`Verify-OversizeParallelIndependence.ps1`・`Verify-OversizeRecycledHardlinkIndependence.ps1`は同じ候補のassemblyを使い、独立rootの同時pinと無関係な生存別名への書込みopenを実Shell後のCore境界で確認する。権限不足で部分完了した結果の順序と状態を区別し、不明な削除を再送しない。
 - 新規削除前後でPrunlet保存領域を比較し、操作manifest・PIDL・File ID・ACL snapshot・monitor・index・復元stageを作らないことを確認する。固定`maintenance.lock`と操作記録を区別する。通常削除・list・maintainが旧ファイル操作ディレクトリを走査しないことも確認する。
 - 内容・File ID・ADS・通常属性・case-sensitiveな名前・ACLと、リンク先の保全・外部ハードリンク別名との共有を確認する。復元は今回fixtureのWindowsゴミ箱項目だけで行い、ゴミ箱全体の空化や既存項目の清掃は行わない。復元先に既存項目を作り、上書きせず競合を扱う。
 - preflight失敗時の全対象保全、独立対象の並行完了、同一対象・親子の排他、共有ハードリンク検出時の排他、入力順を確認する。MCPの要求枠とworker枠・進捗分離・EOF後の完了を区別する。

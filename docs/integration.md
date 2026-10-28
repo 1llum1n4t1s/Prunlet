@@ -28,7 +28,7 @@ RTKの共通指示と同様、エージェントのツール選択を案内す�
 
 通常はインストーラーが設定を作成します。手動の初期化は[README](../README.md#初期設定)を参照してください。`backupDirectory`は保護された共通metadata基点で、レジストリ記録を`.registry-records-v1/<operationId>`へ保存します。新しいファイル・フォルダー削除は操作記録やsnapshotを作りません。
 
-ファイルはWindowsのゴミ箱へ移し、復元はWindowsの画面で行います。CLIの`restore`（`registry-restore`の別名）とMCPの`restore_registry`はレジストリ専用です。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールです。`operations`と`list_operations`にもファイル削除を載せません。
+ファイル・フォルダーは通常Windowsのゴミ箱へ移し、復元はWindowsの画面で行います。Windowsが対象をゴミ箱に対して大きすぎると判定し、元の実体を再確認できた場合は、元の名前の永久削除を試みます。削除の完了を確認できたときだけ`permanently_deleted`を返します。サイズ超過以外の失敗からは永久削除へ切り替えません。CLIの`restore`（`registry-restore`の別名）とMCPの`restore_registry`はレジストリ専用です。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールです。`operations`と`list_operations`にもファイル削除を載せません。
 
 旧ファイルデータと旧レジストリ配置を扱うのは`migrate [--dry-run | --apply]`だけです。旧ファイルの復元互換は終了し、所有確認済みの旧退避rootと操作記録を本文の展開・hash・コピー・bundle化なしでWindowsゴミ箱へ破棄します。レジストリの完全保全と非上書き復元は維持します。インストーラーの`migrate --apply --if-needed`はpolicy 2評価済みの中央旧GUID走査を省き、更新時のonline owned store/restore rootの固定位置と小markerだけを確認します。通常削除・一覧・保守に旧ファイル走査を入れません。所有不明・registry signal・offline・拒否は警告して残し、file整理の未完了だけでregistry通常操作を止めません。中断gateは自動解除せず、元フォルダーとWindowsゴミ箱を確認後の`migrate --apply --retry-legacy-discard`だけで明示再評価します。設定検証は無走査・不変更の`validate-config`を使います。移行開始後の導入失敗では新exe・設定・登録を保持します。
 
@@ -38,7 +38,9 @@ RTKの共通指示と同様、エージェントのツール選択を案内す�
 
 対応するCodexの`exec_command`では、実削除を初回から`sandbox_permissions: "require_escalated"`で申請します。Windowsの管理者起動とは別の条件であり、Prunletの自動昇格や承認ポリシーの無効化はありません。対応しないホストでは正式な承認経路に従います。拒否された対象を別shell・別APIへ付け替えません。
 
-ファイル結果は`recycled`・`would_recycle`・`already_absent`・`failed`・`ambiguous`です。`failed`・`ambiguous`は成功扱いにしません。`ambiguous`となった削除は、許可取得だけを根拠に再送せず、CLIのJSON・元対象・Windowsのゴミ箱を確認します。ファイルの操作ID・Prunlet復元記録による照合は提供しません。レジストリ切断後は操作IDを使う`registry-reconcile`で照合し、同じ削除を再送しません。
+ファイル結果は`recycled`・`permanently_deleted`・`would_recycle`・`already_absent`・`failed`・`ambiguous`です。`permanently_deleted`の元の名前はゴミ箱から復元できません。dry-runはサイズ超過の最終判定を行わず、永久削除になる可能性を警告します。`failed`・`ambiguous`は成功扱いにしません。Shell直前に対象名が差し替わると別実体がゴミ箱へ移る可能性があり、移動後の実体が一致しない場合は`ambiguous`で停止します。`ambiguous`となった削除は、許可取得だけを根拠に再送せず、CLIのJSON・元対象・Windowsのゴミ箱を確認します。ファイルの操作ID・Prunlet復元記録による照合は提供しません。レジストリ切断後は操作IDを使う`registry-reconcile`で照合し、同じ削除を再送しません。
+
+退避先の保護では、設定された各ボリュームの保存先も実体とボリュームの対応を確認します。別ボリュームの設定先でも、権限不足や不正なリンクなどで確認できない場合は、対象外の保存先を誤って削除しないよう削除とdry-runを停止し、該当する設定パスと理由を返します。
 
 ## 使用中のファイルと同時実行
 
@@ -46,7 +48,7 @@ RTKの共通指示と同様、エージェントのツール選択を案内す�
 
 1秒以上の待機はstderrへ経過時間を出し、以後5秒おきと取得時に通知します。CLIのstdoutは最終JSON専用です。MCPの`tools/call`に`params._meta.progressToken`を指定すると`notifications/progress`で受け取れます。最終応答後は通知を送りません。
 
-独立したファイル対象はprocess共通のworker上限内で処理します。同一対象・親子・共有ハードリンクの競合は排他し、MCP要求の並行数とfile worker数を区別します。registry privilege変更をfile workerと並行させません。
+独立したファイル対象はprocess共通のworker上限内で処理します。同一対象・親子の競合と、同じ要求内で共有するハードリンクの固定削除は排他します。別の要求やprocessに含まれる別名は、この要求内のFile ID排他の対象ではありません。MCP要求の並行数とfile worker数を区別し、registry privilege変更をfile workerと並行させません。
 
 使用中のDLLやファイルはWindowsが移動を拒否する場合があります。Prunletはコピー・属性やACLの変更・利用プロセスの終了で拒否を回避しません。失敗や不明状態は元対象とゴミ箱を確認してください。
 
@@ -81,7 +83,24 @@ MCP登録の実行内容は次のとおりです。
 
 `exec_command`系で`tool_input.shell`が`pwsh`・`powershell`・`cmd`（`.exe`や絶対パスを含む）と明示された場合は、その文字列規則を使います。`Bash`への追加property、shell未指定・未知・`bash`等の指定だけでは実行器を推測せず、複数の規則で安全側に検査します。Windowsのホストには未知shellをCMDで実行するものがあるためです。
 
-SSHでMac等へ送るPowerShellのスクリプト文字列には、`exec_command`の` shell: "pwsh" `を明示し、単引用ヒアストリング（`@'`と行頭の`'@`）を使ってください。文字列内の引用符や`rm`をローカルの削除と混同せず、終端の前後にあるローカル削除は検査します。二重引用ヒアストリングの`$()`はローカルで展開されるため、限定検査で安全に扱えず拒否します。未終端・不正なヒアストリングも拒否します。SSHの存在や接続先の名前を使った削除の素通し例外は設けません。
+Codexの`exec_command`はフックへ`Bash`とコマンド文字列を渡し、実行shellを渡しません。`shell: "pwsh"`だけではPowerShellと別shellを区別できないため、そのままのヒアストリングは安全側に拒否されることがあります。SSHの存在や接続先の名前を使った削除の素通し例外は設けません。
+
+Mac等へ送るシェルスクリプトを単引用ヒアストリングに入れた**ローカルPowerShellスクリプト全体**は、shellを起動せずにUTF-16LE Base64へ変換し、単独の`pwsh -NoProfile -EncodedCommand <base64>`として渡します。たとえばCodexのJavaScript実行環境では次の形です。`script`は実際に使うローカルPowerShellスクリプトへ置き換えます。
+
+```javascript
+const script = "# Prunlet\n" + "$remote = @'\nprintf 'hello from Mac\\n'\n'@\nWrite-Output $remote";
+const bytes = new Uint8Array(script.length * 2);
+for (let i = 0; i < script.length; i++) {
+  const unit = script.charCodeAt(i);
+  bytes[i * 2] = unit & 255;
+  bytes[i * 2 + 1] = unit >>> 8;
+}
+const encoded = bytes.toBase64();
+const result = await tools.exec_command({ cmd: `pwsh -NoProfile -EncodedCommand ${encoded}`, shell: "pwsh", login: false });
+text(result.output);
+```
+
+先頭のASCIIコメントはGit Bashによる先頭スラッシュのパス変換を避けます。Base64は暗号化ではないため、秘密をコマンドやログへ埋め込まないでください。フックはこの単独・無引用の形式だけを厳密に復号し、PowerShellの文字列とローカルの直接削除を検査します。認識した省略形やwrapper、動的な引数、追加コマンド、不正なBase64・UTF-16は拒否します。復号本文の未対応構文（展開文字列の`$()`、ブロックコメント、ハッシュ表、スマート引用符、Unicode escape、動的または引用した名前の呼び出し、別shellや`Start-Process`による起動など）も安全側に拒否します。単引用ヒアストリング内の文字はデータです。未認識の外部wrapper・動的生成・外部スクリプト・他言語APIを含むすべての削除を検出する保証はありません。
 
 登録するWindows hookコマンドは`<Systemのcmd.exe絶対パス> /d /c call "<exe>" --config "<config>" hook`です。Codexは環境の既定シェルをフックへ引き継ぐため、CMDを明示して`call`をCMD内で実行します。登録パスにCMD再展開文字やPowerShellの展開文字（ドル記号・バッククォート）が含まれる場合は、書込み前に自動登録を拒否します。旧`--hook-script <script>`は互換引数として受理するだけで、PowerShell backendを起動しません。更新で配置済み旧backendを退役させる際は、製品バックアップを保全してCoreによるWindowsゴミ箱への削除を使います。
 
@@ -99,7 +118,7 @@ SSHでMac等へ送るPowerShellのスクリプト文字列には、`exec_command
 
 レジストリ限定の素通し例外はありません。認識した`Remove-Item`・既定alias、`Remove-ItemProperty`・`rp`と`reg[.exe] delete`を拒否します。`reg query`や`echo`の引数にある無関係なコマンド文字列は通過します。既存のwrapper・escape検出を維持します。`{}`は実行許可ではなく、他hookとホストの承認へ判断を委ねる応答です。
 
-拒否時は配置済みexe・設定で、ファイルには`delete --paths-file <absolute-json-file>`、レジストリには`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <single-key-path>`を最初からCMDで使う手順を案内します。レジストリで成功した`operationId`を保持し、`registry-restore <operationId>`（`restore`もレジストリ専用の別名）で非上書き復元します。ファイル・フォルダーは操作IDを保存せず、Windowsのゴミ箱で復元します。MCP代替入口は`delete_registry`・`restore_registry`です。view必須、既定値の空文字、完全ACLの権限とKTMの境界は[README](../README.md#レジストリの削除復元)を参照してください。削除許可とホスト承認を維持し、拒否対象を別経路で再試行しません。hook自身は削除・自動置換・PowerShell backend起動を行いません。
+拒否時は配置済みexe・設定で、ファイルには`delete --paths-file <absolute-json-file>`、レジストリには`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <single-key-path>`を最初からCMDで使う手順を案内します。レジストリで成功した`operationId`を保持し、`registry-restore <operationId>`（`restore`もレジストリ専用の別名）で非上書き復元します。ファイル・フォルダーは操作IDを保存せず、`recycled`の項目だけをWindowsのゴミ箱で復元できます。MCP代替入口は`delete_registry`・`restore_registry`です。view必須、既定値の空文字、完全ACLの権限とKTMの境界は[README](../README.md#レジストリの削除復元)を参照してください。削除許可とホスト承認を維持し、拒否対象を別経路で再試行しません。hook自身は削除・自動置換・PowerShell backend起動を行いません。
 
 MCPの1行とhookの入力全体は、UTF-16の文字数で1,048,576文字まで受理します。MCPは空白だけの行を従来どおり無視します。それ以外の超過行は残りを改行まで読み捨ててエラーを返し、次の要求を処理します。hookは上限超過を検出するとEOFを待たず拒否します。読み取り中も保持する入力をこの上限までに抑えます。
 

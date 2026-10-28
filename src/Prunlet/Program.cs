@@ -44,9 +44,11 @@ internal static class Program
                     prunlet --config <absolute-json-path> hook [--hook-script <legacy-path>]
                     Legacy --allowed-root <directory> options are accepted but do not restrict target directories.
                     Metadata and volume recovery directories are protected.
-                    Files and folders move into the Windows Recycle Bin without Prunlet operation records.
-                    Restore files and folders using Windows Recycle Bin; no CLI or MCP file restore is provided.
-                    Windows controls Recycle Bin retention; unavailable recycling fails without permanent-delete fallback.
+                    Files and folders normally move into the Windows Recycle Bin without Prunlet operation records.
+                    When Windows reports a file or folder too large for the bin, Prunlet attempts to permanently delete its confirmed original.
+                    Only a confirmed removal returns permanently_deleted; an uncertain attempt returns ambiguous.
+                    Other recycling failures do not trigger permanent deletion. Dry-run cannot predict which outcome applies.
+                    Restore recycled items using Windows Recycle Bin; permanently deleted items cannot be restored there.
                     Registry snapshots retain the configured 7-day / 1 GiB defaults.
                     Maintain and purge manage registry recovery only; inspection is the default.
                     Migrate discards owned legacy file recovery data through Windows Recycle Bin; registry recovery stays protected.

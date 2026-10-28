@@ -4,9 +4,9 @@
 
 Windowsのファイル・フォルダー・レジストリ削除は、配置済み共通指示のexe・設定の絶対パスを使い、最初から`cmd.exe`・`login: false`でPrunlet CLIを呼ぶ。空白・Unicode・多数・長いファイル対象は絶対パスのUTF-8 JSON一覧を`delete [--dry-run] --paths-file <絶対パス>`で渡す。レジストリは`registry-delete --view <32|64> ... -- <single-key-path>`を使う。exe・設定自体をCMDで安全に表現できない場合は実行前に同じCoreのMCPを選ぶ。拒否された削除を別shell・Prunletへ付け替えて再試行しない。詳細は[連携手順](docs/integration.md)を参照する。
 
-ファイル・フォルダーはWindowsのゴミ箱へ移し、操作記録自体を作らない。操作ID・PIDL・File ID・内容hash・size・ACL snapshot、manifest・monitor・index・retirement・復元stageを新規作成しない。復元と保持管理はWindowsのゴミ箱へ任せ、CLI/MCPのファイル復元を追加しない。共通の固定`maintenance.lock`は排他用であり操作記録ではない。`allowedRoots`は互換入力で、削除対象フォルダーの許可リストを設けない。永久削除・独自退避・コピーfallback・自動昇格・リンク先走査を追加しない。中央metadata・レジストリ専用namespace・未移行の旧領域とその祖先を保護する。
+ファイル・フォルダーは通常Windowsのゴミ箱へ移し、操作記録自体を作らない。Windowsが対象をゴミ箱には大きすぎると明示し、保持した実体と再固定した名前・親・属性が一致した場合だけ、同じ要求内で元の名前を永久削除する。サイズ超過以外の失敗や不明な結果からは永久削除へ切り替えない。操作ID・PIDL・File ID・内容hash・size・ACL snapshot、manifest・monitor・index・retirement・復元stageを新規作成しない。ゴミ箱に移った項目の復元と保持管理はWindowsへ任せ、CLI/MCPのファイル復元を追加しない。共通の固定`maintenance.lock`は排他用であり操作記録ではない。`allowedRoots`は互換入力で、削除対象フォルダーの許可リストを設けない。独自退避・コピーfallback・自動昇格・リンク先走査を追加しない。中央metadata・レジストリ専用namespace・未移行の旧領域とその祖先を保護する。
 
-`FileDeleteResult`は`dryRun`・`items`・`warnings`、各項目は`path`・`kind`・`status`・任意`error`である。状態は`recycled`・`would_recycle`・`already_absent`・`failed`・`ambiguous`で、`failed`と`ambiguous`は非成功として返す。不明な削除を自動再送せず、元対象とWindowsゴミ箱を確認する。
+`FileDeleteResult`は`dryRun`・`items`・`warnings`、各項目は`path`・`kind`・`status`・任意`error`である。状態は`recycled`・`permanently_deleted`・`would_recycle`・`already_absent`・`failed`・`ambiguous`で、`failed`と`ambiguous`は非成功として返す。Shellが返した項目を一時的に開き、事前に保持した元のFile IDと照合できない場合は`ambiguous`とする。dry-runでは永久削除の要否を予測できないことを警告する。不明な削除を自動再送せず、元対象とWindowsゴミ箱を確認する。
 
 レジストリは[専用設計](DESIGN.md#レジストリの削除と復元)のstage・snapshot・永続化・commit順、完全security bytes照合、schema 5の作成時からの非公開ACL、曖昧状態の保全を維持する。非トランザクション削除へのfallbackを追加しない。`restore`（`registry-restore`の別名）・`operations`・`purge`・`maintain`はレジストリ専用で、MCPは5ツールを維持する。レジストリ記録は`backupDirectory/.registry-records-v1/{id}`へ置き、manifestの`MetadataRoot`は共通基点を保持する。
 

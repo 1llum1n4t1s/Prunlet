@@ -13,15 +13,21 @@
 
 `Protocol/HookRouter`は`Bash`・`exec_command`・`functions.exec_command`のコマンド文字列を検査する。`exec_command`系の明示的な`tool_input.shell`がPowerShellまたはCMDなら、その文字列規則を選択する。shell未指定・未知・Posix系の指定、および`Bash`ではCMD・PowerShell・Posixの複数規則で検査する。未知shellをCMDで実行するWindowsホストがあるため、tool名やshell名だけからPosix実行とは推測しない。静的なshell wrapperのコマンド本文も再帰検査し、認識したPowerShell・CMDのwrapperには対応する規則を使う。
 
-PowerShellのヒアストリングは行頭の終端までを文字列として読み、終端前後のローカルコマンドを検査する。これにより、リモート送信用の文字列内にある削除とローカル削除を区別する。展開型ヒアストリングの未エスケープな`$()`はローカル実行を伴い、限定lexerで安全に検査できないため拒否する。不正・未終端のヒアストリングも拒否し、SSHの存在や接続先による素通し例外は設けない。外部scriptの内容・動的なコマンド名・他言語のAPIまで検査する保証はない。利用時の書き方は[連携手順](docs/integration.md)、解析の実プロセス検証は[検証手順](docs/verification.md#通常e2eの検証範囲)を参照する。
+PowerShellのヒアストリングは行頭の終端までを文字列として読み、終端前後のローカルコマンドを検査する。Codexの実ホストは`exec_command`を`Bash`として渡し、実行shellをフック入力に含めない。同じ文字列がshellによって実行コードにもデータにもなるため、shell不明のままPowerShellとは決め打ちしない。単独の静的な`pwsh -NoProfile -EncodedCommand <canonical UTF-16LE Base64>`は復号してPowerShellとして限定検査し、未対応の動的呼出し・展開・別shell等は拒否する。認識した省略形やwrapperは限定形式として扱わず、不正・未終端のヒアストリングも拒否する。SSHの存在や接続先による素通し例外は設けない。未認識の外部wrapper、外部scriptの内容・動的なコマンド名・他言語のAPIまで検査する保証はない。利用時の書き方は[連携手順](docs/integration.md)、解析の実プロセス検証は[検証手順](docs/verification.md#通常e2eの検証範囲)を参照する。
 
 ## 削除と復元のデータフロー
 
-ファイル・フォルダーは入力パスを正規化し、対象・祖先・保護領域・リンクを検証する。全対象のpreflightを終えてからWindowsゴミ箱へ移す。永久削除・独自退避・別ボリュームへのコピーへのfallbackを加えない。再帰指定のない非空フォルダーは拒否し、リンク先を走査しない。
+ファイル・フォルダーは入力パスを正規化し、対象・祖先・保護領域・リンクを検証する。全対象のpreflightを終えてからWindowsゴミ箱へ移す。Windowsが対象を大きすぎると明示し、生成先や別原因の失敗がなく、保持した元実体と再固定した名前・親・属性が一致した場合だけ、同じ要求内で対象名を永久削除する。フォルダーの進捗通知は失敗と扱わない。その他の失敗・不明状態からは永久削除へ切り替えない。再帰指定のない非空フォルダーは拒否し、リンク先を走査しない。独自退避・別ボリュームへのコピー・自動昇格は行わない。
 
 新規ファイル削除では、操作ID・PIDL・File ID・内容hash・size・ACL snapshotを復元用に永続化しない。manifest・monitor・index・retirement・復元stageも作成しない。処理中の安全確認に使う情報と永続的な操作記録を区別する。共通の`maintenance.lock`は排他制御用の固定ファイルであり、操作記録ではない。
 
-`Delete`は`FileDeleteResult`を返し、`dryRun`・`items`・`warnings`を持つ。項目は`path`・`kind`・`status`・任意の`error`だけであり、状態は`recycled`・`would_recycle`・`already_absent`・`failed`・`ambiguous`である。`failed`・`ambiguous`はCLIの非ゼロ終了とMCPの`isError`へ反映する。結果不明時は同じ削除を再送せず、元対象とWindowsのゴミ箱を確認する。
+サイズ超過時の固定削除は、共有inspectionで元実体を保持し、DELETE非共有のhandleで親・名前・ID・属性を再照合して、そのhandleへ削除を設定する。フォルダーは固定した親から子を列挙し、各実体を検証してから再帰的に削除する。Shellの全結果を受けてから固定削除を開始し、同じbatch内の同じFile IDをopen前からclose・確認まで排他する。独立した実体はworker上限内で並列に処理し、限られた排他枠が重なる場合は一時待機する。途中失敗・一致不能・削除後の名前消失を確認できない場合は`ambiguous`で止める。
+
+同じ実体の別名を複数扱う場合は、確認した変更時刻と一時handleを保持し、可能な場合は通常ストリームと既存のADSへの書込みを抑止する。guardには実行または読取のアクセス権が必要で、取得できない場合は同じroot内の従来処理を維持し、別rootへの引継ぎは停止する。Shellでゴミ箱へ移った無関係な実体には固定削除用guardを取得しない。guardや時刻の確認は外部プロセスによる属性・ACL・ストリームのあらゆる変更を排除する保証ではなく、確認できない状態からは推測して再送しない。
+
+Shellがゴミ箱への移動を成功と返した場合は、返却項目だけを一時的に開き、保持した元実体のFile IDと照合する。識別できない場合や不一致は`ambiguous`とし、記録やゴミ箱全体の走査は行わない。この照合は事後の検出であり、Shell直前の名前差し替えによって別実体がゴミ箱へ移ること自体は防げない。
+
+`Delete`は`FileDeleteResult`を返し、`dryRun`・`items`・`warnings`を持つ。項目は`path`・`kind`・`status`・任意の`error`だけであり、状態は`recycled`・`permanently_deleted`・`would_recycle`・`already_absent`・`failed`・`ambiguous`である。`permanently_deleted`は対象の元名をゴミ箱へ移さず削除したことを示し、別ハードリンクやバックアップの消去は保証しない。dry-runはWindowsの最終判定を予測できないことを警告する。`failed`・`ambiguous`はCLIの非ゼロ終了とMCPの`isError`へ反映する。結果不明時は同じ削除を再送せず、元対象とWindowsのゴミ箱を確認する。
 
 復元と保持期間の管理はWindowsのゴミ箱で行う。Windowsが完全削除した実体をPrunletが復元できるとは扱わない。ハードリンクの別名は実体を共有し、生存する外部別名からの書込みがゴミ箱内にも反映される。通常属性・ADS・case-sensitiveな名前とACLはWindowsが移す同じオブジェクトの状態であり、Prunletが保存時点の不変コピーやACL再適用を提供するものではない。
 
@@ -65,7 +71,7 @@ native scopeの識別はmanifestとsnapshotのhash内に保存し、machine・SI
 
 volume側は8 KiB以内のstore markerでSID・metadata root・StoreKey・volume・root identityとprivate ACLを検証した専用StoreKey/restore rootだけを扱う。privateBase・custom設定dir・他StoreKeyを丸ごと処分しない。中央GUID操作は直下の正規file marker名で分類し、本文が破損・未完了でも処分できる。registry manifest・pending・publication・namespace/controlのsignalは先に保護する。typed file rootは正規layout、既存bundle/journalは予約prefixとprivate metadata所有範囲で限定し、本文の任意Pathへ削除範囲を広げない。
 
-所有inventoryのpinを解放してからdispatchし、直前にpath・root identity・marker・非reparseを再確認する。通常削除と同じ`NativeRecycleBin.RecycleUnrecorded`を使い、永久削除・copy fallback・任意対象の保護解除フラグを追加しない。結果はPathと`recycled`・`would_recycle`・`already_absent`・`retained`・`failed`・`ambiguous`であり、file操作ID・復元記録を新設しない。
+所有inventoryのpinを解放してからdispatchし、直前にpath・root identity・marker・非reparseを再確認する。元実体の共有handleをShell処理中も保持し、返却項目が同じ実体と確認できなければ`ambiguous`で止めてgateを残す。通常削除と同じ`NativeRecycleBin.RecycleUnrecorded`を使い、永久削除・copy fallback・任意対象の保護解除フラグを追加しない。結果はPathと`recycled`・`would_recycle`・`already_absent`・`retained`・`failed`・`ambiguous`であり、file操作ID・復元記録を新設しない。
 
 移行全体で固定のprivate空ファイル`.legacy-file-discard-in-progress`を1個だけ使う。これは対象Path・ID・hash・ACL本文を持たない実行gateであり、CreateNew・Flush・検証後にdispatchし、確認済み成功時だけ除去する。存在または不正形はfile discardだけを停止し、registry処理は続ける。installerは解除せず、元フォルダーとWindowsゴミ箱の確認後の`migrate --apply --retry-legacy-discard`だけが、正規の空private gateを解除して再評価する。dry-runとif-neededにackを組み合わせない。
 
@@ -89,7 +95,7 @@ latest導入時に`capacityDefaultMigrationVersion`が欠落または1未満の�
 
 ## 不変条件と設計判断
 
-拒否された削除を別shell・別API・別exeへ付け替えない。ゴミ箱失敗時に永久削除せず、処理不明時は確認せず再送しない。保護領域・祖先・リンク先を通常削除で破壊しない。レジストリの完全ACL・raw bytes・transaction・非上書き復元を維持する。
+拒否された削除を別shell・別API・別exeへ付け替えない。明示的なサイズ超過以外のゴミ箱失敗時に永久削除せず、処理不明時は確認せず再送しない。保護領域・祖先・リンク先を通常削除で破壊しない。レジストリの完全ACL・raw bytes・transaction・非上書き復元を維持する。
 
 ## 導入と検証の境界
 

@@ -38,8 +38,10 @@ internal static class VolumeRecoveryStore
     {
         var location = Location(config, sourcePath);
         var restore = Location(config, sourcePath, restore: true);
+        var defaultRecovery = Location(config, sourcePath, useDefault: true);
         var defaultRestore = Location(config, sourcePath, useDefault: true, restore: true);
-        return [location.PrivateBase, location.Root, restore.PrivateBase, restore.Root, defaultRestore.PrivateBase, defaultRestore.Root];
+        return [location.PrivateBase, location.Root, restore.PrivateBase, restore.Root,
+            defaultRecovery.PrivateBase, defaultRecovery.Root, defaultRestore.PrivateBase, defaultRestore.Root];
     }
 
     // 明示移行のroot所有確認だけ。作成・ACL変更・子payloadや他StoreKeyの列挙は行わない。

@@ -27,11 +27,37 @@ public sealed partial class DeletionService
         if (path != PathPolicy.Absolute(path) || path.Length == 3 || PathPolicy.Within(path, config.BackupDirectory)
             || (directory && PathPolicy.Within(config.BackupDirectory, path)))
             throw new ArgumentException("Target is inside or contains the metadata recovery directory.");
+        // 他volumeの設定値も短縮名等を実体へ解決して保護する。不正・未検証なら削除しない。
         var protectedRoots = VolumeRecoveryStore.ProtectedRoots(config, path)
-            .Concat(config.VolumeRecoveryDirectories.Values.Select(PathPolicy.Absolute));
+            .Concat(config.VolumeRecoveryDirectories.SelectMany(ConfiguredRecoveryRoots));
         foreach (var root in protectedRoots)
             if (PathPolicy.Within(path, root) || (directory && PathPolicy.Within(root, path)))
                 throw new ArgumentException("Target is inside or contains a volume recovery directory.");
+    }
+
+    private static IEnumerable<string> ConfiguredRecoveryRoots(KeyValuePair<string, string> pair)
+    {
+        var expectedVolume = PathPolicy.Absolute(pair.Key);
+        foreach (var value in new[] { pair.Value, pair.Value + ".restore" })
+            yield return ResolveConfiguredRecoveryRoot(value, expectedVolume);
+    }
+
+    private static string ResolveConfiguredRecoveryRoot(string value, string expectedVolume)
+    {
+        string resolved;
+        string actualVolume;
+        try
+        {
+            resolved = PathPolicy.Resolve(value, finalDirectory: true, allowMissing: true);
+            actualVolume = NativeFiles.VolumeMountRoot(resolved);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or System.Security.SecurityException)
+        {
+            throw new InvalidDataException($"Configured recovery directory could not be validated: {value}. {ex.Message}", ex);
+        }
+        if (!actualVolume.Equals(expectedVolume, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"Configured recovery directory must remain on its configured volume: {value} (expected {expectedVolume}, actual {actualVolume}).");
+        return resolved;
     }
 
     private static MoveEntryIdentity? InspectMoveLocation(string path)

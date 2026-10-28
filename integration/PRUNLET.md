@@ -17,14 +17,15 @@ Codexの通常経路は、対象の絶対パスをそのままの文字列をUTF
 <installed-exe> --config <absolute-config> delete --recursive --paths-file <absolute-json-file>
 ```
 
-上のプレースホルダーは共通AGENTSに記録したパスと今回作成した実パスへ置き換える。CMDのtool callでは、たとえば `tools.exec_command({cmd: "<installed-exe> --config <absolute-config> delete --paths-file <absolute-json-file>", shell: "cmd.exe", login: false, sandbox_permissions: "require_escalated", justification: "許可された対象をWindowsのゴミ箱へ移すため、正式なsandbox権限を要求します。"})` として直接渡す。ファイル・フォルダーの復元はWindowsのゴミ箱で行う。`-- <literal-path>...`もCLIでは対応するが、CMDの引用が必要な対象には配列ファイルを使う。
+上のプレースホルダーは共通AGENTSに記録したパスと今回作成した実パスへ置き換える。CMDのtool callでは、たとえば `tools.exec_command({cmd: "<installed-exe> --config <absolute-config> delete --paths-file <absolute-json-file>", shell: "cmd.exe", login: false, sandbox_permissions: "require_escalated", justification: "許可された対象をPrunletで削除するため、正式なsandbox権限を要求します。"})` として直接渡す。ゴミ箱へ移った項目の復元はWindowsのゴミ箱で行う。`-- <literal-path>...`もCLIでは対応するが、CMDの引用が必要な対象には配列ファイルを使う。
 
 - 通常ファイルのMSIX転送・8.3短縮名・slash表記・拡張長のローカルドライブ表記に対応する。入力の実体を検証し、結果の`path`は実体パスを示す。
-- 範囲確認が必要なら、削除前に`--dry-run`で確認する。dry-runは通常sandboxでも行えるが、ゴミ箱への実移動は行わず、成功しても実処理に必要な権限を保証しない。CLIのJSON結果と終了コードを読み、各対象の`recycled`・`would_recycle`・`already_absent`・`failed`・`ambiguous`を判定する。`ambiguous`は成功扱いせず、同じ削除を再送しない。
-- ファイル・フォルダーの操作記録・操作IDは保存しない。復元はWindowsのゴミ箱で行い、Windows側で完全削除された項目は復元できない。復元先に既存項目がある場合は上書きせず、Windowsの画面で競合を確認する。
+- 範囲確認が必要なら、削除前に`--dry-run`で確認する。dry-runは通常sandboxでも行えるが、実処理に必要な権限と、対象がサイズ超過で永久削除されるかは予測しない。CLIのJSON結果と終了コードを読み、各対象の`recycled`・`permanently_deleted`・`would_recycle`・`already_absent`・`failed`・`ambiguous`を判定する。`ambiguous`は成功扱いせず、同じ削除を再送しない。
+- ファイル・フォルダーの操作記録・操作IDは保存しない。`recycled`項目はWindowsのゴミ箱で復元し、`permanently_deleted`の元の名前はゴミ箱から復元できない。復元先に既存項目がある場合は上書きせず、Windowsの画面で競合を確認する。
 - 削除対象フォルダーの事前登録・追加許可は不要。ユーザーが依頼した削除対象、または現在の作業で清掃が許可された一時ファイルを、保存場所を理由に追加確認せず処理する。
-- 空フォルダーは通常の`delete`、内容がある作業フォルダーは`delete --recursive`でフォルダー自体まで清掃する。MCPでは`recursive: true`を指定する。空の子フォルダーを含むツリーもWindowsのゴミ箱から復元する。
-- ファイル・フォルダーはWindowsのゴミ箱へ移す。Prunletは復元用の操作ID・PIDL・File IDや内容・ACLのsnapshotを保存しない。永久削除や独自領域へのfallbackは行わず、リンク先を辿らない。ハードリンクの別名とは実体を共有する。
+- 空フォルダーは通常の`delete`、内容がある作業フォルダーは`delete --recursive`でフォルダー自体まで清掃する。MCPでは`recursive: true`を指定する。`recycled`のツリーは空の子フォルダーも含めWindowsのゴミ箱から復元する。
+- ファイル・フォルダーは通常Windowsのゴミ箱へ移す。Windowsが対象を大きすぎると判定し、元の実体を再確認できた場合はその名前の永久削除を試み、完了を確認できたときだけ`permanently_deleted`を返す。サイズ超過以外では永久削除へ切り替えない。Prunletは復元用の操作ID・PIDL・File IDや内容・ACLのsnapshotを保存せず、リンク先を辿らない。ハードリンクの別名とは実体を共有する。
+- `permanently_deleted`は元の名前の結果であり、別ハードリンク・既存コピー・バックアップの消去を意味しない。Shell直前の名前差し替えで別実体がゴミ箱へ移った場合も`ambiguous`で停止する。
 - `maintain [--apply]`・`purge <operationId> [--apply]`はレジストリsnapshotだけを整理する。省略時は検査のみ。ファイル・フォルダーはWindowsの保持・清掃に任せる。ゴミ箱全体を空にしたり旧専用領域を手動削除したりしない。
 - インストール済みexeや設定そのものに空白・CMDの特殊文字を含む配置など、CLIの引数を正しく渡せないと実行前に分かる場合は、互換クライアント向けPrunlet MCPを最初から明示選択するか、必要な配置・入力を確認する。削除を試して拒否された後にMCPへ切り替えない。
 - ホスト・Prunlet・管理ポリシーに拒否された対象は、shell、MCP、別API、別exeで再試行しない。拒否理由と必要な判断を報告する。
@@ -50,4 +51,4 @@ exe・configは共通AGENTSのbindingへ置き換える。上のCMD例は空白�
 
 hookは限定した直接削除コマンドを検知して拒否する補助であり、shellを推測してコマンドを置換しない。外部スクリプト、動的コマンド、他言語のファイルAPIをすべて検出する保証はない。共通指示の読込みや将来すべての呼出しの遵守も、個別の実ホスト検証と区別する。
 
-SSHでMac等へ送るPowerShellスクリプトは、`exec_command`の` shell: "pwsh" `を明示し、単引用ヒアストリングへ格納する。フックは明示PowerShell文脈の文字列内の`rm`をローカル削除として扱わず、文字列の前後の削除は検査する。shell不明やSSHの存在だけで素通しにせず、展開型ヒアストリングの`$()`と不正な終端は拒否する。拒否された実削除をこの書き方へ付け替えて再送しない。
+Codexのフック入力には`exec_command`の実行shellが渡らず、`shell: "pwsh"`だけではMac等に送るヒアストリング内の`rm`を区別できない。ローカルPowerShellスクリプト全体をshellを起動せずUTF-16LE Base64へ変換し、単独の`pwsh -NoProfile -EncodedCommand <base64>`で渡す。先頭にASCIIコメント行を置いてGit Bashのパス変換を避ける。Prunletはこの形式を復号して限定検査し、ローカルの直接削除・不正入力・解析不能な展開等は拒否する。Base64は秘密を隠さない。裸のヒアストリングやSSHの存在だけでは素通しせず、拒否された実削除を別形式へ付け替えて再送しない。具体例と検査範囲はリポジトリの連携手順を参照する。

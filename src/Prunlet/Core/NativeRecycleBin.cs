@@ -10,9 +10,13 @@ namespace Prunlet.Core;
 // ごみ箱の実体・付随情報の変更はShellだけに任せる。
 internal static class NativeRecycleBin
 {
+    internal static event Action<string, string>? BeforeRecycleCheckpoint;
+    internal static event Action<string, string>? RecycleCreatedCheckpoint;
+
     private const int Abort = unchecked((int)0x80004004);
     private const int AlreadyExists = unchecked((int)0x80070050);
     private const int DontProcessChildren = 0x00270008;
+    private const int RecycleSizeTooBig = unchecked((int)0x80270037);
     private const uint FileSystemPath = 0x80058000;
 
     private static readonly Guid RecycleFolder = new("B7534046-3ECB-4C18-BE4E-64CD4CB7D6AC");
@@ -23,11 +27,18 @@ internal static class NativeRecycleBin
     private static readonly Guid TransferSourceId = new("00ADB003-BDE9-45C6-8E29-D09F9353E108");
 
     // 記録を作らずWindowsへ移動だけを委ねる。PIDLの保存・実体列挙・ACL snapshotは行わない。
-    internal static void RecycleUnrecorded(string sourcePath, Action<string> beforeDelete)
+    internal static void RecycleUnrecorded(string sourcePath, Action<string> beforeDelete, Action<string> verifyRecycled)
+        => _ = RecycleCore(sourcePath, beforeDelete, recognizeOversize: false, allowFolderProgress: false, verifyRecycled);
+
+    // 通常の削除だけがサイズ超過を判別する。旧データ移行は従来どおり失敗で停止する。
+    internal static bool RecycleDeleteTarget(string sourcePath, bool allowFolderProgress, Action<string> beforeDelete, Action<string> verifyRecycled)
+        => RecycleCore(sourcePath, beforeDelete, recognizeOversize: true, allowFolderProgress, verifyRecycled);
+
+    private static bool RecycleCore(string sourcePath, Action<string> beforeDelete, bool recognizeOversize, bool allowFolderProgress, Action<string>? verifyRecycled = null)
     {
         ArgumentNullException.ThrowIfNull(beforeDelete);
         sourcePath = PathPolicy.Absolute(sourcePath);
-        InSta(() =>
+        return InSta(() =>
         {
             var source = ShellItem(sourcePath);
             IShellItem? parent = null;
@@ -36,7 +47,7 @@ internal static class NativeRecycleBin
             ITransferSource? transfer = null;
             uint cookie = 0;
             var advised = false;
-            var sink = new TransferSink();
+            var sink = new TransferSink(sourcePath, allowFolderProgress);
             try
             {
                 RequireOk(source.GetParent(out parent), "Cannot resolve the source Shell parent");
@@ -46,10 +57,20 @@ internal static class NativeRecycleBin
                 RequireOk(transfer.Advise(sink, out cookie), "Cannot observe Shell recycling");
                 advised = true;
                 beforeDelete(PhysicalPath(source));
-                // 失敗・確認・再試行・昇格要求を永久削除等へ切り替えない。
+                BeforeRecycleCheckpoint?.Invoke("before-recycle", sourcePath);
                 var result = transfer.RecycleItem(source, bin, 0, out created);
+                // Shellがサイズ超過だけを返し、新項目や別原因の失敗がない場合に限る。
+                if (recognizeOversize && result == RecycleSizeTooBig && created is null && !sink.Uncertain)
+                    return false;
                 RequireCompletedTransfer(result, "Windows did not confirm recycling");
+                if (sink.HadFailure) throw new IOException("Windows reported a failure during recycling; completion is unknown.");
                 if (created is null) throw new IOException("Windows returned no recycled item; completion is unknown.");
+                if (verifyRecycled is not null)
+                {
+                    var recycledPath = PhysicalPath(created);
+                    RecycleCreatedCheckpoint?.Invoke(sourcePath, recycledPath);
+                    verifyRecycled(recycledPath);
+                }
 
                 return true;
             }
@@ -149,15 +170,37 @@ internal static class NativeRecycleBin
     }
 
     [ComVisible(true), ClassInterface(ClassInterfaceType.None)]
-    private sealed class TransferSink : ITransferAdviseSink
+    private sealed class TransferSink(string expectedPath, bool allowFolderProgress) : ITransferAdviseSink
     {
-        public int UpdateProgress(ulong currentBytes, ulong totalBytes, int currentFiles, int totalFiles, int currentFolders, int totalFolders) => 0;
+        internal bool Uncertain { get; private set; }
+        internal bool HadFailure { get; private set; }
+        public int UpdateProgress(ulong currentBytes, ulong totalBytes, int currentFiles, int totalFiles, int currentFolders, int totalFolders)
+        {
+            if (!allowFolderProgress && (currentBytes != 0 || currentFiles != 0 || currentFolders != 0)) Uncertain = true;
+            return 0;
+        }
         public int UpdateTransferState(uint state) => 0;
-        public int ConfirmOverwrite(IShellItem? source, IShellItem? destinationParent, string name) => AlreadyExists;
-        public int ConfirmEncryptionLoss(IShellItem? source) => Abort;
-        public int FileFailure(IShellItem? item, string? name, int error, IntPtr rename, uint renameLength) => error < 0 ? error : Abort;
-        public int SubStreamFailure(IShellItem? item, string name, int error) => error < 0 ? error : Abort;
-        public int PropertyFailure(IShellItem? item, IntPtr key, int error) => error < 0 ? error : Abort;
+        public int ConfirmOverwrite(IShellItem? source, IShellItem? destinationParent, string name) { HadFailure = Uncertain = true; return AlreadyExists; }
+        public int ConfirmEncryptionLoss(IShellItem? source) { HadFailure = Uncertain = true; return Abort; }
+        public int FileFailure(IShellItem? item, string? name, int error, IntPtr rename, uint renameLength)
+        {
+            HadFailure = true;
+            if (error != RecycleSizeTooBig || item is null) Uncertain = true;
+            else
+            {
+                try
+                {
+                    var itemPath = PhysicalPath(item);
+                    if (!itemPath.Equals(expectedPath, StringComparison.Ordinal))
+                        Uncertain = true;
+                    if (name is not null && !name.Equals(Path.GetFileName(itemPath), StringComparison.Ordinal)) Uncertain = true;
+                }
+                catch (Exception ex) when (ex is IOException or COMException or ArgumentException or UnauthorizedAccessException or System.Security.SecurityException) { Uncertain = true; }
+            }
+            return error < 0 ? error : Abort;
+        }
+        public int SubStreamFailure(IShellItem? item, string name, int error) { HadFailure = Uncertain = true; return error < 0 ? error : Abort; }
+        public int PropertyFailure(IShellItem? item, IntPtr key, int error) { HadFailure = Uncertain = true; return error < 0 ? error : Abort; }
     }
 
     [ComImport, Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
