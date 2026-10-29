@@ -464,6 +464,43 @@ internal static class HookRouter
                 {
                     var next = i + 1;
                     while (next < script.Length && char.IsWhiteSpace(script[next])) next++;
+                    if (next < script.Length && script[next] == '\'' && (i == 0 || script[i - 1] != '&'))
+                    {
+                        if (script.AsSpan(i + 1, next - i - 1).IndexOfAny('\r', '\n') >= 0)
+                            throw new InvalidDataException("EncodedCommand invocation target cannot cross a line boundary.");
+                        // 単引用の静的な呼出し先だけを復号し、通常のコマンド判定へ渡す。
+                        var target = new StringBuilder();
+                        var end = next + 1;
+                        for (; end < script.Length; end++)
+                        {
+                            var value = script[end];
+                            if (value is '\r' or '\n' || value is >= '\u2018' and <= '\u201E')
+                                throw new InvalidDataException("EncodedCommand invocation target cannot be inspected.");
+                            if (value != '\'') { target.Append(value); continue; }
+                            if (end + 1 < script.Length && script[end + 1] == '\'') { target.Append('\''); end++; continue; }
+                            break;
+                        }
+                        if (end == script.Length || target.Length == 0
+                            || (end + 1 < script.Length && !char.IsWhiteSpace(script[end + 1])
+                                && script[end + 1] is not (';' or '|' or '&')))
+                            throw new InvalidDataException("EncodedCommand invocation target must be a complete static literal.");
+                        // Windowsは末尾の空白やドットを除いて実行ファイルを解決する場合がある。
+                        if (char.IsWhiteSpace(target[0]) || char.IsWhiteSpace(target[^1]) || target[^1] == '.')
+                            throw new InvalidDataException("EncodedCommand invocation target has an ambiguous name.");
+                        // regのネイティブ引数構文は限定lexerでは安全に判定できない。
+                        if (CommandLeaf(target.ToString()).Equals("reg", StringComparison.OrdinalIgnoreCase))
+                            throw new InvalidDataException("EncodedCommand quoted reg invocation cannot be inspected.");
+                        if (text.Length > 0 || quoted)
+                        {
+                            yield return new ShellToken(text.ToString(), false, quoted, quoteStart, quoteKind, substitutionBackticks, quotedSubexpression, cmdEqualityIndex, cmdQuotedAfterEquality);
+                            text.Clear(); quoted = false; quoteStart = -1; quoteKind = '\0'; substitutionBackticks = 0; quotedSubexpression = false;
+                            cmdEqualityIndex = -1; cmdPreviousEqual = false; cmdQuotedAfterEquality = false;
+                        }
+                        yield return new ShellToken("", true, false);
+                        yield return new ShellToken(target.ToString(), false, false);
+                        i = end;
+                        continue;
+                    }
                     if (next < script.Length && script[next] is '(' or '$' or '@' or '{' or '\'' or '"' or '\u0060')
                         throw new InvalidDataException("EncodedCommand dynamic invocation cannot be inspected.");
                 }
@@ -539,7 +576,10 @@ internal static class HookRouter
             else AppendUnquoted(c);
         }
         if (strictEncoded && quote != '\0') throw new InvalidDataException("EncodedCommand has an unterminated string.");
-        if (text.Length > 0 || quoted) yield return new ShellToken(text.ToString(), false, quoted, quoteStart, quoteKind, substitutionBackticks, quotedSubexpression, cmdEqualityIndex, cmdQuotedAfterEquality);
+        if (text.Length > 0 || quoted)
+        {
+            yield return new ShellToken(text.ToString(), false, quoted, quoteStart, quoteKind, substitutionBackticks, quotedSubexpression, cmdEqualityIndex, cmdQuotedAfterEquality);
+        }
     }
 
     private static string ReadPowerShellHereString(string script, ref int position, char quote)

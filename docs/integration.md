@@ -90,7 +90,7 @@ Codexの`exec_command`はフックへ`Bash`とコマンド文字列を渡し、�
 Mac等へ送るシェルスクリプトを単引用ヒアストリングに入れた**ローカルPowerShellスクリプト全体**は、shellを起動せずにUTF-16LE Base64へ変換し、単独の`pwsh -NoProfile -EncodedCommand <base64>`として渡します。たとえばCodexのJavaScript実行環境では次の形です。`script`は実際に使うローカルPowerShellスクリプトへ置き換えます。
 
 ```javascript
-const script = "# Prunlet\n" + "$remote = @'\nprintf 'hello from Mac\\n'\n'@\nWrite-Output $remote";
+const script = "# Prunlet\n" + "$remote = @'\nprintf 'hello from Mac\\n'\n'@\n& 'C:\\Program Files\\Git\\usr\\bin\\ssh.exe' mac $remote";
 const bytes = new Uint8Array(script.length * 2);
 for (let i = 0; i < script.length; i++) {
   const unit = script.charCodeAt(i);
@@ -102,7 +102,7 @@ const result = await tools.exec_command({ cmd: `pwsh -NoProfile -EncodedCommand 
 text(result.output);
 ```
 
-先頭のASCIIコメントはGit Bashによる先頭スラッシュのパス変換を避けます。Base64は暗号化ではないため、秘密をコマンドやログへ埋め込まないでください。フックはこの単独・無引用の形式だけを厳密に復号し、PowerShellの文字列とローカルの直接削除を検査します。認識した省略形やwrapper、動的な引数、追加コマンド、不正なBase64・UTF-16は拒否します。復号本文の未対応構文（展開文字列の`$()`、ブロックコメント、ハッシュ表、スマート引用符、Unicode escape、動的または引用した名前の呼び出し、別shellや`Start-Process`による起動など）も安全側に拒否します。単引用ヒアストリング内の文字はデータです。未認識の外部wrapper・動的生成・外部スクリプト・他言語APIを含むすべての削除を検出する保証はありません。
+先頭のASCIIコメントはGit Bashによる先頭スラッシュのパス変換を避けます。Base64は暗号化ではないため、秘密をコマンドやログへ埋め込まないでください。フックはこの単独・無引用の形式だけを厳密に復号し、PowerShellの文字列とローカルの直接削除を検査します。認識した省略形やwrapper、動的な引数、追加コマンド、不正なBase64・UTF-16は拒否します。復号本文では、`& 'C:\Program Files\Git\usr\bin\ssh.exe'`のような完全な単引用リテラルの実行名も検査します。同じ構文でのローカル削除、`reg`、別shellや`Start-Process`の呼び出しは拒否します。引用した`reg`は動的な動詞やネイティブ引数の解釈を保証できないため、照会も含めて従来どおり拒否します。SSHへの単引用文字列・単引用ヒアストリングの引数はデータとして扱い、その前後のローカルコマンドは引き続き検査します。未対応構文（展開文字列の`$()`、ブロックコメント、ハッシュ表、スマート引用符、Unicode escape、変数・式・部分引用を使う動的な実行名、末尾に空白やドットのある実行名など）は安全側に拒否します。shell不明の元コマンドをSSH名だけで許可する例外はありません。未認識の外部wrapper・動的生成・外部スクリプト・他言語APIを含むすべての削除を検出する保証はありません。
 
 登録するWindows hookコマンドは`<Systemのcmd.exe絶対パス> /d /c call "<exe>" --config "<config>" hook`です。Codexは環境の既定シェルをフックへ引き継ぐため、CMDを明示して`call`をCMD内で実行します。登録パスにCMD再展開文字やPowerShellの展開文字（ドル記号・バッククォート）が含まれる場合は、書込み前に自動登録を拒否します。旧`--hook-script <script>`は互換引数として受理するだけで、PowerShell backendを起動しません。更新で配置済み旧backendを退役させる際は、製品バックアップを保全してCoreによるWindowsゴミ箱への削除を使います。
 
