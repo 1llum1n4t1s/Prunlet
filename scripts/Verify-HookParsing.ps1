@@ -65,8 +65,34 @@ $cases = @(
     @{ name='file-remove-item'; command='Remove-Item -LiteralPath "<FILE>"'; shell='pwsh'; pass=$false },
     @{ name='powershell-escape'; command='Remove`-Item -LiteralPath "<FILE>"'; shell='pwsh'; pass=$false },
     @{ name='cmd-escape'; command='d^el "<FILE>"'; shell='cmd.exe'; pass=$false },
-    @{ name='posix-escape'; command='r\m -- "<FILE>"'; shell='bash'; pass=$false }
+    @{ name='posix-escape'; command='r\m -- "<FILE>"'; shell='bash'; pass=$false },
+    @{ name='cmd-hash-before-delete'; command='echo # note & del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-hash-without-delete'; command='echo # note'; shell='cmd.exe'; pass=$true },
+    @{ name='powershell-hash-comment'; command='Write-Output ok # note & Remove-Item -LiteralPath "<FILE>"'; shell='pwsh'; pass=$true; bashPass=$false },
+    @{ name='cmd-if-equal'; command='if 1==1 del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-equal-spaced'; command='if 1 == 1 del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-equal-right-spaced'; command='if 1== 1 del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-equal-left-spaced'; command='if 1 ==1 del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-empty-quoted'; command='if ""=="" del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-quoted-operands'; command='if "a==b" == "a==b" del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-quoted-keyword'; command='if "exist" == "exist" del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-escaped-equals'; command='if 1=^=1 del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-exist'; command='if exist "<FILE>" del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-defined'; command='if defined TEMP del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-errorlevel'; command='if not errorlevel 1 del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-cmdextversion'; command='if cmdextversion 1 del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-registry'; command='if /i not a EQU b reg delete HKCU\Software\PrunletHookProbe /f'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-wrapper'; command='cmd /c "if 1==1 del <FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-wrapper-quoted'; command='cmd /c if "a==b"=="a==b" del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-wrapper-empty'; command='cmd /c if ""=="" del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-wrapper-quoted-data'; command='cmd /c if "del"=="del" echo safe'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-if-wrapper-pwsh'; command='cmd /c if "x"=="x" del "<FILE>"'; shell='pwsh'; pass=$false },
+    @{ name='cmd-if-wrapper-pwsh-data'; command='cmd /c if "del"=="del" echo safe'; shell='pwsh'; pass=$true },
+    @{ name='cmd-if-quoted-data'; command='if "del" == "del" echo safe'; shell='cmd.exe'; pass=$true }
 )
+foreach ($operator in @('EQU', 'NEQ', 'LSS', 'LEQ', 'GTR', 'GEQ')) {
+    $cases += @{ name="cmd-if-$operator"; command="if 1 $operator 1 del <FILE>"; shell='cmd.exe'; pass=$false }
+}
 
 # 実ホストの Bash 入力では shell がない。対象文字列は UTF-16LE にして hook へ渡すだけで、実行しない。
 function ConvertTo-EncodedHookCommand([string]$scriptText) {

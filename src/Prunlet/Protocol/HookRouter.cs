@@ -14,6 +14,10 @@ internal static class HookRouter
     {
         "Remove-Item", "ri", "rm", "rmdir", "rd", "del", "erase", "Remove-ItemProperty", "rp"
     };
+    private static readonly HashSet<string> CmdComparisonOperators = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "equ", "neq", "lss", "leq", "gtr", "geq"
+    };
 
     // 旧登録の --hook-script は受理するが、外部コードとして読み取ったり実行したりしない。
     internal static async Task<int> RunAsync(string configPath, string? legacyHookScript = null, string? commandExecutable = null)
@@ -147,12 +151,9 @@ internal static class HookRouter
             var condition = index + 1;
             if (condition < words.Count && words[condition].Text.Equals("/i", StringComparison.OrdinalIgnoreCase)) condition++;
             if (condition < words.Count && words[condition].Text.Equals("not", StringComparison.OrdinalIgnoreCase)) condition++;
-            if (condition + 2 >= words.Count) return false;
-            var kind = words[condition].Text;
-            if (!kind.Equals("exist", StringComparison.OrdinalIgnoreCase)
-                && !kind.Equals("defined", StringComparison.OrdinalIgnoreCase)
-                && !kind.Equals("errorlevel", StringComparison.OrdinalIgnoreCase)) return false;
-            return IsDeletionCommand(words.GetRange(condition + 2, words.Count - condition - 2), depth + 1, strictEncoded);
+            var commandIndex = CmdIfCommandIndex(words, condition);
+            return commandIndex is int start
+                && IsDeletionCommand(words.GetRange(start, words.Count - start), depth + 1, strictEncoded);
         }
         if (!IsShellWrapper(name)) return false;
         var isPowerShell = WindowsShellMode(name) == EscapeMode.PowerShell;
@@ -167,11 +168,35 @@ internal static class HookRouter
             if (i + 1 >= words.Count) return false;
             var body = words.Count == i + 2 && words[i + 1].Quoted
                 ? words[i + 1].Text
-                : string.Join(" ", words.Skip(i + 1).Select(QuoteToken));
+                : string.Join(" ", words.Skip(i + 1).Select(token => QuoteToken(token, WindowsShellMode(name) == EscapeMode.Cmd)));
             return ContainsDirectDeletion(body, depth + 1, WindowsShellMode(name), strictEncoded);
         }
         // -Fileや外部scriptの内容、動的な名前、他言語のコードは検査しない。
         return false;
+    }
+
+    private static int? CmdIfCommandIndex(List<ShellToken> words, int condition)
+    {
+        if (condition + 2 >= words.Count) return null;
+        var kind = words[condition].Text;
+        if (!words[condition].Quoted && (kind.Equals("exist", StringComparison.OrdinalIgnoreCase)
+            || kind.Equals("defined", StringComparison.OrdinalIgnoreCase)
+            || kind.Equals("errorlevel", StringComparison.OrdinalIgnoreCase)
+            || kind.Equals("cmdextversion", StringComparison.OrdinalIgnoreCase))) return condition + 2;
+
+        var comparison = condition;
+        if (words[comparison].CmdEqualityIndex < 0)
+        {
+            comparison++;
+            if (CmdComparisonOperators.Contains(words[comparison].Text))
+                return condition + 3 < words.Count ? condition + 3 : null;
+            if (words[comparison].CmdEqualityIndex != 0) return null;
+        }
+        var token = words[comparison];
+        // ==の右側が同じtoken内にあるか、空の引用文字列かを区別する。
+        var hasRight = token.CmdEqualityIndex + 2 < token.Text.Length || token.CmdQuotedAfterEquality;
+        var start = comparison + (hasRight ? 1 : 2);
+        return start < words.Count ? start : null;
     }
 
     private static bool ContainsNoncanonicalEncodedInvocation(List<ShellToken> words, int depth)
@@ -361,8 +386,20 @@ internal static class HookRouter
             || name.Equals("commandwithargs", StringComparison.OrdinalIgnoreCase));
     }
 
-    private static string QuoteToken(ShellToken token) => token.Quoted
-        ? "\"" + token.Text.Replace("\"", "\"\"") + "\"" : token.Text;
+    private static string QuoteToken(ShellToken token, bool cmdWrapper)
+    {
+        static string Quote(string value) => "\"" + value.Replace("\"", "\"\"") + "\"";
+        if (cmdWrapper && token.Quoted && token.CmdEqualityIndex >= 0)
+        {
+            // 部分引用されたIF比較を再引用する際、演算子を引用内に移さない。
+            var left = token.Text[..token.CmdEqualityIndex];
+            var right = token.Text[(token.CmdEqualityIndex + 2)..];
+            var hasLeft = left.Length != 0 || token.QuoteStart == 0;
+            var hasRight = right.Length != 0 || token.CmdQuotedAfterEquality;
+            return (hasLeft ? Quote(left) : "") + "==" + (hasRight ? Quote(right) : "");
+        }
+        return token.Quoted ? Quote(token.Text) : token.Text;
+    }
 
     private static string CommandLeaf(string value)
     {
@@ -391,6 +428,19 @@ internal static class HookRouter
         char quote = '\0';
         var substitutionBackticks = 0;
         var quotedSubexpression = false;
+        var cmdEqualityIndex = -1;
+        var cmdPreviousEqual = false;
+        var cmdQuotedAfterEquality = false;
+        void AppendUnquoted(char value)
+        {
+            if (value == '=')
+            {
+                if (cmdPreviousEqual && cmdEqualityIndex < 0) cmdEqualityIndex = text.Length - 1;
+                cmdPreviousEqual = true;
+            }
+            else cmdPreviousEqual = false;
+            text.Append(value);
+        }
         for (var i = 0; i < script.Length; i++)
         {
             var c = script[i];
@@ -451,7 +501,7 @@ internal static class HookRouter
             {
                 c = script[++i];
                 if (c is '\r' or '\n') { if (c == '\r' && i + 1 < script.Length && script[i + 1] == '\n') i++; }
-                else text.Append(c);
+                else AppendUnquoted(c);
                 continue;
             }
             if (mode == EscapeMode.PowerShell && c == '@' && i + 1 < script.Length && script[i + 1] is '\'' or '"')
@@ -466,9 +516,11 @@ internal static class HookRouter
             if (c == '"' || (c == '\'' && mode != EscapeMode.Cmd))
             {
                 if (quoteStart < 0) { quoteStart = text.Length; quoteKind = c; }
+                if (cmdEqualityIndex >= 0) cmdQuotedAfterEquality = true;
+                cmdPreviousEqual = false;
                 quote = c; quoted = true; continue;
             }
-            if (c == '#' && text.Length == 0)
+            if (mode != EscapeMode.Cmd && c == '#' && text.Length == 0)
             {
                 while (i < script.Length && script[i] is not ('\r' or '\n')) i++;
                 c = '\n';
@@ -478,15 +530,16 @@ internal static class HookRouter
             {
                 if (text.Length > 0 || quoted)
                 {
-                    yield return new ShellToken(text.ToString(), false, quoted, quoteStart, quoteKind, substitutionBackticks, quotedSubexpression);
+                    yield return new ShellToken(text.ToString(), false, quoted, quoteStart, quoteKind, substitutionBackticks, quotedSubexpression, cmdEqualityIndex, cmdQuotedAfterEquality);
                     text.Clear(); quoted = false; quoteStart = -1; quoteKind = '\0'; substitutionBackticks = 0; quotedSubexpression = false;
+                    cmdEqualityIndex = -1; cmdPreviousEqual = false; cmdQuotedAfterEquality = false;
                 }
                 if (boundary) yield return new ShellToken("", true, false);
             }
-            else text.Append(c);
+            else AppendUnquoted(c);
         }
         if (strictEncoded && quote != '\0') throw new InvalidDataException("EncodedCommand has an unterminated string.");
-        if (text.Length > 0 || quoted) yield return new ShellToken(text.ToString(), false, quoted, quoteStart, quoteKind, substitutionBackticks, quotedSubexpression);
+        if (text.Length > 0 || quoted) yield return new ShellToken(text.ToString(), false, quoted, quoteStart, quoteKind, substitutionBackticks, quotedSubexpression, cmdEqualityIndex, cmdQuotedAfterEquality);
     }
 
     private static string ReadPowerShellHereString(string script, ref int position, char quote)
@@ -520,7 +573,7 @@ internal static class HookRouter
         throw new InvalidDataException("PowerShell here-string has no valid closing marker.");
     }
 
-    private readonly record struct ShellToken(string Text, bool Boundary, bool Quoted, int QuoteStart = -1, char QuoteKind = '\0', int CommandSubstitutionBackticks = 0, bool QuotedSubexpression = false);
+    private readonly record struct ShellToken(string Text, bool Boundary, bool Quoted, int QuoteStart = -1, char QuoteKind = '\0', int CommandSubstitutionBackticks = 0, bool QuotedSubexpression = false, int CmdEqualityIndex = -1, bool CmdQuotedAfterEquality = false);
 
     private static int Pass() { Console.WriteLine("{}"); return 0; }
 

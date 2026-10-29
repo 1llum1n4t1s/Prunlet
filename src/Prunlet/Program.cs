@@ -256,7 +256,7 @@ internal static class Program
         catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
         {
             // MCP起動前のエラーもプロトコルstdoutへ混ぜない。
-            if (args.Contains("mcp", StringComparer.Ordinal)) Console.Error.WriteLine(ex.Message);
+            if (args is ["--config", _, "mcp", ..]) Console.Error.WriteLine(ex.Message);
             else Write(new { error = ex.Message, type = ex.GetType().Name });
             return 1;
         }
