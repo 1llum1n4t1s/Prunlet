@@ -39,6 +39,7 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 - 並行・待機: 同一対象・親子・共有ハードリンクの排他、全preflight失敗時保全、process worker上限、入力順を確認する。60秒超ロック待機と解放後続行、CLI stderr/stdout、MCP token付き進捗と最終応答後抑止、EOF後完了を確認する。
 - レジストリ: `scripts/Verify-RegistryRecovery.ps1`と、native sessionの`Verify-RegistrySession.ps1`のPrepare・Start（`-AssertNativeWindows`）・Current・Runを使う。完全ACL/raw bytes・競合・transaction・snapshot保全・専用namespace/予算を確認する。同じexeのcurrent側6801拒否保全と明示native側CLI/MCP正常往復、実token・view/scopeを区別し、権限・KTM・viewの未検証を成功に数えない。
 - 導入: installer・共通指示・登録解除変更では`scripts/Verify-LatestInstall.ps1`を実行する。fixtureと実GitHub、保存内容と実ホストhook読込・承認・guide遵守を区別する。移行開始後の失敗で旧binaryへrollbackせず新exe/設定/登録を保全し、同じCLIで再開できることを確認する。
+- 起動時更新: `integration/start-prunlet-mcp.ps1`・`src/Prunlet/Core/StartupUpdate*`・公開ZIPの生成や登録を変更した場合は、[導入検証](docs/verification.md#latestインストーラー)の起動時更新の範囲も確認する。公開と同じZIPによる複数回更新、使用中の延期、独立hook、途中再開、登録改変の保全、ADSを含む容量上限を検証し、通常の導入検証だけで代替しない。
 
 ゴミ箱全体の空化・既存項目の清掃を行わず、今回fixtureだけを扱う。検証後の保持・清掃は[検証手順](docs/verification.md#検証後の保持と清掃)に従い、未清掃パス・理由・再開条件を返す。
 
@@ -49,5 +50,7 @@ Dependabotと依存検証・自動マージのworkflowを変更する場合は�
 対外表記ではREADME冒頭の副題を併記する。今後のX告知では本文と紹介画像に同じ副題を毎回含め、GitHubの説明欄も同じ表記に揃える。X告知本文には、README冒頭に沿った紹介文を毎回1文入れる。その紹介文には、`blocked by policy`による清掃の停止を減らす目的と、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約する使い方を含める。
 
 利用者向け導入は`scripts/Install-Prunlet.ps1`でGitHubの既定ブランチ最新HEADを解決する。開発クローンやローカルビルドをlatest導入の代用にしない。インストール元のリポジトリ・取得ブランチ・コミットは`source-info.json`へ記録する。既存設定は[容量上限の一度だけの移行](DESIGN.md#容量上限の一度だけの移行)を除いて保持する。旧復元データはCoreの明示`migrate`で移行し、通常APIから変更しない。設定読込・dry-runへ暗黙の適用を持ち込まず、移行済み印と移行後の利用者変更を尊重する。導入検証では、旧容量からの移行、未知の設定とACLの保持、再更新時の冪等性、ロック・登録失敗時の原本保全と復旧も確認する。
+
+MCP起動時の自動更新は手動導入とは別の経路である。[更新の設計](DESIGN.md#起動時自動更新)に従い、更新状態・製品排他・配布検証・容量検査を迂回しない。配布物は`scripts/Package-PrunletUpdate.ps1`で生成し、公開タグから生成するrelease workflowとの形式の一致を維持する。
 
 依存追加、公開、バージョン変更、Gitのコミット・プッシュは今回の依頼に含まれる場合だけ行う。コードコメントは日本語。[README](README.md)は利用者向け、[DESIGN.md](DESIGN.md)は現在の設計、連携と検証の詳細は`docs/`、エージェントの作業規約は本ファイルに置き、同じ説明を複製せず参照する。
