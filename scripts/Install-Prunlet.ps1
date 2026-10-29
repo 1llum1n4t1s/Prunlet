@@ -12,7 +12,8 @@ param(
     [switch]$RegisterCodex,
     [switch]$RegisterAgentInstructions,
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
-    [string]$SettingsBackupDirectory
+    [string]$SettingsBackupDirectory,
+    [switch]$PrepareStartupUpdate
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -90,14 +91,17 @@ function Expand-CheckedArchive([string]$Archive, [string]$Destination) {
         $rootName = @($roots)[0]
         $root = Join-Path $Destination $rootName
         if (!(Test-Path -LiteralPath $root -PathType Container)) { throw 'Source archive root is not a directory.' }
-        foreach ($required in @('src\Prunlet\Prunlet.csproj', 'scripts\Publish-Prunlet.ps1', 'integration\configuration-common.ps1', 'integration\maintenance-task.ps1', 'integration\uninstall-maintenance.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1', 'integration\install-agent-instructions.ps1', 'integration\PRUNLET.md')) {
+        foreach ($required in @('src\Prunlet\Prunlet.csproj', 'scripts\Install-Prunlet.ps1', 'scripts\Publish-Prunlet.ps1', 'integration\start-prunlet-mcp.ps1', 'integration\configuration-common.ps1', 'integration\maintenance-task.ps1', 'integration\uninstall-maintenance.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1', 'integration\install-agent-instructions.ps1', 'integration\PRUNLET.md')) {
             if (!(Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Latest source is not installable; required file missing: $required. Publish the source to the repository default branch first." }
         }
         return $root
     } finally { $zip.Dispose() }
 }
 
+
+
 if (!$IsWindows) { throw 'Prunlet installation requires Windows and PowerShell 7.' }
+if ($PrepareStartupUpdate) { throw 'Source-build startup preparation is no longer supported. Use the registered MCP startup entry to verify and prepare a published release package.' }
 if ($RegisterAgentInstructions -and !$RegisterCodex) { throw 'RegisterAgentInstructions requires explicit -RegisterCodex.' }
 if ($Repository -cnotmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$') { throw 'Repository must be a GitHub owner/repository name.' }
 $nativeArchitecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
@@ -109,13 +113,19 @@ if ($env:CODEX_HOME) { $ForbiddenRoots += Assert-PlainPath $env:CODEX_HOME 'CODE
 $scriptParent = Split-Path -Parent $PSScriptRoot
 if (Test-Path -LiteralPath (Join-Path $scriptParent 'src\Prunlet\Prunlet.csproj')) { $ForbiddenRoots += $scriptParent }
 $InstallDirectory = Assert-ExternalPath $InstallDirectory 'InstallDirectory'
-if (!$WorkDirectory) { $WorkDirectory = Join-Path ([IO.Path]::GetTempPath()) "Codex\Prunlet\$runId" }
+
+if (!$WorkDirectory) {
+    $WorkDirectory = Join-Path ([IO.Path]::GetTempPath()) "Codex\Prunlet\$runId"
+}
 $WorkDirectory = Assert-ExternalPath $WorkDirectory 'WorkDirectory'
-if ((Test-InTree $WorkDirectory $InstallDirectory) -or (Test-InTree $InstallDirectory $WorkDirectory)) { throw 'WorkDirectory and InstallDirectory must be separate trees.' }
+if ((Test-InTree $WorkDirectory $InstallDirectory) -or (Test-InTree $InstallDirectory $WorkDirectory)) {
+    throw 'WorkDirectory and InstallDirectory must be separate trees.'
+}
 if (Test-Path -LiteralPath $WorkDirectory) { throw 'WorkDirectory must be a new directory owned by this installation.' }
 if (Test-Path -LiteralPath $InstallDirectory -PathType Leaf) { throw 'InstallDirectory is a file.' }
 $configPath = Join-Path $InstallDirectory 'config.json'
 $existingConfig = Test-Path -LiteralPath $configPath -PathType Leaf
+
 if (!$BackupDirectory) { $BackupDirectory = Join-Path $InstallDirectory 'recovery' }
 $BackupDirectory = Assert-ExternalPath $BackupDirectory 'BackupDirectory'
 if ($existingConfig) {
@@ -132,7 +142,7 @@ if ($RegisterCodex -and $SettingsBackupDirectory) { $SettingsBackupDirectory = A
 if (!(Get-Command dotnet -ErrorAction SilentlyContinue)) { throw '.NET 10 SDK is required. Install the SDK and run this installer again.' }
 $sdks = @(& dotnet --list-sdks)
 if ($LASTEXITCODE -ne 0 -or !($sdks | Where-Object { $_ -match '^10\.' })) { throw '.NET 10 SDK is required; an installed runtime alone cannot build latest source.' }
-$products = @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\configuration-common.ps1', 'bin\maintenance-task.ps1', 'bin\uninstall-maintenance.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
+$products = @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\prunlet-hook.exe', 'bin\Install-Prunlet.ps1', 'bin\start-prunlet-mcp.ps1', 'bin\configuration-common.ps1', 'bin\maintenance-task.ps1', 'bin\uninstall-maintenance.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
 $retiredProducts = @('bin\codex-pretooluse.ps1')
 $previousGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
 $previousGuideSha256 = if (Test-Path -LiteralPath $previousGuidePath -PathType Leaf) { (Get-FileHash -LiteralPath $previousGuidePath -Algorithm SHA256).Hash } else { $null }
@@ -143,7 +153,9 @@ foreach ($relative in @($products + $retiredProducts)) {
 }
 $headers = @{ 'User-Agent' = 'Prunlet-Latest-Installer'; 'Accept' = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
 $mutexKey = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($InstallDirectory.ToLowerInvariant())))
+$globalInstallationMutex = [Threading.Mutex]::new($false, ('Global\Prunlet-Install-' + $mutexKey))
 $installationMutex = [Threading.Mutex]::new($false, ('Local\Prunlet-Install-' + $mutexKey))
+$globalMutexAcquired = $false
 $mutexAcquired = $false
 $createdWork = $false
 $changed = [Collections.Generic.List[string]]::new()
@@ -160,16 +172,20 @@ $storageMigrationStarted = $false
 $storageMigration = $null
 $migrationJson = $null
 try {
+    try { $globalMutexAcquired = $globalInstallationMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $globalMutexAcquired = $true }
+    if (!$globalMutexAcquired) { throw 'Another Prunlet installation is already running for this directory.' }
     try { $mutexAcquired = $installationMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $mutexAcquired = $true }
     if (!$mutexAcquired) { throw 'Another Prunlet installation is already running for this directory.' }
-    New-Item -ItemType Directory -Path $WorkDirectory | Out-Null
-    $createdWork = $true
     $metadata = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository" -Headers $headers -TimeoutSec 60
     $branch = [string]$metadata.default_branch
     if (!$branch) { throw 'GitHub did not return a default branch.' }
     $head = Invoke-RestMethod -Uri ("https://api.github.com/repos/$Repository/commits/" + [Uri]::EscapeDataString($branch)) -Headers $headers -TimeoutSec 60
     $sha = [string]$head.sha
     if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw 'GitHub did not return a valid commit SHA.' }
+
+
+    New-Item -ItemType Directory -Path $WorkDirectory | Out-Null
+    $createdWork = $true
     $downloadUrl = "https://codeload.github.com/$Repository/zip/$sha"
     $archive = Join-Path $WorkDirectory 'source.zip'
     Invoke-WebRequest -Uri $downloadUrl -Headers @{ 'User-Agent' = 'Prunlet-Latest-Installer' } -OutFile $archive -TimeoutSec 120 | Out-Null
@@ -188,6 +204,8 @@ try {
     if (!(Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Build did not produce prunlet.exe.' }
     $maintenanceExe = Join-Path $buildRoot 'publish\prunlet-maintenance.exe'
     if (!(Test-Path -LiteralPath $maintenanceExe -PathType Leaf)) { throw 'Build did not produce prunlet-maintenance.exe.' }
+    $hookExe = Join-Path $buildRoot 'publish\prunlet-hook.exe'
+    if (!(Test-Path -LiteralPath $hookExe -PathType Leaf)) { throw 'Build did not produce prunlet-hook.exe.' }
     # 初期設定も外部作業場所で検証する。既存設定の移行は配置後に行う。
     $newConfig = Join-Path $WorkDirectory 'config.json'
     if (!$existingConfig) {
@@ -201,8 +219,14 @@ try {
         & $exe --config $configPath validate-config | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'Prunlet rejected the existing configuration; it was preserved.' }
     }
-    $provenance = [ordered]@{ repository = $Repository; defaultBranch = $branch; commitSha = $sha; downloadUrl = $downloadUrl; archiveSha256 = $archiveHash; executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; maintenanceExecutableSha256 = (Get-FileHash -LiteralPath $maintenanceExe -Algorithm SHA256).Hash; installedUtc = [DateTimeOffset]::UtcNow.ToString('o'); runtime = $Runtime }
+    $auxiliaryHashes = [ordered]@{}
+    foreach ($relative in $products | Where-Object { $_ -notin @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\prunlet-hook.exe', 'source-info.json') }) {
+        $source = if ($relative -eq 'bin\Install-Prunlet.ps1') { Join-Path $sourceRoot 'scripts\Install-Prunlet.ps1' } else { Join-Path $sourceRoot ('integration\' + [IO.Path]::GetFileName($relative)) }
+        $auxiliaryHashes[$relative] = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+    }
+    $provenance = [ordered]@{ repository = $Repository; defaultBranch = $branch; commitSha = $sha; downloadUrl = $downloadUrl; archiveSha256 = $archiveHash; executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; maintenanceExecutableSha256 = (Get-FileHash -LiteralPath $maintenanceExe -Algorithm SHA256).Hash; hookExecutableSha256 = (Get-FileHash -LiteralPath $hookExe -Algorithm SHA256).Hash; auxiliarySha256 = $auxiliaryHashes; installedUtc = [DateTimeOffset]::UtcNow.ToString('o'); runtime = $Runtime }
     $provenance | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $WorkDirectory 'source-info.json') -Encoding utf8NoBOM
+
     # 製品ファイルと設定原本を保全する。復元領域の移行は更新の最後にCoreへ委ねる。
     foreach ($relative in @($products + $retiredProducts)) {
         $target = Join-Path $InstallDirectory $relative
@@ -220,7 +244,7 @@ try {
     }
     New-TrackedDirectory (Join-Path $InstallDirectory 'bin')
     foreach ($relative in $products) {
-        $inputPath = if ($relative -in @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe')) { Join-Path (Join-Path $buildRoot 'publish') ([IO.Path]::GetFileName($relative)) } elseif ($relative -eq 'source-info.json') { Join-Path $WorkDirectory $relative } else { Join-Path $sourceRoot ('integration\' + [IO.Path]::GetFileName($relative)) }
+        $inputPath = if ($relative -in @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\prunlet-hook.exe')) { Join-Path (Join-Path $buildRoot 'publish') ([IO.Path]::GetFileName($relative)) } elseif ($relative -eq 'source-info.json') { Join-Path $WorkDirectory $relative } elseif ($relative -eq 'bin\Install-Prunlet.ps1') { Join-Path $sourceRoot 'scripts\Install-Prunlet.ps1' } else { Join-Path $sourceRoot ('integration\' + [IO.Path]::GetFileName($relative)) }
         $target = Join-Path $InstallDirectory $relative
         [void]$changed.Add($relative)
         Copy-Item -LiteralPath $inputPath -Destination $target -Force
@@ -403,4 +427,6 @@ try {
     }
     if ($mutexAcquired) { $installationMutex.ReleaseMutex() }
     $installationMutex.Dispose()
+    if ($globalMutexAcquired) { $globalInstallationMutex.ReleaseMutex() }
+    $globalInstallationMutex.Dispose()
 }

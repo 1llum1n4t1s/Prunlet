@@ -3,11 +3,13 @@ param(
     [Parameter(Mandatory)][string]$ConfigPath,
     [string]$HookPath,
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
-    [string]$BackupDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\integration-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')))
+    [string]$BackupDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\integration-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))),
+    [switch]$ValidateOnly,
+    [switch]$StartupUpdate
 )
 . (Join-Path $PSScriptRoot 'configuration-common.ps1')
 $CodexHome = Resolve-Absolute $CodexHome 'CodexHome'
-$BackupDirectory = Assert-ExternalBackup $BackupDirectory $CodexHome
+$BackupDirectory = Assert-ExternalBackup $BackupDirectory $CodexHome -AllowStartupStage:$StartupUpdate
 foreach ($pair in @(@($ExecutablePath, 'ExecutablePath'), @($ConfigPath, 'ConfigPath'))) {
     $resolved = Resolve-Absolute $pair[0] $pair[1]
     if (!(Test-Path -LiteralPath $resolved -PathType Leaf)) { throw ($pair[1] + ' does not exist.') }
@@ -20,7 +22,10 @@ if ($prunletConfig.schema -ne 1 -or !$prunletConfig.backupDirectory) { throw 'In
 $hooksPath = Join-Path $CodexHome 'hooks.json'
 $tomlPath = Join-Path $CodexHome 'config.toml'
 $hooks = Read-Hooks $hooksPath
-$nativeCommand = 'call ' + (Quote-CommandArgument $ExecutablePath) + ' --config ' + (Quote-CommandArgument $ConfigPath) + ' hook'
+$hookExecutable = Resolve-Absolute (Join-Path ([IO.Path]::GetDirectoryName($ExecutablePath)) 'prunlet-hook.exe') 'HookExecutablePath'
+if (!(Test-Path -LiteralPath $hookExecutable -PathType Leaf)) { throw 'Prunlet hook executable does not exist.' }
+$nativeCommand = 'call ' + (Quote-CommandArgument $hookExecutable) + ' --config ' + (Quote-CommandArgument $ConfigPath) + ' hook --cli-executable ' + (Quote-CommandArgument $ExecutablePath)
+$previousNativeCommand = 'call ' + (Quote-CommandArgument $ExecutablePath) + ' --config ' + (Quote-CommandArgument $ConfigPath) + ' hook'
 # hookは環境既定shellを継承するため、CALLを実行するCMDを明示する。
 $cmdPath = Resolve-Absolute (Join-Path ([Environment]::GetFolderPath('System')) 'cmd.exe') 'System CMD'
 $null = Quote-CommandArgument $cmdPath
@@ -28,7 +33,7 @@ if ($cmdPath -match '\s') { throw 'System CMD path requires quoting; explicit ho
 $command = $cmdPath + ' /d /c ' + $nativeCommand
 $legacyPaths = @((Join-Path ([IO.Path]::GetDirectoryName($ExecutablePath)) 'codex-pretooluse.ps1'))
 if ($HookPath) { $legacyPaths += $HookPath }
-$knownCommands = @($command, $nativeCommand)
+$knownCommands = @($command, $nativeCommand, ($cmdPath + ' /d /c ' + $previousNativeCommand), $previousNativeCommand)
 foreach ($legacyPath in $legacyPaths) {
     $knownCommands += 'call ' + (Quote-CommandArgument $ExecutablePath) + ' --config ' + (Quote-CommandArgument $ConfigPath) + ' hook --hook-script ' + (Quote-CommandArgument $legacyPath)
     $knownCommands += 'pwsh -NoProfile -NonInteractive -File ' + (Quote-CommandArgument $legacyPath) + ' -ExecutablePath ' + (Quote-CommandArgument $ExecutablePath) + ' -ConfigPath ' + (Quote-CommandArgument $ConfigPath)
@@ -50,14 +55,22 @@ if ($owned.Count -eq 1) {
     $hooks.hooks.PreToolUse = $groups
 }
 $toml = if (Test-Path -LiteralPath $tomlPath) { [IO.File]::ReadAllText($tomlPath) } else { '' }
+$originalToml = $toml
 Assert-SimpleIntegrationToml $toml
 $newline = if ($toml.Contains("`r`n")) { "`r`n" } else { "`n" }
-$mcpBlock = (@('# BEGIN PRUNLET MCP', '[mcp_servers.prunlet]', ('command = ' + (Toml-String $ExecutablePath)), ('args = [' + (Toml-String '--config') + ', ' + (Toml-String $ConfigPath) + ', ' + (Toml-String 'mcp') + ']'), '# END PRUNLET MCP') -join $newline) + $newline
+$wrapper = Resolve-Absolute (Join-Path ([IO.Path]::GetDirectoryName($ExecutablePath)) 'start-prunlet-mcp.ps1') 'MCP startup wrapper'
+if (!(Test-Path -LiteralPath $wrapper -PathType Leaf)) { throw 'Prunlet MCP startup wrapper does not exist.' }
+$oldMcpBlock = (@('# BEGIN PRUNLET MCP', '[mcp_servers.prunlet]', ('command = ' + (Toml-String $ExecutablePath)), ('args = [' + (Toml-String '--config') + ', ' + (Toml-String $ConfigPath) + ', ' + (Toml-String 'mcp') + ']'), '# END PRUNLET MCP') -join $newline) + $newline
+$mcpArgs = @('-NoProfile', '-NonInteractive', '-File', $wrapper, '-ExecutablePath', $ExecutablePath, '-ConfigPath', $ConfigPath, '-CodexHome', $CodexHome)
+$mcpBlock = (@('# BEGIN PRUNLET MCP', '[mcp_servers.prunlet]', ('command = ' + (Toml-String 'pwsh')), ('args = [' + (($mcpArgs | ForEach-Object { Toml-String $_ }) -join ', ') + ']'), 'startup_timeout_sec = 600', '# END PRUNLET MCP') -join $newline) + $newline
 $withoutMcp = Remove-OwnedBlock $toml 'MCP'
 if ($withoutMcp -match '(?im)^[ \t]*\[[ \t]*["'']?mcp_servers["'']?[ \t]*\.[ \t]*["'']?prunlet["'']?(?:[ \t]*\.|[ \t]*\])' -or $withoutMcp -match '(?im)^[ \t]*["'']?mcp_servers["'']?[ \t]*(?:=|\.[ \t]*["'']?prunlet["'']?[ \t]*\.)') { throw 'An existing or unsupported mcp_servers.prunlet entry requires review; it was not overwritten.' }
 $parentMcp = [regex]::Match($withoutMcp, '(?m)^\[mcp_servers\][ \t]*(?:#[^\r\n]*)?\r?\n(?:(?!^\[)[\s\S])*')
 if ($parentMcp.Success -and @($parentMcp.Value -split '\r?\n' | Where-Object { (Get-TomlRootKey $_) -ceq 'prunlet' }).Count) { throw 'An existing inline mcp_servers.prunlet entry requires review; it was not overwritten.' }
-if ($withoutMcp -cne $toml -and !$toml.Contains($mcpBlock)) { throw 'Existing Prunlet MCP block differs; uninstall it before changing registration.' }
+if ($withoutMcp -cne $toml -and !$toml.Contains($mcpBlock)) {
+    if (!$toml.Contains($oldMcpBlock)) { throw 'Existing Prunlet MCP block differs; uninstall it before changing registration.' }
+    $toml = $toml.Replace($oldMcpBlock, $mcpBlock)
+}
 if ($withoutMcp -ceq $toml) { $toml = $toml.TrimEnd("`r", "`n") + $newline + $newline + $mcpBlock }
 # features.hooksが明示falseのときは利用者の設定を勝手に反転しない。
 $featureTable = [regex]::Match($toml, '(?m)^[ \t]*\[features\][ \t]*(?:#[^\r\n]*)?\r?\n(?:(?!^[ \t]*\[)[\s\S])*')
@@ -78,6 +91,7 @@ if ($featureTable.Success) {
     $toml += $newline + '# BEGIN PRUNLET HOOK-FEATURE' + $newline + '[features]' + $newline + 'hooks = true' + $newline + '# END PRUNLET HOOK-FEATURE' + $newline
 }
 # 両設定の内容を先に構成し、衝突があれば書込み前に停止する。
+if ($ValidateOnly) { return @{ status = 'validated'; hookChanged = [bool]$hookChanged; mcpChanged = [bool]($toml -cne $originalToml) } }
 if ($hookChanged) { Write-PreservedFile $hooksPath ($hooks | ConvertTo-Json -Depth 100) $BackupDirectory }
 Write-PreservedFile $tomlPath $toml $BackupDirectory
 @{ status = 'installed'; codexHome = $CodexHome; backupRoot = $BackupDirectory; requiresHookTrust = $true; message = 'Review and trust the Prunlet hook through Codex /hooks. Trust settings were not changed.' } | ConvertTo-Json -Compress

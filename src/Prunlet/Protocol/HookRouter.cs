@@ -16,7 +16,7 @@ internal static class HookRouter
     };
 
     // 旧登録の --hook-script は受理するが、外部コードとして読み取ったり実行したりしない。
-    internal static async Task<int> RunAsync(string configPath, string? legacyHookScript = null)
+    internal static async Task<int> RunAsync(string configPath, string? legacyHookScript = null, string? commandExecutable = null)
     {
         try
         {
@@ -36,7 +36,7 @@ internal static class HookRouter
             if (command.ValueKind != JsonValueKind.String) throw new ArgumentException("Hook command must be a string.");
             if (!ContainsDirectDeletion(command.GetString()!, mode: ExecutionMode(name.GetString()!, arguments))) return Pass();
 
-            var executable = Environment.ProcessPath ?? "prunlet.exe";
+            var executable = commandExecutable ?? Environment.ProcessPath ?? "prunlet.exe";
             return Deny($"Direct shell deletion is blocked. For explicitly authorized targets, use the installed Prunlet CLI from the start with shell=cmd.exe and login=false: {CmdPath(executable)} --config {CmdPath(configPath)} delete --paths-file <absolute-json-file>; for registry keys/values use {CmdPath(executable)} --config {CmdPath(configPath)} registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <registry-key-path>. File and folder deletions have no Prunlet operation record. Normally restore recycled items using Windows Recycle Bin; a file or folder Windows reports as too large may instead be permanently deleted. Dry-run cannot predict the final disposition. Keep registry operationId and use {CmdPath(executable)} --config {CmdPath(configPath)} registry-restore <operationId>. On hosts supporting exec_command sandbox permissions, request sandbox_permissions=\"require_escalated\" from the first real file deletion because Recycle Bin access may be restricted. This is a formal host permission request, not Windows UAC or administrator elevation. A dry-run does not prove real-operation permissions. Existing host approvals and policies still apply. Do not retry a policy-rejected target through another route or automatically resend a failed deletion; check uncertain file results using the source and Windows Recycle Bin; reconcile registry results using registry-reconcile <operationId> before deciding next steps.");
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)

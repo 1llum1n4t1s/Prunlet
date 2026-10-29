@@ -139,7 +139,7 @@ $fixtureRoot = Join-Path $OutputDirectory 'fixture'
 $source = Join-Path $fixtureRoot 'Prunlet-fixture'
 New-Item -ItemType Directory -Path $source, (Join-Path $source 'scripts') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'src'), (Join-Path $repoRoot 'integration') -Destination $source -Recurse
-Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1') -Destination (Join-Path $source 'scripts')
+Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Join-Path $repoRoot 'scripts\Install-Prunlet.ps1') -Destination (Join-Path $source 'scripts')
 $fixtureGuideSha256 = (Get-FileHash -LiteralPath (Join-Path $source 'integration\PRUNLET.md') -Algorithm SHA256).Hash
 Assert-True ($fixtureGuideSha256 -ceq (Get-FileHash -LiteralPath (Join-Path $repoRoot 'integration\PRUNLET.md') -Algorithm SHA256).Hash) 'Fixture guide differs from the current working tree.'
 # 実行した検証・導入・ビルド・連携元のhashを、C#本文とは別にレポートへ固定する。
@@ -551,7 +551,7 @@ try {
         Assert-True ([IO.File]::ReadAllText($instructionGuide).Contains('--paths-file')) 'Guide omits literal paths-file input.'
         $registeredGuide = [IO.File]::ReadAllText($instructionGuide)
         Assert-True ($registeredGuide.Contains('初回から `sandbox_permissions: "require_escalated"`') -and $registeredGuide.Contains('login: false, sandbox_permissions: "require_escalated"')) 'Guide omits the initial formal sandbox permission request or its CMD example.'
-        Assert-True ($registeredGuide.Contains('WindowsのUAC昇格や管理者実行ではない') -and $registeredGuide.Contains('成功しても実処理に必要な権限を保証しない')) 'Guide omits the UAC distinction or dry-run permission limitation.'
+        Assert-True ($registeredGuide.Contains('WindowsのUAC昇格や管理者実行ではない') -and $registeredGuide.Contains('実処理に必要な権限と、対象がサイズ超過で永久削除されるかは予測しない')) 'Guide omits the UAC distinction or dry-run permission limitation.'
         Assert-True ($registeredGuide.Contains('同じ削除を自動再送しない') -and $registeredGuide.Contains('状態を照合') -and $registeredGuide.Contains('元の削除許可とホストの承認・管理ポリシーを守る')) 'Guide omits uncertain-state reconciliation or preserves no host policy boundary.'
         $withoutBlock = [regex]::Replace($agentText, '<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->\r\n[\s\S]*?\r\n<!-- END PRUNLET AGENT-INSTRUCTIONS -->\r\n', '')
         Assert-True ($withoutBlock -ceq $originalAgentText) 'Existing AGENTS body or newlines changed.'
@@ -569,6 +569,8 @@ try {
         $customExe = Join-Path $customProduct 'custom-prunlet.exe'
         $customConfig = Join-Path $customProduct 'custom-config.json'
         Copy-Item -LiteralPath (Join-Path $instructionInstall 'bin\prunlet.exe') -Destination $customExe
+        Copy-Item -LiteralPath (Join-Path $instructionInstall 'bin\prunlet-hook.exe') -Destination (Join-Path $customProduct 'prunlet-hook.exe')
+        Copy-Item -LiteralPath (Join-Path $instructionInstall 'bin\start-prunlet-mcp.ps1') -Destination (Join-Path $customProduct 'start-prunlet-mcp.ps1')
         Copy-Item -LiteralPath (Join-Path $instructionInstall 'config.json') -Destination $customConfig
         $customAgents = Join-Path $customCodex 'AGENTS.md'
         [IO.File]::WriteAllText($customAgents, $originalAgentText, [Text.UTF8Encoding]::new($true))
@@ -668,14 +670,15 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         $updatedBytes = [IO.File]::ReadAllBytes($fileCliAgents)
         Assert-True ($updatedBytes[0] -eq 0xef -and $updatedBytes[1] -eq 0xbb -and $updatedBytes[2] -eq 0xbf) 'CLI migration changed the BOM.'
     }
-    Test-Case 'Explicit CMD hook migrates three owned routes and preserves unrelated handlers' {
+    Test-Case 'Independent CMD hook migrates owned routes and preserves unrelated handlers' {
         $exePath = Join-Path $instructionInstall 'bin\prunlet.exe'
+        $hookPath = Join-Path $instructionInstall 'bin\prunlet-hook.exe'
         $cfgPath = Join-Path $instructionInstall 'config.json'
         $oldHelper = Join-Path $instructionInstall 'bin\codex-pretooluse.ps1'
         $nativeCommand = 'call "' + $exePath + '" --config "' + $cfgPath + '" hook'
         $cmdPath = Join-Path ([Environment]::GetFolderPath('System')) 'cmd.exe'
-        $expectedCommand = $cmdPath + ' /d /c ' + $nativeCommand
-        $legacyCommands = @($nativeCommand, ($nativeCommand + ' --hook-script "' + $oldHelper + '"'), ('pwsh -NoProfile -NonInteractive -File "' + $oldHelper + '" -ExecutablePath "' + $exePath + '" -ConfigPath "' + $cfgPath + '"'))
+        $expectedCommand = $cmdPath + ' /d /c call "' + $hookPath + '" --config "' + $cfgPath + '" hook --cli-executable "' + $exePath + '"'
+        $legacyCommands = @($nativeCommand, ($cmdPath + ' /d /c ' + $nativeCommand), ($nativeCommand + ' --hook-script "' + $oldHelper + '"'), ('pwsh -NoProfile -NonInteractive -File "' + $oldHelper + '" -ExecutablePath "' + $exePath + '" -ConfigPath "' + $cfgPath + '"'))
         $route = 0
         foreach ($legacyCommand in $legacyCommands) {
             $migrationCodex = Join-Path $OutputDirectory ('native-hook-migration-codex-' + $route++)
@@ -733,13 +736,16 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         $spaceCodex = Join-Path $OutputDirectory 'space-hook-codex'
         New-Item -ItemType Directory -Path $spaceProduct, $spaceCodex | Out-Null
         $spaceExe = Join-Path $spaceProduct 'prunlet.exe'
+        $spaceHook = Join-Path $spaceProduct 'prunlet-hook.exe'
         $spaceConfig = Join-Path $spaceProduct 'config space.json'
         Copy-Item -LiteralPath (Join-Path $instructionInstall 'bin\prunlet.exe') -Destination $spaceExe
+        Copy-Item -LiteralPath (Join-Path $instructionInstall 'bin\prunlet-hook.exe') -Destination $spaceHook
+        Copy-Item -LiteralPath (Join-Path $instructionInstall 'bin\start-prunlet-mcp.ps1') -Destination (Join-Path $spaceProduct 'start-prunlet-mcp.ps1')
         Copy-Item -LiteralPath (Join-Path $instructionInstall 'config.json') -Destination $spaceConfig
         & (Join-Path $instructionInstall 'bin\install-codex.ps1') -ExecutablePath $spaceExe -ConfigPath $spaceConfig -CodexHome $spaceCodex -BackupDirectory $instructionBackup | Out-Null
         $spaceHooks = [IO.File]::ReadAllText((Join-Path $spaceCodex 'hooks.json')) | ConvertFrom-Json
         $spaceCommand = @($spaceHooks.hooks.PreToolUse | ForEach-Object { $_.hooks } | Where-Object { $_.statusMessage -eq 'Prunlet: protected literal deletion' })[0].command
-        $spaceExpected = (Join-Path ([Environment]::GetFolderPath('System')) 'cmd.exe') + ' /d /c call "' + $spaceExe + '" --config "' + $spaceConfig + '" hook'
+        $spaceExpected = (Join-Path ([Environment]::GetFolderPath('System')) 'cmd.exe') + ' /d /c call "' + $spaceHook + '" --config "' + $spaceConfig + '" hook --cli-executable "' + $spaceExe + '"'
         Assert-True ($spaceCommand -ceq $spaceExpected) 'Space-path registration did not quote the installed exe and config exactly.'
         $launchVariants = @(@{ name = 'standard'; command = $registeredCommand }, @{ name = 'spaces'; command = $spaceCommand })
         $sentinel = Join-Path $allowed 'registered-hook-sentinel.txt'

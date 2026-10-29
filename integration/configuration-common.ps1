@@ -4,13 +4,31 @@ function Resolve-Absolute([string]$Path, [string]$Label) {
     if ($Path -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+(?:\\|$))') { throw "$Label must be an absolute Windows path." }
     return [IO.Path]::GetFullPath($Path)
 }
-function Assert-ExternalBackup([string]$Directory, [string]$CodexDirectory) {
+function Assert-ExternalBackup([string]$Directory, [string]$CodexDirectory, [switch]$AllowStartupStage) {
     $resolved = Resolve-Absolute $Directory 'BackupDirectory'
     $homeFull = (Resolve-Absolute $CodexDirectory 'CodexHome').TrimEnd('\', '/')
     $repoFull = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd('\', '/')
     $userCodex = [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.codex')).TrimEnd('\', '/')
+    $ownedStageBackup = $false
+    if ($AllowStartupStage) {
+        $expected = Join-Path $repoFull '.prunlet-update-stage\registration-backup'
+        if (!$resolved.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) { throw 'Startup registration backup must use the fixed update stage.' }
+        $statePath = Join-Path $repoFull '.prunlet-update-state.json'
+        $ownerPath = Join-Path $repoFull '.prunlet-update-stage\.prunlet-stage-owner.json'
+        foreach ($path in @($statePath, $ownerPath)) {
+            $item = Get-Item -LiteralPath $path -Force
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Startup update ownership is not an ordinary file.' }
+        }
+        $state = [IO.File]::ReadAllText($statePath) | ConvertFrom-Json -AsHashtable
+        $owner = [IO.File]::ReadAllText($ownerPath) | ConvertFrom-Json -AsHashtable
+        if ($state.product -cne 'Prunlet' -or $state.schema -ne 1 -or $state.phase -cne 'switching' -or $owner.product -cne 'Prunlet' -or $owner.schema -ne 1 -or $owner.epoch -ne 1 -or !$owner.installRoot.Equals($repoFull, [StringComparison]::OrdinalIgnoreCase) -or $owner.candidateCommit -cne $state.candidateCommit) { throw 'Startup registration backup ownership is invalid.' }
+        $ownedStageBackup = $true
+    }
     foreach ($forbidden in @($homeFull, $repoFull, $userCodex)) {
-        if ($resolved.Equals($forbidden, [StringComparison]::OrdinalIgnoreCase) -or $resolved.StartsWith($forbidden + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'BackupDirectory must be outside CodexHome, the repository and the user .codex directory.' }
+        if ($resolved.Equals($forbidden, [StringComparison]::OrdinalIgnoreCase) -or $resolved.StartsWith($forbidden + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            if ($ownedStageBackup -and $forbidden.Equals($repoFull, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            throw 'BackupDirectory must be outside CodexHome, the repository and the user .codex directory.'
+        }
     }
     # リパースポイント経由で禁止保存先へ入ることも拒否する。
     $ancestor = $resolved
@@ -85,7 +103,7 @@ function Remove-OwnedBlock([string]$Text, [string]$Name) {
     if ($matches.Count -eq 1) {
         $block = $matches[0]
         $lines = @($block.Value -split '\r?\n' | Where-Object { $_ -and $_ -notmatch '^# (?:BEGIN|END) PRUNLET ' })
-        if ($Name -eq 'MCP' -and ($lines.Count -ne 3 -or $lines[0] -cne '[mcp_servers.prunlet]' -or $lines[1] -notmatch '^command = "' -or $lines[2] -notmatch '^args = \[')) { throw 'Prunlet MCP block was edited; preserve it and review before uninstall.' }
+        if ($Name -eq 'MCP' -and (($lines.Count -ne 3 -and $lines.Count -ne 4) -or $lines[0] -cne '[mcp_servers.prunlet]' -or $lines[1] -notmatch '^command = "' -or $lines[2] -notmatch '^args = \[' -or ($lines.Count -eq 4 -and $lines[3] -cne 'startup_timeout_sec = 600'))) { throw 'Prunlet MCP block was edited; preserve it and review before uninstall.' }
         if ($Name -eq 'MCP') {
             if (Test-TomlTrailingValues $Text ($block.Index + $block.Length)) {
                 throw 'User settings follow the Prunlet MCP marker; review before changing registration to preserve their table ownership.'

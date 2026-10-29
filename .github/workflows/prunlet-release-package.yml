@@ -1,0 +1,83 @@
+name: Prunlet release packages
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    # 公開タグから生成した実物だけを、同じreleaseへ添付する。
+    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && !github.event.release.prerelease && !github.event.release.draft }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [win-x64, win-arm64]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout the released tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+      - name: Verify the released commit
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRUNLET_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:PRUNLET_TAG -cnotmatch '^v?[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?$') { throw 'Unsupported release tag.' }
+          $commit = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $commit -cnotmatch '^[0-9a-f]{40}$') { throw 'Checkout commit is invalid.' }
+          if ($commit -cne $env:GITHUB_SHA) { throw 'Checkout differs from the release event commit.' }
+          $tagCommit = (git rev-list -n 1 ('refs/tags/' + $env:PRUNLET_TAG)).Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -cne $commit) { throw 'Checkout does not match the release tag.' }
+          $branch = (gh api "repos/$env:GITHUB_REPOSITORY" --jq '.default_branch').Trim()
+          if ($LASTEXITCODE -ne 0 -or $branch -cnotmatch '^[A-Za-z0-9._/-]+$') { throw 'Default branch is invalid.' }
+          git merge-base --is-ancestor $commit ('refs/remotes/origin/' + $branch)
+          if ($LASTEXITCODE -ne 0) { throw 'Release commit is not on the default branch.' }
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+          "branch=$branch" >> $env:GITHUB_OUTPUT
+      - name: Build the released commit
+        env:
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          PRUNLET_RUNTIME: ${{ matrix.runtime }}
+          PRUNLET_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $env:PRUNLET_RUNTIME)
+          $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
+          & ./scripts/Publish-Prunlet.ps1 -OutputDirectory $output -Runtime $env:PRUNLET_RUNTIME | Out-Null
+          $expectedVersion = $env:PRUNLET_TAG -replace '^v', ''
+          foreach ($name in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
+            $product = Join-Path $output ('publish/' + $name)
+            if (![IO.File]::Exists($product)) { throw "Published product missing: $name" }
+            $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($product).ProductVersion
+            if (($version -split '\+')[0] -cne $expectedVersion) { throw "Published product version differs: $name $version" }
+          }
+          & ./scripts/Package-PrunletUpdate.ps1 -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory (Join-Path $output 'publish') -OutputPath $package -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME | Out-Null
+      - name: Attach the same package to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRUNLET_TAG: ${{ github.event.release.tag_name }}
+          PRUNLET_RUNTIME: ${{ matrix.runtime }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
+          gh release upload $env:PRUNLET_TAG $package --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed; an existing asset was not overwritten.' }

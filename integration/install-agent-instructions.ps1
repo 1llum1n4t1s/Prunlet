@@ -8,7 +8,8 @@ param(
     [string]$ExecutablePath = (Join-Path $PSScriptRoot 'prunlet.exe'),
     [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config.json'),
     [switch]$Uninstall,
-    [switch]$ValidateOnly
+    [switch]$ValidateOnly,
+    [switch]$StartupUpdate
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'configuration-common.ps1')
@@ -43,7 +44,7 @@ function Read-AgentDocument([string]$Path) {
 function Encode-AgentDocument($Document, [string]$Text) { return ,([byte[]]($Document.prefix + $Document.encoding.GetBytes($Text))) }
 
 $CodexHome = Resolve-Absolute $CodexHome 'CodexHome'
-$BackupDirectory = Assert-ExternalBackup $BackupDirectory $CodexHome
+$BackupDirectory = Assert-ExternalBackup $BackupDirectory $CodexHome -AllowStartupStage:$StartupUpdate
 $agentPath = Assert-AgentFilePath (Join-Path $CodexHome 'AGENTS.md')
 $guidePath = Assert-AgentFilePath (Join-Path $CodexHome 'PRUNLET.md')
 $document = Read-AgentDocument $agentPath
@@ -116,8 +117,16 @@ else {
     # BOMは別に保持し、既存本文のバイト列と末尾の改行は変更しない。
     $updatedText = $block + $document.text
 }
-if ($ValidateOnly) { return @{ instructionsPresent = $owned; agentPath = $agentPath; guidePath = $guidePath } }
 [byte[]]$updatedAgent = Encode-AgentDocument $document $updatedText
+if ($ValidateOnly) {
+    return @{
+        instructionsPresent = $owned
+        agentPath = $agentPath
+        guidePath = $guidePath
+        agentChanged = ((Get-BytesHash $updatedAgent) -cne (Get-BytesHash $document.bytes))
+        guideChanged = (!$guideExists -or $guideHash -cne $sourceHash)
+    }
+}
 $changes = [Collections.Generic.List[object]]::new()
 if ((Get-BytesHash $updatedAgent) -cne (Get-BytesHash $document.bytes)) { $changes.Add(@{ target = $agentPath; bytes = $updatedAgent; remove = $false }) }
 if ($Uninstall) { $changes.Add(@{ target = $guidePath; bytes = $null; remove = $true }) }

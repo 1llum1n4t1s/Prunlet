@@ -67,6 +67,8 @@ pwsh -NoProfile -File .\scripts\Verify-LatestInstall.ps1 -OutputDirectory $lates
 
 GitHub応答を検証用アーカイブへ差し替え、実際のインストーラー・.NETビルド・配置・Codex登録を通すE2Eです。最新HEADの再解決、同一SHAからの導入、クローンに依存しない登録、旧設定の容量を一度だけ1 GiBへ移すこと、新規設定の移行印、移行後の明示容量と他設定・レジストリ復元データの保持、大小文字を変えた印・容量、設定だけ残る再導入、未知設定の拒否、設定ロック時の保全、制限DACLの保存と登録失敗時の設定バイト列・SDDL復旧、ZIPの不正経路・重複・リンク、取得とビルドの失敗、製品更新の失敗時の復元を検証します。Codex設定がロックされて登録が途中で失敗した場合の復旧と、旧`allowedRoots`内外にある作業場所での導入も確認します。実ユーザーの配置先・Codex設定は使いません。設定検証が`validate-config`で走査・変更せず、全登録・旧backend退役後に明示移行することを確認します。移行開始後の失敗は旧binaryへrollbackせず新exe・設定・登録を保全し、同じCLIで再開できることを確認します。
 
+起動時更新では、旧MCPが応答中の延期と終了後の切替、独立hookの応答、標準入出力とEOF、複数起動の排他、取得失敗時の旧版利用、切替・登録・移行途中からの再開を確認します。 配布と同じZIPから複数回更新し、補助製品の変更・据置・再変更、旧slotの実体再利用、schema 5記録の不変更を確認します。容量検査はファイルとディレクトリのADS、stateの一時出力を含め、上限拒否時に元データを変えないことを確認します。改変した登録・不正state・互換性を確認できない候補は保持して停止し、不明な清掃を自動再送しないことを確認します。隔離fixtureでの成功と、公開後の実ホストでの読み込み・hook信頼は区別します。
+
 定期整理はTask Scheduler境界を隔離して、毎日03:00と現在のユーザーのログオンの両トリガー、有効状態、`StartWhenAvailable`、電池使用時の実行許可、既存タスク設定の保持をXMLで検証します。PCの電源断・スリープ・ログオフを伴う取り逃し回復の実動作は、この検証の対象外です。
 
 非表示起動は`scripts/Verify-MaintenanceTask.ps1 -ExecutablePath <今回のCLI exe> -OutputDirectory <新しい外部D作業領域> -ReportPath <外部JSONレポート>`で、実Task Schedulerと保守専用exeを検証します。同じpublishフォルダーに`prunlet-maintenance.exe`が必要です。CLIのconsole subsystemと保守exeのGUI subsystem、旧タスクからの設定を保つ移行、保守以外のコマンドの拒否、期限切れ整理・保持対象の復元、失敗終了コード、所有者検証を確認します。`-PauseForWindowInspection`は旧・新タスクを専用lockで待機させ、別途ウィンドウを観測するための指定です。配置後も同じ登録タスクを手動起動して表示と終了コードを確認し、実際のWindows再起動と区別します。

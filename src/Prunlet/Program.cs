@@ -14,6 +14,26 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
+#if !PRUNLET_MAINTENANCE_HOST
+        if (string.Equals(Path.GetFileName(Environment.ProcessPath), "prunlet-hook.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.InputEncoding = new System.Text.UTF8Encoding(false);
+            Console.OutputEncoding = new System.Text.UTF8Encoding(false);
+            try
+            {
+                if (args.Length != 5 || args[0] != "--config" || args[2] != "hook"
+                    || args[3] != "--cli-executable" || !Path.IsPathFullyQualified(args[1])
+                    || !Path.IsPathFullyQualified(args[4]))
+                    throw new ArgumentException("Invalid Prunlet hook arguments.");
+                return await HookRouter.RunAsync(Path.GetFullPath(args[1]), commandExecutable: Path.GetFullPath(args[4]));
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
+            {
+                Write(new { hookSpecificOutput = new { hookEventName = "PreToolUse", permissionDecision = "deny", permissionDecisionReason = "Prunlet hook could not start: " + ex.Message } });
+                return 0;
+            }
+        }
+#endif
 #if PRUNLET_MAINTENANCE_HOST
         // 非表示の定期保守入口は既存Coreの明示適用だけを受け付ける。
         if (args is not ["--config", _, "maintain", "--apply"]) return 2;
@@ -23,6 +43,13 @@ internal static class Program
 #endif
         try
         {
+#if !PRUNLET_MAINTENANCE_HOST
+            if (args is ["--startup-update-protocol"])
+            {
+                Write(new { protocol = 1, storageEpoch = 1 });
+                return 0;
+            }
+#endif
             if (args.Length == 0 || args is ["--help"] or ["help"])
             {
                 Console.WriteLine("""
@@ -71,13 +98,70 @@ internal static class Program
             if (!Path.IsPathFullyQualified(args[1])) throw new ArgumentException("Config path must be absolute.");
             var command = args[2];
             var commandArgs = args[3..];
-            if (command == "init") return Initialize(configPath, commandArgs);
             if (command == "hook")
             {
                 if (commandArgs.Length != 0 && (commandArgs.Length != 2 || commandArgs[0] != "--hook-script"))
                     throw new ArgumentException("Use hook with no arguments, or legacy --hook-script <path>.");
                 return await HookRouter.RunAsync(configPath, commandArgs.Length == 2 ? commandArgs[1] : null);
             }
+            if (command == "__begin-published-update")
+            {
+                if (commandArgs.Length is not (1 or 2)) throw new ArgumentException("Published update requires a release commit and optional expected installed commit.");
+                Write(StartupUpdateCoordinator.BeginPublished(configPath, commandArgs[0], commandArgs.Length == 2 ? commandArgs[1] : null));
+                return 0;
+            }
+            if (command == "__check-startup-budget")
+            {
+                if (commandArgs.Length != 1 || !long.TryParse(commandArgs[0], System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out var bytes))
+                    throw new ArgumentException("Specify the additional update storage bytes.");
+                StartupUpdateBudget.Ensure(StartupUpdateCoordinator.InstallationRoot(configPath), bytes);
+                Write(new { status = "available" });
+                return 0;
+            }
+            if (command == "__download-published-package")
+            {
+                if (commandArgs.Length != 5
+                    || !long.TryParse(commandArgs[2], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var assetId)
+                    || !long.TryParse(commandArgs[4], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var bytes))
+                    throw new ArgumentException("Published download requires repository, commit, asset ID, SHA-256 and byte length.");
+                StartupPublishedDownload.Receive(configPath, commandArgs[0], commandArgs[1], assetId, commandArgs[3], bytes);
+                Write(new { status = "downloaded" });
+                return 0;
+            }
+            if (command == "__prepare-published-package")
+            {
+                if (commandArgs.Length != 7
+                    || !long.TryParse(commandArgs[5], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var bytes)
+                    || !long.TryParse(commandArgs[6], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var assetId))
+                    throw new ArgumentException("Published preparation requires repository, branch, commit, runtime, SHA-256, byte length and asset ID.");
+                Write(StartupUpdateCoordinator.PreparePublished(configPath, commandArgs[0], commandArgs[1], commandArgs[2], commandArgs[3], commandArgs[4], bytes, assetId));
+                return 0;
+            }
+            if (command == "__apply-startup-update")
+            {
+                if (commandArgs.Length != 0) throw new ArgumentException("Startup update accepts no arguments.");
+                var update = StartupUpdateCoordinator.Apply(configPath);
+                Write(update);
+                return update.Status is "deferred" or "ambiguous" ? 1 : 0;
+            }
+            if (command is "__apply-startup-integration" or "__confirm-startup-integration")
+            {
+                if (commandArgs.Length != 0) throw new ArgumentException("Startup integration accepts no arguments.");
+                if (command == "__apply-startup-integration") StartupUpdateCoordinator.ApplyIntegration(configPath);
+                else StartupUpdateCoordinator.ConfirmIntegration(configPath);
+                Write(new { status = command == "__apply-startup-integration" ? "integration_applied" : "integration_confirmed" });
+                return 0;
+            }
+            StartupUpdateGate.EnsureReady(configPath);
+            if (command == "__cleanup-startup-stage")
+            {
+                if (commandArgs.Length != 0) throw new ArgumentException("Stage cleanup accepts no arguments.");
+                var cleanup = StartupUpdateCoordinator.CleanupStage(configPath);
+                Write(cleanup);
+                return cleanup.Status == "ambiguous" ? 1 : 0;
+            }
+            if (command == "init") return Initialize(configPath, commandArgs);
             var config = PrunletConfig.Load(configPath);
             if (command == "registry-session")
             {

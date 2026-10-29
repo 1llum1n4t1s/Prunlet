@@ -101,6 +101,14 @@ latest導入時に`capacityDefaultMigrationVersion`が欠落または1未満の�
 
 利用者向け導入はGitHubの既定ブランチ最新HEADを解決し、取得元・ブランチ・commitを`source-info.json`へ記録する。開発クローン・ローカルビルドをlatest導入の代用にしない。設定の検証には`validate-config`を使い、設定読込とservice構築だけで走査・変更しない。共通指示の生成元は`integration/PRUNLET.md`で、配置済み共通指示の更新とソース変更は別の結果として扱う。
 
+CodexのMCP起動時に公開済みlatestを確認し、既存版の子孫で更新protocolと保管形式が互換の候補だけを準備する。既存の製品・登録の所有とhashを確認し、旧CLI/MCPと保守exeを同時にwrite排他できなければ変更せず延期する。hookは独立exeとして継続し、旧プロセスを終了させない。固定の更新状態は製品切替・登録・移行の再開と更新cacheの所有確認・再利用に限り、ファイル操作履歴には使わない。途中状態では通常CLI/MCPと保守を止め、候補からレジストリ移行を再開する。移行開始後は旧exeへrollbackせず、registryが利用可能になってからsource-infoとidleを確定する。書込みや置換が不明なときは保全して自動再送せず、確定したregistryの利用とは分離する。
+
+stageは再帰削除せず、完了した世代の正規製品とmetadataをhashと実体で照合して主streamだけを再利用する。正常な次回更新を、stageが存在するだけで止めない。未知の項目は残して容量へ含め、未確定の切替・移行は先に同じ候補で再開する。
+
+配布元の方針は公開済みGitHub Releaseであり、その発行者を信頼する。タグが既定ブランチ上のcommitを指すこととasset digest・size、パッケージ内のcommit・runtime・製品hashを検証する。digestは転送内容の一致を示し、ソースからビルドされたことを独立に証明しない。Actionsの期限付きartifactを更新の必須条件としない。
+
+更新用cacheはレジストリ復元領域とは別に合計2 GiBを上限とする。公開ZIP・stage・製品slot・固定candidate/previous・保全した異常世代・各ディレクトリのADS・更新管理ファイルを容量に含め、確保前と完了後に検査する。slotはcache専用で、実行・移動・削除しない。正規hash・長さ・単一linkを同じ排他handleで確認し、通常streamだけをin-place更新する。候補へはそのhandleの通常streamだけをCreateNewコピーする。ADSや不明な部分書込みは保持し、予算不足を自動削除で回避しない。
+
 ビルドと検証の実行規約・必須コマンドは[AGENTS.md](AGENTS.md#ビルドと検証)、各経路の検証範囲とfixtureの保持・清掃は[検証手順](docs/verification.md)を正本とする。
 
 ## 依存更新の境界

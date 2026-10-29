@@ -34,4 +34,7 @@ New-Item -ItemType Directory -Path $maintenanceIntermediate, $maintenancePublish
 if ($LASTEXITCODE -ne 0) { throw "Maintenance publish failed: $LASTEXITCODE" }
 $maintenanceExe = Join-Path $publish 'prunlet-maintenance.exe'
 Copy-Item -LiteralPath (Join-Path $maintenancePublish 'prunlet-maintenance.exe') -Destination $maintenanceExe
-[ordered]@{ executable = $exe; maintenanceExecutable = $maintenanceExe; runtime = $Runtime; sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; maintenanceSha256 = (Get-FileHash -LiteralPath $maintenanceExe -Algorithm SHA256).Hash; bytes = (Get-Item -LiteralPath $exe).Length } | ConvertTo-Json
+# hookは更新中のCLI排他から独立した入口を使う。同じバイナリを入口名で限定する。
+$hookExe = Join-Path $publish 'prunlet-hook.exe'
+Copy-Item -LiteralPath $exe -Destination $hookExe
+[ordered]@{ executable = $exe; maintenanceExecutable = $maintenanceExe; hookExecutable = $hookExe; runtime = $Runtime; sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; maintenanceSha256 = (Get-FileHash -LiteralPath $maintenanceExe -Algorithm SHA256).Hash; hookSha256 = (Get-FileHash -LiteralPath $hookExe -Algorithm SHA256).Hash; bytes = (Get-Item -LiteralPath $exe).Length } | ConvertTo-Json
