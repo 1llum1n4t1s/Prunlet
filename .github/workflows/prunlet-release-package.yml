@@ -71,13 +71,27 @@ jobs:
             if (($version -split '\+')[0] -cne $expectedVersion) { throw "Published product version differs: $name $version" }
           }
           & ./scripts/Package-PrunletUpdate.ps1 -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory (Join-Path $output 'publish') -OutputPath $package -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME | Out-Null
+      - name: Verify the release package
+        id: verified_package
+        env:
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          PRUNLET_RUNTIME: ${{ matrix.runtime }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $env:PRUNLET_RUNTIME)
+          $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
+          $sha256 = & ./scripts/Verify-ReleasePackage.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory (Join-Path $output 'publish') -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME -Repository $env:GITHUB_REPOSITORY
+          "sha256=$sha256" >> $env:GITHUB_OUTPUT
       - name: Attach the same package to the release
         env:
           GH_TOKEN: ${{ github.token }}
           PRUNLET_TAG: ${{ github.event.release.tag_name }}
           PRUNLET_RUNTIME: ${{ matrix.runtime }}
+          PRUNLET_EXPECTED_SHA256: ${{ steps.verified_package.outputs.sha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
           $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
+          if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -cne $env:PRUNLET_EXPECTED_SHA256) { throw 'Package changed after verification.' }
           gh release upload $env:PRUNLET_TAG $package --repo $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed; an existing asset was not overwritten.' }
