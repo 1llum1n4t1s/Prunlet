@@ -51,6 +51,6 @@ Dependabotと依存検証・自動マージのworkflowを変更する場合は�
 
 利用者向け導入は`scripts/Install-Prunlet.ps1`でGitHubの既定ブランチ最新HEADを解決する。開発クローンやローカルビルドをlatest導入の代用にしない。インストール元のリポジトリ・取得ブランチ・コミットは`source-info.json`へ記録する。既存設定は[容量上限の一度だけの移行](DESIGN.md#容量上限の一度だけの移行)を除いて保持する。旧復元データはCoreの明示`migrate`で移行し、通常APIから変更しない。設定読込・dry-runへ暗黙の適用を持ち込まず、移行済み印と移行後の利用者変更を尊重する。導入検証では、旧容量からの移行、未知の設定とACLの保持、再更新時の冪等性、ロック・登録失敗時の原本保全と復旧も確認する。
 
-MCP起動時の自動更新は手動導入とは別の経路である。[更新の設計](DESIGN.md#起動時自動更新)に従い、更新状態・製品排他・配布検証・容量検査を迂回しない。配布物は`scripts/Package-PrunletUpdate.ps1`で生成し、公開タグから生成するrelease workflowとの形式の一致を維持する。
+MCP起動時の自動更新は手動導入とは別の経路である。[更新の設計](DESIGN.md#起動時自動更新)に従い、更新状態・製品排他・配布検証・容量検査を迂回しない。配布物は`scripts/Package-PrunletUpdate.ps1`で生成し、公開タグから生成するrelease workflowとの形式の一致を維持する。公開ZIPは`scripts/Verify-ReleasePackage.ps1 -PackagePath <ZIP絶対パス> -SourceRoot <ソース絶対パス> -PublishDirectory <publish絶対パス> -CommitSha <40桁SHA> -DefaultBranch <既定ブランチ> -Runtime <win-x64|win-arm64> -Repository <owner/repo>`で生成元と照合し、返されたZIP全体のSHA-256がアップロード直前にも一致することを確認する。
 
 依存追加、公開、バージョン変更、Gitのコミット・プッシュは今回の依頼に含まれる場合だけ行う。コードコメントは日本語。[README](README.md)は利用者向け、[DESIGN.md](DESIGN.md)は現在の設計、連携と検証の詳細は`docs/`、エージェントの作業規約は本ファイルに置き、同じ説明を複製せず参照する。

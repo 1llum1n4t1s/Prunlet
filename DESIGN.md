@@ -5,13 +5,15 @@
 ## 構成と責務
 
 - `Core/DeletionService`がファイル削除・レジストリ削除と復元・保守・明示移行を担当する。CLI・MCP・hookに別の削除方式を実装しない。
-- `Program`はCLIの入力検証とJSON出力、`Protocol/McpServer`はstdio JSON-RPCを担当する。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールである。
+- `Program`はCLIの入力検証とJSON出力、`Protocol/McpServer`はstdio JSON-RPCを担当する。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールである。`--config <path> mcp`として起動した場合は、起動前・引数検証の例外もstderrへ出してプロトコルstdoutを保つ。他のCLIでは例外をstdoutのJSONで返し、値名などの引数に`mcp`が含まれるだけでは出力先を変えない。
 - hookは認識した直接削除を検査・拒否し、配置済みCLIを案内する。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
 - Windows Shellがゴミ箱への移動とファイル復元を担当する。Prunletのファイル復元API・通常の履歴圧縮入口は提供しない。
 
 ### フックのshell解析境界
 
 `Protocol/HookRouter`は`Bash`・`exec_command`・`functions.exec_command`のコマンド文字列を検査する。`exec_command`系の明示的な`tool_input.shell`がPowerShellまたはCMDなら、その文字列規則を選択する。shell未指定・未知・Posix系の指定、および`Bash`ではCMD・PowerShell・Posixの複数規則で検査する。未知shellをCMDで実行するWindowsホストがあるため、tool名やshell名だけからPosix実行とは推測しない。静的なshell wrapperのコマンド本文も再帰検査し、認識したPowerShell・CMDのwrapperには対応する規則を使う。
+
+CMD規則では`#`をコメントとして扱わず、後続のコマンド区切り以降も検査する。静的な`IF`は`/i`・`not`、`exist`・`defined`・`errorlevel`・`cmdextversion`、`==`と`EQU/NEQ/LSS/LEQ/GTR/GEQ`の条件直後のコマンドを検査する。条件の真偽は評価せず、比較値や`echo`の引数を削除コマンドとは扱わない。wrapper本文の再構成では、引用内の`==`と引用外の比較演算子、空の引用文字列を区別して保つ。
 
 PowerShellのヒアストリングは行頭の終端までを文字列として読み、終端前後のローカルコマンドを検査する。Codexの実ホストは`exec_command`を`Bash`として渡し、実行shellをフック入力に含めない。同じ文字列がshellによって実行コードにもデータにもなるため、shell不明のままPowerShellとは決め打ちしない。単独の静的な`pwsh -NoProfile -EncodedCommand <canonical UTF-16LE Base64>`は復号してPowerShellとして限定検査し、未対応の動的呼出し・展開・別shell等は拒否する。認識した省略形やwrapperは限定形式として扱わず、不正・未終端のヒアストリングも拒否する。SSHの存在や接続先による素通し例外は設けない。未認識の外部wrapper、外部scriptの内容・動的なコマンド名・他言語のAPIまで検査する保証はない。利用時の書き方は[連携手順](docs/integration.md)、解析の実プロセス検証は[検証手順](docs/verification.md#通常e2eの検証範囲)を参照する。
 
@@ -109,7 +111,7 @@ MCP起動時に公開済みlatestを確認し、既存版の子孫で更新proto
 
 stageは再帰削除せず、完了した世代の正規製品とmetadataをhashと実体で照合して主streamだけを再利用する。正常な次回更新を、stageが存在するだけで止めない。未知の項目は残して容量へ含め、未確定の切替・移行は先に同じ候補で再開する。
 
-配布元の方針は公開済みGitHub Releaseであり、その発行者を信頼する。`.github/workflows/prunlet-release-package.yml`が公開タグからwin-x64・win-arm64をビルドし、`scripts/Package-PrunletUpdate.ps1`で作成したZIPを同じreleaseへ添付する。既存assetは上書きしない。取得側はタグが既定ブランチ上のcommitを指すこととasset digest・size、パッケージ内のcommit・runtime・製品hashを検証する。digestは転送内容の一致を示し、ソースからビルドされたことを独立に証明しない。Actionsの期限付きartifactを更新の必須条件としない。
+配布元の方針は公開済みGitHub Releaseであり、その発行者を信頼する。`.github/workflows/prunlet-release-package.yml`が公開タグからwin-x64・win-arm64をビルドし、`scripts/Package-PrunletUpdate.ps1`でZIPを作成する。公開前に`Verify-ReleasePackage.ps1`がentryの過不足・重複、metadataの取得元・commit・runtime等、および全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合する。検証済みZIP全体のSHA-256をアップロード直前にも再確認し、同じreleaseへ添付する。既存assetは上書きしない。取得側はタグが既定ブランチ上のcommitを指すこととasset digest・size、パッケージ内のcommit・runtime・製品hashを検証する。digestは転送内容の一致を示し、ソースからビルドされたことを独立に証明しない。Actionsの期限付きartifactを更新の必須条件としない。
 
 更新用cacheはレジストリ復元領域とは別に合計2 GiBを上限とする。公開ZIP・stage・製品slot・固定candidate/previous・保全した異常世代・各ディレクトリのADS・更新管理ファイルを容量に含め、確保前と完了後に検査する。slotはcache専用で、実行・移動・削除しない。正規hash・長さ・単一linkを同じ排他handleで確認し、通常streamだけをin-place更新する。候補へはそのhandleの通常streamだけをCreateNewコピーする。ADSや不明な部分書込みは保持し、予算不足を自動削除で回避しない。
 
