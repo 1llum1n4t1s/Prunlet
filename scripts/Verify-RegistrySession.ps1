@@ -126,8 +126,9 @@ $settings = OpenPreparedPins $settingsPath
 $script:LaunchPrepared=$settings
 . (Join-Path $OutputDirectory 'SessionE2E.Common.ps1')
 AssertPreparedSettings $settings
-if ($Mode -in @('Start', 'Run') -and [string]::IsNullOrWhiteSpace($settings.moveExecutablePath)) {
-    throw 'Full native validation requires Prepare -MoveExecutablePath with the genuine schema4 baseline. No desktop session was launched.'
+if ($Mode -in @('Start', 'Run') -and ([string]::IsNullOrWhiteSpace($settings.moveExecutablePath) -or
+    [string]::IsNullOrWhiteSpace($settings.assemblyPath) -or [string]::IsNullOrWhiteSpace($settings.legacyRegistryExecutablePath))) {
+    throw 'Full native validation requires Prepare -MoveExecutablePath (genuine schema4 baseline), -AssemblyPath (candidate DLL), and -LegacyRegistryExecutablePath (genuine schema5 baseline). No desktop session was launched by this invocation.'
 }
 if (!('SessionE2ENative' -as [type])) { Add-Type -Path (Join-Path $OutputDirectory 'SessionFixture.cs') }
 if (!('SessionLaunchNative' -as [type])) { Add-Type -Path (Join-Path $OutputDirectory 'SessionLaunchNative.cs') }

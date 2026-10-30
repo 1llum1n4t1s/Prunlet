@@ -8,16 +8,19 @@ Windows・.NET 10 SDK・PowerShell 7で実行する。ビルドは`scripts/Publi
 
 フックのshell文字列解析は`scripts/Verify-HookParsing.ps1`に今回のexeと未使用の外部出力先・reportを渡して確認する。Mac向けSSH送信のヒアストリングを含む入力は実行せず、hookプロセスのstdinへJSONとして送り、許可・拒否、stdout/stderr、終了コードとfixture不変更を照合する。Codexの`Bash`とshell欠落、単独EncodedCommandの復号、認識した別名・不正値・外側wrapperの拒否、復号本文の直接削除と解析不能な展開、明示PowerShell、CMD、shell不明を区別する。SSH先での実削除を成功条件へ置き換えない。
 
-新しいファイル経路は、操作記録を作らずWindowsゴミ箱へ移す経路と、Windowsのサイズ超過判定後に対象名を固定して削除する経路として検証する。旧schema 1〜4/6の復元・圧縮・終了履歴runnerを、新版通常経路の必須成功条件として使わない。旧版exeで作ったデータは下記の明示移行検証だけに使用する。
+スパースfixtureのC#は`scripts/recordless-e2e/SparseFixture.cs`を共通入力とし、各runnerはこの実ファイルのpathとSHA-256を記録する。旧runnerのhere-stringやAST配置を検証入力として使わない。
 
+新しいファイル経路は、操作記録を作らずWindowsゴミ箱へ移す経路と、予約名の通常ファイルまたはWindowsのサイズ超過判定後の対象名を固定して削除する経路として検証する。旧schema 1〜4/6の復元・圧縮・終了履歴runnerを、新版通常経路の必須成功条件として使わない。旧版exeで作ったデータは下記の明示移行検証だけに使用する。
+
+- 予約名の通常ファイルについてCLI・stdio MCPの永久削除、dry-runの`would_permanently_delete`と不変更、通常名との混合・生存ハードリンク保全を確認する。予約名のディレクトリ・リンク・祖先とdevice構文は拒否し、preflight失敗や実体差し替えで無関係な対象を削除しないことを確認する。
 - CLIの単一・複数・Unicode・長いパス・`--paths-file`・空フォルダー・明示再帰とdry-run、MCPの入力型・余剰property・1〜256件上限を実プロセスで確認する。
-- ファイル結果が`dryRun`・`items`・`warnings`で、項目が`path`・`kind`・`status`・任意`error`だけを返すことを確認する。`recycled`・`permanently_deleted`・`would_recycle`・`already_absent`・`failed`・`ambiguous`と終了コード/MCP `isError`を照合し、operationId・backupPath・hash・sizeを返さないことを確認する。dry-runでは永久削除になるか予測できない旨を確認する。
+- ファイル結果が`dryRun`・`items`・`warnings`で、項目が`path`・`kind`・`status`・任意`error`だけを返すことを確認する。`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`と終了コード/MCP `isError`を照合し、operationId・backupPath・hash・sizeを返さないことを確認する。dry-runでは予約名の通常ファイルの永久削除予定と、それ以外のサイズ超過による永久削除を予測できない旨を確認する。
 - 実際の容量超過を起こす専用sparse fixtureをCLI・MCPで検証し、ファイル・フォルダーの元名の消失と今回分のゴミ箱項目、混合batch・生存hardlink・部分失敗の扱いを確認する。サイズ超過以外の失敗では永久削除せず、旧既定と設定済みの退避先を保護する。Shellの直前とサイズ超過の通知後での差し替え・ロックを別々に確認し、Shellが別実体を移した場合は`ambiguous`を返すこととWindows側の副作用を区別する。
 - `Verify-OversizeRaces.ps1`・`Verify-BeforeRecycleRace.ps1`・`Verify-BeforeRecycleSmallRace.ps1`は、同じ候補のexe・assembly・assembly SHA-256と未使用の外部D出力先を受け取る。実ShellとCore内部の境界を再現し、CLI・MCPの実プロセス検証とは区別する。証拠が一致したfixtureだけを清掃候補として残し、指定された経路で清掃する。
 - 共有ハードリンクのサイズ超過は`Verify-RecordlessFiles.ps1`のCLI・MCPとassembly指定の競合ケースで確認する。`Verify-OversizeMixedHardlinks.ps1`・`Verify-OversizeHardlinkPermissions.ps1`は通常Shellとの混合、単一・同一root・別rootのアクセス権不足を確認する。`Verify-OversizeParallelIndependence.ps1`・`Verify-OversizeRecycledHardlinkIndependence.ps1`は同じ候補のassemblyを使い、独立rootの同時pinと無関係な生存別名への書込みopenを実Shell後のCore境界で確認する。権限不足で部分完了した結果の順序と状態を区別し、不明な削除を再送しない。
 - 新規削除前後でPrunlet保存領域を比較し、操作manifest・PIDL・File ID・ACL snapshot・monitor・index・復元stageを作らないことを確認する。固定`maintenance.lock`と操作記録を区別する。通常削除・list・maintainが旧ファイル操作ディレクトリを走査しないことも確認する。
 - 内容・File ID・ADS・通常属性・case-sensitiveな名前・ACLと、リンク先の保全・外部ハードリンク別名との共有を確認する。復元は今回fixtureのWindowsゴミ箱項目だけで行い、ゴミ箱全体の空化や既存項目の清掃は行わない。復元先に既存項目を作り、上書きせず競合を扱う。
-- preflight失敗時の全対象保全、独立対象の並行完了、同一対象・親子の排他、共有ハードリンク検出時の排他、入力順を確認する。MCPの要求枠とworker枠・進捗分離・EOF後の完了を区別する。
+- preflight失敗時の全対象保全、独立対象の並行完了、同一対象・親子の排他、共有ハードリンク検出時の排他、入力順を確認する。MCPの要求枠とworker枠・進捗分離・EOF後の完了を区別する。競合のないCLIのstderr静穏、MCP数値tokenの型と値・単調な進捗・total不在・stderrとの本文と件数の一致、token省略時の通知なしも確認する。ロード中DLLの拒否時は元の内容・ID・属性・treeを保全し、解放後はWindowsゴミ箱との往復を確認する。
 - `restore`/`registry-restore`がファイルを復元せず、MCPの一覧が5ツールで`restore_files`を持たないことを確認する。hookの直接削除拒否・非削除入力通過・配置済みCLI案内・既存ホスト権限を確認する。
 
 `scripts/Verify-RecordlessFiles.ps1 -ExecutablePath <今回のexe> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSONパス>`を実行する。追加オプションは実装済みスクリプトのparamと照合し、未実行のケース数を成功実績として記載しない。
@@ -34,6 +37,8 @@ Windows・.NET 10 SDK・PowerShell 7で実行する。ビルドは`scripts/Publi
 
 新しいexeのCLI・stdio MCP・hookを実プロセスで検証する。fixtureは利用可能なhiveの専用キー配下へ隔離して作成し、hive・view・実行権限をレポートへ記録する。HKCUでKTMを利用できない環境では、許可されたHKLMの専用fixtureで正系を検証し、HKCUの拒否・原データ保全と区別する。レポートと一時物は外部作業領域へ置き、親を事前作成する。終了コード・stdout JSON・`passed`/`failed`を読み、未実行の権限・view・KTMケースを合格扱いしない。
 
+snapshotの公開境界は`scripts/Verify-RegistrySnapshotPublication.ps1 -AssemblyPath <今回のassembly絶対パス> -ExpectedAssemblySha256 <SHA-256> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSON絶対パス>`で確認する。容量予約に使ったbytesと公開本文・owner長/hashの一致、private ACL、中断後のprefix再開、改変prefixの拒否と保全を検証する。これはmetadata fixtureによる保存境界の検証であり、実レジストリのtransaction・完全ACL・native session往復を代替しない。
+
 - CLIのview欠落・重複・不正・未知引数・複数キー、MCPの余剰property・型不正を拒否する。値名はliteralで、空の既定値名（CLIの`--value-name=`を含む）と値+再帰拒否を確認する。
 - キー・値・既定値・未知の型を含むuint型番号と生バイト列・Unicode名を往復し、キーごとのOwner/Group/DACL/SACLとMandatory Labelを含む生のセキュリティ記述子を完全一致で比較する。値復元で親ACLが変わらないことを確認する。
 - SACL実体がない子キーにも`SE_SACL_AUTO_INHERITED`だけがある階層を含め、ACLの不在・null・空を区別して制御フラグを完全一致で比較する。フラグ欠落を比較除外で回避しない。
@@ -48,7 +53,7 @@ Windows・.NET 10 SDK・PowerShell 7で実行する。ビルドは`scripts/Publi
 
 明示native sessionでは、Codex側の通常CLI・MCPを実際に起動して同じnative scopeの値を削除・復元する。通常clientと専用の管理者clientの結果を分け、セッションの実際の起動tokenも記録する。同じSIDでも別ログオン識別子からの接続は拒否する。管理者セッションでの検証を通常tokenで起動したセッションの検証に数えない。通常clientの完全ACL権限不足は正常往復の成功に数えない。RPC後の`kind`、`allowedRoots:null`とvolumeパスのslash・末尾区切りを含む設定照合、期限切れ・未接続・capability/peer/scope/config改変、scope欠落の旧記録、接続断後のoperationId照合、60秒超の共通ロック待機とMCP進捗を確認する。元のMSIX仮想viewをnativeの同名キーと同一視せず、清掃不能なprivate fixtureを新規作成しない。
 
-再現用の`scripts/Verify-RegistrySession.ps1`は、`-Mode Prepare -ExecutablePath <今回のexe> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSONパス>`で固定したscopeと入力を準備する。同じexe・出力先・レポートを指定した`-Mode Start -AssertNativeWindows`でdesktop Explorer経由の通常用・管理者用helperを非表示起動する。UACが表示された場合だけ利用者が同意し、同意を代行しない。実token・ログオンID・exe・作成時刻・期限・scope・設定を照合してStartを確定し、入力hashとread handle・claim/permit・nonce・親の生存を確認してRunへ渡す。Run permit前にはfixtureを作成せず、二重Start/Run・改変・期限切れ・取消・親終了・遅延起動を拒否する。UACの実際の取消と記録による境界検証は区別する。
+再現用の`scripts/Verify-RegistrySession.ps1`は、`-Mode Prepare -ExecutablePath <今回のexe> -AssemblyPath <同じ候補のassembly絶対パス> -MoveExecutablePath <真正なschema 4旧版exe> -LegacyRegistryExecutablePath <真正なschema 5旧版exe> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSONパス>`で固定したscopeと入力を準備する。完全なStart・Runにはこの3依存を必須とし、欠落はUACやnative起動前に拒否する。Currentだけを確認するPrepareでは任意指定を維持する。同じexe・出力先・レポートを指定した`-Mode Start -AssertNativeWindows`でdesktop Explorer経由の通常用・管理者用helperを非表示起動する。UACが表示された場合だけ利用者が同意し、同意を代行しない。実token・ログオンID・exe・作成時刻・期限・scope・設定を照合してStartを確定し、入力hashとread handle・claim/permit・nonce・親の生存を確認してRunへ渡す。Run permit前にはfixtureを作成せず、二重Start/Run・改変・期限切れ・取消・親終了・遅延起動を拒否する。UACの実際の取消と記録による境界検証は区別する。
 
 `-Mode Current`は同じ引数で、既存の仮想SoftwareへのCLI・MCPのdry-run拒否と原本・metadataの不変更、hook subprocessを確認する。新しいprivate fixtureは作成しない。Start後の`-Mode Run`で往復・競合・完全ACL・切断後照合を実行する。fixture作成前に実際のCodex clientと通常セッションのログオンIDも照合し、不一致ならキーを作成せず停止する。通常・管理者でログオンIDが異なる接続は拒否され、サーバーの権限を借りないことも確認する。汎用brokerやタスクは登録しない。
 

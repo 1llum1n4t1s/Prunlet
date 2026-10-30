@@ -18,16 +18,14 @@ if((Get-FileHash -LiteralPath $AssemblyPath).Hash -cne $ExpectedAssemblySha256){
 $hostScript=Join-Path $PSScriptRoot 'recordless-e2e/OversizeCheckpointHost.ps1'
 $common=Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1'; . $common
 $helperFiles=@('NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs')|ForEach-Object {Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $_}
-$sources=@(@($PSCommandPath,$hostScript,$common,(Join-Path $PSScriptRoot 'Verify-RecycleBin.ps1'))+$helperFiles|ForEach-Object {@{path=$_;sha256=(Get-FileHash -LiteralPath $_).Hash}})
+$sources=@(@($PSCommandPath,$hostScript,$common,(Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs'))+$helperFiles|ForEach-Object {@{path=$_;sha256=(Get-FileHash -LiteralPath $_).Hash}})
 $exeHash=(Get-FileHash -LiteralPath $ExecutablePath).Hash
 $null=[IO.Directory]::CreateDirectory($OutputDirectory);$script:temp=Join-Path $OutputDirectory 'temp';$null=[IO.Directory]::CreateDirectory($script:temp)
 $oldTemp=$env:TEMP;$oldTmp=$env:TMP;$env:TEMP=$script:temp;$env:TMP=$script:temp
 $script:commands=[Collections.Generic.List[object]]::new();$results=[Collections.Generic.List[object]]::new()
 try {
  Add-Type -Path $helperFiles -CompilerOptions '/unsafe'
- $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'Verify-RecycleBin.ps1'),[ref]$tokens,[ref]$errors)
- $definitions=@($ast.FindAll({param($n)$n-is[Management.Automation.Language.StringConstantExpressionAst]-and$n.Value.Contains('public static class PrunletSparseE2E {')},$true))
- Assert-R ($errors.Count-eq0-and$definitions.Count-eq1) 'Sparse helper source ambiguous';Add-Type -TypeDefinition $definitions[0].Value
+ Add-Type -Path (Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs')
  foreach($mode in @('replace','lock')) {
   $state=@{mode=$mode;passed=$false;cleanupReady=$false;cleanup='retained for external CLI cleanup'};$results.Add($state)
   try {

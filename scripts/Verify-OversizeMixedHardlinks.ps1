@@ -198,17 +198,13 @@ function Test-Mixed([string]$Mode) {
 }
 try {
     Add-Type -Path $helperFiles -CompilerOptions '/unsafe'
-    $tokens=$null; $errors=$null
-    $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'Verify-RecycleBin.ps1'),[ref]$tokens,[ref]$errors)
-    $definitions=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] -and $n.Value.Contains('public static class PrunletSparseE2E {')},$true))
-    Assert-R ($definitions.Count -eq 1 -and $errors.Count -eq 0) 'Sparse finalizer source ambiguous.'
-    if (!('PrunletSparseE2E' -as [type])) { Add-Type -TypeDefinition $definitions[0].Value }
+ if (!('PrunletSparseE2E' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs') }
     Test-Mixed 'cli'
     Test-Mixed 'mcp'
 } catch { $results.Add(@{name='setup'; passed=$false; error=$_.Exception.ToString()}) }
 finally {
     try {
-        $report=@{suite='oversize-mixed-hardlinks'; executable=$ExecutablePath; executableSha256=(Get-FileHash -LiteralPath $ExecutablePath).Hash; output=$OutputDirectory; temp=$script:temp; passed=@($results | Where-Object passed).Count; failed=@($results | Where-Object {!$_.passed}).Count; results=@($results); commands=@($script:commands); retained='Output fixtures and identified Windows Bin entries are retained for inspection.'}
+        $report=@{suite='oversize-mixed-hardlinks';sparseHelper=@{path=(Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs');sha256=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs')).Hash}; executable=$ExecutablePath; executableSha256=(Get-FileHash -LiteralPath $ExecutablePath).Hash; output=$OutputDirectory; temp=$script:temp; passed=@($results | Where-Object passed).Count; failed=@($results | Where-Object {!$_.passed}).Count; results=@($results); commands=@($script:commands); retained='Output fixtures and identified Windows Bin entries are retained for inspection.'}
         Save-R $ReportPath $report
     } finally { $env:TEMP=$oldTemp; $env:TMP=$oldTmp }
 }

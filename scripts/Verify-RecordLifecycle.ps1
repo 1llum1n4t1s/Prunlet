@@ -113,11 +113,7 @@ function Test-LifecycleCase([string]$Name,[scriptblock]$Body){
 function Initialize-LifecycleSparseNative {
  if('PrunletSparseE2E'-as[type]){return}
  # 別runnerは実行せず、検証済みnative helperの型定義だけを共有する。
- $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'Verify-RecycleBin.ps1'),[ref]$tokens,[ref]$errors)
- Assert-Lifecycle ($errors.Count-eq0) 'Sparse helper source has parse errors'
- $definitions=@($ast.FindAll({param($node)$node-is[Management.Automation.Language.StringConstantExpressionAst]-and$node.Value.Contains('public static class PrunletSparseE2E')},$true))
- Assert-Lifecycle ($definitions.Count-eq1-and$definitions[0].Value.Contains('RestoreTiny(')) 'Unique safe sparse finalizer definition required'
- Add-Type -TypeDefinition $definitions[0].Value
+ Add-Type -Path (Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs')
 }
 function Get-LifecycleOriginalEvidence([string]$Path,[int]$PrefixLength=0){
  $e=@{identity=[LifecycleE2ENative]::Identity($Path);security=[LifecycleE2ENative]::Security($Path);attributes=[int][IO.File]::GetAttributes($Path)}
@@ -1163,7 +1159,7 @@ foreach($bindingFault in @('owner-bytes','namespace','body-id','body-length')){
  }
 }
 if($results.Count-ne51){$results.Add(@{name='default-coverage-count';passed=$false;error='Expected all 51 lifecycle cases.'})}
-$report=@{sourceSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash;expectedCases=51;executablePath=$ExecutablePath;executableSha256=(Get-FileHash -LiteralPath $ExecutablePath).Hash;baselineExecutablePath=$BaselineExecutablePath;fileCount=$FileCount;results=@($results);passed=@($results|Where-Object passed).Count;failed=@($results|Where-Object {!$_.passed}).Count;scope='isolated CLI lifecycle E2E; Windows bin limited to this fixture';retainedDirectory=$OutputDirectory}
+$report=@{sparseHelper=@{path=(Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs');sha256=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs')).Hash};sourceSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash;expectedCases=51;executablePath=$ExecutablePath;executableSha256=(Get-FileHash -LiteralPath $ExecutablePath).Hash;baselineExecutablePath=$BaselineExecutablePath;fileCount=$FileCount;results=@($results);passed=@($results|Where-Object passed).Count;failed=@($results|Where-Object {!$_.passed}).Count;scope='isolated CLI lifecycle E2E; Windows bin limited to this fixture';retainedDirectory=$OutputDirectory}
 [IO.File]::WriteAllText($ReportPath,($report|ConvertTo-Json -Depth 30),$utf8)
 $report|Select-Object passed,failed,fileCount|ConvertTo-Json
 if($report.failed){exit 1}

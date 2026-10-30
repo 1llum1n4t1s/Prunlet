@@ -36,7 +36,7 @@ $oldTemp=$env:TEMP; $oldTmp=$env:TMP; $env:TEMP=$script:temp; $env:TMP=$script:t
 $script:commands=[Collections.Generic.List[object]]::new(); $results=[Collections.Generic.List[object]]::new(); $backups=[Collections.Generic.List[object]]::new()
 $helperFiles=@('NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs') | ForEach-Object { Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $_ }
 function Save-Progress {
-    Save-R $ReportPath @{suite='oversize-hardlink-permissions'; executable=$ExecutablePath; executableSha256=(Get-FileHash -LiteralPath $ExecutablePath).Hash; output=$OutputDirectory; temp=$script:temp; executed=$results.Count; passed=@($results | Where-Object passed).Count; failed=@($results | Where-Object {!$_.passed}).Count; aclBackups=@($backups); results=@($results); commands=@($script:commands); retained='All fixture paths and identified Bin entries are retained; inspect ambiguous results without retrying.'}
+    Save-R $ReportPath @{suite='oversize-hardlink-permissions';sparseHelper=@{path=(Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs');sha256=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs')).Hash}; executable=$ExecutablePath; executableSha256=(Get-FileHash -LiteralPath $ExecutablePath).Hash; output=$OutputDirectory; temp=$script:temp; executed=$results.Count; passed=@($results | Where-Object passed).Count; failed=@($results | Where-Object {!$_.passed}).Count; aclBackups=@($backups); results=@($results); commands=@($script:commands); retained='All fixture paths and identified Bin entries are retained; inspect ambiguous results without retrying.'}
 }
 function Shared-Node($Handle) {
     $method=[Prunlet.RecordlessE2E.FixtureNative].GetMethod('ReadNode',[Reflection.BindingFlags]'NonPublic,Static')
@@ -213,11 +213,7 @@ public static class PermissionProbe {
     }
 }
 '@
-    $tokens=$null; $errors=$null
-    $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'Verify-RecycleBin.ps1'),[ref]$tokens,[ref]$errors)
-    $definitions=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] -and $n.Value.Contains('public static class PrunletSparseE2E {')},$true))
-    Assert-R ($definitions.Count -eq 1 -and $errors.Count -eq 0) 'Sparse finalizer source ambiguous.'
-    if (!('PrunletSparseE2E' -as [type])) { Add-Type -TypeDefinition $definitions[0].Value }
+ if (!('PrunletSparseE2E' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs') }
     foreach ($mode in @('cli','mcp')) { Test-Scenario $mode 'one'; Test-Scenario $mode 'two-roots'; Test-Scenario $mode 'same-root' }
 } catch { $results.Add(@{name='setup'; passed=$false; error=$_.Exception.ToString()}) }
 finally { try { Save-Progress } finally { $env:TEMP=$oldTemp; $env:TMP=$oldTmp } }

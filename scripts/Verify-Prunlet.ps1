@@ -39,7 +39,7 @@ $script:SymbolicRestoreEvidence = [Collections.Generic.List[object]]::new()
 
 # 読み取り専用対応で想定する失敗: 削除不可、dry-runの属性変更、復元時の通常属性・内容・時刻の欠落、
 # 再帰/ADS/MCPの経路漏れ、外部hardlink・リンク先の属性変更、旧manifest非互換、不正属性の受理、
-# ACL拒否・ロード中DLL失敗後の元属性や検証済みコピーの欠損（DLLはVerify-TransientLocksで確認）。
+# ACL拒否・ロード中DLL失敗後の元属性や検証済みコピーの欠損（DLLはVerify-RecordlessFilesで確認）。
 function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { throw $Message } }
 function New-File([string]$Name, [string]$Content = 'Prunlet fixture') {
     $path = Join-Path $script:Scope $Name
