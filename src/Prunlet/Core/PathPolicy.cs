@@ -4,13 +4,16 @@ namespace Prunlet.Core;
 
 internal static class PathPolicy
 {
-    internal static string Absolute(string? value) => AbsoluteCore(value, allowReservedNames: false);
+    internal static string Absolute(string? value) => AbsoluteCore(value, allowReservedNames: false, allowReservedLeaf: false);
+
+    // 外部の削除対象だけ、親は通常の構文を維持して最終名の予約名を許す。
+    internal static string FileDeleteAbsolute(string? value) => AbsoluteCore(value, allowReservedNames: false, allowReservedLeaf: true);
 
     // 列挙・ハンドル由来の実ファイル名を、必ず拡張長形式で開く内部経路に限り使う。
     // 外部入力の予約名拒否とは分離し、名前空間・ADS・走査などの構文制約は共通に保つ。
-    internal static string FileSystemAbsolute(string? value) => AbsoluteCore(value, allowReservedNames: true);
+    internal static string FileSystemAbsolute(string? value) => AbsoluteCore(value, allowReservedNames: true, allowReservedLeaf: false);
 
-    private static string AbsoluteCore(string? value, bool allowReservedNames)
+    private static string AbsoluteCore(string? value, bool allowReservedNames, bool allowReservedLeaf)
     {
         // 拡張長形式も通常のローカルドライブに限り、同じ構文検査へ通す。
         if (value?.StartsWith(@"\\?\", StringComparison.Ordinal) == true) value = value[4..];
@@ -21,19 +24,30 @@ internal static class PathPolicy
             throw new ArgumentException("Use an absolute local drive path without wildcards, ADS, UNC, or device syntax.");
         var path = value.TrimEnd('\\');
         if (path.Length == 2) path += "\\";
-        foreach (var component in path[3..].Split('\\', StringSplitOptions.None))
+        var components = path[3..].Split('\\', StringSplitOptions.None);
+        for (var index = 0; index < components.Length; index++)
         {
             if (path.Length == 3) break;
+            var component = components[index];
             if (component.Length == 0 || component is "." or ".." || component.EndsWith('.') || component.EndsWith(' ')
                 || component.IndexOfAny(['<', '>', '"', '|']) >= 0 || component.Any(char.IsControl))
                 throw new ArgumentException("Path components cannot contain traversal, empty components, invalid characters, or trailing dots/spaces.");
-            var stem = component.Split('.')[0].ToUpperInvariant();
-            if (!allowReservedNames && (stem is "CON" or "PRN" or "AUX" or "NUL" or "CONIN$" or "CONOUT$"
-                || (stem.Length == 4 && (stem.StartsWith("COM", StringComparison.Ordinal) || stem.StartsWith("LPT", StringComparison.Ordinal))
-                    && "123456789¹²³".Contains(stem[3]))))
+            if (!allowReservedNames && !(allowReservedLeaf && index == components.Length - 1) && IsReservedName(component))
                 throw new ArgumentException("Device names are not allowed.");
         }
-        return Path.GetFullPath(path);
+        // 通常形式の GetFullPath は末尾 NUL 等をデバイス名へ変換する。
+        var extended = @"\\?\" + path;
+        if (!Path.GetFullPath(extended).Equals(extended, StringComparison.Ordinal))
+            throw new ArgumentException("Path normalization changed the local filesystem path.");
+        return path;
+    }
+
+    internal static bool IsReservedName(string component)
+    {
+        var stem = component.Split('.')[0].ToUpperInvariant();
+        return stem is "CON" or "PRN" or "AUX" or "NUL" or "CONIN$" or "CONOUT$"
+            || (stem.Length == 4 && (stem.StartsWith("COM", StringComparison.Ordinal) || stem.StartsWith("LPT", StringComparison.Ordinal))
+                && "123456789¹²³".Contains(stem[3]));
     }
 
     internal static bool Within(string path, string root) => path.Equals(root, StringComparison.OrdinalIgnoreCase)
@@ -48,9 +62,9 @@ internal static class PathPolicy
 
     // 入力の全祖先と、ハンドルが示す実体の全祖先を固定してから実体パスを返す。
     // 欠損対象は最後に確認できた実体の親へ連結し、短縮名やホスト転送を引き継がない。
-    internal static string Resolve(string path, bool finalDirectory = false, bool allowMissing = true)
+    internal static string Resolve(string path, bool finalDirectory = false, bool allowMissing = true, bool allowReservedLeaf = false)
     {
-        path = Absolute(path);
+        path = allowReservedLeaf ? FileDeleteAbsolute(path) : Absolute(path);
         var components = Components(path).ToArray();
         using var lease = new DirectoryLease();
         var pinned = new HashSet<string>(StringComparer.Ordinal);

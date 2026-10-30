@@ -2,7 +2,7 @@
 
 Prunletは、`blocked by policy`による清掃の停止を減らすために、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約するWindows用ツールです。許可された削除を最初からPrunletへ任せる使い方に揃えます。
 
-指定したファイル・フォルダーを通常はWindowsのゴミ箱へ移します。Windowsがゴミ箱には大きすぎると判断した対象は、元の名前を固定できた場合に限り永久削除を試みます。Prunletはファイルの操作記録・操作ID・復元用snapshotを保存せず、ゴミ箱に移った項目の復元と保持期間の管理はWindowsに任せます。レジストリのキー・値は専用snapshotとトランザクションで保全し、操作IDによる非上書き復元を提供します。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
+指定したファイル・フォルダーを通常はWindowsのゴミ箱へ移します。予約名の通常ファイルと、Windowsがゴミ箱には大きすぎると判断した対象は、元の名前を固定できた場合に限り永久削除を試みます。Prunletはファイルの操作記録・操作ID・復元用snapshotを保存せず、ゴミ箱に移った項目の復元と保持期間の管理はWindowsに任せます。レジストリのキー・値は専用snapshotとトランザクションで保全し、操作IDによる非上書き復元を提供します。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
 
 ファイルと空フォルダーを扱い、`--recursive`を明示するとフォルダー全体を削除できます。リンク先は辿りません。サイズ超過以外のゴミ箱の失敗では永久削除や独自退避へ切り替えません。ハードリンクは生存する別名と内容を共有するため、保存時点の不変コピーではありません。
 
@@ -106,13 +106,13 @@ exe・設定は配置済みの絶対パスへ置き換えてください。Codex
 ["C:\\work\\project\\unused.txt", "C:\\work\\project\\other.txt"]
 ```
 
-空フォルダーは通常の`delete`、内容があるフォルダーは`delete --recursive --paths-file <絶対JSONパス>`で扱います。単純なパスは`delete [--dry-run] [--recursive] -- <絶対パス> [...]`でも渡せます。ワイルドカード・ネットワークパス・未知のreparseタグは扱いません。リンクはリンク自体を削除し、リンク先を走査しません。
+空フォルダーは通常の`delete`、内容があるフォルダーは`delete --recursive --paths-file <絶対JSONパス>`で扱います。単純なパスは`delete [--dry-run] [--recursive] -- <絶対パス> [...]`でも渡せます。ワイルドカード・ネットワークパス・未知のreparseタグは扱いません。リンクはリンク自体を削除し、リンク先を走査しません。`NUL`や`NUL.txt`などWindows予約名と同じ名前の通常ファイルは、実体を確認して追加確認なしで永久削除します。ゴミ箱には入りません。予約名の祖先・ディレクトリ・リンクはこの例外の対象外です。
 
-結果は`dryRun`・`items`・`warnings`です。各項目の`path`・`kind`・`status`と任意の`error`を確認します。状態は`recycled`・`permanently_deleted`・`would_recycle`・`already_absent`・`failed`・`ambiguous`で、ファイルの操作ID・backupPath・hash・sizeは返しません。`permanently_deleted`は指定した元の名前をゴミ箱に移さず削除したことを示し、他のハードリンクやバックアップの消去は意味しません。`failed`と`ambiguous`は成功扱いになりません。
+結果は`dryRun`・`items`・`warnings`です。各項目の`path`・`kind`・`status`と任意の`error`を確認します。状態は`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`で、ファイルの操作ID・backupPath・hash・sizeは返しません。`permanently_deleted`は指定した元の名前をゴミ箱に移さず削除したことを示し、他のハードリンクやバックアップの消去は意味しません。`failed`と`ambiguous`は成功扱いになりません。
 
 `recycled`項目の復元はWindowsのゴミ箱から行います。`permanently_deleted`の元の名前はゴミ箱から復元できません。Prunletにはファイル復元コマンド・MCPツールがありません。ゴミ箱の復元先に既存項目がある場合は、Windowsの画面で競合を確認し、上書きしないでください。
 
-使用中・権限不足・パス制限などで移動できない場合は結果を確認してください。Shell処理中に対象名が差し替えられると、別の実体がゴミ箱へ移る可能性があります。Prunletは移動後の実体を照合し、一致しない場合は`ambiguous`で停止します。`ambiguous`は元対象とWindowsのゴミ箱を確認し、同じ削除を自動再送しません。dry-runの`would_recycle`は入力の事前検査結果で、実行時に`permanently_deleted`になるかどうかや実移動の成功は予測できません。
+使用中・権限不足・パス制限などで移動できない場合は結果を確認してください。Shell処理中に対象名が差し替えられると、別の実体がゴミ箱へ移る可能性があります。Prunletは移動後の実体を照合し、一致しない場合は`ambiguous`で停止します。`ambiguous`は元対象とWindowsのゴミ箱を確認し、同じ削除を自動再送しません。予約名の通常ファイルは、dry-runで`would_permanently_delete`を返し、実際には削除しません。それ以外の`would_recycle`は入力の事前検査結果で、実行時に`permanently_deleted`になるかどうかや実移動の成功は予測できません。
 
 ## レジストリの削除・復元
 

@@ -552,6 +552,7 @@ try {
         $registeredGuide = [IO.File]::ReadAllText($instructionGuide)
         Assert-True ($registeredGuide.Contains('初回から `sandbox_permissions: "require_escalated"`') -and $registeredGuide.Contains('login: false, sandbox_permissions: "require_escalated"')) 'Guide omits the initial formal sandbox permission request or its CMD example.'
         Assert-True ($registeredGuide.Contains('WindowsのUAC昇格や管理者実行ではない') -and $registeredGuide.Contains('実処理に必要な権限と、対象がサイズ超過で永久削除されるかは予測しない')) 'Guide omits the UAC distinction or dry-run permission limitation.'
+        Assert-True ($registeredGuide.Contains('末尾名がWindows予約名の実在する通常ファイルだけ') -and $registeredGuide.Contains('追加確認やShell試行なしで永久削除する') -and $registeredGuide.Contains('予約名の祖先・ディレクトリ・reparse pointはこの例外に含めない') -and $registeredGuide.Contains('would_permanently_delete')) 'Guide omits the reserved regular-file permanent deletion boundary or its dry-run status.'
         Assert-True ($registeredGuide.Contains('同じ削除を自動再送しない') -and $registeredGuide.Contains('状態を照合') -and $registeredGuide.Contains('元の削除許可とホストの承認・管理ポリシーを守る')) 'Guide omits uncertain-state reconciliation or preserves no host policy boundary.'
         $withoutBlock = [regex]::Replace($agentText, '<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->\r\n[\s\S]*?\r\n<!-- END PRUNLET AGENT-INSTRUCTIONS -->\r\n', '')
         Assert-True ($withoutBlock -ceq $originalAgentText) 'Existing AGENTS body or newlines changed.'

@@ -72,9 +72,11 @@ internal static class Program
                     Legacy --allowed-root <directory> options are accepted but do not restrict target directories.
                     Metadata and volume recovery directories are protected.
                     Files and folders normally move into the Windows Recycle Bin without Prunlet operation records.
+                    An ordinary file with a Windows reserved final name is permanently deleted after identity checks, without using the bin.
+                    Dry-run reports that case as would_permanently_delete. Reserved-name directories and links are rejected.
                     When Windows reports a file or folder too large for the bin, Prunlet attempts to permanently delete its confirmed original.
                     Only a confirmed removal returns permanently_deleted; an uncertain attempt returns ambiguous.
-                    Other recycling failures do not trigger permanent deletion. Dry-run cannot predict which outcome applies.
+                    Other recycling failures do not trigger permanent deletion. Dry-run cannot predict an ordinary item's bin-size outcome.
                     Restore recycled items using Windows Recycle Bin; permanently deleted items cannot be restored there.
                     Registry snapshots retain the configured 7-day / 1 GiB defaults.
                     Maintain and purge manage registry recovery only; inspection is the default.

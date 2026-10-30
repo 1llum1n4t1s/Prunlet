@@ -20,11 +20,11 @@ Codexの通常経路は、対象の絶対パスをそのままの文字列をUTF
 上のプレースホルダーは共通AGENTSに記録したパスと今回作成した実パスへ置き換える。CMDのtool callでは、たとえば `tools.exec_command({cmd: "<installed-exe> --config <absolute-config> delete --paths-file <absolute-json-file>", shell: "cmd.exe", login: false, sandbox_permissions: "require_escalated", justification: "許可された対象をPrunletで削除するため、正式なsandbox権限を要求します。"})` として直接渡す。ゴミ箱へ移った項目の復元はWindowsのゴミ箱で行う。`-- <literal-path>...`もCLIでは対応するが、CMDの引用が必要な対象には配列ファイルを使う。
 
 - 通常ファイルのMSIX転送・8.3短縮名・slash表記・拡張長のローカルドライブ表記に対応する。入力の実体を検証し、結果の`path`は実体パスを示す。
-- 範囲確認が必要なら、削除前に`--dry-run`で確認する。dry-runは通常sandboxでも行えるが、実処理に必要な権限と、対象がサイズ超過で永久削除されるかは予測しない。CLIのJSON結果と終了コードを読み、各対象の`recycled`・`permanently_deleted`・`would_recycle`・`already_absent`・`failed`・`ambiguous`を判定する。`ambiguous`は成功扱いせず、同じ削除を再送しない。
+- 範囲確認が必要なら、削除前に`--dry-run`で確認する。dry-runは通常sandboxでも行えるが、実処理に必要な権限と、対象がサイズ超過で永久削除されるかは予測しない。予約名の通常ファイルは`would_permanently_delete`で示し、実際には削除しない。CLIのJSON結果と終了コードを読み、各対象の`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`を判定する。`ambiguous`は成功扱いせず、同じ削除を再送しない。
 - ファイル・フォルダーの操作記録・操作IDは保存しない。`recycled`項目はWindowsのゴミ箱で復元し、`permanently_deleted`の元の名前はゴミ箱から復元できない。復元先に既存項目がある場合は上書きせず、Windowsの画面で競合を確認する。
 - 削除対象フォルダーの事前登録・追加許可は不要。ユーザーが依頼した削除対象、または現在の作業で清掃が許可された一時ファイルを、保存場所を理由に追加確認せず処理する。
 - 空フォルダーは通常の`delete`、内容がある作業フォルダーは`delete --recursive`でフォルダー自体まで清掃する。MCPでは`recursive: true`を指定する。`recycled`のツリーは空の子フォルダーも含めWindowsのゴミ箱から復元する。
-- ファイル・フォルダーは通常Windowsのゴミ箱へ移す。Windowsが対象を大きすぎると判定し、元の実体を再確認できた場合はその名前の永久削除を試み、完了を確認できたときだけ`permanently_deleted`を返す。サイズ超過以外では永久削除へ切り替えない。Prunletは復元用の操作ID・PIDL・File IDや内容・ACLのsnapshotを保存せず、リンク先を辿らない。ハードリンクの別名とは実体を共有する。
+- ファイル・フォルダーは通常Windowsのゴミ箱へ移す。`NUL`や`NUL.txt`など末尾名がWindows予約名の実在する通常ファイルだけは、元実体と親・名前・属性を固定して照合し、追加確認やShell試行なしで永久削除する。予約名の祖先・ディレクトリ・reparse pointはこの例外に含めない。通常名の対象は、Windowsが対象を大きすぎると判定し、元の実体を再確認できた場合はその名前の永久削除を試み、完了を確認できたときだけ`permanently_deleted`を返す。サイズ超過以外では永久削除へ切り替えない。Prunletは復元用の操作ID・PIDL・File IDや内容・ACLのsnapshotを保存せず、リンク先を辿らない。ハードリンクの別名とは実体を共有する。
 - `permanently_deleted`は元の名前の結果であり、別ハードリンク・既存コピー・バックアップの消去を意味しない。Shell直前の名前差し替えで別実体がゴミ箱へ移った場合も`ambiguous`で停止する。
 - `maintain [--apply]`・`purge <operationId> [--apply]`はレジストリsnapshotだけを整理する。省略時は検査のみ。ファイル・フォルダーはWindowsの保持・清掃に任せる。ゴミ箱全体を空にしたり旧専用領域を手動削除したりしない。
 - インストール済みexeや設定そのものに空白・CMDの特殊文字を含む配置など、CLIの引数を正しく渡せないと実行前に分かる場合は、互換クライアント向けPrunlet MCPを最初から明示選択するか、必要な配置・入力を確認する。削除を試して拒否された後にMCPへ切り替えない。

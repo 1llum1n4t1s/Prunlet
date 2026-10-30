@@ -127,7 +127,7 @@ internal static class VolumeRecoveryStore
 
     private static StoreLocation Location(PrunletConfig config, string sourcePath, bool useDefault = false, bool restore = false)
     {
-        var source = PathPolicy.Absolute(sourcePath);
+        var source = PathPolicy.FileDeleteAbsolute(sourcePath);
         // reparse対象自身ではなく、その名前が置かれているボリュームを選ぶ。
         var sourceParent = Path.GetDirectoryName(source) ?? source;
         var mountRoot = NativeFiles.VolumeMountRoot(sourceParent);

@@ -29,6 +29,7 @@ public sealed partial class DeletionService
         var identities = new MoveEntryIdentity?[paths.Length];
         var parentIdentities = new MoveEntryIdentity?[paths.Length];
         var needsExclusive = new bool[paths.Length];
+        var reserved = normalized.Select(path => PathPolicy.IsReservedName(Path.GetFileName(path))).ToArray();
         try
         {
             // 実体の全木を読まず、入力rootと親だけを全件preflightする。
@@ -57,12 +58,14 @@ public sealed partial class DeletionService
                         throw new IOException("Recycle link root resolved to another path.");
                     if (identity.ReparseTag != 0 && NativeFiles.ValidateReparse(NativeFiles.ReadReparse(inspection)) != identity.ReparseTag)
                         throw new IOException("Recycle source reparse metadata differs.");
+                    if (reserved[index] && (identity.IsDirectory || identity.ReparseTag != 0))
+                        throw new ArgumentException("Reserved names are supported only for ordinary files.");
                     identities[index] = identity;
                     item.Kind = identity.ReparseTag switch { 0 => identity.IsDirectory ? "directory" : "file", 0xa0000003 => "junction", 0xa000000c => "symlink", _ => throw new IOException("Unsupported reparse point.") };
                     if (identity.IsDirectory && identity.ReparseTag == 0 && !recursive && Directory.EnumerateFileSystemEntries(path).Any())
                         throw new ArgumentException("Nonempty directories require explicit recursive deletion.");
                     needsExclusive[index] = !identity.IsDirectory && NativeFiles.HasMultipleLinks(inspection);
-                    if (!exclusive && needsExclusive[index]) { item.Status = "would_recycle"; return; }
+                    if (!exclusive && needsExclusive[index]) { item.Status = reserved[index] ? "would_permanently_delete" : "would_recycle"; return; }
                     var root = NativeFiles.OpenRecordlessPreflight(path); roots[index] = root;
                     var fixedIdentity = NativeFiles.MoveIdentity(root);
                     if (!SameRecordlessObject(identity, fixedIdentity) || fixedIdentity.Attributes != identity.Attributes)
@@ -70,7 +73,7 @@ public sealed partial class DeletionService
                     VerifyPermanentHandle(root, path, fixedIdentity);
                     // 同一実体の別aliasもpreflightできるよう、排他batchは各rootを順に解放する。
                     if (exclusive) { root.Dispose(); roots[index] = null; }
-                    item.Status = "would_recycle";
+                    item.Status = reserved[index] ? "would_permanently_delete" : "would_recycle";
                 }
                 catch (Exception ex) when (IsRecycleFailure(ex)) { item.Error = ex.Message; }
             }, sequential: exclusive);
@@ -90,6 +93,7 @@ public sealed partial class DeletionService
             {
                 var item = result.Items[index];
                 if (item.Status == "already_absent") return;
+                if (reserved[index]) { roots[index]?.Dispose(); oversized[index] = true; return; }
                 var started = false;
                 var identity = identities[index]!;
                 var fileKey = (identity.VolumeSerialNumber, identity.FileId);
@@ -158,18 +162,19 @@ public sealed partial class DeletionService
             {
                 if (!oversized[index]) return;
                 var item = result.Items[index];
+                var started = !reserved[index];
                 try
                 {
                     using var original = inspections[index] ?? throw new IOException("Recycle source inspection was not retained.");
-                    DeleteOversizedTarget(item.Path, identities[index]!, parentIdentities[index]!, original, recursive, oversizedHardlinks);
+                    DeleteOversizedTarget(item.Path, identities[index]!, parentIdentities[index]!, original, recursive, oversizedHardlinks, () => started = true);
                     original.Dispose();
                     if (InspectMoveLocation(item.Path) is not null) throw new IOException("A source name is still present after the Windows deletion attempt.");
                     item.Status = "permanently_deleted";
                 }
                 catch (Exception ex) when (IsRecycleFailure(ex))
                 {
-                    item.Status = "ambiguous";
-                    item.Error = ex.Message + " Some entries may already have been permanently deleted. The operation was not retried. Inspect the Windows Recycle Bin and the source before any further action.";
+                    item.Status = started ? "ambiguous" : "failed";
+                    item.Error = ex.Message + (started ? " Some entries may already have been permanently deleted. The operation was not retried. Inspect the Windows Recycle Bin and the source before any further action." : "");
                 }
             }, sequential: exclusive);
             return result;
@@ -221,7 +226,7 @@ public sealed partial class DeletionService
             throw new IOException("Retained hardlink identity changed.");
     }
 
-    private void DeleteOversizedTarget(string path, MoveEntryIdentity expected, MoveEntryIdentity expectedParent, SafeFileHandle original, bool recursive, OversizedHardlinkState hardlinks)
+    private void DeleteOversizedTarget(string path, MoveEntryIdentity expected, MoveEntryIdentity expectedParent, SafeFileHandle original, bool recursive, OversizedHardlinkState hardlinks, Action beforeDelete)
     {
         CheckRecycleTarget(path, expected.IsDirectory);
         using var parent = NativeFiles.OpenDirectory(Path.GetDirectoryName(path)!);
@@ -244,7 +249,7 @@ public sealed partial class DeletionService
             || current.Attributes != held.Attributes)
             throw new IOException("Oversized target changed before its name could be fixed.");
         VerifyPermanentHandle(pinned, path, current);
-        DeletePinnedOversized(pinned, path, current, recursive, hardlinks);
+        DeletePinnedOversized(pinned, path, current, recursive, hardlinks, beforeDelete);
     }
 
     private static void VerifyPermanentHandle(SafeFileHandle handle, string path, MoveEntryIdentity identity)
@@ -255,7 +260,7 @@ public sealed partial class DeletionService
             throw new IOException("Oversized link identity or reparse data changed.");
     }
 
-    private static void DeletePinnedOversized(SafeFileHandle handle, string path, MoveEntryIdentity identity, bool recursive, OversizedHardlinkState hardlinks)
+    private static void DeletePinnedOversized(SafeFileHandle handle, string path, MoveEntryIdentity identity, bool recursive, OversizedHardlinkState hardlinks, Action beforeDelete)
     {
         var stack = new Stack<PermanentDeleteFrame>();
         stack.Push(new(handle, path, identity, ownsHandle: false));
@@ -363,6 +368,7 @@ public sealed partial class DeletionService
                         || NativeFiles.PinnedLastWriteTime(frame.Handle) != verifiedWriteTime)
                         throw new IOException("A hardlink changed before deletion.");
                 }
+                beforeDelete();
                 NativeFiles.SetPermanentDeletePending(frame.Handle, posix);
                 if (posix) OversizedDeleteCheckpoint?.Invoke("hardlink-pending", frame.Path);
                 if (posix && (NativeFiles.PinnedChangeTime(hardlinks.Guards[fileKey]) != verifiedTime

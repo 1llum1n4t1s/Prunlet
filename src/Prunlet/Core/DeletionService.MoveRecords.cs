@@ -24,7 +24,7 @@ public sealed partial class DeletionService
 
     private void CheckMoveTarget(string path, bool directory)
     {
-        if (path != PathPolicy.Absolute(path) || path.Length == 3 || PathPolicy.Within(path, config.BackupDirectory)
+        if (path != PathPolicy.FileDeleteAbsolute(path) || path.Length == 3 || PathPolicy.Within(path, config.BackupDirectory)
             || (directory && PathPolicy.Within(config.BackupDirectory, path)))
             throw new ArgumentException("Target is inside or contains the metadata recovery directory.");
         // 他volumeの設定値も短縮名等を実体へ解決して保護する。不正・未検証なら削除しない。
