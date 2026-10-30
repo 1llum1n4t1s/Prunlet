@@ -58,7 +58,7 @@ public sealed partial class DeletionService
             using var operation = NewOperationLease.Create(config.BackupDirectory, requestedOperationId);
             result.OperationId = operation.OperationId;
             var snapshotPath = Path.Combine(operation.Directory, RegistrySnapshotName);
-            var payload = PublishRegistryJson(snapshotPath, operation.OperationId, snapshot, held, result.Warnings);
+            var payload = PublishRegistrySnapshot(snapshotPath, operation.OperationId, snapshot, bytes, held, result.Warnings);
             item.BackupPath = snapshotPath;
             item.Sha256 = HashStream(payload);
             item.Size = payload.Length;

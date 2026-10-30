@@ -111,12 +111,14 @@ public sealed partial class DeletionService
         { warnings?.Add($"Registry publication cleanup for {id} was retained: {ex.Message}"); return false; }
     }
 
-    private FileStream PublishRegistryOwnedJson<T>(string finalPath, string id, T value, List<FileStream> held, List<string>? warnings)
+    private FileStream PublishRegistryOwnedJson<T>(string finalPath, string id, T value, List<FileStream> held, List<string>? warnings, byte[]? snapshotBytes = null)
     {
         var directory = Path.GetDirectoryName(finalPath)!; var final = Path.GetFileName(finalPath);
         var checkpoint = RegistryPublicationCheckpoint;
         if (!IsRegistryFinalName(final) || directory != Path.Combine(RegistryRoot(create: false), id))
             throw new InvalidDataException("Registry publication destination is outside its private operation.");
+        if (snapshotBytes is not null && (value is not RegistrySnapshot || final != RegistrySnapshotName))
+            throw new InvalidDataException("Pre-serialized registry data is restricted to snapshots.");
         var ownerPath = Path.Combine(directory, RegistryOwnerName(final)); var pending = Path.Combine(directory, RegistryPendingName(final));
         RegistryPublicationOwner? owner = null;
         if (InspectMoveLocation(ownerPath) is not null)
@@ -125,7 +127,7 @@ public sealed partial class DeletionService
             if (value is RegistryReceipt receipt) receipt.CreatedUtc = owner.CreatedUtc;
             else if (value is RegistryManifest manifest) manifest.CreatedUtc = owner.CreatedUtc;
         }
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(value, RegistryJsonOptions);
+        var bytes = snapshotBytes ?? JsonSerializer.SerializeToUtf8Bytes(value, RegistryJsonOptions);
         var hash = Convert.ToHexStringLower(SHA256.HashData(bytes));
         if (owner is not null && (owner.Length != bytes.Length || owner.Sha256 != hash))
             throw new InvalidDataException("Registry publication retry differs from its reserved complete body.");

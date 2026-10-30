@@ -9,7 +9,13 @@ public sealed partial class DeletionService
 
     public DeletionService(PrunletConfig config) : this(config, null) { }
 
-    internal DeletionService CreateRequestService() => new(config, registrySession);
+    internal DeletionService CreateRequestService()
+    {
+        var request = new DeletionService(config, registrySession);
+        // 親の待機診断を引き継ぎ、要求固有のMCP通知は各requestで別途購読する。
+        request.RecoveryLockProgress += RecoveryLockProgress;
+        return request;
+    }
 
     internal DeletionService(PrunletConfig config, RegistrySessionContext? registrySession)
     {

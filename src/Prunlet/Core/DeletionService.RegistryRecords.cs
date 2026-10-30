@@ -230,6 +230,10 @@ public sealed partial class DeletionService
     private FileStream PublishRegistryJson<T>(string finalPath, string operationId, T value, List<FileStream> held, List<string>? warnings = null)
         => PublishRegistryOwnedJson(finalPath, operationId, value, held, warnings);
 
+    // 容量予約時に確定したsnapshot本文だけを再利用する。manifest・receiptは再開時に日時を再束縛する。
+    private FileStream PublishRegistrySnapshot(string finalPath, string operationId, RegistrySnapshot value, byte[] bytes, List<FileStream> held, List<string>? warnings = null)
+        => PublishRegistryOwnedJson(finalPath, operationId, value, held, warnings, bytes);
+
     private static FileStream HoldRegistryFile(string path, List<FileStream> held)
     {
         var stream = HoldPurgeMetadata(path, held);
