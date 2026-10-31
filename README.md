@@ -175,7 +175,7 @@ MSIX由来の仮想viewで6801になる場合は、[通常Windowsの明示セッ
 
 | ツール | 引数 | 用途 |
 | --- | --- | --- |
-| `delete_files` | `paths`、任意の`dryRun`・`recursive` | ファイル・空フォルダー、明示再帰で内容も削除 |
+| `delete_files` | 同期: `paths`、任意の`dryRun`・`recursive`。待機登録: `action: "enqueue"`・`paths`、任意の`recursive`。照会・取消: `action: "status"` / `"cancel"`・`jobId`のみ | ファイル・フォルダーの同期削除、待機登録・照会・取消。待機登録は`dryRun`非対応 |
 | `delete_registry` | `path`・`view`（`"32"`/`"64"`）、任意の`valueName`・`recursive`・`dryRun` | キーまたは値を保全して削除。空の`valueName`は既定値 |
 | `restore_registry` | `operationId` | レジストリ操作を非上書きで復元 |
 | `reconcile_registry` | `operationId` | 切断後に保存済みの結果を読取り確認。削除・復元を再送しない |

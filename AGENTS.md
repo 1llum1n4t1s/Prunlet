@@ -14,6 +14,8 @@ native sessionはscopeの明示選択を必要とする。検証起動は固定�
 
 並列削除はclaim取得順・全preflight完了後の実行・process共通worker上限・ハードリンク検出時の排他再実行を維持する。MCP要求枠とfile worker枠を分け、registry privilege変更をfile workerと並行させない。
 
+使用中の対象を待つ場合は、削除開始前にCLIの`delete-queue`またはMCPの`delete_files`の`action: "enqueue"`へ明示登録する。通常削除と同じshell・設定・権限境界を守り、拒否・失敗・不明結果の再試行先にしない。受付だけで完了とせず、CLIの`delete-queue-status <job-id>`またはMCPの`action: "status"`と`jobId`で最終結果を確認する。取消は`pending`の間だけで、結果不明なら元対象とWindowsゴミ箱を確認し、自動再送しない。実体照合・worker寿命・保持の設計は[明示的な削除待機キュー](DESIGN.md#明示的な削除待機キュー)を参照する。
+
 保持制御はレジストリschema 5専用で、既定7日・合計1 GiB、事前容量走査・整理前後再走査・共通ロック・単一超過時だけの予算を維持する。Windowsゴミ箱のファイルと未移行旧ファイルは容量・期限・purgeに含めない。ファイル削除・通常一覧・通常保守は旧ファイル操作ディレクトリを走査しない。手動整理はCLI明示適用のみで、MCPへpurgeを追加しない。
 
 旧ファイルの復元互換を維持せず、明示`migrate`で所有確認済みの旧退避root・操作記録をWindowsゴミ箱へ破棄する。旧schemaのparser・decode・内容hash・ACL snapshot・コピー・bundle・sidecar・復元helperは追加しない。store/restoreの専用StoreKey rootと小marker、中央の正規file marker、typed root layoutで所有を確認し、registry signals・共通基点・他config/privateBase・未知の非所有領域を保護する。ファイル別の恒久一覧を作らず、固定private空gate `.legacy-file-discard-in-progress` だけで中断の自動再送を止める。正規gateの明示ackは`migrate --apply --retry-legacy-discard`のみで、installerは指定しない。fileの未完了はregistry利用を塞がない。policy 2評価済みの`--apply --if-needed`は中央旧GUID再走査を省き、更新時のonline owned store固定位置・小marker確認だけを続ける。通常file/list/maintainは旧領域を走査しない。
@@ -37,6 +39,8 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 - フック解析: shell選択・文字列解析・拒否理由を変更した場合は`scripts/Verify-HookParsing.ps1 -ExecutablePath <今回のexe絶対パス> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSON絶対パス> -ConfigPath <設定絶対パス>`を実行する。検査用コマンド文字列を直接実行せず、hookへのJSON入力で許可・拒否とfixture不変更を確認する。拒否理由の`reasonValid`も確認し、検知命令・shell解釈または検査不能の原因、およびshell不明時の候補判定の説明を検証する。範囲と判定は[検証手順](docs/verification.md#通常e2eの検証範囲)に従う。
 - 旧データ移行: `scripts/Verify-FileRecordMigration.ps1`へ今回のexeと真正な旧版exeを渡す。旧schema fixtureを新版で捏造せず、所有済み旧rootの直接Bin破棄、壊れたfile本文の非読取、registry混在/他config/未知非所有領域の保護、dry-run不変更・gate不作成、中断後の自動再送拒否・明示ack、policy 0→2と更新時の後online store回収を確認する。旧file復元・bundle・sidecar・copy・履歴圧縮は成功条件へ残さない。
 - 並行・待機: 同一対象・親子・共有ハードリンクの排他、全preflight失敗時保全、process worker上限、入力順を確認する。60秒超ロック待機と解放後続行、CLI stderr/stdout、MCP token付き進捗と最終応答後抑止、EOF後完了を確認する。
+- 削除待機キュー: キュー・実体照合・CLI/MCP入口を変更した場合は`scripts/Verify-DeferredDeleteQueue.ps1 -ExecutablePath <今回のexe絶対パス> -ConfigPath <設定絶対パス> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSON絶対パス>`を実行する。待機・取消・解放後の削除・stdio切断後の継続を確認し、保持期限や各上限などの追加検証範囲は[検証手順](docs/verification.md#一時的なロックとロード中dll)と照合する。通常の同期削除の検証だけで代替しない。
+- 再帰永久削除: 子の実体・時刻照合を変更した場合は`scripts/Verify-HardlinkEntryTimes.ps1`へ`-ExecutablePath`・`-AssemblyPath`・`-ExpectedAssemblySha256`・未使用の外部D絶対パスの`-OutputDirectory`・外部JSONの`-ReportPath`を渡す。CLI/MCPのハードリンク削除と別名の保全、Core境界での変更検知と診断値を区別して確認する。候補assemblyは今回のexeと同じビルドを使う。
 - レジストリ: `scripts/Verify-RegistryRecovery.ps1`と、native sessionの`Verify-RegistrySession.ps1`のPrepare・Start（`-AssertNativeWindows`）・Current・Runを使う。完全ACL/raw bytes・競合・transaction・snapshot保全・専用namespace/予算を確認する。同じexeのcurrent側6801拒否保全と明示native側CLI/MCP正常往復、実token・view/scopeを区別し、権限・KTM・viewの未検証を成功に数えない。
 - snapshot公開: 容量予約・本文のシリアライズ・公開処理を変更した場合は`scripts/Verify-RegistrySnapshotPublication.ps1`も実行する。必須引数と保存境界の検証範囲は[レジストリ検証](docs/verification.md#レジストリの削除と復元)に従い、実レジストリの往復検証とは区別する。
 - 導入: installer・共通指示・登録解除変更では`scripts/Verify-LatestInstall.ps1`を実行する。fixtureと実GitHub、保存内容と実ホストhook読込・承認・guide遵守を区別する。移行開始後の失敗で旧binaryへrollbackせず新exe/設定/登録を保全し、同じCLIで再開できることを確認する。
