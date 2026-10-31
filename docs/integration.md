@@ -122,6 +122,8 @@ text(result.output);
 
 レジストリ限定の素通し例外はありません。認識した`Remove-Item`・既定alias、`Remove-ItemProperty`・`rp`と`reg[.exe] delete`を拒否します。`reg query`や`echo`の引数にある無関係なコマンド文字列は通過します。既存のwrapper・escape検出を維持します。`{}`は実行許可ではなく、他hookとホストの承認へ判断を委ねる応答です。
 
+拒否理由には、検知した命令・オプションと判定時のshell解釈を含めます。shell情報がない・未対応の場合は候補としての解釈であり、ローカル削除と確定したものではないと説明します。検索文字列やリモートスクリプトの引用が別shellで命令と解釈される可能性を区別し、Windows用CLIの案内をリモート削除へ適用しません。検査不能な構文や入力は、その原因を返します。
+
 拒否時は配置済みexe・設定で、ファイルには`delete --paths-file <absolute-json-file>`、レジストリには`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <single-key-path>`を最初からCMDで使う手順を案内します。レジストリで成功した`operationId`を保持し、`registry-restore <operationId>`（`restore`もレジストリ専用の別名）で非上書き復元します。ファイル・フォルダーは操作IDを保存せず、`recycled`の項目だけをWindowsのゴミ箱で復元できます。MCP代替入口は`delete_registry`・`restore_registry`です。view必須、既定値の空文字、完全ACLの権限とKTMの境界は[README](../README.md#レジストリの削除復元)を参照してください。削除許可とホスト承認を維持し、拒否対象を別経路で再試行しません。hook自身は削除・自動置換・PowerShell backend起動を行いません。
 
 MCPの1行とhookの入力全体は、UTF-16の文字数で1,048,576文字まで受理します。MCPは空白だけの行を従来どおり無視します。それ以外の超過行は残りを改行まで読み捨ててエラーを返し、次の要求を処理します。hookは上限超過を検出するとEOFを待たず拒否します。読み取り中も保持する入力をこの上限までに抑えます。

@@ -4,8 +4,19 @@ using System.Text.RegularExpressions;
 
 namespace Prunlet.Protocol;
 
-internal static class HookRouter
+internal sealed class HookRouter
 {
+    // 判定中の根拠は要求専用インスタンスに置き、並行要求や次の入力へ持ち越さない。
+    private EscapeMode? interpretedMode;
+    private string? detection;
+
+    private bool Detected(string reason, string token)
+    {
+        var label = interpretedMode switch { EscapeMode.Cmd => "CMD", EscapeMode.PowerShell => "PowerShell", EscapeMode.Posix => "POSIX", _ => "undetermined" };
+        detection ??= $"Prunlet rejected this command: {reason}; detected token {JsonSerializer.Serialize(token)}; interpretation={label}.";
+        return true;
+    }
+
     // 外側のshellが不明でも、3種のshellで同じ引数になる静的な形だけを受け付ける。
     private static readonly Regex EncodedPowerShell = new(
         @"\A[ \t]*(?:pwsh|powershell)(?:\.exe)?[ \t]+-NoProfile[ \t]+-EncodedCommand[ \t]+(?<data>[A-Za-z0-9+/]+={0,2})[ \t]*\z",
@@ -38,10 +49,16 @@ internal static class HookRouter
             var command = arguments.TryGetProperty("command", out var text) ? text
                 : arguments.TryGetProperty("cmd", out text) ? text : default;
             if (command.ValueKind != JsonValueKind.String) throw new ArgumentException("Hook command must be a string.");
-            if (!ContainsDirectDeletion(command.GetString()!, mode: ExecutionMode(name.GetString()!, arguments))) return Pass();
+            var mode = ExecutionMode(name.GetString()!, arguments);
+            var inspection = new HookRouter();
+            if (!inspection.ContainsDirectDeletion(command.GetString()!, mode: mode)) return Pass();
+            var reason = inspection.detection ?? "Prunlet rejected this command because an invocation could not be safely classified.";
+            if (mode is null)
+                reason += " Shell metadata is missing or unsupported; this is a candidate interpretation, not a confirmed local deletion. Quoted search text or remote script data may be interpreted as command syntax.";
+            reason += " The hook did not execute the command. The following CLI guidance applies only to authorized Windows deletion targets. ";
 
             var executable = commandExecutable ?? Environment.ProcessPath ?? "prunlet.exe";
-            return Deny($"Direct shell deletion is blocked. For explicitly authorized targets, use the installed Prunlet CLI from the start with shell=cmd.exe and login=false: {CmdPath(executable)} --config {CmdPath(configPath)} delete --paths-file <absolute-json-file>; for registry keys/values use {CmdPath(executable)} --config {CmdPath(configPath)} registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <registry-key-path>. File and folder deletions have no Prunlet operation record. Normally restore recycled items using Windows Recycle Bin; a file or folder Windows reports as too large may instead be permanently deleted. Dry-run cannot predict the final disposition. Keep registry operationId and use {CmdPath(executable)} --config {CmdPath(configPath)} registry-restore <operationId>. On hosts supporting exec_command sandbox permissions, request sandbox_permissions=\"require_escalated\" from the first real file deletion because Recycle Bin access may be restricted. This is a formal host permission request, not Windows UAC or administrator elevation. A dry-run does not prove real-operation permissions. Existing host approvals and policies still apply. Do not retry a policy-rejected target through another route or automatically resend a failed deletion; check uncertain file results using the source and Windows Recycle Bin; reconcile registry results using registry-reconcile <operationId> before deciding next steps.");
+            return Deny(reason + $"For explicitly authorized targets, use the installed Prunlet CLI from the start with shell=cmd.exe and login=false: {CmdPath(executable)} --config {CmdPath(configPath)} delete --paths-file <absolute-json-file>; for registry keys/values use {CmdPath(executable)} --config {CmdPath(configPath)} registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <registry-key-path>. File and folder deletions have no Prunlet operation record. Normally restore recycled items using Windows Recycle Bin; a file or folder Windows reports as too large may instead be permanently deleted. Dry-run cannot predict the final disposition. Keep registry operationId and use {CmdPath(executable)} --config {CmdPath(configPath)} registry-restore <operationId>. On hosts supporting exec_command sandbox permissions, request sandbox_permissions=\"require_escalated\" from the first real file deletion because Recycle Bin access may be restricted. This is a formal host permission request, not Windows UAC or administrator elevation. A dry-run does not prove real-operation permissions. Existing host approvals and policies still apply. Do not retry a policy-rejected target through another route or automatically resend a failed deletion; check uncertain file results using the source and Windows Recycle Bin; reconcile registry results using registry-reconcile <operationId> before deciding next steps.");
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
@@ -69,9 +86,9 @@ internal static class HookRouter
         _ => null
     };
 
-    private static bool ContainsDirectDeletion(string script, int depth = 0, EscapeMode? mode = null, bool strictEncoded = false)
+    private bool ContainsDirectDeletion(string script, int depth = 0, EscapeMode? mode = null, bool strictEncoded = false)
     {
-        if (depth > 4) return strictEncoded;
+        if (depth > 4) return strictEncoded && Detected("inspection depth limit exceeded", depth.ToString());
         if (depth == 0)
         {
             var match = EncodedPowerShell.Match(script);
@@ -94,25 +111,31 @@ internal static class HookRouter
         return false;
     }
 
-    private static bool ContainsDirectDeletion(string script, int depth, EscapeMode mode, bool strictEncoded)
+    private bool ContainsDirectDeletion(string script, int depth, EscapeMode mode, bool strictEncoded)
     {
-        var command = new List<ShellToken>();
-        foreach (var token in Tokens(script, mode, strictEncoded))
+        var previousMode = interpretedMode;
+        interpretedMode = mode;
+        try
         {
-            if (token.Boundary)
+            var command = new List<ShellToken>();
+            foreach (var token in Tokens(script, mode, strictEncoded))
             {
-                if (IsDeletionCommand(command, depth, strictEncoded)) return true;
-                command.Clear();
+                if (token.Boundary)
+                {
+                    if (IsDeletionCommand(command, depth, strictEncoded)) return true;
+                    command.Clear();
+                }
+                else command.Add(token);
             }
-            else command.Add(token);
+            return IsDeletionCommand(command, depth, strictEncoded);
         }
-        return IsDeletionCommand(command, depth, strictEncoded);
+        finally { interpretedMode = previousMode; }
     }
 
-    private static bool IsDeletionCommand(List<ShellToken> words, int depth, bool strictEncoded)
+    private bool IsDeletionCommand(List<ShellToken> words, int depth, bool strictEncoded)
     {
         if (words.Count == 0) return false;
-        if (depth > 4) return strictEncoded;
+        if (depth > 4) return strictEncoded && Detected("inspection depth limit exceeded", depth.ToString());
         if (ContainsNoncanonicalEncodedInvocation(words, depth)) return true;
         var index = 0;
         var name = CommandLeaf(words[index].Text.TrimStart('@'));
@@ -126,15 +149,15 @@ internal static class HookRouter
             name = CommandLeaf(words[index].Text.TrimStart('@'));
         }
         // 削除名は代入の推定より先に判定する（'='を削除対象にすることもある）。
-        if (DeleteCommands.Contains(name)) return true;
+        if (DeleteCommands.Contains(name)) return Detected("deletion command", name);
         if (name.Equals("reg", StringComparison.OrdinalIgnoreCase))
-            return index + 1 < words.Count && words[index + 1].Text.Equals("delete", StringComparison.OrdinalIgnoreCase);
+            return index + 1 < words.Count && words[index + 1].Text.Equals("delete", StringComparison.OrdinalIgnoreCase) && Detected("registry deletion command", "reg delete");
         if (strictEncoded && (name.Equals("iex", StringComparison.OrdinalIgnoreCase)
             || name.Equals("Invoke-Expression", StringComparison.OrdinalIgnoreCase)
             || name.Equals("Start-Process", StringComparison.OrdinalIgnoreCase)
             || name.Equals("start", StringComparison.OrdinalIgnoreCase)
-            || name.Equals("saps", StringComparison.OrdinalIgnoreCase))) return true;
-        if (strictEncoded && IsShellWrapper(name)) return true;
+            || name.Equals("saps", StringComparison.OrdinalIgnoreCase))) return Detected("dynamic invocation inside EncodedCommand cannot be inspected", name);
+        if (strictEncoded && IsShellWrapper(name)) return Detected("nested shell inside EncodedCommand cannot be inspected", name);
         if (strictEncoded)
         {
             // 代入・return等の右辺もPowerShellではコマンドとして実行される。
@@ -159,7 +182,7 @@ internal static class HookRouter
         var isPowerShell = WindowsShellMode(name) == EscapeMode.PowerShell;
         for (var i = index + 1; i < words.Count; i++)
         {
-            if (isPowerShell && IsEncodedOption(words[i].Text)) return true;
+            if (isPowerShell && IsEncodedOption(words[i].Text)) return Detected("noncanonical EncodedCommand invocation", words[i].Text);
             // -Fileの後ろは外部scriptの引数であり、起動オプションではない。
             if (isPowerShell && IsPowerShellFileOption(words[i].Text)) return false;
             if (!(isPowerShell && IsPowerShellCommandOption(words[i].Text))
@@ -199,7 +222,7 @@ internal static class HookRouter
         return start < words.Count ? start : null;
     }
 
-    private static bool ContainsNoncanonicalEncodedInvocation(List<ShellToken> words, int depth)
+    private bool ContainsNoncanonicalEncodedInvocation(List<ShellToken> words, int depth)
     {
         // wrapper本文と実行される展開は調べる。通常の引用データはコマンドではない。
         var parts = new List<string>();
@@ -291,14 +314,14 @@ internal static class HookRouter
             if (WindowsShellMode(CommandLeaf(part)) != EscapeMode.PowerShell) continue;
             for (var j = i + 1; j < parts.Count; j++)
             {
-                if (IsEncodedOption(parts[j])) return true;
+                if (IsEncodedOption(parts[j])) return Detected("noncanonical EncodedCommand invocation", parts[j]);
                 if (IsPowerShellFileOption(parts[j]) || IsPowerShellCommandOption(parts[j])) break;
             }
         }
         return false;
     }
 
-    private static bool ContainsExpandedSubexpression(string text, int depth)
+    private bool ContainsExpandedSubexpression(string text, int depth)
     {
         var start = 0;
         while ((start = text.IndexOf("$(", start, StringComparison.Ordinal)) >= 0)
@@ -322,7 +345,7 @@ internal static class HookRouter
         return false;
     }
 
-    private static bool? InspectPowerShellAssignment(List<ShellToken> words, int index, int depth)
+    private bool? InspectPowerShellAssignment(List<ShellToken> words, int index, int depth)
     {
         // [type] $x と [type]$x の両方を扱う。括弧・プロパティ後の代入も調べる。
         if (words[index].Text.StartsWith('[') && words[index].Text.EndsWith(']')
@@ -350,7 +373,7 @@ internal static class HookRouter
         return null;
     }
 
-    private static bool InspectPowerShellExpression(List<ShellToken> words, int index, int depth)
+    private bool InspectPowerShellExpression(List<ShellToken> words, int index, int depth)
     {
         if (index >= words.Count) return false;
         // 式の先頭が引用文字列ならコマンドではない。展開式は字句検査で拒否する。

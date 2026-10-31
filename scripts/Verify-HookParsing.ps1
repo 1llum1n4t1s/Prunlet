@@ -301,6 +301,10 @@ $encodedCases += @{ name='encoded-excessive-nesting'; command=$nested; pass=$fal
 $cases += $encodedCases
 
 $results = [Collections.Generic.List[object]]::new()
+$cases += @(
+    @{ name='quoted-search-ambiguous-shell'; command="rg -n 'item|rmdir|tail' sample.txt"; pass=$false },
+    @{ name='quoted-search-powershell'; command="rg -n 'item|rmdir|tail' sample.txt"; shell='pwsh'; pass=$true; bashPass=$false }
+)
 foreach ($case in $cases) {
     foreach ($tool in @('Bash', 'exec_command', 'functions.exec_command')) {
         $inputObject = @{ cwd = $OutputDirectory }
@@ -337,7 +341,15 @@ foreach ($case in $cases) {
         $fixtureUnchanged = [IO.File]::Exists($fixture) -and (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash -ceq $fixtureHash
         $expectedPass = if ($tool -eq 'Bash' -and $case.ContainsKey('bashPass')) { $case.bashPass } else { $case.pass }
         $expected = if ($expectedPass) { 'pass' } else { 'deny' }
-        $results.Add([pscustomobject]@{ name=$case.name; tool=$tool; input=$event; inputJson=$json; expected=$expected; decision=$decision; exitCode=$process.ExitCode; stdout=$stdout; stderr=$stderr; fixtureUnchanged=$fixtureUnchanged; passed=($process.ExitCode -eq 0 -and $decision -ceq $expected -and $fixtureUnchanged) })
+        $reasonValid = $true
+        if ($decision -eq 'deny') {
+            $reason = $parsed.hookSpecificOutput.permissionDecisionReason
+            $reasonValid = $reason -notmatch '^Direct shell deletion is blocked' -and ($reason -match 'detected token .+; interpretation=' -or $reason -match 'could not inspect the hook input: .+')
+            if ($case.name -eq 'file-remove-item') { $reasonValid = $reasonValid -and $reason.Contains('detected token "Remove-Item"') }
+            if ($case.name -eq 'registry-delete') { $reasonValid = $reasonValid -and $reason.Contains('registry deletion command') -and $reason.Contains('"reg delete"') }
+            if ($case.name -in @('quoted-search-ambiguous-shell','ssh-quoted-path-unknown-shell')) { $reasonValid = $reasonValid -and $reason.Contains('Shell metadata is missing or unsupported') -and $reason.Contains('interpretation=CMD') }
+        }
+        $results.Add([pscustomobject]@{ name=$case.name; tool=$tool; input=$event; inputJson=$json; expected=$expected; decision=$decision; exitCode=$process.ExitCode; stdout=$stdout; stderr=$stderr; fixtureUnchanged=$fixtureUnchanged; reasonValid=$reasonValid; passed=($process.ExitCode -eq 0 -and $decision -ceq $expected -and $fixtureUnchanged -and $reasonValid) })
         $process.Dispose()
     }
 }
