@@ -13,6 +13,8 @@
 
 `Protocol/HookRouter`は`Bash`・`exec_command`・`functions.exec_command`のコマンド文字列を検査する。`exec_command`系の明示的な`tool_input.shell`がPowerShellまたはCMDなら、その文字列規則を選択する。shell未指定・未知・Posix系の指定、および`Bash`ではCMD・PowerShell・Posixの複数規則で検査する。未知shellをCMDで実行するWindowsホストがあるため、tool名やshell名だけからPosix実行とは推測しない。静的なshell wrapperのコマンド本文も再帰検査し、認識したPowerShell・CMDのwrapperには対応する規則を使う。
 
+拒否理由の検知情報と解析中のshell規則は要求専用の`HookRouter`インスタンスに保持し、別要求へ持ち越さない。検知した命令・オプションと、その検知に使ったshell解釈を応答へ含め、検査不能な入力には原因を返す。shell未指定・未知の場合は候補の解釈であることを明示し、ローカル削除と断定しない。検索文字列やリモートスクリプトの引用も別shellでは命令になり得るため、CLI案内は許可されたWindows対象に限定する。応答形式と利用時の扱いは[連携手順](docs/integration.md#hookの検査範囲)を参照する。
+
 CMD規則では`#`をコメントとして扱わず、後続のコマンド区切り以降も検査する。静的な`IF`は`/i`・`not`、`exist`・`defined`・`errorlevel`・`cmdextversion`、`==`と`EQU/NEQ/LSS/LEQ/GTR/GEQ`の条件直後のコマンドを検査する。条件の真偽は評価せず、比較値や`echo`の引数を削除コマンドとは扱わない。wrapper本文の再構成では、引用内の`==`と引用外の比較演算子、空の引用文字列を区別して保つ。
 
 PowerShellのヒアストリングは行頭の終端までを文字列として読み、終端前後のローカルコマンドを検査する。Codexの実ホストは`exec_command`を`Bash`として渡し、実行shellをフック入力に含めない。同じ文字列がshellによって実行コードにもデータにもなるため、shell不明のままPowerShellとは決め打ちしない。単独の静的な`pwsh -NoProfile -EncodedCommand <canonical UTF-16LE Base64>`は復号してPowerShellとして限定検査し、未対応の動的呼出し・展開・別shell等は拒否する。復号本文の完全な単引用リテラルを使った`&`呼出しは実行名へ戻して同じ削除・wrapper検査へ渡し、引数や前後のローカル処理の検査を続ける。認識した省略形やwrapperは限定形式として扱わず、不正・未終端のヒアストリングも拒否する。SSHの存在や接続先による素通し例外は設けない。未認識の外部wrapper、外部scriptの内容・動的なコマンド名・他言語のAPIまで検査する保証はない。利用時の書き方は[連携手順](docs/integration.md)、解析の実プロセス検証は[検証手順](docs/verification.md#通常e2eの検証範囲)を参照する。
