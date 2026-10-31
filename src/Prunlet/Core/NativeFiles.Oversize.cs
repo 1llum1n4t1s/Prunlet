@@ -108,14 +108,40 @@ internal static partial class NativeFiles
         }
     }
 
-    internal static (long ChangeTime, long LastWriteTime) VerifyPinnedEntryTimes(SafeFileHandle handle, PinnedDirectoryEntry entry, long? ownLinkChangeTime)
+    internal static PinnedEntryBaseline CapturePinnedEntryBaseline(SafeFileHandle handle, string path, ulong volume, PinnedDirectoryEntry entry)
     {
+        var identity = MoveIdentity(handle);
         if (!GetPinnedBasicInformation(handle, 0, out var info, (uint)Marshal.SizeOf<BasicInformation>()))
-            ThrowLastError("Cannot inspect the pinned directory entry times");
-        if (info.CreationTime != entry.CreationTime || info.ChangeTime != (ownLinkChangeTime ?? entry.ChangeTime))
-            throw new IOException("Directory entry changed after enumeration.");
+            ThrowLastError($"Cannot inspect directory entry baseline: '{path}'");
+        var baseline = new PinnedEntryBaseline(identity, info.CreationTime, info.ChangeTime, info.LastWriteTime);
+        if (identity.VolumeSerialNumber != volume || !identity.FileId.Equals(entry.FileId, StringComparison.OrdinalIgnoreCase)
+            || identity.Attributes != entry.Attributes || identity.ReparseTag != entry.ReparseTag
+            || info.CreationTime == 0 || info.ChangeTime == 0)
+            throw PinnedEntryMismatch("baseline capture", path, volume, entry, baseline, baseline, null);
+        return baseline;
+    }
+
+    internal static (long ChangeTime, long LastWriteTime) VerifyPinnedEntryTimes(SafeFileHandle handle, string path, ulong volume,
+        PinnedDirectoryEntry entry, PinnedEntryBaseline baseline, long? ownLinkChangeTime)
+    {
+        var identity = MoveIdentity(handle);
+        if (!GetPinnedBasicInformation(handle, 0, out var info, (uint)Marshal.SizeOf<BasicInformation>()))
+            ThrowLastError($"Cannot inspect the pinned directory entry times: '{path}'");
+        var actual = new PinnedEntryBaseline(identity, info.CreationTime, info.ChangeTime, info.LastWriteTime);
+        if (identity != baseline.Identity || info.CreationTime != baseline.CreationTime
+            || info.ChangeTime != (ownLinkChangeTime ?? baseline.ChangeTime) || info.LastWriteTime != baseline.LastWriteTime)
+            throw PinnedEntryMismatch("delete pin verification", path, volume, entry, baseline, actual, ownLinkChangeTime);
         return (info.ChangeTime, info.LastWriteTime);
     }
+
+    private static IOException PinnedEntryMismatch(string stage, string path, ulong volume, PinnedDirectoryEntry entry,
+        PinnedEntryBaseline baseline, PinnedEntryBaseline actual, long? ownLinkChangeTime)
+        => new($"Directory entry changed during {stage}: '{path}'. "
+            + $"Enumerated[volume={volume:X16}, id={entry.FileId}, attributes={entry.Attributes:X8}, reparseTag={entry.ReparseTag:X8}, creation={entry.CreationTime}, change={entry.ChangeTime}]; "
+            + $"Baseline[{DescribePinnedEntry(baseline)}]; Actual[{DescribePinnedEntry(actual)}]; expectedChange={ownLinkChangeTime ?? baseline.ChangeTime}.");
+
+    private static string DescribePinnedEntry(PinnedEntryBaseline value)
+        => $"volume={value.Identity.VolumeSerialNumber:X16}, id={value.Identity.FileId}, attributes={value.Identity.Attributes:X8}, reparseTag={value.Identity.ReparseTag:X8}, creation={value.CreationTime}, change={value.ChangeTime}, lastWrite={value.LastWriteTime}";
 
     internal static long PinnedChangeTime(SafeFileHandle handle)
     {
@@ -153,3 +179,4 @@ internal static partial class NativeFiles
 }
 
 internal readonly record struct PinnedDirectoryEntry(string Name, string FileId, uint Attributes, uint ReparseTag, long CreationTime, long ChangeTime);
+internal readonly record struct PinnedEntryBaseline(MoveEntryIdentity Identity, long CreationTime, long ChangeTime, long LastWriteTime);

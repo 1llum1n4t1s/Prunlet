@@ -41,6 +41,16 @@ Shellがゴミ箱への移動を成功と返した場合は、返却項目だけ
 
 失敗時の診断はCoreの`FileDeletionDiagnostics`が担当し、`DeletionService`が各項目の`error`へ付加してCLI・MCPへ返す。共有・ロック違反の場合だけ保持元を観測し、dry-runではプロセス照会を行わない。診断は失敗後の現在値であり、診断不能でも元の削除結果を維持する。保持元の特定を削除の再試行やプロセス停止へ結び付けない。照会方法と観測範囲の制約は[連携手順](docs/integration.md#使用中のファイルと同時実行)を参照する。
 
+### 明示的な削除待機キュー
+
+通常の同期`Delete`とは別に、CLIの`delete-queue`・`delete-queue-status`・`delete-queue-cancel`で明示的な待機ジョブを扱う。MCPは既存の`delete_files`の`action`に`enqueue`・`status`・`cancel`を追加し、5ツールを維持する。拒否や不明な削除結果からの自動再送には使わない。
+
+同じexeのジョブ専用一時workerとユーザー限定IPCを使い、ジョブ・実体照合情報・結果をメモリーだけに保持する。SID・Windows sessionごとのnamed Mutexで完了保持中を含め最大8 workerに制限する。1要求1〜256パス・親を含む照合情報4096項目・IPC入力1 MiBを上限とする。対象・親・再帰対象の子を削除前に固定して事前probeのWin32 32/33だけを1秒間隔で期限なく待ち、実体や再帰範囲の変更を検出したら中止する。全対象が削除可能になってから既存Coreの削除経路を一度だけ呼び、削除開始後は再送しない。取消は開始判定と同じlockで`pending`の間だけ受理する。
+
+状態は`pending`・`running`・`completed`・`failed`・`ambiguous`・`cancelled`・`unavailable`。最終結果は1時間保持し、`expiresUtc`で期限を返す。照会不能・worker終了・期限切れは`unavailable`として結果不明を示す。受付済みなら呼出元のstdio切断後も継続し、workerが初期ACKを返せなければ削除を開始しない。
+
+待機ジョブIDは復元用操作IDではなく、manifest・snapshot・恒久キュー・操作履歴を作らない。OSやworkerの消失時は結果不明として扱い、再起動後に同じ削除を再開しない。既存の同期削除・保護領域・ゴミ箱移動と永久削除の条件は維持する。
+
 ## 保存領域と保護
 
 `backupDirectory`は保護されたmetadataの基点である。manifestの`MetadataRoot`は従来の共通基点を維持する。レジストリの通常記録は`<backupDirectory>/.registry-records-v1/<operationId>`へ分離し、通常の一覧・保守・復元はそのnamespaceを対象にする。

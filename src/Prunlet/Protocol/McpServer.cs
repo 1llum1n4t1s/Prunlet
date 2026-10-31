@@ -4,7 +4,7 @@ using Prunlet.Core;
 
 namespace Prunlet.Protocol;
 
-internal sealed class McpServer(DeletionService service, Func<object> listOperations)
+internal sealed class McpServer(DeletionService service, Func<object> listOperations, string configPath)
 {
     private bool initialized;
     private bool ready;
@@ -178,7 +178,18 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
             switch (name)
             {
                 case "delete_files":
-                    RejectExtraProperties(args, "paths", "dryRun", "recursive");
+                    var action = args.TryGetProperty("action", out _) ? StringProperty(args, "action") : null;
+                    if (action is "status" or "cancel")
+                    {
+                        RejectExtraProperties(args, "action", "jobId");
+                        var jobId = StringProperty(args, "jobId");
+                        result = action == "cancel" ? DeferredDeleteQueue.Cancel(jobId) : DeferredDeleteQueue.Status(jobId);
+                        break;
+                    }
+                    if (action is not null and not "enqueue")
+                        throw new RpcException(-32602, "Action must be enqueue, status or cancel when specified.");
+                    if (action == "enqueue") RejectExtraProperties(args, "action", "paths", "recursive");
+                    else RejectExtraProperties(args, "paths", "dryRun", "recursive");
                     if (!args.TryGetProperty("paths", out var paths) || paths.ValueKind != JsonValueKind.Array || paths.GetArrayLength() == 0 || paths.GetArrayLength() > 256)
                         throw new RpcException(-32602, "Paths must contain 1 to 256 strings.");
                     if (paths.EnumerateArray().Any(path => path.ValueKind != JsonValueKind.String))
@@ -187,7 +198,10 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                         throw new RpcException(-32602, "DryRun must be boolean.");
                     if (args.TryGetProperty("recursive", out var recursive) && recursive.ValueKind is not JsonValueKind.True and not JsonValueKind.False)
                         throw new RpcException(-32602, "Recursive must be boolean.");
-                    result = service.Delete(paths.EnumerateArray().Select(path => path.GetString()!).ToArray(), dryRun.ValueKind == JsonValueKind.True, recursive.ValueKind == JsonValueKind.True);
+                    var deletePaths = paths.EnumerateArray().Select(path => path.GetString()!).ToArray();
+                    result = action == "enqueue"
+                        ? DeferredDeleteQueue.Enqueue(configPath, deletePaths, recursive.ValueKind == JsonValueKind.True)
+                        : service.Delete(deletePaths, dryRun.ValueKind == JsonValueKind.True, recursive.ValueKind == JsonValueKind.True);
                     break;
                 case "delete_registry":
                     RejectExtraProperties(args, "path", "view", "valueName", "recursive", "dryRun");
@@ -247,9 +261,17 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                 {
                     paths = new { type = "array", items = new { type = "string" }, minItems = 1, maxItems = 256 },
                     dryRun = new { type = "boolean", description = "Inspect without changing files or directories." },
-                    recursive = new { type = "boolean", description = "Explicitly include all files and subdirectories of directory targets. Defaults to false." }
+                    recursive = new { type = "boolean", description = "Explicitly include all files and subdirectories of directory targets. Defaults to false." },
+                    action = new { type = "string", @enum = new[] { "enqueue", "status", "cancel" }, description = "Omit for synchronous deletion. Enqueue returns a queued job and accepts paths and recursive, but not dryRun. Status and cancel require jobId only. Cancel is allowed only while waiting and is refused after deletion starts." },
+                    jobId = new { type = "string", description = "Queued deletion job identifier, required only with action=status or cancel." }
                 },
-                required = new[] { "paths" }, additionalProperties = false
+                oneOf = new object[]
+                {
+                    new { required = new[] { "paths" }, properties = new { action = false, jobId = false } },
+                    new { required = new[] { "action", "paths" }, properties = new { action = new { @enum = new[] { "enqueue" } }, dryRun = false, jobId = false } },
+                    new { required = new[] { "action", "jobId" }, properties = new { action = new { @enum = new[] { "status", "cancel" } }, paths = false, dryRun = false, recursive = false } }
+                },
+                additionalProperties = false
             },
             annotations = new { readOnlyHint = false, destructiveHint = true, idempotentHint = false, openWorldHint = false }
         },

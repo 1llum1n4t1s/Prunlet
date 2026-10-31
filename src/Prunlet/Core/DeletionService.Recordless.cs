@@ -7,11 +7,11 @@ public sealed partial class DeletionService
 {
     internal static event Action<string, string>? OversizedDeleteCheckpoint;
 
-    private FileDeleteResult DeleteRecordless(string[] paths, bool dryRun, bool recursive)
-        => DeleteRecordlessCore(paths, dryRun, recursive, exclusive: false)
-            ?? DeleteRecordlessCore(paths, dryRun, recursive, exclusive: true)!;
+    private FileDeleteResult DeleteRecordless(string[] paths, bool dryRun, bool recursive, IReadOnlyList<DeferredDeletePreflight>? queued = null)
+        => DeleteRecordlessCore(paths, dryRun, recursive, exclusive: false, queued)
+            ?? DeleteRecordlessCore(paths, dryRun, recursive, exclusive: true, queued)!;
 
-    private FileDeleteResult? DeleteRecordlessCore(string[] paths, bool dryRun, bool recursive, bool exclusive)
+    private FileDeleteResult? DeleteRecordlessCore(string[] paths, bool dryRun, bool recursive, bool exclusive, IReadOnlyList<DeferredDeletePreflight>? queued)
     {
         ArgumentNullException.ThrowIfNull(paths);
         if (paths.Length is 0 or > 256) throw new ArgumentException("Specify between 1 and 256 paths.");
@@ -21,6 +21,11 @@ public sealed partial class DeletionService
                 if (PathPolicy.Within(normalized[i], normalized[j]) || PathPolicy.Within(normalized[j], normalized[i]))
                     throw new ArgumentException("Duplicate or overlapping target paths are not allowed.");
         using var coordination = dryRun ? null : AcquireRecoveryCoordination(create: true, deletionTargets: exclusive ? null : normalized);
+        if (queued is not null)
+        {
+            if (queued.Count != paths.Length) throw new ArgumentException("Queue snapshot count differs.");
+            foreach (var snapshot in queued) snapshot.VerifyUnchanged();
+        }
         var result = new FileDeleteResult { DryRun = dryRun };
         result.Items.AddRange(normalized.Select(path => new FileDeleteItem { Path = path, Status = "failed" }));
         var parents = new DirectoryLease?[paths.Length];
@@ -112,6 +117,7 @@ public sealed partial class DeletionService
                     string? recycledPath = null;
                     var recycled = NativeRecycleBin.RecycleDeleteTarget(item.Path, identity.IsDirectory && identity.ReparseTag == 0, resolved =>
                     {
+                        queued?[index].VerifyUnchanged();
                         if (!resolved.Equals(item.Path, StringComparison.Ordinal)) throw new IOException("Shell resolved a different recycle source path.");
                         CheckRecycleTarget(item.Path, identity.IsDirectory);
                         using var parent = NativeFiles.OpenDirectory(Path.GetDirectoryName(item.Path)!);
@@ -166,12 +172,13 @@ public sealed partial class DeletionService
                 var started = !reserved[index];
                 try
                 {
+                    queued?[index].VerifyUnchanged();
                     using var original = inspections[index] ?? throw new IOException("Recycle source inspection was not retained.");
                     DeleteOversizedTarget(item.Path, identities[index]!, parentIdentities[index]!, original, recursive, oversizedHardlinks, () =>
                     {
                         revalidatePermanentDeletes[index]?.Invoke();
                         started = true;
-                    });
+                    }, queued is null ? null : path => queued[index].ReleaseDeletedEntry(path));
                     original.Dispose();
                     if (InspectMoveLocation(item.Path) is not null) throw new IOException("A source name is still present after the Windows deletion attempt.");
                     item.Status = "permanently_deleted";
@@ -231,7 +238,7 @@ public sealed partial class DeletionService
             throw new IOException("Retained hardlink identity changed.");
     }
 
-    private void DeleteOversizedTarget(string path, MoveEntryIdentity expected, MoveEntryIdentity expectedParent, SafeFileHandle original, bool recursive, OversizedHardlinkState hardlinks, Action beforeDelete)
+    private void DeleteOversizedTarget(string path, MoveEntryIdentity expected, MoveEntryIdentity expectedParent, SafeFileHandle original, bool recursive, OversizedHardlinkState hardlinks, Action beforeDelete, Action<string>? afterDeletePending = null)
     {
         CheckRecycleTarget(path, expected.IsDirectory);
         using var parent = NativeFiles.OpenDirectory(Path.GetDirectoryName(path)!);
@@ -254,7 +261,7 @@ public sealed partial class DeletionService
             || current.Attributes != held.Attributes)
             throw new IOException("Oversized target changed before its name could be fixed.");
         VerifyPermanentHandle(pinned, path, current);
-        DeletePinnedOversized(pinned, path, current, recursive, hardlinks, beforeDelete);
+        DeletePinnedOversized(pinned, path, current, recursive, hardlinks, beforeDelete, afterDeletePending);
     }
 
     private static void VerifyPermanentHandle(SafeFileHandle handle, string path, MoveEntryIdentity identity)
@@ -265,7 +272,7 @@ public sealed partial class DeletionService
             throw new IOException("Oversized link identity or reparse data changed.");
     }
 
-    private static void DeletePinnedOversized(SafeFileHandle handle, string path, MoveEntryIdentity identity, bool recursive, OversizedHardlinkState hardlinks, Action beforeDelete)
+    private static void DeletePinnedOversized(SafeFileHandle handle, string path, MoveEntryIdentity identity, bool recursive, OversizedHardlinkState hardlinks, Action beforeDelete, Action<string>? afterDeletePending)
     {
         var stack = new Stack<PermanentDeleteFrame>();
         stack.Push(new(handle, path, identity, ownsHandle: false));
@@ -275,57 +282,84 @@ public sealed partial class DeletionService
             {
                 if (frame.Entries is null)
                 {
-                    // 固定した親から列挙し、開いた子のIDと時刻を再照合する。
+                    // 固定した親から列挙する。時刻は列挙キャッシュでなく、子の保持handleから採る。
                     frame.Entries = frame.Identity.IsDirectory && frame.Identity.ReparseTag == 0
                         ? NativeFiles.ReadPinnedDirectory(frame.Handle) : [];
                     if (stack.Count == 1 && !recursive && frame.Entries.Count != 0)
                         throw new IOException("A nonrecursive oversized directory is no longer empty.");
+                    // 兄弟の処理中の変更も検出するため、削除開始前に全子の実体と時刻を保持する。
+                    frame.Inspections = new SafeFileHandle?[frame.Entries.Count];
+                    frame.Baselines = new PinnedEntryBaseline[frame.Entries.Count];
+                    for (var index = 0; index < frame.Entries.Count; index++)
+                    {
+                        var entry = frame.Entries[index];
+                        var childPath = PathPolicy.FileSystemAbsolute(Path.Combine(frame.Path, entry.Name));
+                        if (!PathPolicy.Within(childPath, frame.Path) || childPath.Equals(frame.Path, StringComparison.OrdinalIgnoreCase))
+                            throw new IOException($"Oversized directory entry escaped its fixed parent: '{childPath}'.");
+                        try
+                        {
+                            var inspection = NativeFiles.OpenShellInspection(childPath);
+                            frame.Inspections[index] = inspection;
+                            frame.Baselines[index] = NativeFiles.CapturePinnedEntryBaseline(inspection, childPath, frame.Identity.VolumeSerialNumber, entry);
+                        }
+                        catch (Exception ex) when (IsRecycleFailure(ex))
+                        {
+                            throw new IOException($"Cannot capture directory entry baseline '{childPath}'. Enumerated[id={entry.FileId}, attributes={entry.Attributes:X8}, reparseTag={entry.ReparseTag:X8}, creation={entry.CreationTime}, change={entry.ChangeTime}]. {ex.Message}", ex);
+                        }
+                    }
+                    if (frame.Identity.IsDirectory && frame.Identity.ReparseTag == 0)
+                        OversizedDeleteCheckpoint?.Invoke("directory-baselines-captured", frame.Path);
                 }
                 if (frame.Next < frame.Entries.Count)
                 {
-                    var entry = frame.Entries[frame.Next++];
+                    var entryIndex = frame.Next++;
+                    var entry = frame.Entries[entryIndex];
                     var childPath = PathPolicy.FileSystemAbsolute(Path.Combine(frame.Path, entry.Name));
                     if (!PathPolicy.Within(childPath, frame.Path) || childPath.Equals(frame.Path, StringComparison.OrdinalIgnoreCase))
-                        throw new IOException("Oversized directory entry escaped its fixed parent.");
+                        throw new IOException($"Oversized directory entry escaped its fixed parent: '{childPath}'.");
                     var isDirectory = (entry.Attributes & (uint)FileAttributes.Directory) != 0;
+                    var inspection = frame.Inspections![entryIndex] ?? throw new IOException($"Directory entry baseline was not retained: '{childPath}'.");
+                    var baseline = frame.Baselines![entryIndex];
                     var lease = !isDirectory && entry.ReparseTag == 0
                         ? hardlinks.Hold((frame.Identity.VolumeSerialNumber, entry.FileId)) : null;
                     SafeFileHandle child;
                     try
                     {
+                        // 先取りした実体を保持したままDELETE pinを取得し、ID再利用を防ぐ。
+                        OversizedDeleteCheckpoint?.Invoke("child-baseline-captured", childPath);
                         child = isDirectory && entry.ReparseTag == 0
                             ? NativeFiles.OpenPermanentDirectory(childPath) : NativeFiles.OpenRecordlessPreflight(childPath);
                     }
                     catch (Exception ex) when (IsRecycleFailure(ex))
                     {
+                        inspection?.Dispose();
                         lease?.Dispose();
                         OversizedDeleteCheckpoint?.Invoke("child-open-failed", childPath);
-                        throw;
+                        throw new IOException($"Cannot capture or pin directory entry '{childPath}'. Enumerated[id={entry.FileId}, attributes={entry.Attributes:X8}, reparseTag={entry.ReparseTag:X8}, creation={entry.CreationTime}, change={entry.ChangeTime}]. {ex.Message}", ex);
                     }
-                    catch { lease?.Dispose(); throw; }
+                    catch { inspection?.Dispose(); lease?.Dispose(); throw; }
                     try
                     {
                         OversizedDeleteCheckpoint?.Invoke("child-pinned", childPath);
                         var current = NativeFiles.MoveIdentity(child);
-                        if (!UsableRecordlessIdentity(current) || current.VolumeSerialNumber != frame.Identity.VolumeSerialNumber
-                            || !current.FileId.Equals(entry.FileId, StringComparison.OrdinalIgnoreCase)
-                            || current.Attributes != entry.Attributes || current.ReparseTag != entry.ReparseTag)
-                            throw new IOException("Oversized directory entry changed after enumeration.");
                         var key = (current.VolumeSerialNumber, current.FileId);
+                        var ownLinkChange = hardlinks.Changed.TryGetValue(key, out var changeTime);
+                        var verifiedTimes = NativeFiles.VerifyPinnedEntryTimes(child, childPath, frame.Identity.VolumeSerialNumber,
+                            entry, baseline, ownLinkChange ? changeTime : null);
                         if (hardlinks.Uncertain.ContainsKey(key))
                             throw new IOException("A prior hardlink deletion could not be confirmed.");
                         if (!hardlinks.CanContinueInRoot(key, path))
                             throw new IOException("A shared hardlink without a retained write guard cannot continue in another root.");
-                        var ownLinkChange = hardlinks.Changed.TryGetValue(key, out var changeTime);
                         if (ownLinkChange && (!hardlinks.Guards.TryGetValue(key, out var guard)
                             || !SameRecordlessObject(current, NativeFiles.MoveIdentity(guard))))
                             throw new IOException("A shared hardlink identity could not be retained.");
-                        var verifiedTimes = NativeFiles.VerifyPinnedEntryTimes(child, entry, ownLinkChange ? changeTime : null);
                         VerifyPermanentHandle(child, childPath, current);
                         stack.Push(new(child, childPath, current, ownsHandle: true) { VerifiedChangeTime = verifiedTimes.ChangeTime, VerifiedLastWriteTime = verifiedTimes.LastWriteTime, Lease = lease });
                         lease = null;
                     }
                     catch { child.Dispose(); lease?.Dispose(); throw; }
+                    // 非POSIX削除を自分のinspectionでdelete-pendingにしないよう、実行前に解放する。
+                    finally { inspection.Dispose(); frame.Inspections[entryIndex] = null; }
                     continue;
                 }
                 var ordinaryFile = !frame.Identity.IsDirectory && frame.Identity.ReparseTag == 0;
@@ -375,6 +409,7 @@ public sealed partial class DeletionService
                 }
                 beforeDelete();
                 NativeFiles.SetPermanentDeletePending(frame.Handle, posix);
+                afterDeletePending?.Invoke(frame.Path);
                 if (posix) OversizedDeleteCheckpoint?.Invoke("hardlink-pending", frame.Path);
                 if (posix && (NativeFiles.PinnedChangeTime(hardlinks.Guards[fileKey]) != verifiedTime
                     || NativeFiles.PinnedLastWriteTime(hardlinks.Guards[fileKey]) != verifiedWriteTime
@@ -401,13 +436,14 @@ public sealed partial class DeletionService
                         hardlinks.Uncertain.TryRemove(fileKey, out _);
                     }
                 }
-                finally { frame.Lease?.Dispose(); }
+                finally { frame.ReleaseInspections(); frame.Lease?.Dispose(); }
             }
         }
         finally
         {
             foreach (var frame in stack)
             {
+                frame.ReleaseInspections();
                 if (frame.OwnsHandle) frame.Handle.Dispose();
                 frame.Lease?.Dispose();
             }
@@ -546,6 +582,14 @@ public sealed partial class DeletionService
         internal long? VerifiedLastWriteTime { get; init; }
         internal IDisposable? Lease { get; init; }
         internal IReadOnlyList<PinnedDirectoryEntry>? Entries { get; set; }
+        internal SafeFileHandle?[]? Inspections { get; set; }
+        internal PinnedEntryBaseline[]? Baselines { get; set; }
         internal int Next { get; set; }
+        internal void ReleaseInspections()
+        {
+            if (Inspections is null) return;
+            foreach (var inspection in Inspections) inspection?.Dispose();
+            Inspections = null;
+        }
     }
 }

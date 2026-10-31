@@ -116,6 +116,20 @@ exe・設定は配置済みの絶対パスへ置き換えてください。Codex
 
 Windowsのゴミ箱にある間のアクセス権と、復元先の親からの権限継承もWindowsの動作に従います。ハードリンクは内容だけでなくACLも共有するため、ゴミ箱への移動時の権限変更が、生存する別名にも反映されます。
 
+### 使用中のファイルを待機して削除する
+
+使用中の対象を待つ場合は、削除の開始前に明示的な`delete-queue`へ登録します。通常の`delete`は従来どおり同期で結果を返します。
+
+```cmd
+C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete-queue --paths-file C:\work\delete-paths.json
+C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete-queue-status <job-id>
+C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete-queue-cancel <job-id>
+```
+
+非空フォルダーは`delete-queue --recursive --paths-file <絶対JSONパス>`、単純なパスは`delete-queue [--recursive] -- <絶対パス> [...]`で指定できます。登録応答は削除完了ではありません。返されたジョブIDで状態と最終結果を確認してください。MCPでは既存の`delete_files`に`action: "enqueue"`・`"status"`・`"cancel"`を指定します。詳細は[連携手順](docs/integration.md#明示的な削除待機キュー)を参照してください。
+
+キューは対象・親・再帰対象の子の実体を削除前に固定し、共有・ロック違反だけを期限なく待ちます。待機中に実体が変われば中止し、削除開始後の失敗や不明な結果を再送しません。同じユーザー・Windowsセッションで最大8件（完了後の保持中も含む）です。待機中だけ取消でき、最終結果は1時間保持します。ジョブは専用の一時workerのメモリーだけにあり、ファイル操作の記録や復元用IDではありません。期限切れやOS・worker終了で結果を確認できない場合は、元対象とWindowsのゴミ箱を確認し、同じ削除を自動再送しないでください。
+
 ## レジストリの削除・復元
 
 許可されたローカルのHKCU・HKLM・HKUのキーまたは値を、明示した32/64ビットviewで退避して削除できます。キーのパスは絶対指定し、`--`の後へ1件だけ渡します。`--value-name`を省略するとキー、指定すると文字通りの値名を対象にします。既定値は空の名前なので、PowerShellから空引数が失われない`--value-name=`を使えます。値削除と`--recursive`は併用できません。子キーを含む削除には`--recursive`が必要です。

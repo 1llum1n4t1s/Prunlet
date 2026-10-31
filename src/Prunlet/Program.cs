@@ -58,6 +58,10 @@ internal static class Program
                     prunlet --config <absolute-json-path> validate-config
                     prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]
                     prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>
+                    prunlet --config <absolute-json-path> delete-queue [--recursive] -- <absolute-path> [...]
+                    prunlet --config <absolute-json-path> delete-queue [--recursive] --paths-file <absolute-json-file>
+                    prunlet --config <absolute-json-path> delete-queue-status <job-id>
+                    prunlet --config <absolute-json-path> delete-queue-cancel <job-id>
                     prunlet --config <absolute-json-path> registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <registry-key-path>
                     prunlet --config <absolute-json-path> registry-session --minutes <1..60> --assert-native-windows
                     prunlet --config <absolute-json-path> registry-reconcile <operation-id>
@@ -215,6 +219,30 @@ internal static class Program
                         throw new ArgumentException("Use delete [--dry-run] [--recursive] -- <absolute-path> [...] or delete [--dry-run] [--recursive] --paths-file <absolute-json-file>.");
                     result = service.Delete(paths, dryRun, recursive);
                     break;
+                case "delete-queue":
+                    var queueRecursive = commandArgs.Length > 0 && commandArgs[0] == "--recursive";
+                    var queueOffset = queueRecursive ? 1 : 0;
+                    string[] queuePaths;
+                    if (commandArgs.Length == queueOffset + 2 && commandArgs[queueOffset] == "--paths-file")
+                        queuePaths = ReadDeletePathsFile(commandArgs[queueOffset + 1]);
+                    else if (commandArgs.Length > queueOffset + 1 && commandArgs[queueOffset] == "--")
+                        queuePaths = commandArgs[(queueOffset + 1)..];
+                    else
+                        throw new ArgumentException("Use delete-queue [--recursive] -- <absolute-path> [...] or delete-queue [--recursive] --paths-file <absolute-json-file>.");
+                    result = DeferredDeleteQueue.Enqueue(configPath, queuePaths, queueRecursive);
+                    break;
+                case "delete-queue-status":
+                case "delete-queue-cancel":
+                    if (commandArgs.Length != 1 || string.IsNullOrWhiteSpace(commandArgs[0]))
+                        throw new ArgumentException($"Use {command} <job-id>.");
+                    result = command == "delete-queue-cancel"
+                        ? DeferredDeleteQueue.Cancel(commandArgs[0])
+                        : DeferredDeleteQueue.Status(commandArgs[0]);
+                    break;
+                case "__delete-queue-worker":
+                    if (commandArgs.Length != 0) throw new ArgumentException("Queue worker accepts no arguments.");
+                    await DeferredDeleteQueue.RunWorkerAsync(configPath);
+                    return 0;
                 case "registry-delete":
                     var registryOptions = ParseRegistryDelete(commandArgs);
                     result = service.DeleteRegistry(registryOptions.Request, registryOptions.DryRun);
@@ -247,7 +275,7 @@ internal static class Program
                     break;
                 case "mcp":
                     if (commandArgs.Length != 0) throw new ArgumentException("MCP accepts no arguments.");
-                    await new McpServer(service, () => ListOperations(config)).RunAsync(Console.In, Console.Out);
+                    await new McpServer(service, () => ListOperations(config), configPath).RunAsync(Console.In, Console.Out);
                     return 0;
                 default:
                     throw new ArgumentException($"Unknown command: {command}");
@@ -365,6 +393,9 @@ internal static class Program
 
     internal static bool HasErrors(object result)
     {
+        if (result is DeferredDeleteQueueResult queued)
+            return !string.IsNullOrEmpty(queued.Error) || queued.Status is "failed" or "ambiguous" or "unavailable"
+                || queued.Result is not null && HasErrors(queued.Result);
         if (result is OperationsResult) return false;
         if (result is RecoveryMigrationResult migration)
             return !migration.DryRun && !migration.RegistryReady || migration.Operations.Any(operation => operation.Status is "failed" or "ambiguous");
