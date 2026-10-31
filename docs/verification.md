@@ -10,12 +10,12 @@ Windows・.NET 10 SDK・PowerShell 7で実行する。ビルドは`scripts/Publi
 
 スパースfixtureのC#は`scripts/recordless-e2e/SparseFixture.cs`を共通入力とし、各runnerはこの実ファイルのpathとSHA-256を記録する。旧runnerのhere-stringやAST配置を検証入力として使わない。
 
-新しいファイル経路は、操作記録を作らずWindowsゴミ箱へ移す経路と、予約名の通常ファイルまたはWindowsのサイズ超過判定後の対象名を固定して削除する経路として検証する。旧schema 1〜4/6の復元・圧縮・終了履歴runnerを、新版通常経路の必須成功条件として使わない。旧版exeで作ったデータは下記の明示移行検証だけに使用する。
+新しいファイル経路は、操作記録を作らずWindowsゴミ箱へ移す経路と、予約名の通常ファイル、Windowsのサイズ超過判定後、または対象ボリュームの即時削除設定とゴミ箱利用不可を確認した後に対象名を固定して削除する経路として検証する。旧schema 1〜4/6の復元・圧縮・終了履歴runnerを、新版通常経路の必須成功条件として使わない。旧版exeで作ったデータは下記の明示移行検証だけに使用する。
 
 - 予約名の通常ファイルについてCLI・stdio MCPの永久削除、dry-runの`would_permanently_delete`と不変更、通常名との混合・生存ハードリンク保全を確認する。予約名のディレクトリ・リンク・祖先とdevice構文は拒否し、preflight失敗や実体差し替えで無関係な対象を削除しないことを確認する。
 - CLIの単一・複数・Unicode・長いパス・`--paths-file`・空フォルダー・明示再帰とdry-run、MCPの入力型・余剰property・1〜256件上限を実プロセスで確認する。
 - ファイル結果が`dryRun`・`items`・`warnings`で、項目が`path`・`kind`・`status`・任意`error`だけを返すことを確認する。`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`と終了コード/MCP `isError`を照合し、operationId・backupPath・hash・sizeを返さないことを確認する。dry-runでは予約名の通常ファイルの永久削除予定と、それ以外のサイズ超過による永久削除を予測できない旨を確認する。
-- 実際の容量超過を起こす専用sparse fixtureをCLI・MCPで検証し、ファイル・フォルダーの元名の消失と今回分のゴミ箱項目、混合batch・生存hardlink・部分失敗の扱いを確認する。サイズ超過以外の失敗では永久削除せず、旧既定と設定済みの退避先を保護する。Shellの直前とサイズ超過の通知後での差し替え・ロックを別々に確認し、Shellが別実体を移した場合は`ambiguous`を返すこととWindows側の副作用を区別する。
+- 実際の容量超過を起こす専用sparse fixtureをCLI・MCPで検証し、ファイル・フォルダーの元名の消失と今回分のゴミ箱項目、混合batch・生存hardlink・部分失敗の扱いを確認する。確認済みの即時削除設定とサイズ超過以外の失敗では永久削除せず、旧既定と設定済みの退避先を保護する。即時削除設定のボリュームは設定を変更せずCLI・MCPで通常サイズのファイルと再帰削除を確認する。Shellの直前とサイズ超過・ゴミ箱利用不可の通知後での差し替え・ロックを別々に確認し、Shellが別実体を移した場合は`ambiguous`を返すこととWindows側の副作用を区別する。
 - `Verify-OversizeRaces.ps1`・`Verify-BeforeRecycleRace.ps1`・`Verify-BeforeRecycleSmallRace.ps1`は、同じ候補のexe・assembly・assembly SHA-256と未使用の外部D出力先を受け取る。実ShellとCore内部の境界を再現し、CLI・MCPの実プロセス検証とは区別する。証拠が一致したfixtureだけを清掃候補として残し、指定された経路で清掃する。
 - 共有ハードリンクのサイズ超過は`Verify-RecordlessFiles.ps1`のCLI・MCPとassembly指定の競合ケースで確認する。`Verify-OversizeMixedHardlinks.ps1`・`Verify-OversizeHardlinkPermissions.ps1`は通常Shellとの混合、単一・同一root・別rootのアクセス権不足を確認する。`Verify-OversizeParallelIndependence.ps1`・`Verify-OversizeRecycledHardlinkIndependence.ps1`は同じ候補のassemblyを使い、独立rootの同時pinと無関係な生存別名への書込みopenを実Shell後のCore境界で確認する。権限不足で部分完了した結果の順序と状態を区別し、不明な削除を再送しない。
 - 新規削除前後でPrunlet保存領域を比較し、操作manifest・PIDL・File ID・ACL snapshot・monitor・index・復元stageを作らないことを確認する。固定`maintenance.lock`と操作記録を区別する。通常削除・list・maintainが旧ファイル操作ディレクトリを走査しないことも確認する。

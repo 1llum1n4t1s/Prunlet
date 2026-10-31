@@ -17,6 +17,7 @@ internal static class NativeRecycleBin
     private const int AlreadyExists = unchecked((int)0x80070050);
     private const int DontProcessChildren = 0x00270008;
     private const int RecycleSizeTooBig = unchecked((int)0x80270037);
+    private const int RecycleUnavailable = unchecked((int)0x80270036);
     private const uint FileSystemPath = 0x80058000;
 
     private static readonly Guid RecycleFolder = new("B7534046-3ECB-4C18-BE4E-64CD4CB7D6AC");
@@ -30,15 +31,18 @@ internal static class NativeRecycleBin
     internal static void RecycleUnrecorded(string sourcePath, Action<string> beforeDelete, Action<string> verifyRecycled)
         => _ = RecycleCore(sourcePath, beforeDelete, recognizeOversize: false, allowFolderProgress: false, verifyRecycled);
 
-    // 通常の削除だけがサイズ超過を判別する。旧データ移行は従来どおり失敗で停止する。
-    internal static bool RecycleDeleteTarget(string sourcePath, bool allowFolderProgress, Action<string> beforeDelete, Action<string> verifyRecycled)
-        => RecycleCore(sourcePath, beforeDelete, recognizeOversize: true, allowFolderProgress, verifyRecycled);
+    // 通常削除だけが固定削除へ進める。旧データ移行は従来どおり失敗で停止する。
+    internal static bool RecycleDeleteTarget(string sourcePath, bool allowFolderProgress, Action<string> beforeDelete, Action<string> verifyRecycled, out Action? revalidatePermanentDelete)
+    {
+        revalidatePermanentDelete = RecycleCore(sourcePath, beforeDelete, recognizeOversize: true, allowFolderProgress, verifyRecycled);
+        return revalidatePermanentDelete is null;
+    }
 
-    private static bool RecycleCore(string sourcePath, Action<string> beforeDelete, bool recognizeOversize, bool allowFolderProgress, Action<string>? verifyRecycled = null)
+    private static Action? RecycleCore(string sourcePath, Action<string> beforeDelete, bool recognizeOversize, bool allowFolderProgress, Action<string>? verifyRecycled = null)
     {
         ArgumentNullException.ThrowIfNull(beforeDelete);
         sourcePath = PathPolicy.Absolute(sourcePath);
-        return InSta(() =>
+        return InSta<Action?>(() =>
         {
             var source = ShellItem(sourcePath);
             IShellItem? parent = null;
@@ -57,11 +61,17 @@ internal static class NativeRecycleBin
                 RequireOk(transfer.Advise(sink, out cookie), "Cannot observe Shell recycling");
                 advised = true;
                 beforeDelete(PhysicalPath(source));
+                var immediateDelete = recognizeOversize ? RecycleImmediateDeleteSetting.TryCapture(sourcePath) : null;
                 BeforeRecycleCheckpoint?.Invoke("before-recycle", sourcePath);
                 var result = transfer.RecycleItem(source, bin, 0, out created);
-                // Shellがサイズ超過だけを返し、新項目や別原因の失敗がない場合に限る。
-                if (recognizeOversize && result == RecycleSizeTooBig && created is null && !sink.Uncertain)
-                    return false;
+                // 新項目や別原因の失敗がなく、Shellが明示した理由と設定が一致する場合に限る。
+                if (recognizeOversize && result == RecycleSizeTooBig && created is null && !sink.Uncertain && sink.MatchesFailure(result))
+                    return static () => { };
+                if (recognizeOversize && result == RecycleUnavailable && created is null && !sink.Uncertain && sink.MatchesFailure(result) && immediateDelete is not null)
+                {
+                    immediateDelete.Revalidate(sourcePath);
+                    return () => immediateDelete.Revalidate(sourcePath);
+                }
                 RequireCompletedTransfer(result, "Windows did not confirm recycling");
                 if (sink.HadFailure) throw new IOException("Windows reported a failure during recycling; completion is unknown.");
                 if (created is null) throw new IOException("Windows returned no recycled item; completion is unknown.");
@@ -72,7 +82,7 @@ internal static class NativeRecycleBin
                     verifyRecycled(recycledPath);
                 }
 
-                return true;
+                return null;
             }
             finally
             {
@@ -174,6 +184,8 @@ internal static class NativeRecycleBin
     {
         internal bool Uncertain { get; private set; }
         internal bool HadFailure { get; private set; }
+        private int? failureResult;
+        internal bool MatchesFailure(int result) => failureResult is null || failureResult == result;
         public int UpdateProgress(ulong currentBytes, ulong totalBytes, int currentFiles, int totalFiles, int currentFolders, int totalFolders)
         {
             if (!allowFolderProgress && (currentBytes != 0 || currentFiles != 0 || currentFolders != 0)) Uncertain = true;
@@ -185,7 +197,9 @@ internal static class NativeRecycleBin
         public int FileFailure(IShellItem? item, string? name, int error, IntPtr rename, uint renameLength)
         {
             HadFailure = true;
-            if (error != RecycleSizeTooBig || item is null) Uncertain = true;
+            if (failureResult is not null && failureResult != error) Uncertain = true;
+            failureResult = error;
+            if (error is not (RecycleSizeTooBig or RecycleUnavailable) || item is null) Uncertain = true;
             else
             {
                 try

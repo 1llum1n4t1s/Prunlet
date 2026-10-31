@@ -81,14 +81,15 @@ public sealed partial class DeletionService
             if (dryRun)
             {
                 if (result.Items.Any(item => item.Status == "would_recycle"))
-                    result.Warnings.Add("Dry-run cannot determine whether Windows will recycle an item; an oversized file or directory may be permanently deleted.");
+                    result.Warnings.Add("Dry-run cannot determine whether Windows will recycle an item; an oversized file or directory, or an item on a volume configured for immediate deletion, may be permanently deleted.");
                 return result;
             }
             if (result.Items.Any(item => item.Status == "failed"))
                 throw new IOException("Deletion preflight failed; original targets were retained. " + string.Join(" ", result.Items.Where(item => item.Error is not null).Select(item => item.Error)));
-            // Shellを全件試した後、容量超過だけを固定削除する。同じbatchのShellと固定削除を重ねない。
+            // Shellを全件試した後、容量超過・照合済み即時削除設定だけを固定削除する。
             using var oversizedHardlinks = new OversizedHardlinkState();
             var oversized = new bool[paths.Length];
+            var revalidatePermanentDeletes = new Action?[paths.Length];
             DeletionWorkers.For(paths.Length, index =>
             {
                 var item = result.Items[index];
@@ -128,7 +129,7 @@ public sealed partial class DeletionService
                     {
                         VerifyRecycledObject(path, identity);
                         recycledPath = path;
-                    });
+                    }, out revalidatePermanentDeletes[index]);
                     if (!recycled)
                     {
                         OversizedDeleteCheckpoint?.Invoke("oversize-reported", item.Path);
@@ -157,7 +158,7 @@ public sealed partial class DeletionService
                     item.Error = FileDeletionDiagnostics.Describe(item.Path, ex) + (started ? " The operation was not retried. Inspect the Windows Recycle Bin and the source before any further action." : "");
                 }
             }, sequential: exclusive);
-            // Shellが全件終わってから容量超過を処理し、同一実体だけを排他する。
+            // Shellが全件終わってから固定削除を処理し、同一実体だけを排他する。
             DeletionWorkers.For(paths.Length, index =>
             {
                 if (!oversized[index]) return;
@@ -166,7 +167,11 @@ public sealed partial class DeletionService
                 try
                 {
                     using var original = inspections[index] ?? throw new IOException("Recycle source inspection was not retained.");
-                    DeleteOversizedTarget(item.Path, identities[index]!, parentIdentities[index]!, original, recursive, oversizedHardlinks, () => started = true);
+                    DeleteOversizedTarget(item.Path, identities[index]!, parentIdentities[index]!, original, recursive, oversizedHardlinks, () =>
+                    {
+                        revalidatePermanentDeletes[index]?.Invoke();
+                        started = true;
+                    });
                     original.Dispose();
                     if (InspectMoveLocation(item.Path) is not null) throw new IOException("A source name is still present after the Windows deletion attempt.");
                     item.Status = "permanently_deleted";

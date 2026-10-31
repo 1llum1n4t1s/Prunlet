@@ -40,7 +40,7 @@ RTKの共通指示と同様、エージェントのツール選択を案内す�
 
 対応するCodexの`exec_command`では、実削除を初回から`sandbox_permissions: "require_escalated"`で申請します。Windowsの管理者起動とは別の条件であり、Prunletの自動昇格や承認ポリシーの無効化はありません。対応しないホストでは正式な承認経路に従います。拒否された対象を別shell・別APIへ付け替えません。
 
-ファイル結果は`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`です。`permanently_deleted`の元の名前はゴミ箱から復元できません。dry-runは予約名の通常ファイルを`would_permanently_delete`で示し、不変更を保ちます。それ以外はサイズ超過の最終判定を行わず、永久削除になる可能性を警告します。`failed`・`ambiguous`は成功扱いにしません。Shell直前に対象名が差し替わると別実体がゴミ箱へ移る可能性があり、移動後の実体が一致しない場合は`ambiguous`で停止します。`ambiguous`となった削除は、許可取得だけを根拠に再送せず、CLIのJSON・元対象・Windowsのゴミ箱を確認します。ファイルの操作ID・Prunlet復元記録による照合は提供しません。レジストリ切断後は操作IDを使う`registry-reconcile`で照合し、同じ削除を再送しません。
+ファイル結果は`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`です。`permanently_deleted`の元の名前はゴミ箱から復元できません。dry-runは予約名の通常ファイルを`would_permanently_delete`で示し、不変更を保ちます。それ以外はWindowsの最終判定を行わず、サイズ超過や対象ボリュームの即時削除設定によって永久削除になる可能性を警告します。`failed`・`ambiguous`は成功扱いにしません。Shell直前に対象名が差し替わると別実体がゴミ箱へ移る可能性があり、移動後の実体が一致しない場合は`ambiguous`で停止します。`ambiguous`となった削除は、許可取得だけを根拠に再送せず、CLIのJSON・元対象・Windowsのゴミ箱を確認します。ファイルの操作ID・Prunlet復元記録による照合は提供しません。レジストリ切断後は操作IDを使う`registry-reconcile`で照合し、同じ削除を再送しません。
 
 退避先の保護では、設定された各ボリュームの保存先も実体とボリュームの対応を確認します。別ボリュームの設定先でも、権限不足や不正なリンクなどで確認できない場合は、対象外の保存先を誤って削除しないよう削除とdry-runを停止し、該当する設定パスと理由を返します。
 
