@@ -37,6 +37,8 @@ Shellがゴミ箱への移動を成功と返した場合は、返却項目だけ
 
 ロック待機の`RecoveryLockProgress`はCoreが発行し、`Program`がstderrへ診断を出す。MCPの並行ファイル要求用serviceもこの購読を引き継ぐ。`McpServer`は要求ごとの`progressToken`がある場合だけ追加購読して`notifications/progress`を返し、処理終了時に解除して最終応答後の通知と別要求への混入を防ぐ。
 
+失敗時の診断はCoreの`FileDeletionDiagnostics`が担当し、`DeletionService`が各項目の`error`へ付加してCLI・MCPへ返す。共有・ロック違反の場合だけ保持元を観測し、dry-runではプロセス照会を行わない。診断は失敗後の現在値であり、診断不能でも元の削除結果を維持する。保持元の特定を削除の再試行やプロセス停止へ結び付けない。照会方法と観測範囲の制約は[連携手順](docs/integration.md#使用中のファイルと同時実行)を参照する。
+
 ## 保存領域と保護
 
 `backupDirectory`は保護されたmetadataの基点である。manifestの`MetadataRoot`は従来の共通基点を維持する。レジストリの通常記録は`<backupDirectory>/.registry-records-v1/<operationId>`へ分離し、通常の一覧・保守・復元はそのnamespaceを対象にする。
