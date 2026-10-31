@@ -38,6 +38,7 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 - 旧データ移行: `scripts/Verify-FileRecordMigration.ps1`へ今回のexeと真正な旧版exeを渡す。旧schema fixtureを新版で捏造せず、所有済み旧rootの直接Bin破棄、壊れたfile本文の非読取、registry混在/他config/未知非所有領域の保護、dry-run不変更・gate不作成、中断後の自動再送拒否・明示ack、policy 0→2と更新時の後online store回収を確認する。旧file復元・bundle・sidecar・copy・履歴圧縮は成功条件へ残さない。
 - 並行・待機: 同一対象・親子・共有ハードリンクの排他、全preflight失敗時保全、process worker上限、入力順を確認する。60秒超ロック待機と解放後続行、CLI stderr/stdout、MCP token付き進捗と最終応答後抑止、EOF後完了を確認する。
 - レジストリ: `scripts/Verify-RegistryRecovery.ps1`と、native sessionの`Verify-RegistrySession.ps1`のPrepare・Start（`-AssertNativeWindows`）・Current・Runを使う。完全ACL/raw bytes・競合・transaction・snapshot保全・専用namespace/予算を確認する。同じexeのcurrent側6801拒否保全と明示native側CLI/MCP正常往復、実token・view/scopeを区別し、権限・KTM・viewの未検証を成功に数えない。
+- snapshot公開: 容量予約・本文のシリアライズ・公開処理を変更した場合は`scripts/Verify-RegistrySnapshotPublication.ps1`も実行する。必須引数と保存境界の検証範囲は[レジストリ検証](docs/verification.md#レジストリの削除と復元)に従い、実レジストリの往復検証とは区別する。
 - 導入: installer・共通指示・登録解除変更では`scripts/Verify-LatestInstall.ps1`を実行する。fixtureと実GitHub、保存内容と実ホストhook読込・承認・guide遵守を区別する。移行開始後の失敗で旧binaryへrollbackせず新exe/設定/登録を保全し、同じCLIで再開できることを確認する。
 - 起動時更新: `integration/start-prunlet-mcp.ps1`・`src/Prunlet/Core/StartupUpdate*`・公開ZIPの生成や登録を変更した場合は、[導入検証](docs/verification.md#latestインストーラー)の起動時更新の範囲も確認する。公開と同じZIPによる複数回更新、使用中の延期、独立hook、途中再開、登録改変の保全、ADSを含む容量上限を検証し、通常の導入検証だけで代替しない。
 

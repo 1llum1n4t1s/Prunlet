@@ -75,7 +75,7 @@ public sealed partial class DeletionService
                     if (exclusive) { root.Dispose(); roots[index] = null; }
                     item.Status = reserved[index] ? "would_permanently_delete" : "would_recycle";
                 }
-                catch (Exception ex) when (IsRecycleFailure(ex)) { item.Error = ex.Message; }
+                catch (Exception ex) when (IsRecycleFailure(ex)) { item.Error = FileDeletionDiagnostics.Describe(path, ex, inspectLocks: !dryRun); }
             }, sequential: exclusive);
             if (!exclusive && needsExclusive.Any(value => value)) return null;
             if (dryRun)
@@ -154,7 +154,7 @@ public sealed partial class DeletionService
                     inspections[index]?.Dispose();
                     if (started && trackHardlink) oversizedHardlinks.Uncertain.TryAdd(fileKey, 0);
                     item.Status = started ? "ambiguous" : "failed";
-                    item.Error = ex.Message + (started ? " The operation was not retried. Inspect the Windows Recycle Bin and the source before any further action." : "");
+                    item.Error = FileDeletionDiagnostics.Describe(item.Path, ex) + (started ? " The operation was not retried. Inspect the Windows Recycle Bin and the source before any further action." : "");
                 }
             }, sequential: exclusive);
             // Shellが全件終わってから容量超過を処理し、同一実体だけを排他する。
@@ -174,7 +174,7 @@ public sealed partial class DeletionService
                 catch (Exception ex) when (IsRecycleFailure(ex))
                 {
                     item.Status = started ? "ambiguous" : "failed";
-                    item.Error = ex.Message + (started ? " Some entries may already have been permanently deleted. The operation was not retried. Inspect the Windows Recycle Bin and the source before any further action." : "");
+                    item.Error = FileDeletionDiagnostics.Describe(item.Path, ex) + (started ? " Some entries may already have been permanently deleted. The operation was not retried. Inspect the Windows Recycle Bin and the source before any further action." : "");
                 }
             }, sequential: exclusive);
             return result;
