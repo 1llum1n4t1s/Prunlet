@@ -134,6 +134,8 @@ C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet
 
 許可されたローカルのHKCU・HKLM・HKUのキーまたは値を、明示した32/64ビットviewで退避して削除できます。キーのパスは絶対指定し、`--`の後へ1件だけ渡します。`--value-name`を省略するとキー、指定すると文字通りの値名を対象にします。既定値は空の名前なので、PowerShellから空引数が失われない`--value-name=`を使えます。値削除と`--recursive`は併用できません。子キーを含む削除には`--recursive`が必要です。
 
+キー名に含まれるコロンもそのまま指定できます。たとえば`HKCU:\Software\Example\C:#Program Files#Fixture.exe`の末尾は1つのキー名です。`%5C`などを含む名前も文字通りに扱い、URLデコードは行いません。
+
 ```text
 prunlet --config <絶対パス> registry-delete --view 64 --dry-run -- HKCU:\Software\Example
 prunlet --config <絶対パス> registry-delete --view 64 --recursive -- HKCU:\Software\Example
