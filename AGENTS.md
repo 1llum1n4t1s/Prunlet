@@ -20,7 +20,9 @@ native sessionはscopeの明示選択を必要とする。検証起動は固定�
 
 旧ファイルの復元互換を維持せず、明示`migrate`で所有確認済みの旧退避root・操作記録をWindowsゴミ箱へ破棄する。旧schemaのparser・decode・内容hash・ACL snapshot・コピー・bundle・sidecar・復元helperは追加しない。store/restoreの専用StoreKey rootと小marker、中央の正規file marker、typed root layoutで所有を確認し、registry signals・共通基点・他config/privateBase・未知の非所有領域を保護する。ファイル別の恒久一覧を作らず、固定private空gate `.legacy-file-discard-in-progress` だけで中断の自動再送を止める。正規gateの明示ackは`migrate --apply --retry-legacy-discard`のみで、installerは指定しない。fileの未完了はregistry利用を塞がない。policy 2評価済みの`--apply --if-needed`は中央旧GUID再走査を省き、更新時のonline owned store固定位置・小marker確認だけを続ける。通常file/list/maintainは旧領域を走査しない。
 
-対応するCodexの`exec_command`では、ファイル・フォルダーの実削除を初回から`sandbox_permissions: "require_escalated"`で申請する。Windowsの管理者起動とは区別し、dry-runをゴミ箱アクセス許可の証拠にしない。[sandboxとゴミ箱へのアクセス](docs/integration.md#sandboxとゴミ箱へのアクセス)に従う。
+Codexの`exec_command`が正式なsandbox権限要求に対応し、実効設定で要求が必要かつ許可される場合は、ファイル・フォルダーの実削除を初回から`sandbox_permissions: "require_escalated"`で申請する。要求が不要・未対応・禁止の場合は実効設定と正式な承認経路に従う。dry-runをゴミ箱アクセス許可の証拠にしない。
+
+Windowsの管理者起動はsandbox権限申請と区別する。許可済みの削除に管理者権限が必要なら、手動実行を依頼する前に、ホストの許可範囲でエージェントが管理者CMDを起動し、同じ配置済みCLI・設定を直接使う。起動先の実トークン・必要なprivilege・CLIの終了コード・JSON・対象状態を確認する。Prunlet自身の自動昇格禁止と区別し、本人のUAC同意を代行せず、拒否・結果不明を迂回しない。権限不足で停止した後の再実行条件も含め、[sandboxとゴミ箱へのアクセス](docs/integration.md#sandboxとゴミ箱へのアクセス)に従う。
 
 ## ビルドと検証
 
