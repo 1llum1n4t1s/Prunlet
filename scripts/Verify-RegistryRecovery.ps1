@@ -422,6 +422,18 @@ Case 'provider-module-prefixes-accepted' {
     }
     Assert-True ((Snapshot) -ceq $before) 'Provider dry run changed source.'
 }
+Case 'literal-colon-key-roundtrip' {
+    $relative = $script:Relative; $path = $script:Path
+    foreach ($name in @('C:#Program Files#Fixture.exe','C:%5CProgram Files%5CFixture.exe')) {
+        $script:Relative = $relative + '\' + $name
+        $script:Path = $path + '\' + $name
+        Fixture; $before = Snapshot
+        $op = Delete-Registry
+        Assert-True (!(Exists)) 'Literal colon key was retained.'
+        $null = Restore $op
+        Assert-True ((Snapshot) -ceq $before) 'Literal colon key roundtrip changed source.'
+    }
+}
 Case 'explicit-views-do-not-touch-distinct-other-view' {
     Fixture -View 64; $before64 = Snapshot 64
     # SYSTEMとHKCU\Softwareの共有viewでは、同名の別fixtureを作って上書きしない。

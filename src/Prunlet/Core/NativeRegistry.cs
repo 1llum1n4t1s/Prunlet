@@ -38,7 +38,7 @@ internal static class NativeRegistry
         };
         var segments = path[(slash + 1)..].Split('\\');
         if (segments.Length > MaximumDepth || segments.Any(segment => segment.Length == 0 || segment.Length > 255
-            || segment is "." or ".." || segment.IndexOfAny(['*', '?', '[', ']', '/', ':']) >= 0))
+            || segment is "." or ".." || segment.IndexOfAny(['*', '?', '[', ']', '/']) >= 0))
             throw new ArgumentException("Registry paths cannot be roots, relative, wildcarded, or contain empty/unsupported segments.");
         if (request.ValueName is not null) ValidateText(request.ValueName, 16383, "Registry value name", allowEmpty: true);
         return new RegistryTarget(hive + "\\" + string.Join('\\', segments), hive, segments, request.View, request.ValueName);
