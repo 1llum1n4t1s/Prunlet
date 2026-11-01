@@ -38,7 +38,11 @@ RTKの共通指示と同様、エージェントのツール選択を案内す�
 
 削除元への書込みが許可されても、ホストのsandbox内でWindowsゴミ箱への書込み権限を取得できるとは限りません。`delete --dry-run`はShell移動を行わないため、実処理の権限を保証しません。`COPYENGINE_E_ACCESS_DENIED_SRC`（`0x80270021`）だけから元対象のACL破損と判断せず、実行元のsandbox条件とゴミ箱へのアクセスも切り分けます。
 
-対応するCodexの`exec_command`では、実削除を初回から`sandbox_permissions: "require_escalated"`で申請します。Windowsの管理者起動とは別の条件であり、Prunletの自動昇格や承認ポリシーの無効化はありません。対応しないホストでは正式な承認経路に従います。拒否された対象を別shell・別APIへ付け替えません。
+対応するCodexの`exec_command`では、実削除を初回から`sandbox_permissions: "require_escalated"`で申請します。Windowsの管理者起動とは別の条件であり、Prunlet自身の自動昇格や承認ポリシーの無効化はありません。現在のホストが権限要求を提供しない、または禁止している場合は、実効設定と正式な承認経路に従います。拒否された対象を別shell・別APIへ付け替えません。
+
+Windowsの管理者権限が必要な場合は、実削除前に実トークンと必要な権限を確認し、許可済みの範囲でエージェントが管理者CMDを起動します。`Start-Process -Verb RunAs -WindowStyle Hidden`等は起動制御にだけ使い、実削除はそのCMD内から配置済みPrunlet CLIと同じ設定で直接実行します。Codexやストアアプリが非管理者であることだけでは、管理者プロセスを起動できない根拠になりません。手動実行用スクリプトを渡す前に、管理者起動の成否、起動先の実トークンと必要なprivilege、CLIの終了コード・JSON・対象の状態まで確認します。本人の同意・認証が必要な場合や実際の起動失敗・正式な拒否では、その阻害理由と必要最小限の操作を伝えます。
+
+失敗した削除の自動再送は行いません。削除前に止まった権限不足を確認し、利用者が管理者での再実行を明示許可した場合は、エージェントが上記の経路で実行します。ポリシー拒否と結果不明はこの対象に含めません。レジストリのnative sessionによる検証は、引き続き固定したPrepare入力・scope・実トークン・Run permitの契約に従います。
 
 ファイル結果は`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`です。`permanently_deleted`の元の名前はゴミ箱から復元できません。dry-runは予約名の通常ファイルを`would_permanently_delete`で示し、不変更を保ちます。それ以外はWindowsの最終判定を行わず、サイズ超過や対象ボリュームの即時削除設定によって永久削除になる可能性を警告します。`failed`・`ambiguous`は成功扱いにしません。Shell直前に対象名が差し替わると別実体がゴミ箱へ移る可能性があり、移動後の実体が一致しない場合は`ambiguous`で停止します。`ambiguous`となった削除は、許可取得だけを根拠に再送せず、CLIのJSON・元対象・Windowsのゴミ箱を確認します。ファイルの操作ID・Prunlet復元記録による照合は提供しません。レジストリ切断後は操作IDを使う`registry-reconcile`で照合し、同じ削除を再送しません。
 
