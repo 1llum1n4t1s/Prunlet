@@ -13,10 +13,53 @@ param(
     [switch]$RegisterAgentInstructions,
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [string]$SettingsBackupDirectory,
-    [switch]$PrepareStartupUpdate
+    [switch]$PrepareStartupUpdate,
+    [switch]$UseGitHubCliAuthentication
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+function Invoke-PrunletGitHubCli([string]$Endpoint) {
+    $command = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (!$command) { throw 'GitHub CLI authentication requires an existing gh executable.' }
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $command.Source
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    foreach ($argument in @('api', '--hostname', 'github.com', '--method', 'GET', $Endpoint)) { $start.ArgumentList.Add($argument) }
+    # 親のデバッグ設定による認証情報の出力と、対話待ちを避ける。
+    [void]$start.Environment.Remove('GH_DEBUG')
+    $start.Environment['GH_PROMPT_DISABLED'] = '1'
+    $start.Environment['GIT_TERMINAL_PROMPT'] = '0'
+    $start.Environment['GH_PAGER'] = 'cat'
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    try {
+        try { [void]$process.Start() } catch { throw 'GitHub CLI could not be started.' }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (!$process.WaitForExit(60000)) {
+            try { $process.Kill($true) } catch { }
+            throw 'GitHub CLI request timed out after 60 seconds.'
+        }
+        $output = $stdout.GetAwaiter().GetResult()
+        # stderrは回収だけを行い、認証関連の生出力を例外や記録へ転載しない。
+        [void]$stderr.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) { throw "GitHub CLI request failed (exit code $($process.ExitCode))." }
+        return $output
+    } finally { $process.Dispose() }
+}
+function Get-PrunletGitHubApiResponse([string]$Endpoint) {
+    if (!$UseGitHubCliAuthentication) {
+        return Invoke-RestMethod -Uri ("https://api.github.com/" + $Endpoint) -Headers $headers -TimeoutSec 60
+    }
+    $json = Invoke-PrunletGitHubCli $Endpoint
+    try { $response = ConvertFrom-Json -InputObject $json -ErrorAction Stop } catch { throw 'GitHub CLI returned invalid JSON.' }
+    if ($null -eq $response -or $response -isnot [pscustomobject]) { throw 'GitHub CLI returned an invalid API response.' }
+    return $response
+}
 
 function Test-InTree([string]$Path, [string]$Root) {
     $Path.Equals($Root, [StringComparison]::OrdinalIgnoreCase) -or $Path.StartsWith($Root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
@@ -176,10 +219,10 @@ try {
     if (!$globalMutexAcquired) { throw 'Another Prunlet installation is already running for this directory.' }
     try { $mutexAcquired = $installationMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $mutexAcquired = $true }
     if (!$mutexAcquired) { throw 'Another Prunlet installation is already running for this directory.' }
-    $metadata = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository" -Headers $headers -TimeoutSec 60
+    $metadata = Get-PrunletGitHubApiResponse "repos/$Repository"
     $branch = [string]$metadata.default_branch
     if (!$branch) { throw 'GitHub did not return a default branch.' }
-    $head = Invoke-RestMethod -Uri ("https://api.github.com/repos/$Repository/commits/" + [Uri]::EscapeDataString($branch)) -Headers $headers -TimeoutSec 60
+    $head = Get-PrunletGitHubApiResponse ("repos/$Repository/commits/" + [Uri]::EscapeDataString($branch))
     $sha = [string]$head.sha
     if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw 'GitHub did not return a valid commit SHA.' }
 

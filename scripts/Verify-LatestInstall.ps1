@@ -3,7 +3,9 @@
 param(
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
-    [switch]$CheckPublicHead
+    [switch]$CheckPublicHead,
+    [string]$FixtureRoot,
+    [switch]$UseGitHubCliAuthentication
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -25,6 +27,10 @@ foreach ($path in @($OutputDirectory, $ReportPath)) {
     if (Test-Path -LiteralPath $full) { throw 'Verification destinations must be new.' }
 }
 New-Item -ItemType Directory -Path $OutputDirectory, (Split-Path -Parent $ReportPath) -Force | Out-Null
+. (Join-Path $PSScriptRoot 'Verification-Common.ps1')
+. (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')
+$fileFixtureRun = if ($FixtureRoot) { New-VerificationFixtureRun -FixtureRoot $FixtureRoot -ForbiddenRoots $forbidden -NamePrefix 'installer-files' } else { $null }
+$fileFixtureDirectory = if ($fileFixtureRun) { $fileFixtureRun.directory } else { $OutputDirectory }
 $fixtureUpdateBackupRoot = Join-Path $OutputDirectory 'update-backups'
 $fixtureVolumeStore = Join-Path $OutputDirectory 'volume-stores'
 $results = [Collections.Generic.List[object]]::new()
@@ -119,11 +125,42 @@ Test-Case 'Update backup root cannot be inside a repository or installation' {
     Expect-Failure { & $installer -UpdateBackupRoot (Join-Path $install 'updates') -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'backup-install-work') } 'separate from install'
     Assert-True (!(Test-Path -LiteralPath $install)) 'Invalid update backup root created installation files.'
 }
+# 本番関数そのものを独立スコープへ読み込み、認証境界の失敗を検証する。
+$installerTokens = $null
+$installerErrors = $null
+$installerAst = [Management.Automation.Language.Parser]::ParseFile($installer, [ref]$installerTokens, [ref]$installerErrors)
+if ($installerErrors.Count) { throw 'Installer script has parse errors.' }
+$githubHelperSource = ($installerAst.FindAll({ param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Invoke-PrunletGitHubCli', 'Get-PrunletGitHubApiResponse')
+}, $false) | ForEach-Object { $_.Extent.Text }) -join "`n"
+$githubHelperBlock = [scriptblock]::Create($githubHelperSource)
+Test-Case 'Explicit GitHub CLI authentication fails closed when gh is missing' {
+    . $githubHelperBlock
+    function Get-Command { param($Name, $CommandType, $ErrorAction) return $null }
+    Expect-Failure { Invoke-PrunletGitHubCli 'repos/1llum1n4t1s/Prunlet' } 'requires an existing gh executable'
+}
+Test-Case 'Explicit GitHub CLI authentication rejects nonzero exit without raw stderr' {
+    $pwshPath = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+    . $githubHelperBlock
+    # PowerShellはgh専用の固定引数を拒否し、実プロセスの非成功を返す。
+    function Get-Command { param($Name, $CommandType, $ErrorAction) [pscustomobject]@{ Source = $pwshPath } }
+    $caught = $null
+    try { Invoke-PrunletGitHubCli 'repos/1llum1n4t1s/Prunlet' | Out-Null } catch { $caught = $_ }
+    Assert-True ($null -ne $caught -and $caught.ToString() -match '^GitHub CLI request failed \(exit code -?\d+\)\.$') 'Nonzero exit did not return a bounded, sanitized failure.'
+}
+Test-Case 'Explicit GitHub CLI authentication rejects invalid JSON without raw output' {
+    . $githubHelperBlock
+    $UseGitHubCliAuthentication = $true
+    function Invoke-PrunletGitHubCli { param($Endpoint) return 'private-output-invalid-json' }
+    $caught = $null
+    try { Get-PrunletGitHubApiResponse 'repos/1llum1n4t1s/Prunlet' | Out-Null } catch { $caught = $_ }
+    Assert-True ($null -ne $caught -and $caught.ToString() -ceq 'GitHub CLI returned invalid JSON.') 'Invalid JSON was accepted or raw output escaped into the error.'
+}
 if ($CheckPublicHead) {
     Test-Case 'Public default branch is queried without clone fallback' {
         $publicInstall = Join-Path $OutputDirectory 'public-install'
         try {
-            & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $publicInstall -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'public-work') | Out-Null
+            & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $publicInstall -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'public-work') -UseGitHubCliAuthentication:$UseGitHubCliAuthentication | Out-Null
             $publicInfo = Get-Content -LiteralPath (Join-Path $publicInstall 'source-info.json') -Raw | ConvertFrom-Json
             Assert-True ($publicInfo.commitSha -match '^[0-9a-f]{40}$') 'Public installation has no provenance.'
         } catch {
@@ -143,7 +180,7 @@ Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Joi
 $fixtureGuideSha256 = (Get-FileHash -LiteralPath (Join-Path $source 'integration\PRUNLET.md') -Algorithm SHA256).Hash
 Assert-True ($fixtureGuideSha256 -ceq (Get-FileHash -LiteralPath (Join-Path $repoRoot 'integration\PRUNLET.md') -Algorithm SHA256).Hash) 'Fixture guide differs from the current working tree.'
 # 実行した検証・導入・ビルド・連携元のhashを、C#本文とは別にレポートへ固定する。
-$verificationInputFiles = @(@($PSCommandPath, $installer, (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1')) + $recordlessHelpers + @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'integration') -File | ForEach-Object FullName) | Sort-Object -Unique | ForEach-Object {
+$verificationInputFiles = @(@($PSCommandPath, $installer, (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Join-Path $PSScriptRoot 'Verification-Common.ps1'), (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')) + $recordlessHelpers + @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'integration') -File | ForEach-Object FullName) | Sort-Object -Unique | ForEach-Object {
     @{ path = [IO.Path]::GetRelativePath($repoRoot, $_); sha256 = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash }
 })
 $fixtureSourceFiles = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'src') -Filter '*.cs' -File -Recurse | ForEach-Object {
@@ -331,14 +368,14 @@ try {
         Assert-True ($initialSettings.capacityDefaultMigrationVersion -eq 1) 'New installation was not marked migrated.'
         Assert-True (!$initialSettings.ContainsKey('volumeRecoveryDirectories') -or $initialSettings.volumeRecoveryDirectories.Count -eq 0) 'Fresh installation changed default volume placement.'
         Set-FixtureVolumeMap $installedConfig
-        $target = Join-Path $OutputDirectory 'unregistered-install-target.txt'
+        $target = Join-Path $fileFixtureDirectory 'unregistered-install-target.txt'
         [IO.File]::WriteAllText($target, 'unregistered install target')
         $targetId = [PrunletLatestMoveIdentity]::Read($target)
         $priorPidls = @([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($targetId) | ForEach-Object Pidl)
         $deleted = (& $installedExe --config $installedConfig delete -- $target | ConvertFrom-Json)
         Assert-True ($LASTEXITCODE -eq 0 -and ![IO.File]::Exists($target) -and $deleted.items[0].status -eq 'recycled' -and !$deleted.PSObject.Properties['operationId']) 'Installed CLI did not recycle without a file operation record.'
         $binItem = [Prunlet.RecordlessE2E.OwnedBinLocator]::FindNew($targetId, [string[]]$priorPidls)
-        $null = [Prunlet.RecordlessE2E.FixtureNative]::RestoreOwned($binItem.Pidl, $binItem.PhysicalPath, $targetId, $target, $OutputDirectory)
+        $null = [Prunlet.RecordlessE2E.FixtureNative]::RestoreOwned($binItem.Pidl, $binItem.PhysicalPath, $targetId, $target, $fileFixtureDirectory)
         Assert-True ([IO.File]::ReadAllText($target) -eq 'unregistered install target' -and [PrunletLatestMoveIdentity]::Read($target) -ceq $targetId) 'Windows restoration of installed CLI item differs.'
         $protected = Join-Path $install 'recovery\protected-install-target.txt'
         [IO.File]::WriteAllText($protected, 'keep recovery storage')
@@ -593,10 +630,10 @@ try {
         Assert-True (Test-Path -LiteralPath $customConfig -PathType Leaf) 'Uninstall removed the custom config.'
     }
     Test-Case 'Owned MCP-first instructions upgrade to CLI binding without changing the body' {
-        $legacyInstall = Join-Path $OutputDirectory 'legacy-instruction-install'
+        $legacyInstall = Join-Path $fileFixtureDirectory 'legacy-instruction-install'
         $legacyCodex = Join-Path $OutputDirectory 'legacy-instruction-codex'
         New-Item -ItemType Directory -Path $legacyCodex | Out-Null
-        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $legacyInstall -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'legacy-instruction-base-work') | Out-Null
+        & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $legacyInstall -BackupDirectory (Join-Path $OutputDirectory 'legacy-instruction-recovery') -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'legacy-instruction-base-work') | Out-Null
         $obsoleteBackend = Join-Path $legacyInstall 'bin\codex-pretooluse.ps1'
         [IO.File]::WriteAllText($obsoleteBackend, '# Previous installed PowerShell backend fixture', [Text.UTF8Encoding]::new($false))
         $obsoleteHash = (Get-FileHash -LiteralPath $obsoleteBackend -Algorithm SHA256).Hash
@@ -939,7 +976,7 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
     Remove-Item Function:\Get-ScheduledTask, Function:\Export-ScheduledTask, Function:\Register-ScheduledTask, Function:\Unregister-ScheduledTask
     Remove-Variable PrunletMaintenanceFixture -Scope Global
     # junctionと更新バックアップも隔離出力内に残し、結果確認後にPrunletで一括清掃する。
-    [ordered]@{ verifiedUtc = [DateTimeOffset]::UtcNow.ToString('o'); fixtureSource = 'current working tree including untracked C# files'; fixtureSourceFiles = $fixtureSourceFiles; verificationInputFiles = $verificationInputFiles; fixtureArchiveSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash; fixtureGuideSha256 = $fixtureGuideSha256; publicHeadChecked = [bool]$CheckPublicHead; failureConditions = $failureConditions; results = @($results.ToArray()); passed = !@($results | Where-Object { !$_.passed }).Count; retention = 'Keep this report as reproducible installer verification evidence; delete when superseded.'; reproduce = 'Run scripts/Verify-LatestInstall.ps1 with new external OutputDirectory and ReportPath.' } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ReportPath -Encoding utf8NoBOM
+    [ordered]@{ fileFixtureRun = $fileFixtureRun; verifiedUtc = [DateTimeOffset]::UtcNow.ToString('o'); fixtureSource = 'current working tree including untracked C# files'; fixtureSourceFiles = $fixtureSourceFiles; verificationInputFiles = $verificationInputFiles; fixtureArchiveSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash; fixtureGuideSha256 = $fixtureGuideSha256; publicHeadChecked = [bool]$CheckPublicHead; publicHeadAuthentication = $(if ($UseGitHubCliAuthentication) { 'github-cli' } else { 'unauthenticated' }); failureConditions = $failureConditions; results = @($results.ToArray()); passed = !@($results | Where-Object { !$_.passed }).Count; retention = 'Keep this report as reproducible installer verification evidence; delete when superseded.'; reproduce = 'Run scripts/Verify-LatestInstall.ps1 with new external OutputDirectory and ReportPath.' } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ReportPath -Encoding utf8NoBOM
 }
 Get-Content -LiteralPath $ReportPath -Raw
 if (@($results | Where-Object { !$_.passed }).Count) { throw 'Latest installer verification failed; read the JSON report.' }
