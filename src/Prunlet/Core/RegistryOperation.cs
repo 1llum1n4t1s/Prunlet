@@ -8,11 +8,14 @@ public sealed class RegistryDeleteRequest
     public string View { get; set; } = "";
     public string? ValueName { get; set; }
     public bool Recursive { get; set; }
+    public string AccessMode { get; set; } = "normal";
 }
 
 internal sealed record RegistryTarget(string Path, string Hive, string[] Segments, string View, string? ValueName)
 {
     internal string Kind => ValueName is null ? "registry-key" : "registry-value";
+    internal string AccessMode { get; init; } = "normal";
+    internal bool BackupRestore => AccessMode == "backupRestore";
 }
 
 internal sealed class RegistrySnapshot

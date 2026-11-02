@@ -5,11 +5,13 @@ param(
     [Parameter(Mandatory)][string]$ExpectedAssemblySha256,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
-    [switch]$Large
+    [switch]$Large,
+    [string]$FixtureRoot
 )
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
+. (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')
 if (!$IsWindows -or [Environment]::Version.Major -ne 10) { throw 'Native Windows and .NET 10 PowerShell required' }
 foreach ($path in @($ExecutablePath, $AssemblyPath, $OutputDirectory, $ReportPath)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Absolute paths required' }
@@ -22,6 +24,8 @@ foreach ($path in @($OutputDirectory, $ReportPath)) {
 }
 if (![IO.File]::Exists($ExecutablePath) -or ![IO.File]::Exists($AssemblyPath)) { throw 'Candidate executable/assembly missing' }
 if ((Get-FileHash -LiteralPath $AssemblyPath).Hash -cne $ExpectedAssemblySha256) { throw 'Candidate assembly hash mismatch' }
+$script:fixtureRun = $null
+if ($FixtureRoot) { $script:fixtureRun = New-VerificationFixtureRun -FixtureRoot $FixtureRoot -ForbiddenRoots @($repo, (Join-Path $env:USERPROFILE '.codex')) -NamePrefix 'hardlink-times' }
 $null = [IO.Directory]::CreateDirectory($OutputDirectory)
 $script:temp = Join-Path $OutputDirectory 'temp'
 $null = [IO.Directory]::CreateDirectory($script:temp)
@@ -32,7 +36,7 @@ $common = Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1'
 $script:commands = [Collections.Generic.List[object]]::new()
 $results = [Collections.Generic.List[object]]::new()
 $helpers = @('NativeShellFixture.cs', 'FixtureNative.cs', 'OwnedBinLocator.cs', 'SparseFixture.cs') | ForEach-Object { Join-Path $PSScriptRoot "recordless-e2e/$_" }
-$sourceHashes = @(@($PSCommandPath, $common) + $helpers | ForEach-Object { @{ path = $_; sha256 = (Get-FileHash -LiteralPath $_).Hash } })
+$sourceHashes = @(@($PSCommandPath, $common, (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')) + $helpers | ForEach-Object { @{ path = $_; sha256 = (Get-FileHash -LiteralPath $_).Hash } })
 try {
     Add-Type -Path $helpers -CompilerOptions '/unsafe'
     # 公開CLI/MCPに検証専用APIを増やさず、同じCoreの既存内部checkpointだけで競合を同期する。
@@ -142,6 +146,43 @@ public static class HardlinkEntryTimesProbe {
         catch { $results.Add(@{ name = $Name; passed = $false; error = $_.Exception.Message; stack = $_.ScriptStackTrace; observed = $script:observed; elapsedMs = $clock.ElapsedMilliseconds }) }
     }
     foreach ($transport in @('cli', 'mcp')) {
+        Case-H "many-root-hardlinks-$transport" {
+            $s = New-ScopeR "many-root-hardlinks-$transport"
+            $outside = Join-Path $s.files 'outside'; $null = [IO.Directory]::CreateDirectory($outside)
+            $keepers = @((Join-Path $outside 'empty'), (Join-Path $outside 'small'))
+            [IO.File]::WriteAllBytes($keepers[0], [byte[]]::new(0)); [IO.File]::WriteAllText($keepers[1], 'export {};')
+            foreach ($keeper in $keepers) { [IO.File]::WriteAllText(($keeper + ':proof'), 'external stream') }
+            $external = @(foreach ($kind in 0..1) { foreach ($index in 0..699) {
+                $alias = Join-Path $outside ("alias-$kind-$index")
+                [Prunlet.RecordlessE2E.FixtureNative]::CreateHardlink($alias, $keepers[$kind]); @{ path = $alias; kind = $kind }
+            } })
+            # 予約名の通常ファイルにより、ボリューム設定に依存せず同じroot固定削除経路を通す。
+            $paths = @(foreach ($index in 0..127) { foreach ($kind in 0..1) {
+                $parent = Join-Path (Join-Path $s.files 'targets') ("$index-$kind"); $null = [IO.Directory]::CreateDirectory($parent)
+                $path = Join-Path $parent 'NUL'; [Prunlet.RecordlessE2E.FixtureNative]::CreateHardlink(('\\?\' + $path), $keepers[$kind]); $path
+            } })
+            $before = @($keepers | ForEach-Object { ,(Snapshot-R $_) })
+            Assert-R ($before[0][0].NumberOfLinks -eq 829 -and $before[1][0].NumberOfLinks -eq 829) 'Many-root hardlink fixture count wrong'
+            if ($transport -eq 'cli') {
+                $response = Delete-R $s $paths; $script:observed.response = $response; Assert-R ($response.exitCode -eq 0) 'Many-root CLI deletion failed'
+            } else {
+                $session = Open-McpR $s
+                try { Init-McpR $session; $response = Call-McpR $session 2 'delete_files' @{ paths = $paths }; $script:observed.response = $response; Assert-R (!$response.failed) 'Many-root MCP deletion failed' }
+                finally { Close-McpR $session }
+            }
+            $script:observed.response = $response
+            Assert-WireR $response $paths @($paths | ForEach-Object { 'permanently_deleted' })
+            foreach ($path in $paths) { Assert-R (![IO.File]::Exists(('\\?\' + $path))) 'A deleted root name remains' }
+            $after = @($keepers | ForEach-Object { ,(Snapshot-R $_) })
+            foreach ($kind in 0..1) {
+                foreach ($field in @('Id', 'SecurityBase64', 'Attributes')) { Assert-R ($before[$kind][0].$field -ceq $after[$kind][0].$field) "External alias $field changed" }
+                Assert-R (($before[$kind][0].Streams | ConvertTo-Json -Depth 10 -Compress) -ceq ($after[$kind][0].Streams | ConvertTo-Json -Depth 10 -Compress)) 'External alias streams changed'
+                Assert-R ($after[$kind][0].NumberOfLinks -eq 701) 'External alias link count wrong'
+            }
+            foreach ($alias in $external) { Assert-R ([Prunlet.RecordlessE2E.FixtureNative]::Identity($alias.path) -ceq $after[$alias.kind][0].Id) 'An external alias changed identity or disappeared' }
+            $script:observed.aliasBefore = $before; $script:observed.aliasAfter = $after; $script:observed.externalAliasCount = $external.Count
+            No-FileRecordsR $s
+        }
         Case-H "stale-hardlink-$transport" {
             $s = New-ScopeR "stale-hardlink-$transport"
             $root = Join-Path $s.files 'node_modules'; $store = Join-Path $s.files 'store'
@@ -248,9 +289,9 @@ public static class HardlinkEntryTimesProbe {
         }
     }
 } finally {
-    $report = @{ executable = $ExecutablePath; executableSha256 = (Get-FileHash -LiteralPath $ExecutablePath).Hash; assembly = $AssemblyPath; assemblySha256 = (Get-FileHash -LiteralPath $AssemblyPath).Hash; sources = $sourceHashes; results = @($results); commands = @($script:commands); passed = @($results | Where-Object passed).Count; failed = @($results | Where-Object { !$_.passed }).Count; retainedFixtures = $OutputDirectory; note = 'Fresh fixtures only; failed/ambiguous deletes are never resent. Race fixtures retained for inspection.' }
+    $report = @{ fixtureRun = $script:fixtureRun; executable = $ExecutablePath; executableSha256 = (Get-FileHash -LiteralPath $ExecutablePath).Hash; assembly = $AssemblyPath; assemblySha256 = (Get-FileHash -LiteralPath $AssemblyPath).Hash; sources = $sourceHashes; results = @($results); commands = @($script:commands); passed = @($results | Where-Object passed).Count; failed = @($results | Where-Object { !$_.passed }).Count; retainedFixtures = $OutputDirectory; note = 'Fresh fixtures only; failed/ambiguous deletes are never resent. Race fixtures retained for inspection.' }
     Save-R $ReportPath $report
     $env:TEMP = $oldTemp; $env:TMP = $oldTmp
 }
 $report | Select-Object passed, failed, retainedFixtures | ConvertTo-Json -Compress
-if ($results.Count -ne $(if ($Large) { 5 } else { 4 }) -or $report.failed -ne 0) { exit 1 }
+if ($results.Count -ne $(if ($Large) { 7 } else { 6 }) -or $report.failed -ne 0) { exit 1 }

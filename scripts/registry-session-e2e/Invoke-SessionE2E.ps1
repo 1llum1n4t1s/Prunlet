@@ -203,7 +203,7 @@ try{
   $sw=[Diagnostics.Stopwatch]::StartNew()
   do{$state=NativeRequest 'admin-client-state';if(!$state.finished){Assert ($sw.Elapsed.TotalSeconds-lt 600) 'Explicit administrator clients timeout';Start-Sleep -Milliseconds 200}}while(!$state.finished)
   Assert ($state.exitCode-eq 0) 'Explicit administrator client process failed'
-  $e=ReadJson (Join-Path $PSScriptRoot 'elevated-client-results.json');foreach($r in $e.results){$results.Add($r)};Assert ($e.failed-eq 0-and$e.passed-eq 3) 'Full key roundtrips/default HKCU suite incomplete'
+  $e=ReadJson (Join-Path $PSScriptRoot 'elevated-client-results.json');foreach($r in $e.results){$results.Add($r)};Assert ($e.failed-eq 0-and$e.passed-eq 5) 'Normal/backupRestore full key roundtrips/default HKCU suite incomplete'
  }
  Check 'readonly-private-namespace-observation' {
   $k=[PrunletRegistryE2E]::Open($script:RunRelative,64);$o=@{packaged=[SessionE2ENative]::Packaged();exists=($null-ne$k);privateWritesPerformed=$false}

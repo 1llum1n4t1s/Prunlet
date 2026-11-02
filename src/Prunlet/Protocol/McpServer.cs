@@ -204,7 +204,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                         : service.Delete(deletePaths, dryRun.ValueKind == JsonValueKind.True, recursive.ValueKind == JsonValueKind.True);
                     break;
                 case "delete_registry":
-                    RejectExtraProperties(args, "path", "view", "valueName", "recursive", "dryRun");
+                    RejectExtraProperties(args, "path", "view", "valueName", "recursive", "dryRun", "accessMode");
                     var view = StringProperty(args, "view");
                     if (view is not ("32" or "64")) throw new RpcException(-32602, "View must be 32 or 64.");
                     if (args.TryGetProperty("valueName", out var valueName) && valueName.ValueKind != JsonValueKind.String)
@@ -219,12 +219,12 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                     {
                         Path = StringProperty(args, "path"), View = view,
                         ValueName = valueName.ValueKind == JsonValueKind.String ? valueName.GetString() : null,
-                        Recursive = registryRecursive.ValueKind == JsonValueKind.True
+                        Recursive = registryRecursive.ValueKind == JsonValueKind.True, AccessMode = RegistryAccessMode(args)
                     }, registryDryRun.ValueKind == JsonValueKind.True);
                     break;
                 case "restore_registry":
-                    RejectExtraProperties(args, "operationId");
-                    result = service.RestoreRegistry(StringProperty(args, "operationId"));
+                    RejectExtraProperties(args, "operationId", "accessMode");
+                    result = service.RestoreRegistry(StringProperty(args, "operationId"), RegistryAccessMode(args));
                     break;
                 case "reconcile_registry":
                     RejectExtraProperties(args, "operationId");
@@ -285,7 +285,8 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
                 {
                     path = new { type = "string" }, view = new { type = "string", @enum = new[] { "32", "64" } },
                     valueName = new { type = "string", description = "Literal value name; empty string selects the default value. Omit to delete the key." },
-                    recursive = new { type = "boolean" }, dryRun = new { type = "boolean" }
+                    recursive = new { type = "boolean" }, dryRun = new { type = "boolean" },
+                    accessMode = new { type = "string", @enum = new[] { "normal", "backupRestore" }, description = "Explicit backupRestore enables effective-token backup/restore privileges to bypass ordinary ACL access checks. Only view 64 in a 64-bit Windows process is supported. Default normal; never selected automatically." }
                 },
                 required = new[] { "path", "view" }, additionalProperties = false
             },
@@ -297,7 +298,7 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
             description = "Restore a retained registry operation by operationId in its recorded view. Refuse existing destinations, including an empty existing default value. Restore consumes recovery data after a successful transaction. Insufficient owner/SACL permissions or ambiguous commit state preserve recovery data and do not fall back.",
             inputSchema = new
             {
-                type = "object", properties = new { operationId = new { type = "string" } },
+                type = "object", properties = new { operationId = new { type = "string" }, accessMode = new { type = "string", @enum = new[] { "normal", "backupRestore" }, description = "Choose backupRestore explicitly for this restoration; only recorded view 64 in a 64-bit Windows process is supported. The deletion mode is not remembered." } },
                 required = new[] { "operationId" }, additionalProperties = false
             },
             annotations = new { readOnlyHint = false, destructiveHint = false, idempotentHint = false, openWorldHint = false }
@@ -333,6 +334,16 @@ internal sealed class McpServer(DeletionService service, Func<object> listOperat
     {
         if (args.EnumerateObject().Any(p => !allowed.Contains(p.Name, StringComparer.Ordinal)))
             throw new RpcException(-32602, "Unknown argument property.");
+    }
+
+    private static string RegistryAccessMode(JsonElement args)
+    {
+        if (args.EnumerateObject().Count(property => property.NameEquals("accessMode")) > 1)
+            throw new RpcException(-32602, "Duplicate accessMode is refused.");
+        if (!args.TryGetProperty("accessMode", out var mode)) return "normal";
+        if (mode.ValueKind != JsonValueKind.String || mode.GetString() is not ("normal" or "backupRestore"))
+            throw new RpcException(-32602, "AccessMode must be normal or backupRestore.");
+        return mode.GetString()!;
     }
 
     private static object Error(JsonElement? id, int code, string message) => new { jsonrpc = "2.0", id, error = new { code, message } };

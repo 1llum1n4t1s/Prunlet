@@ -60,7 +60,9 @@ Windowsの管理者権限が必要な場合は、実削除前に実トークン�
 
 使用中のDLLやファイルはWindowsが移動を拒否する場合があります。Prunletはコピー・属性やACLの変更・利用プロセスの終了で拒否を回避しません。失敗や不明状態は元対象とゴミ箱を確認してください。
 
-ファイル削除の失敗はCLI/MCPの`error`に対象パス・HRESULT・取得できたWin32エラー番号を含めます。共有・ロック違反では、通常ファイルのRestart Manager照会とプロセスのロード済みモジュール照会で、観測できた保持元のPID・名前・ファイルパスも返します。診断は失敗後の現在値であり、権限不足・プロセス終了・時間や件数の上限により全保持元を特定できるとは限りません。ディレクトリ配下のファイルハンドルは列挙せず、リンク先も走査しません。特定できない場合はその旨を返し、診断によって削除状態の変更・自動再試行・プロセス停止は行いません。
+ファイル削除の失敗はCLI/MCPの`error`に対象パス・HRESULT・取得できたWin32エラー番号を含めます。共有・ロック違反と削除元へのアクセス拒否では、通常ファイルのRestart Manager照会とプロセスのロード済みモジュール照会で、観測できた保持元のPID・名前・ファイルパスも返します。read-onlyのロード中DLLもアクセス拒否になる場合がありますが、拒否そのものは保持元や原因の証拠ではありません。診断は失敗後の現在値であり、権限不足・プロセス終了・時間や件数の上限により全保持元を特定できるとは限りません。ディレクトリ配下のファイルハンドルは列挙せず、リンク先も走査しません。特定できない場合はその旨を返し、診断によって削除状態の変更・自動再試行・プロセス停止は行いません。
+
+永久削除の要求が受理された後、削除用ハンドルを解放しても名前の状態を確認できなかった場合は、確認できなかった項目と到達段階を`error`に示し、`ambiguous`で停止します。Win32エラー5はアクセス権の制限だけでなく、別のハンドルが残っていて削除待ちの場合にも返るため、番号だけでは原因を断定できません。削除の完了や復元可能性を推測せず、元の場所とWindowsのゴミ箱を確認してください。
 
 .NETの一時領域はビルド完了後に清掃します。標準ビルドは`-p:UseSharedCompilation=false`を指定します。共有ビルドサーバーを停止する場合は他のビルドへの影響を確認します。
 
@@ -151,6 +153,27 @@ text(result.output);
 MCPの1行とhookの入力全体は、UTF-16の文字数で1,048,576文字まで受理します。MCPは空白だけの行を従来どおり無視します。それ以外の超過行は残りを改行まで読み捨ててエラーを返し、次の要求を処理します。hookは上限超過を検出するとEOFを待たず拒否します。読み取り中も保持する入力をこの上限までに抑えます。
 
 このhookは任意コードの全削除を検出する境界ではありません。動的なコマンド名、独自alias、.NETのファイルAPI、他言語のコード、外部スクリプト、エンコード済みコマンド、対話型shellへ後から送る入力などは検出対象外です。Prunletのローカル絶対パス検査・復元データ保存先の保護はCLIとMCPの入口で別途適用されます。通常の削除例とJSON一覧の制限は[README](../README.md#削除復元)を参照してください。
+
+## 保護されたレジストリへの明示アクセス
+
+通常の権限確認を使う`normal`が既定です。バックアップ／復元権限で扱う必要があり、対象の単独削除を明示的に許可されている場合だけ、CLIの`registry-delete`・`registry-restore`（別名`restore`）へ`--access-mode backupRestore`を指定します。MCPでは`delete_registry`・`restore_registry`の`accessMode: "backupRestore"`です。復元時にも指定が必要で、以前の削除方式やアクセス拒否から自動選択しません。
+
+```text
+<installed-exe> --config <absolute-config> registry-delete --access-mode backupRestore --view 64 --value-name <literal-name> --dry-run -- <single-key-path>
+<installed-exe> --config <absolute-config> registry-restore --access-mode backupRestore <operation-id>
+```
+
+このモードは**64bit Windowsの64bitプロセス・view 64だけ**に対応します。バックアップ／復元オプションは要求access maskを無視し、通常の32bit view指定が効かないことを隔離検証で確認したためです。view 32の要求と32bitプロセスでは変更前に停止し、WOW6432Nodeへのパス付け替えは行いません。`normal`では従来どおり両viewを指定できます。Windowsの[既定viewの仕様](https://learn.microsoft.com/en-us/windows/win32/winprog64/accessing-an-alternate-registry-view)に従って64bitの既定viewだけを使います。
+
+実効呼出し元に`SeBackupPrivilege`と`SeRestorePrivilege`が存在することが必要です。キー全体の完全ACL退避には従来どおり`SeSecurityPrivilege`も必要です。呼出し中だけ有効化して元に戻し、別ユーザーやSYSTEMの権限を借りません。native sessionでもクライアントの実効トークンを使います。ACL・所有権の変更、自動昇格、非トランザクション削除への切替は行いません。Windowsの既存キー用API [`ZwOpenKeyTransactedEx`](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwopenkeytransactedex) のバックアップ／復元オプションを使い、別パスへ付け替える方法ではありません。
+
+同じ論理パス・viewの実体固定、通常リンクの拒否、完全退避、トランザクション、復元先の非上書き確認は維持します。権限を備えた読み取りが成功するだけでは、削除・復元可能と判定しません。まず同じ方式のdry-runで権限・接続を確認してください。実BAM等の保護キーがすべて操作可能になる保証や、Windows管理情報を意味的に清掃できる保証はありません。
+
+## Windows管理データの清掃範囲
+
+Prunletのレジストリ削除は、指定したキー・値を完全退避してトランザクションで削除する操作です。アンインストールやWindowsの管理データの整合修復を代行しません。AppContainer・Appx管理情報や共有バイナリ値は、製品名が含まれるだけでは削除可能と判断しないでください。汎用APIはこれらの意味を判別して自動拒否するものではありません。
+
+AppContainerの正規API [`DeleteAppContainerProfile`](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-deleteappcontainerprofile) は現在のユーザーのprofileを削除しますが、失敗時は状態が不定になり得ます。完全な退避・原子的な復元をPrunletの契約で保証できないため、このAPIへの自動切替や専用の削除コマンドは提供しません。StateRepository・AppxAllUserStore・CloudStore・AppCompatCache・BagMRU等も、対象レコードの形式・版・参照関係を検証する専用処理は未対応です。安全な単独削除の根拠が得られないデータは保持してください。
 
 ## レジストリの6801と起動コンテキスト
 

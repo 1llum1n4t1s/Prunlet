@@ -13,36 +13,36 @@ try{
   SaveJson (Join-Path $PSScriptRoot 'cleanup-result.json') $r
   Assert ($r.exitCode-eq 0-and$r.json.operationId) 'Unique native fixture cleanup failed'
  }else{
-  foreach($transport in @('cli','mcp')){
-   Check ('elevated-'+$transport+'-class-full-security-roundtrip') {
-    $leaf='key-'+$transport;$f=NativeRequest 'create' @{leaf=$leaf;tree=$true};$before=NativeRequest 'observe' @{leaf=$leaf}
+  foreach($transport in @('cli','mcp')){foreach($accessMode in @('normal','backupRestore')){
+   Check ('elevated-'+$transport+'-'+$accessMode+'-class-full-security-roundtrip') {
+    $leaf=('key-'+$transport+'-'+$accessMode).ToLowerInvariant();$f=NativeRequest 'create' @{leaf=$leaf;tree=$true};$before=NativeRequest 'observe' @{leaf=$leaf}
     $p=$null
     try{
      if($transport-eq'cli'){
-      $dry=InvokePrunletCli @('registry-delete','--dry-run','--view','64','--recursive','--',$f.path)
+      $dry=InvokePrunletCli @('registry-delete','--dry-run','--view','64','--access-mode',$accessMode,'--recursive','--',$f.path)
       Assert ($dry.exitCode-eq 0-and$dry.stdout-match'would_delete') 'Full-key CLI dry-run failed'
       Assert (($before.snapshot-join"`n")-ceq((NativeRequest 'observe' @{leaf=$leaf}).snapshot-join"`n")) 'Full-key CLI dry-run changed complete raw/security snapshot'
-      $nonrecursive=InvokePrunletCli @('registry-delete','--view','64','--',$f.path)
+      $nonrecursive=InvokePrunletCli @('registry-delete','--view','64','--access-mode',$accessMode,'--',$f.path)
       Assert ($nonrecursive.exitCode-ne 0) 'Nonrecursive CLI accepted a key with descendants'
       Assert (($before.snapshot-join"`n")-ceq((NativeRequest 'observe' @{leaf=$leaf}).snapshot-join"`n")) 'Nonrecursive CLI refusal changed complete raw/security snapshot'
-      $d=InvokePrunletCli @('registry-delete','--view','64','--recursive','--',$f.path);Assert ($d.exitCode-eq 0-and$d.json.operationId) ('Elevated CLI delete: '+$d.stdout+$d.stderr);$id=$d.json.operationId
+      $d=InvokePrunletCli @('registry-delete','--view','64','--access-mode',$accessMode,'--recursive','--',$f.path);Assert ($d.exitCode-eq 0-and$d.json.operationId) ('Elevated CLI delete: '+$d.stdout+$d.stderr);$id=$d.json.operationId
       Assert (!(NativeRequest 'observe' @{leaf=$leaf}).exists) 'Deleted native key remains'
-      $r=InvokePrunletCli @('restore',$id);Assert ($r.exitCode-eq 0) ('Elevated CLI restore: '+$r.stdout+$r.stderr)
-      $again=InvokePrunletCli @('restore',$id);Assert ($again.exitCode-eq 0-and$again.stdout-match'already_restored') 'Consumed CLI restore result'
+      $r=InvokePrunletCli @('restore',$id,'--access-mode',$accessMode);Assert ($r.exitCode-eq 0) ('Elevated CLI restore: '+$r.stdout+$r.stderr)
+      $again=InvokePrunletCli @('restore',$id,'--access-mode',$accessMode);Assert ($again.exitCode-eq 0-and$again.stdout-match'already_restored') 'Consumed CLI restore result'
       $raw=@{dryrun=$dry;nonrecursive=$nonrecursive;delete=$d;restore=$r;again=$again}
      }else{
       $p=McpStart
-      $dry=McpCall $p 'delete_registry' @{path=$f.path;view='64';recursive=$true;dryRun=$true}
+      $dry=McpCall $p 'delete_registry' @{path=$f.path;view='64';recursive=$true;dryRun=$true;accessMode=$accessMode}
       Assert (!$dry.result.isError-and($dry|ConvertTo-Json -Depth 50)-match'would_delete') 'Full-key MCP dry-run failed'
       Assert (($before.snapshot-join"`n")-ceq((NativeRequest 'observe' @{leaf=$leaf}).snapshot-join"`n")) 'Full-key MCP dry-run changed complete raw/security snapshot'
-      $nonrecursive=McpCall $p 'delete_registry' @{path=$f.path;view='64'}
+      $nonrecursive=McpCall $p 'delete_registry' @{path=$f.path;view='64';accessMode=$accessMode}
       Assert $nonrecursive.result.isError 'Nonrecursive MCP accepted a key with descendants'
       Assert (($before.snapshot-join"`n")-ceq((NativeRequest 'observe' @{leaf=$leaf}).snapshot-join"`n")) 'Nonrecursive MCP refusal changed complete raw/security snapshot'
-      $d=McpCall $p 'delete_registry' @{path=$f.path;view='64';recursive=$true};$data=McpData $d
+      $d=McpCall $p 'delete_registry' @{path=$f.path;view='64';recursive=$true;accessMode=$accessMode};$data=McpData $d
       Assert (!$d.result.isError-and$data.operationId) ('Elevated MCP delete: '+($d|ConvertTo-Json -Depth 30));$id=$data.operationId
       Assert (!(NativeRequest 'observe' @{leaf=$leaf}).exists) 'MCP-deleted native key remains'
-      $r=McpCall $p 'restore_registry' @{operationId=$id};Assert (!$r.result.isError) 'Elevated MCP restore failure'
-      $again=McpCall $p 'restore_registry' @{operationId=$id};Assert (!$again.result.isError-and($again|ConvertTo-Json -Depth 30)-match'already_restored') 'Consumed MCP restore result'
+      $r=McpCall $p 'restore_registry' @{operationId=$id;accessMode=$accessMode};Assert (!$r.result.isError) 'Elevated MCP restore failure'
+      $again=McpCall $p 'restore_registry' @{operationId=$id;accessMode=$accessMode};Assert (!$again.result.isError-and($again|ConvertTo-Json -Depth 30)-match'already_restored') 'Consumed MCP restore result'
       $raw=@{dryrun=$dry;nonrecursive=$nonrecursive;delete=$d;restore=$r;again=$again}
      }
      $after=NativeRequest 'observe' @{leaf=$leaf};Assert (($before.snapshot-join"`n")-ceq($after.snapshot-join"`n")) 'Full owner/group/DACL/SACL/raw snapshot mismatch';Assert ($before.keyClass-ceq$after.keyClass) 'Registry key class mismatch'
@@ -51,7 +51,7 @@ try{
      SaveJson (Join-Path $PSScriptRoot ($leaf+'-result.json')) @{operationId=$id;raw=$raw;before=$before;after=$after;reconcile=$rec}
     }finally{if($p){McpStop $p}}
    }
-  }
+  }}
   Check 'administrator-default-hkcu-registry-recovery-suite' {
    Assert (![string]::IsNullOrWhiteSpace($s.moveExecutablePath)) 'Full default HKCU suite requires Prepare -MoveExecutablePath with the genuine schema4 baseline'
    Assert (![string]::IsNullOrWhiteSpace($s.assemblyPath)-and![string]::IsNullOrWhiteSpace($s.legacyRegistryExecutablePath)) 'Full registry checkpoint suite requires the prepared candidate DLL and genuine schema5 baseline'
@@ -64,6 +64,7 @@ try{
    foreach($argument in @('-NoProfile','-File',$s.registryVerificationScriptPath,'-ExecutablePath',$s.executablePath,'-MoveExecutablePath',$s.moveExecutablePath,'-RegistryFixtureRoot','HKCU\Software\PrunletE2E','-OutputDirectory',$suiteOutput,'-ReportPath',$suiteReport)){$info.ArgumentList.Add($argument)}
    if($s.assemblyPath){$info.ArgumentList.Add('-AssemblyPath');$info.ArgumentList.Add($s.assemblyPath)}
    if($s.legacyRegistryExecutablePath){$info.ArgumentList.Add('-LegacyRegistryExecutablePath');$info.ArgumentList.Add($s.legacyRegistryExecutablePath)}
+   if($s.fixtureRoot){$info.ArgumentList.Add('-FixtureRoot');$info.ArgumentList.Add($s.fixtureRoot)}
    $suite=[Diagnostics.Process]::new();$suite.StartInfo=$info
    try{
     $null=$suite.Start();$stdout=$suite.StandardOutput.ReadToEndAsync();$stderr=$suite.StandardError.ReadToEndAsync()

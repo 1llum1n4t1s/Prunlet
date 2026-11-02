@@ -180,7 +180,7 @@ public sealed partial class DeletionService
                         started = true;
                     }, queued is null ? null : path => queued[index].ReleaseDeletedEntry(path));
                     original.Dispose();
-                    if (InspectMoveLocation(item.Path) is not null) throw new IOException("A source name is still present after the Windows deletion attempt.");
+                    VerifyPermanentDeletionAfterClose(item.Path);
                     item.Status = "permanently_deleted";
                 }
                 catch (Exception ex) when (IsRecycleFailure(ex))
@@ -202,6 +202,21 @@ public sealed partial class DeletionService
     private static bool SameRecordlessObject(MoveEntryIdentity expected, MoveEntryIdentity actual)
         => expected.VolumeSerialNumber == actual.VolumeSerialNumber && expected.FileId.Equals(actual.FileId, StringComparison.OrdinalIgnoreCase)
             && expected.IsDirectory == actual.IsDirectory && expected.ReparseTag == actual.ReparseTag;
+
+    private static void VerifyPermanentDeletionAfterClose(string path)
+    {
+        try
+        {
+            if (InspectMoveLocation(path) is not null)
+                throw new IOException("The source name is still present.");
+        }
+        catch (Exception error) when (IsRecycleFailure(error))
+        {
+            // disposition成功後の確認段階だけを示す。保留・ACL・競合の原因は推定しない。
+            throw new IOException($"Windows accepted a deletion request for the previously fixed object. "
+                + $"Verification after Prunlet closed its deletion handle failed for entry {System.Text.Json.JsonSerializer.Serialize(path)}. {error.Message}", error);
+        }
+    }
 
     private static bool UsableRecordlessIdentity(MoveEntryIdentity identity)
         => ValidMoveIdentity(identity) && !identity.FileId.All(character => character is 'F' or 'f');
@@ -261,6 +276,9 @@ public sealed partial class DeletionService
             || current.Attributes != held.Attributes)
             throw new IOException("Oversized target changed before its name could be fixed.");
         VerifyPermanentHandle(pinned, path, current);
+        // root通常ファイルの旧inspectionを残すと、そのcloseが削除後のChangeTimeを遅れて更新する。
+        // 実体と名前は検証済みDELETE pinで保持し、自己変更時刻を捕捉する前に解放する。
+        if (!expected.IsDirectory && expected.ReparseTag == 0) original.Dispose();
         DeletePinnedOversized(pinned, path, current, recursive, hardlinks, beforeDelete, afterDeletePending);
     }
 
@@ -369,11 +387,16 @@ public sealed partial class DeletionService
                 if (ordinaryFile) hardlinks.UpgradeRecycledGuard(fileKey, frame.Path);
                 if (ordinaryFile && !hardlinks.CanContinueInRoot(fileKey, path))
                     throw new IOException("A shared hardlink without a retained write guard cannot continue in another root.");
-                if (ordinaryFile && hardlinks.Changed.TryGetValue(fileKey, out var priorChange)
-                    && (!hardlinks.Guards.TryGetValue(fileKey, out var retained)
-                        || !SameRecordlessObject(frame.Identity, NativeFiles.MoveIdentity(retained))
-                        || NativeFiles.PinnedChangeTime(frame.Handle) != priorChange))
-                    throw new IOException("The retained hardlink changed after a prior deletion.");
+                if (ordinaryFile && hardlinks.Changed.TryGetValue(fileKey, out var priorChange))
+                {
+                    var retainedMatches = hardlinks.Guards.TryGetValue(fileKey, out var retained)
+                        && SameRecordlessObject(frame.Identity, NativeFiles.MoveIdentity(retained));
+                    var actualChange = NativeFiles.PinnedChangeTime(frame.Handle);
+                    if (!retainedMatches || actualChange != priorChange)
+                        throw new IOException($"The retained hardlink changed after a prior deletion. "
+                            + $"RetainedIdentityMatches={retainedMatches}; volume={fileKey.VolumeSerialNumber:X16}, id={fileKey.FileId}, "
+                            + $"expectedChange={priorChange}, actualChange={actualChange}, lastWrite={NativeFiles.PinnedLastWriteTime(frame.Handle)}.");
+                }
                 if (ordinaryFile && NativeFiles.HasMultipleLinks(frame.Handle)
                     && !hardlinks.Guards.ContainsKey(fileKey))
                 {
@@ -421,8 +444,7 @@ public sealed partial class DeletionService
                     if (frame.OwnsHandle || posix)
                     {
                         frame.Handle.Dispose();
-                        if (InspectMoveLocation(frame.Path) is not null)
-                            throw new IOException("An oversized directory entry is still present after deletion.");
+                        VerifyPermanentDeletionAfterClose(frame.Path);
                     }
                     if (posix)
                     {

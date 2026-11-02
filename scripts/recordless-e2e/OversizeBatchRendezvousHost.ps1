@@ -45,6 +45,14 @@ public static class OversizeBatchRendezvousHost {
      if(mode=="guard-probe" && !writerAttempted) {writerAttempted=true;var survivor=Path.Combine(Path.GetDirectoryName(targets[0]),"surviving-alias");try {using var writer=new FileStream(survivor,FileMode.Open,FileAccess.Write,FileShare.ReadWrite|FileShare.Delete);} catch(IOException ex) {writerError=ex.HResult;writerDenied=ex.HResult==unchecked((int)0x80070020);}}
      return;
     }
+    // Coreのbaseline観測はoversize通知と区別する。未知phaseや対象外の通知は引き続き拒否する。
+    if(phase=="directory-baselines-captured" || phase=="child-baseline-captured") {
+     bool owned=Array.Exists(targets,root=>path.StartsWith(root+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase)
+      || (phase=="directory-baselines-captured" && string.Equals(root,path,StringComparison.OrdinalIgnoreCase)));
+     if(!owned) {failure="Baseline checkpoint escaped fixture targets";Monitor.PulseAll(gate);throw new IOException(failure);}
+     if(phase=="directory-baselines-captured") events.Add(new {phase,path,elapsedMs=eventClock.ElapsedMilliseconds});
+     return;
+    }
     if(phase=="child-pinned" || phase=="child-open-failed") {
      if(mode=="locked-child" && string.Equals(path,Path.Combine(targets[0],"huge-sparse"),StringComparison.OrdinalIgnoreCase)) {events.Add(new {phase,path,root=targets[0],elapsedMs=eventClock.ElapsedMilliseconds});return;}
      if(mode!="child-race") return;

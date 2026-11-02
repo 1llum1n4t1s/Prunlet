@@ -62,11 +62,11 @@ internal static class Program
                     prunlet --config <absolute-json-path> delete-queue [--recursive] --paths-file <absolute-json-file>
                     prunlet --config <absolute-json-path> delete-queue-status <job-id>
                     prunlet --config <absolute-json-path> delete-queue-cancel <job-id>
-                    prunlet --config <absolute-json-path> registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <registry-key-path>
+                    prunlet --config <absolute-json-path> registry-delete --view <32|64> [--access-mode <normal|backupRestore>] [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <registry-key-path>
                     prunlet --config <absolute-json-path> registry-session --minutes <1..60> --assert-native-windows
                     prunlet --config <absolute-json-path> registry-reconcile <operation-id>
-                    prunlet --config <absolute-json-path> registry-restore <operation-id>
-                    prunlet --config <absolute-json-path> restore <registry-operation-id>
+                    prunlet --config <absolute-json-path> registry-restore <operation-id> [--access-mode <normal|backupRestore>]
+                    prunlet --config <absolute-json-path> restore <registry-operation-id> [--access-mode <normal|backupRestore>]
                     prunlet --config <absolute-json-path> purge <operation-id> [--dry-run | --apply]
                     prunlet --config <absolute-json-path> maintain [--dry-run | --apply] [--audit-records]
                     prunlet --config <absolute-json-path> operations
@@ -92,6 +92,7 @@ internal static class Program
                     Empty directories are supported; deleting directory contents requires --recursive.
                     Wildcard expansion is unsupported. Links are deleted without following their targets.
                     Registry view is required. Omit value-name for a key; an empty value-name selects the default value.
+                    Registry access defaults to normal. backupRestore is explicit per deletion/restoration, requires effective-token privileges, and supports only view 64 in a 64-bit Windows process.
                     Registry key snapshots require full Owner/Group/DACL/SACL access and SeSecurityPrivilege; no automatic elevation or fallback.
                     """);
                 return 0;
@@ -253,8 +254,8 @@ internal static class Program
                     break;
                 case "restore":
                 case "registry-restore":
-                    if (commandArgs.Length != 1) throw new ArgumentException("Registry restore requires exactly one registry operation id. Restore files with Windows Recycle Bin.");
-                    result = service.RestoreRegistry(commandArgs[0]);
+                    var registryRestore = ParseRegistryRestore(commandArgs);
+                    result = service.RestoreRegistry(registryRestore.OperationId, registryRestore.AccessMode);
                     break;
                 case "purge":
                     if (commandArgs.Length is < 1 or > 2
@@ -296,6 +297,7 @@ internal static class Program
     {
         string? view = null;
         string? valueName = null;
+        string? accessMode = null;
         var hasValueName = false;
         var recursive = false;
         var dryRun = false;
@@ -305,6 +307,8 @@ internal static class Program
             var option = args[index++];
             if (option == "--view" && view is null && index < args.Length && args[index] is "32" or "64")
                 view = args[index++];
+            else if (option == "--access-mode" && accessMode is null && index < args.Length && args[index] is "normal" or "backupRestore")
+                accessMode = args[index++];
             else if (option == "--value-name" && !hasValueName && index < args.Length && args[index] != "--")
             {
                 valueName = args[index++];
@@ -320,9 +324,24 @@ internal static class Program
             else throw new ArgumentException("Unknown, duplicate, missing or invalid registry-delete option: " + option);
         }
         if (view is null || index >= args.Length || args[index] != "--" || args.Length - index != 2)
-            throw new ArgumentException("Use registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <single registry-key-path>.");
+            throw new ArgumentException("Use registry-delete --view <32|64> [--access-mode <normal|backupRestore>] [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <single registry-key-path>.");
         if (hasValueName && recursive) throw new ArgumentException("Recursive cannot be combined with value-name.");
-        return (new RegistryDeleteRequest { Path = args[index + 1], View = view, ValueName = valueName, Recursive = recursive }, dryRun);
+        return (new RegistryDeleteRequest { Path = args[index + 1], View = view, ValueName = valueName, Recursive = recursive, AccessMode = accessMode ?? "normal" }, dryRun);
+    }
+
+    private static (string OperationId, string AccessMode) ParseRegistryRestore(string[] args)
+    {
+        string? operationId = null;
+        string? accessMode = null;
+        for (var index = 0; index < args.Length; index++)
+        {
+            if (args[index] == "--access-mode" && accessMode is null && index + 1 < args.Length && args[index + 1] is "normal" or "backupRestore")
+                accessMode = args[++index];
+            else if (!args[index].StartsWith("--", StringComparison.Ordinal) && operationId is null)
+                operationId = args[index];
+            else throw new ArgumentException("Use registry-restore <operation-id> [--access-mode <normal|backupRestore>]. Unknown or duplicate options are refused.");
+        }
+        return (operationId ?? throw new ArgumentException("Registry restore requires an operation id."), accessMode ?? "normal");
     }
 
     private static string[] ReadDeletePathsFile(string path)

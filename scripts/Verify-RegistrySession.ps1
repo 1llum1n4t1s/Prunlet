@@ -5,6 +5,7 @@
     [string]$MoveExecutablePath,
     [string]$AssemblyPath,
     [string]$LegacyRegistryExecutablePath,
+    [string]$FixtureRoot,
     [switch]$AssertNativeWindows,
     [ValidateSet('Prepare', 'Start', 'Current', 'Run')][string]$Mode = 'Prepare',
     [ValidateSet(-1, 0, 6801)][int]$ExpectedCurrentSoftwareTransactionError = -1
@@ -83,10 +84,17 @@ if ($Mode -eq 'Prepare') {
     $preparedSettings = [IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json -AsHashtable
     $preparedSettings.schema = 2; $preparedSettings.nonce = [guid]::NewGuid().ToString('N')
     $preparedSettings.assemblyPath = $AssemblyPath
+    if ($FixtureRoot) {
+        if (![IO.Path]::IsPathFullyQualified($FixtureRoot) -or ![IO.Directory]::Exists($FixtureRoot)) { throw 'FixtureRoot must be an existing absolute directory.' }
+        Assert-VerificationDestination $FixtureRoot @($repoRoot,$codexRoot)
+    }
+    $preparedSettings.fixtureRoot = $FixtureRoot
     $preparedSettings.assemblySha256 = if ($AssemblyPath) { (Get-FileHash -LiteralPath $AssemblyPath).Hash } else { $null }
     $preparedSettings.legacyRegistryExecutablePath = $LegacyRegistryExecutablePath
     $preparedSettings.legacyRegistryExecutableSha256 = if ($LegacyRegistryExecutablePath) { (Get-FileHash -LiteralPath $LegacyRegistryExecutablePath).Hash } else { $null }
     $preparedSettings.inputs = @()
+    $preparedSettings.inputs += @{path=(Join-Path $PSScriptRoot 'Verification-Fixture.ps1');sha256=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')).Hash}
+    $preparedSettings.inputs += @{path=(Join-Path $PSScriptRoot 'ProtectedRegistryAccess.Native.cs');sha256=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ProtectedRegistryAccess.Native.cs')).Hash}
     $preparedInputs = @([IO.Directory]::EnumerateFiles($OutputDirectory) | Where-Object { [IO.Path]::GetExtension($_) -in @('.ps1','.cs') }) + @($PSCommandPath, (Join-Path $PSScriptRoot 'registry-session-e2e\SessionLaunch.ps1'), $registryVerificationScriptPath, (Join-Path $PSScriptRoot 'Verification-Common.ps1'), $ExecutablePath, $powerShellHostPath)
     # registry runnerが実際に読むWindowsごみ箱検証の依存も同じPrepare入力へ固定する。
     foreach ($name in @('Common.ps1','NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs','PermissionFixture.cs','RegistryCheckpointHost.ps1')) {

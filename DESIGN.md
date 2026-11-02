@@ -43,7 +43,9 @@ Shellがゴミ箱への移動を成功と返した場合は、返却項目だけ
 
 ロック待機の`RecoveryLockProgress`はCoreが発行し、`Program`がstderrへ診断を出す。MCPの並行ファイル要求用serviceもこの購読を引き継ぐ。`McpServer`は要求ごとの`progressToken`がある場合だけ追加購読して`notifications/progress`を返し、処理終了時に解除して最終応答後の通知と別要求への混入を防ぐ。
 
-失敗時の診断はCoreの`FileDeletionDiagnostics`が担当し、`DeletionService`が各項目の`error`へ付加してCLI・MCPへ返す。共有・ロック違反の場合だけ保持元を観測し、dry-runではプロセス照会を行わない。診断は失敗後の現在値であり、診断不能でも元の削除結果を維持する。保持元の特定を削除の再試行やプロセス停止へ結び付けない。照会方法と観測範囲の制約は[連携手順](docs/integration.md#使用中のファイルと同時実行)を参照する。
+失敗時の診断はCoreの`FileDeletionDiagnostics`が担当し、`DeletionService`が各項目の`error`へ付加してCLI・MCPへ返す。共有・ロック違反と削除元へのアクセス拒否では保持元を観測し、dry-runではプロセス照会を行わない。アクセス拒否だけで保持元や原因を断定しない。診断は失敗後の現在値であり、診断不能でも元の削除結果を維持する。保持元の特定を削除の再試行やプロセス停止へ結び付けない。照会方法と観測範囲の制約は[連携手順](docs/integration.md#使用中のファイルと同時実行)を参照する。
+
+固定実体への永久削除要求が受理された後、削除handleを解放してから名前の確認に失敗した場合は、その到達段階と確認できなかったentryをエラーへ含める。Win32 5はACLの制限や削除待ちなど複数の理由で返り得るため、番号だけでは原因を決めない。確認不能は引き続き`ambiguous`として扱い、名前の消失や削除完了を推測しない。
 
 ### 明示的な削除待機キュー
 
@@ -65,9 +67,13 @@ Shellがゴミ箱への移動を成功と返した場合は、返却項目だけ
 
 ## レジストリの削除と復元
 
+この機能は指定したキー・値のトランザクション削除と復元を扱い、Windows管理情報の意味や参照関係を修復する機能ではない。AppContainer profileやAppx packageのライフサイクル処理を汎用削除へ付け替えない。`DeleteAppContainerProfile`は失敗時の状態が不定になり得て、Prunletの完全退避・原子的commit・非上書き復元の契約に組み込めていない。StateRepository・AppxAllUserStore・CloudStore・AppCompatCache・BagMRU等の混在データも、形式・版・参照整合を検証する専用処理がないため、製品名の文字列一致だけで清掃対象を決めない。これはこれらのパスをCoreが一律に識別・拒否するという意味ではなく、呼出し元が安全な単独削除を確認できない対象を要求しないための境界である。
+
 レジストリ操作も`Core`へ集約する。CLIは`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <single-key-path>`、MCPは`delete_registry`と`restore_registry`を提供する。CLIの`restore`と`registry-restore`、MCPの`restore_registry`はレジストリ専用である。削除要求はview必須、値名省略はキー、空文字は既定値であり、値削除の再帰指定を拒否する。
 
 キー名内のcolonはリテラル文字として受理する。`C:#...`や`C:%5C...`もキー名の一部であり、ドライブパスやURLとして解釈・展開しない。相対パス・空segment・wildcardの拒否は維持する。
+
+アクセス方式は要求ごとの`normal`（既定）または明示`backupRestore`で選ぶ。`backupRestore`は64bit OS・64bitプロセス・view 64に限定し、view 32は原本・privilege・transactionを開く前に拒否する。バックアップ／復元オプションがaccess maskとともにWOW64 view指定を無視するため、64bitプロセスの既定viewだけを使用し、32bitパスを合成しない。復元時の記録がview 32の場合も同じ制約で停止する。後者は実効呼出し元の`SeBackupPrivilege`・`SeRestorePrivilege`を一時有効にし、既存キーのnative openに`REG_OPTION_BACKUP_RESTORE`を加える。localでは呼出し元tokenの要求ごとの複製を`RunImpersonated`で使い、native brokerでは既存の要求別token隔離を使う。process tokenを強めたまま後続要求へ持ち越さず、privilege復元の失敗と対象transactionのcommit結果は別に報告する。通常・rawリンク検査・同一オブジェクトのtransaction接続・再帰子・復元で同じ方式を使い、`OBJ_DONT_REPARSE`とリンク検査を維持する。ACL・Ownerを書き換えてアクセスを得ず、権限不足から自動切替しない。方式は退避データのidentityではないためschema 5は変えず、復元時も毎回明示選択する。記録から自動的に強い権限を有効化しない。dry-runでも実削除に必要な実効権限・transaction接続を確認し、stage・commit・対象変更を行わない。
 
 schema 5の`registry-manifest`・snapshot・intent・receiptで、未知の値型も含め型のuint値と生バイト列、キーごとのOwner・Group・DACL・SACL（Mandatory Labelを含む）を保持する。実削除は非トランザクションの対象または親HKEYを保持し、その同じオブジェクトをRootDirectory・空の相対名で`NtOpenKeyTransactedEx`に渡す。まず削除をトランザクション内へstageし、外部には元データが見える状態で、保持した非トランザクションHKEYからsnapshotを取得する。snapshot・manifest・intentのflushとハッシュ検証を済ませてからcommitし、完了receiptを永続化する。したがって外部に削除が確定する前に保全データが永続化される。
 
@@ -83,7 +89,11 @@ manifest・snapshot・intent・receiptの公開は`RegistryPublication`が担当
 
 復元はトランザクション内で新規作成だけを許し、既存キー・値・空の既定値を上書きもマージもしない。値復元は先に書込みをstageしてから、保持した非トランザクション親HKEYで同名値の不存在を確認する。既存値ならロールバックし、競合する外部書込みがあればcommitを失敗させて外部値を保全する。Owner/SACLの適用権限不足もロールバックしsnapshotを保全する。commitとreceipt永続化の間の中断は`ambiguous`としてpayloadを保持し、推測した復元・自動整理を拒否する。キーのclassも保存するが、最終書込み時刻は復元せず、volatileキーも非volatileキーとして復元する。
 
-対象はローカルHKCU/HKLM/HKUの絶対キーで、`Registry::`およびmodule prefixを許容する。ルート自体、mergedなHKCR/HKCC、remote、relative、レジストリリンク、未知のschema・metadataや検証できない復元記録は拒否する。保持条件と整理の責務は[復元データの自動整理](#復元データの自動整理)にまとめる。
+対象はローカルHKCU/HKLM/HKUの絶対キーで、`Registry::`およびmodule prefixを許容する。PowerShell形式の`HKCU:\`・`HKLM:\`・`HKU:\`も受け付ける。ルート自体、mergedなHKCR/HKCC、remote、relative、レジストリリンク、未知のschema・metadataや検証できない復元記録は拒否する。例外は実効ユーザーの`HKCU\Software\Classes`（同じSIDを明記したHKUも含む）が祖先にある要求だけで、native名、REG_LINK型と`\Registry\User\<実効SID>_Classes`のUTF-16生bytes完全一致を検証する。その既知aliasだけ読み取り専用でOSに解決させ、期待する宛先のnative名と解決前後のalias bytesを照合する。REG_LINK値を持つ通常key、別ユーザー・任意の宛先・宛先側や下位のリンク、Classes自身への要求は拒否する。OS解決で得たhandleを変更に使わず、固定User anchorから宛先を1 segmentずつnofollowで開き、snapshotには要求の論理pathを保つ。保持条件と整理の責務は[復元データの自動整理](#復元データの自動整理)にまとめる。
+
+REG_LINK型の値の欠落だけを通常keyの証明にはしない。通常のnative openは`OBJ_DONT_REPARSE`を指定し、保持rawリンクからの相対参照も再解析を拒否する。既知alias以外の全segment・解決先SID_Classes・再帰列挙の子は、同じview・transactionで`OBJ_DONT_REPARSE`かつ`OBJ_OPENLINK`なしでも開き、raw keyとのnative名一致とREG_LINK型の値がないことを確認する。確認で得た通常keyのhandleを以降の探索・snapshot・変更の正本にし、古いraw handleへ戻さない。値を失った実リンクなど、raw keyが存在するのに通常keyとして開けない場合は不存在の成功扱いにせず停止する。通常keyの構造はREG_LINK値の追加だけでは実リンクへ変わらない。未知のリンクを追う確認は行わず、followを明示するのは型・bytes・native名を検証済みの既知Classes aliasの読み取り証明だけである。
+
+aliasの読み取り接続だけでは最終確認後の外部更新と競合しないため、実削除と復元ではalias自身も同じtransactionへ空の相対名で接続し、元のREG_LINK値を同じ型・同じbytesでstageしてwrite guardを得る。先にaliasのSetValue権限・transaction接続と宛先accessを確認し、stage後に非transactionの保持aliasから元bytesを再確認する。aliasと宛先のhandle・native名・bytesを保持し、commit前に再検証する。外部のalias更新が受理されてもtransactionのcommitが競合で失敗するため、対象変更とalias guardは一緒にrollbackされる。dry-runは同じSetValue権限と接続を要求するが、aliasを含む書込みをstageしない。追加権限とcommitによるaliasのlast-write時刻変更の可能性を結果warningsで知らせる。aliasの型・bytesとACLを変更せず、guardを設定できなければ停止し、ACL変更・非transaction操作への切替は行わない。
 
 MSIX由来の仮想viewでtransactionが利用できない場合も、非transaction操作へ切り替えない。通常Windows側の操作には、通常デスクトップの期限付きnative sessionを用意し、`registryScope=nativeWindows`と専用接続情報を明示選択したCLI・MCPから同じCoreへ委任する。検証では`Verify-RegistrySession.ps1`のPrepareで固定したscopeと入力に限り、`Start -AssertNativeWindows`からdesktop Explorerの通常起動とWindowsの`runas`で起動できる。管理者起動の同意はOSのUACポリシーに従い、エージェントは同意を代行しない。入力のread handle・hash、nonce、原子的な開始claim、親の生存・期限、通常/管理者の実token、両者のreadyとRun permitを照合し、遅延起動や曖昧な開始を拒否する。手動のdesktop起動は診断互換として残す。job・silo制約を転送する方式ではなく、通常Windows scopeへの明示委任であり、汎用コマンドbroker・サービス・タスク登録・仮想viewからのfallbackは追加しない。要求ごとのeffective tokenを使用し、session固有の権限を呼出元へ貸さない。sessionはlocal・同じログオン・同じexeに限定し、期限後は新規受付を停止するが進行中のCoreを強制終了しない。
 

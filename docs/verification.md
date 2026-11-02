@@ -4,6 +4,12 @@ Windows・.NET 10 SDK・PowerShell 7で実行する。ビルドは`scripts/Publi
 
 各検証ではCLI・stdio MCP・hookの実プロセス、終了コード・stdout JSON・`passed`/`failed`を読む。skip・CaseFilter・準備だけの成功を全件合格にせず、権限・KTM・view・実offlineなど未検証の環境条件を明記する。今回の変更による結果と過去版の結果を混同しない。
 
+保存先を利用者が明示した場合は、通常のファイル削除fixtureだけを`-FixtureRoot <既存のNTFS絶対ディレクトリ>`へ分離できる。`Verify-RecordlessFiles.ps1`、`Verify-RegistryRecovery.ps1`、`Verify-LatestInstall.ps1`と、native sessionのPrepareが対応する。ビルド・TEMP/TMP・report・復元metadataは引き続き外部Dへ置く。共通helperは通常のdrive絶対パス、非reparse、リポジトリ/Codex home外、作成前後のvolume GUIDを確認し、一意な子ディレクトリだけを使う。
+
+通常のゴミ箱往復にはゴミ箱が有効なボリュームを指定する。即時削除設定のDで`recycled`の期待値を永久削除へ緩和しない。Recordlessの即時削除とボリューム不一致の専用ケースはhost Dに維持する。巨大ファイルの並行検証は実Shell通知2回を要求し、Coreの既知baseline通知は対象境界を検証して区別する。
+
+公開HEADを確認する`Verify-LatestInstall.ps1 -CheckPublicHead`は、必要なら`-UseGitHubCliAuthentication`を明示する。既存のログイン済み`gh`による同じGitHub APIの読取りを検証し、未認証経路の成功とは区別してreportへ記録する。gh欠如・非0終了・不正JSONは元データを変更せず停止する。トークン取得やCLIの自動導入・ログインは行わない。
+
 ## 通常E2Eの検証範囲
 
 フックのshell文字列解析は`scripts/Verify-HookParsing.ps1`に今回のexeと未使用の外部出力先・reportを渡して確認する。Mac向けSSH送信のヒアストリングを含む入力は実行せず、hookプロセスのstdinへJSONとして送り、許可・拒否、stdout/stderr、終了コードとfixture不変更を照合する。Codexの`Bash`とshell欠落、単独EncodedCommandの復号、認識した別名・不正値・外側wrapperの拒否、復号本文の直接削除と解析不能な展開、明示PowerShell、CMD、shell不明を区別する。SSH先での実削除を成功条件へ置き換えない。
@@ -17,6 +23,7 @@ Windows・.NET 10 SDK・PowerShell 7で実行する。ビルドは`scripts/Publi
 - ファイル結果が`dryRun`・`items`・`warnings`で、項目が`path`・`kind`・`status`・任意`error`だけを返すことを確認する。`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`と終了コード/MCP `isError`を照合し、operationId・backupPath・hash・sizeを返さないことを確認する。dry-runでは予約名の通常ファイルの永久削除予定と、それ以外のサイズ超過による永久削除を予測できない旨を確認する。
 - 実際の容量超過を起こす専用sparse fixtureをCLI・MCPで検証し、ファイル・フォルダーの元名の消失と今回分のゴミ箱項目、混合batch・生存hardlink・部分失敗の扱いを確認する。確認済みの即時削除設定とサイズ超過以外の失敗では永久削除せず、旧既定と設定済みの退避先を保護する。即時削除設定のボリュームは設定を変更せずCLI・MCPで通常サイズのファイルと再帰削除を確認する。Shellの直前とサイズ超過・ゴミ箱利用不可の通知後での差し替え・ロックを別々に確認し、Shellが別実体を移した場合は`ambiguous`を返すこととWindows側の副作用を区別する。
 - `Verify-OversizeRaces.ps1`・`Verify-BeforeRecycleRace.ps1`・`Verify-BeforeRecycleSmallRace.ps1`は、同じ候補のexe・assembly・assembly SHA-256と未使用の外部D出力先を受け取る。実ShellとCore内部の境界を再現し、CLI・MCPの実プロセス検証とは区別する。証拠が一致したfixtureだけを清掃候補として残し、指定された経路で清掃する。
+- `Verify-AccessDeniedFiles.ps1`には同一候補の`-ExecutablePath`・`-AssemblyPath`・`-ExpectedAssemblySha256`と新しい外部Dの`-OutputDirectory`・`-ReportPath`を渡す。実効ユーザーの即時削除設定を候補Coreで確認できるDボリューム上の新規fixtureを使い、設定自体は変更しない。CLI・MCPの各経路で、共有handleを保持したroot・再帰中の子が削除待ちとなる条件と、ACLで削除前に拒否される条件を別々に確認する。前者は同じ実体・ACLのままWin32 5と削除待ちを観測し、handle解放後の名前消失と`ambiguous`・事後確認の診断を照合する。後者は全preflight失敗時の同一batchの他対象保全と、受理済みと誤表示しないことを確認する。想定外のゴミ箱移動では、照合できたfixtureの保持先を記録する。既存のBin照合はアクセス不能な項目を省略し得るため、一致0件だけで完全な不在を証明しない。不明・拒否のfixtureは自動再送しない。
 - 共有ハードリンクのサイズ超過は`Verify-RecordlessFiles.ps1`のCLI・MCPとassembly指定の競合ケースで確認する。`Verify-OversizeMixedHardlinks.ps1`・`Verify-OversizeHardlinkPermissions.ps1`は通常Shellとの混合、単一・同一root・別rootのアクセス権不足を確認する。`Verify-OversizeParallelIndependence.ps1`・`Verify-OversizeRecycledHardlinkIndependence.ps1`は同じ候補のassemblyを使い、独立rootの同時pinと無関係な生存別名への書込みopenを実Shell後のCore境界で確認する。権限不足で部分完了した結果の順序と状態を区別し、不明な削除を再送しない。
 - 新規削除前後でPrunlet保存領域を比較し、操作manifest・PIDL・File ID・ACL snapshot・monitor・index・復元stageを作らないことを確認する。固定`maintenance.lock`と操作記録を区別する。通常削除・list・maintainが旧ファイル操作ディレクトリを走査しないことも確認する。
 - 内容・File ID・ADS・通常属性・case-sensitiveな名前・ACLと、リンク先の保全・外部ハードリンク別名との共有を確認する。復元は今回fixtureのWindowsゴミ箱項目だけで行い、ゴミ箱全体の空化や既存項目の清掃は行わない。復元先に既存項目を作り、上書きせず競合を扱う。
@@ -35,12 +42,25 @@ Windows・.NET 10 SDK・PowerShell 7で実行する。ビルドは`scripts/Publi
 
 ## レジストリの削除と復元
 
+保護アクセスのAPI適合性は`Verify-ProtectedRegistryAccess.ps1 -ExpectedSid <実効SID> -OutputDirectory <新しい外部D絶対パス> -ReportPath <新しい外部DのJSON絶対パス> -AssertNativeWindows`で別に確認できる。実token・privilege復元・固定入力hashを記録し、専用volatile GUIDキーだけでACL拒否、backup/restore open、同一実体のKTM接続、完全security/raw bytesのstage/rollback、外部更新とcommitの競合、missing不作成、リンク拒否を検証する。削除APIを使わない適合性probeであり、Prunlet CLI/MCPの削除・復元E2Eを代替しない。medium tokenで権限がない場合はfixture作成前に停止する。リンクfixtureは再送せず、reportのパスを保持してhive unloadまで残す。
+
+`Verify-ProtectedRegistryViews.ps1`には`-ExecutablePath`・`-ExpectedExecutableSha256`・`-ExpectedSid`・新しい外部Dの`-OutputDirectory`/`-ReportPath`・`-AssertNativeWindows`を渡す。独立したHKLM SOFTWAREの32/64 viewへ異なる生データを置き、CLI/MCPのbackupRestore view 32拒否で両方不変更、view 64削除・復元で32側と対象外の値が不変更になることを確認する。バックアップ／復元オプションではaccess maskとWOW64指定が無視され得るため、単に両viewを同じHKLM SYSTEMキーで試すだけでは分離の証拠にしない。このモードの対応は64bit OS・プロセスのview 64だけである。専用volatile fixtureは両viewとも保持し、拒否後に別方式で清掃しない。
+
+通常のRegistryRecoveryの保護ACLケースは、CLI/MCPの実キー・値往復、完全security/class/raw bytes、既存の空既定値の非上書き、通常方式への自動切替なし、dry-run不変更、要求前後のtoken属性を確認する。native session側の既存キー往復はnormal/backupRestoreを同じ検証本体で実行し、brokerの要求・復元option伝播も確認する。Prepareは新しいnative helperも固定入力へ含める。
+
 新しいexeのCLI・stdio MCP・hookを実プロセスで検証する。fixtureは利用可能なhiveの専用キー配下へ隔離して作成し、hive・view・実行権限をレポートへ記録する。HKCUでKTMを利用できない環境では、許可されたHKLMの専用fixtureで正系を検証し、HKCUの拒否・原データ保全と区別する。レポートと一時物は外部作業領域へ置き、親を事前作成する。終了コード・stdout JSON・`passed`/`failed`を読み、未実行の権限・view・KTMケースを合格扱いしない。
 
 snapshotの公開境界は`scripts/Verify-RegistrySnapshotPublication.ps1 -AssemblyPath <今回のassembly絶対パス> -ExpectedAssemblySha256 <SHA-256> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSON絶対パス>`で確認する。容量予約に使ったbytesと公開本文・owner長/hashの一致、private ACL、中断後のprefix再開、改変prefixの拒否と保全を検証する。これはmetadata fixtureによる保存境界の検証であり、実レジストリのtransaction・完全ACL・native session往復を代替しない。
 
 - CLIのview欠落・重複・不正・未知引数・複数キー、MCPの余剰property・型不正を拒否する。値名はliteralで、空の既定値名（CLIの`--value-name=`を含む）と値+再帰拒否を確認する。
 - キー・値・既定値・未知の型を含むuint型番号と生バイト列・Unicode名を往復し、キーごとのOwner/Group/DACL/SACLとMandatory Labelを含む生のセキュリティ記述子を完全一致で比較する。値復元で親ACLが変わらないことを確認する。
+- 実在のMuiCacheを使わず、GUID fixtureへ6種類のパス形状の値名を作成する。CLI・MCPで名前をliteralのまま削除・復元し、型・生bytes・親の完全ACL・他の値の保持と、同名値が復元先にある場合の拒否・snapshot保全を確認する。コロン付きキー名は`C:#Program Files#Norton#Suite#NortonSvc.exe`と既存の`#`・`%5C`形状を往復する。
+- 実効ユーザーの正規`Software\Classes`別名は、OSが解決する実体とREG_LINK bytesを照合したうえで、削除・復元と同じKTM transactionへ同一bytesの書込みをstageして保護する。`Software\Classes\PrunletE2E_<run GUID>`だけをfixtureにし、CLI・MCPの6種類の値名と直接のClasses子キーを32/64両viewで削除・復元する。型・生bytes・兄弟・完全ACLと直接`SID_Classes` backingを照合し、既存復元先の競合・snapshot保全を確認する。共有viewでの両view実行をview分離の証拠にしない。
+- 実別名のREG_LINK bytes・完全ACLは正常往復の前後で一致させ、dry-runは最終書込み時刻と復元metadataも不変更とする。dry-runは書込み権限を検査するが同一bytes書込みをstageしない。実在のMuiCacheやその値は使わず、今回のCLIでGUID fixtureだけを清掃し、残存は`cleanup.remainingClassesPath`へ記録する。
+- `-AssemblyPath`指定時は本番の`VerifyClassesAlias`・`GuardClassesAlias`を専用volatileリンクで検証する。通常キーの一致するREG_LINK bytesを拒否し、実リンクの解決、権限検査だけではbytes・時刻不変更、SetValue拒否時にstage前停止を確認する。同一bytesのstageと対象値の変更を同じtransactionへ入れ、最終`VerifyPinnedNames`後にfixtureリンクを外部writerで更新して、再確認を挟まない実KTM commitの拒否・対象値のrollback・受理済み外部bytesの保全を要求する。結果・native error・候補assembly SHAを`classes-guard-evidence.json`へ保存する。実OSのClasses別名の宛先差し替えは行わない。
+- 同じCore境界ケースで、最終確認後に専用リンクを`NtRenameKey`し、受理時は元の名前へ別の実リンクを作る。renameのtransaction conflict拒否、またはcommit拒否と対象値rollbackを要求し、rename元・置換リンクのbytesを保全する。native errorと候補assembly SHAを`classes-rename-evidence.json`へ保存する。
+- 通常リンクの拒否は通常fixtureとは別の`<run GUID>-link-probes` volatile rootで行う。fixture内だけを向く実リンクを対象とする要求・リンクを祖先に持つ要求、および通常キーの`SymbolicLinkValue`（REG_LINK）をdry-runで拒否し、リンク先を保持する。拒否されたリンクへ清掃APIを付け替えず、`cleanup.retainedVolatileLinkPath`へ残存を記録してログオフまたは再起動まで保持する。preflight後のリンク差し替えはこのケースで検証済みとしない。
+- `core-incomplete-links-cannot-be-used-as-ordinary-keys`では、REG_LINK値をまだ持たない実リンクと、値を設定した後の同じリンクを、`OpenOrdinaryKey`で拒否する。未完成リンクのCLI応答は`already_absent`ではなく`failed`とする。保持rawリンクを親とする子のopenも`OBJ_DONT_REPARSE`により4395で停止し、通常キーの受理と対象の値・完全ACLの不変更を確認する。検証済みの通常handleを後続処理に使い、別handleの名前一致を古いraw実体へ転用しない。
 - SACL実体がない子キーにも`SE_SACL_AUTO_INHERITED`だけがある階層を含め、ACLの不在・null・空を区別して制御フラグを完全一致で比較する。フラグ欠落を比較除外で回避しない。
 - schema 5のpending・snapshot・metadata・ロックと操作ディレクトリが作成時から現在のユーザーSIDとSYSTEMだけのprotected DACL・現在ユーザーOwnerを持つこと、ACL改変時は読取り・復元・整理を拒否してデータを保持することを確認する。未知schemaの保全と、レジストリ専用namespace・保持制御を検証する。
 - `SeSecurityPrivilege`不足・KTM非対応・レジストリリンク等はcommit前に停止する。未知のschema・metadataや検証できない復元記録は復元・整理を拒否して保全する。完全ACLを取得できる実行環境と、権限不足を期待する環境を分ける。自動昇格はしない。
@@ -84,7 +104,7 @@ GitHub応答を検証用アーカイブへ差し替え、実際のインスト�
 
 ## 一時的なロックとロード中DLL
 
-`scripts/Verify-HardlinkEntryTimes.ps1`で、ハードリンクの列挙時刻が古い場合のCLI/MCP削除と外部別名の保全、全兄弟の基準捕捉後に後続の子を更新した場合の停止を確認する。差し替え試行が共有違反で阻止された場合は元内容の保全と削除の正常完了を確認し、別IDの拒否と診断値はCore境界で別に検査する。エラー内の子の絶対パス、列挙値・基準値・実測値・期待変更時刻も検査する。Core境界には候補assemblyとSHA-256を明示し、CLI/MCPの実プロセス結果と区別する。
+`scripts/Verify-HardlinkEntryTimes.ps1`で、ハードリンクの列挙時刻が古い場合のCLI/MCP削除と外部別名の保全、全兄弟の基準捕捉後に後続の子を更新した場合の停止を確認する。多数の入力rootが同じ少数の実体を共有するケースでは、CLI・MCPそれぞれ256入力と外部1400別名を使い、自己削除のinspection解放に伴う時刻更新を外部変更と誤判定しないこと、外部別名のID・ACL・属性・全streamを保持することも確認する。`-FixtureRoot`は通常検証と同じ外部fixture境界で検証し、ビルド・metadata・JSON・reportはDに置く。差し替え試行が共有違反で阻止された場合は元内容の保全と削除の正常完了を確認し、別IDの拒否と診断値はCore境界で別に検査する。エラー内の子の絶対パス、列挙値・基準値・実測値・期待変更時刻も検査する。Core境界には候補assemblyとSHA-256を明示し、CLI/MCPの実プロセス結果と区別する。
 
 60秒超の共通ロック待機と解放後の続行、待機中の元対象・レジストリsnapshot保全を確認する。CLIのstderr通知とstdout JSON、MCPのtoken付き進捗と最終応答後の通知抑止を確認する。固定ロックを削除して競合を回避しない。
 

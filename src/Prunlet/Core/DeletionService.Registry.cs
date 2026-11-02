@@ -10,6 +10,8 @@ public sealed partial class DeletionService
         _ = NativeRegistry.Target(request);
         if (registrySession is null && config.RegistryScope == "nativeWindows")
             return RegistrySessionClient.Delete(config, request, dryRun, RecoveryLockProgress);
+        if (registrySession is null && request.AccessMode == "backupRestore")
+            return NativeRegistry.WithIsolatedEffectiveToken(() => DeleteRegistryLocal(request, dryRun));
         return DeleteRegistryLocal(request, dryRun);
     }
 
@@ -27,22 +29,28 @@ public sealed partial class DeletionService
         var held = new List<FileStream>();
         var commitConfirmed = false;
         var intentPublished = false;
+        NativeRegistry.PrivilegeScope? privileges = null;
         try
         {
             // 単一値は親ACLを変更せず、キー全体だけ完全SACLの権限を要求する。
-            using var privileges = target.ValueName is null ? new NativeRegistry.PrivilegeScope(restore: false, requireEffectiveThreadToken: registrySession is not null) : null;
+            privileges = target.ValueName is null || target.BackupRestore ? new NativeRegistry.PrivilegeScope(restore: false,
+                requireEffectiveThreadToken: registrySession is not null || target.BackupRestore, backupRestore: target.BackupRestore, fullSecurity: target.ValueName is null) : null;
             using var transaction = new NativeRegistry.Transaction();
             RegistrySnapshot snapshot;
             try { snapshot = dryRun ? NativeRegistry.SnapshotForDeletionPreflight(transaction, target, request.Recursive)
                     : NativeRegistry.StageDeletionAndSnapshot(transaction, target, request.Recursive); }
             catch (RegistryTargetMissingException) { item.Status = "already_absent"; item.Size = 0; return result; }
+            if (transaction.HasClassesAlias)
+                result.Warnings.Add("The current-user Classes alias requires additional SetValue access. Actual deletion and restoration stage the same REG_LINK bytes in the target transaction to guard against alias changes; committing may change the alias key's last-write timestamp. Dry-run does not stage this write.");
             snapshot.Scope = registrySession?.Scope;
-            target = NativeRegistry.Target(new RegistryDeleteRequest { Path = snapshot.Path, View = snapshot.View, ValueName = snapshot.ValueName });
+            target = NativeRegistry.Target(new RegistryDeleteRequest { Path = snapshot.Path, View = snapshot.View, ValueName = snapshot.ValueName, AccessMode = target.AccessMode });
             item.Path = target.Path;
             ValidateRegistrySnapshot(new RegistryManifest { Path = target.Path, View = target.View, ValueName = target.ValueName, Scope = snapshot.Scope }, snapshot);
             var bytes = JsonSerializer.SerializeToUtf8Bytes(snapshot, RegistryJsonOptions);
             if (bytes.LongLength > NativeRegistry.MaximumSnapshotBytes) throw new IOException("Serialized registry snapshot exceeds its maximum size.");
             item.Size = bytes.LongLength;
+            if (target.BackupRestore)
+                result.Warnings.Add("Explicit backupRestore access temporarily enables the effective token's backup/restore privileges and bypasses ordinary registry ACL access checks. No elevation, ACL rewrite, or nontransactional fallback is performed. Restoration requires its own explicit access-mode choice.");
             if (target.ValueName is null)
                 result.Warnings.Add("Registry key class, raw values and complete owner/group/DACL/SACL are preserved. Last-write timestamps are recorded but not restored. Volatile-key attributes are not captured; restoration creates nonvolatile keys.");
             item.Status = "would_delete";
@@ -91,28 +99,40 @@ public sealed partial class DeletionService
                     : "Registry deletion was not confirmed. The snapshot and intent are retained; commit outcome is not inferred from the current registry.");
             return result;
         }
-        finally { foreach (var stream in held) stream.Dispose(); }
+        finally
+        {
+            RestoreRegistryPrivileges(privileges, item, result.Warnings, commitConfirmed);
+            foreach (var stream in held) stream.Dispose();
+        }
     }
 
-    public RestoreResult RestoreRegistry(string operationId)
+    public RestoreResult RestoreRegistry(string operationId, string accessMode = "normal")
     {
+        NativeRegistry.ValidateAccessMode(accessMode);
         ValidateMoveOperationId(operationId);
         if (registrySession is null && config.RegistryScope == "nativeWindows")
-            return RegistrySessionClient.Restore(config, operationId, RecoveryLockProgress);
+            return RegistrySessionClient.Restore(config, operationId, RecoveryLockProgress, accessMode);
+        if (registrySession is null && accessMode == "backupRestore")
+            return NativeRegistry.WithIsolatedEffectiveToken(() => RestoreRegistryLocal(operationId, accessMode));
+        return RestoreRegistryLocal(operationId, accessMode);
+    }
+
+    private RestoreResult RestoreRegistryLocal(string operationId, string accessMode)
+    {
         using var coordination = AcquireRecoveryCoordination(create: true);
         EnsureRegistryOperationAvailable(operationId);
-        var result = RestoreRegistryCore(operationId);
+        var result = RestoreRegistryCore(operationId, accessMode);
         if (result.Items.All(item => item.Status is not ("failed" or "conflict"))) CaptureRegistryTerminal(operationId, result.Warnings);
         return result;
     }
 
-    private RestoreResult RestoreRegistryCore(string operationId)
+    private RestoreResult RestoreRegistryCore(string operationId, string accessMode)
     {
         if (config.RegistryScope == "nativeWindows" && registrySession is null)
             throw new InvalidOperationException("Native registry restoration requires a verified session context.");
         using var record = OpenRegistryRecord(operationId);
         var manifest = record.Manifest;
-        var target = NativeRegistry.Target(new RegistryDeleteRequest { Path = manifest.Path, View = manifest.View, ValueName = manifest.ValueName });
+        var target = NativeRegistry.Target(new RegistryDeleteRequest { Path = manifest.Path, View = manifest.View, ValueName = manifest.ValueName, AccessMode = accessMode });
         var result = new RestoreResult { OperationId = operationId };
         var item = RegistryItem(target);
         item.BackupPath = Path.Combine(record.Directory, RegistrySnapshotName);
@@ -120,6 +140,7 @@ public sealed partial class DeletionService
         result.Items.Add(item);
         var intentPublished = record.Has("restore", "intent");
         var committed = false;
+        NativeRegistry.PrivilegeScope? privileges = null;
         try
         {
             RegistryScopeIdentity.RequireExecutionMatch(manifest.Scope, registrySession?.Scope);
@@ -133,10 +154,15 @@ public sealed partial class DeletionService
                 return result;
             }
             if (record.Snapshot is null) throw new InvalidDataException("Registry snapshot is missing.");
-            using var privileges = target.ValueName is null ? new NativeRegistry.PrivilegeScope(restore: true, requireEffectiveThreadToken: registrySession is not null) : null;
+            privileges = target.ValueName is null || target.BackupRestore ? new NativeRegistry.PrivilegeScope(restore: true,
+                requireEffectiveThreadToken: registrySession is not null || target.BackupRestore, backupRestore: target.BackupRestore, fullSecurity: target.ValueName is null) : null;
             using var transaction = new NativeRegistry.Transaction();
             // conflictも内容検証失敗もcommit前にrollbackできる。非上書き作成の検証後にintentを保存する。
             NativeRegistry.Restore(transaction, target, record.Snapshot);
+            if (target.BackupRestore)
+                result.Warnings.Add("Explicit backupRestore restoration temporarily enables the effective token's backup/restore privileges and bypasses ordinary registry ACL access checks; existing destinations are still refused.");
+            if (transaction.HasClassesAlias)
+                result.Warnings.Add("The current-user Classes alias requires additional SetValue access. Restoration stages the same REG_LINK bytes in the target transaction to guard against alias changes; committing may change the alias key's last-write timestamp.");
             WriteRegistryReceipt(record.Directory, manifest, record.ManifestHash, "restore", "intent", record.Held, result.Warnings);
             record.Receipts.Add(RegistryReceiptName("restore", "intent"));
             intentPublished = true;
@@ -160,7 +186,21 @@ public sealed partial class DeletionService
             else if (record.Has("restore", "complete"))
                 result.Warnings.Add("Registry restore is confirmed. Snapshot consumption failed; a retry only consumes the snapshot and never restores the registry again.");
         }
+        finally { RestoreRegistryPrivileges(privileges, item, result.Warnings, committed); }
         return result;
+    }
+
+    private static void RestoreRegistryPrivileges(NativeRegistry.PrivilegeScope? privileges, FileOperationResult item, List<string> warnings, bool committed)
+    {
+        try { privileges?.Dispose(); }
+        catch (Exception ex) when (IsOperational(ex) || ex is InvalidOperationException)
+        {
+            if (item.Status is not ("failed" or "conflict")) item.Status = "failed";
+            item.Error = item.Error is null ? ex.Message : item.Error + " Privilege restoration: " + ex.Message;
+            warnings.Add(committed
+                ? "The registry transaction committed, but effective token privilege restoration failed verification. Do not repeat the registry mutation."
+                : "Effective token privilege restoration failed verification after the registry attempt.");
+        }
     }
 
     private static FileOperationResult RegistryItem(RegistryTarget target) =>

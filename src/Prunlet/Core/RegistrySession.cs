@@ -29,6 +29,7 @@ internal sealed class RegistrySessionRequest
     public string OperationId { get; set; } = "";
     public RegistryDeleteRequest? Delete { get; set; }
     public bool DryRun { get; set; }
+    public string AccessMode { get; set; } = "normal";
     public string ConfigurationSha256 { get; set; } = "";
 }
 
@@ -114,16 +115,18 @@ internal static class RegistrySessionWire
 
     internal static void ValidateRequest(RegistrySessionRequest request, string fingerprint)
     {
+        NativeRegistry.ValidateAccessMode(request.AccessMode);
         if (request.ConfigurationSha256 != fingerprint || !Guid.TryParseExact(request.OperationId, "N", out var id) || id.ToString("N") != request.OperationId)
             throw new InvalidDataException("Registry session configuration or operation identity differs.");
         if (request.Operation == "delete")
         {
-            if (request.Delete is null) throw new InvalidDataException("Registry delete request is missing.");
+            if (request.Delete is null || request.AccessMode != "normal") throw new InvalidDataException("Registry delete request is missing or has a misplaced access mode.");
             _ = NativeRegistry.Target(request.Delete);
         }
         else if (request.Operation is "restore" or "reconcile")
         {
             if (request.Delete is not null || request.DryRun) throw new InvalidDataException("Invalid registry recovery request.");
+            if (request.Operation == "reconcile" && request.AccessMode != "normal") throw new InvalidDataException("Registry reconciliation cannot request backupRestore access.");
         }
         else throw new InvalidDataException("Unknown registry session operation.");
     }
@@ -201,7 +204,7 @@ internal static class RegistrySessionServer
                                 result = request.Operation switch
                                 {
                                     "delete" => service.DeleteRegistryLocal(request.Delete!, request.DryRun, request.OperationId),
-                                    "restore" => service.RestoreRegistry(request.OperationId),
+                                    "restore" => service.RestoreRegistry(request.OperationId, request.AccessMode),
                                     "reconcile" => service.ReconcileRegistry(request.OperationId),
                                     _ => throw new InvalidDataException("Unknown registry session operation.")
                                 };
@@ -236,8 +239,8 @@ internal static class RegistrySessionClient
 {
     internal static DeleteResult Delete(PrunletConfig config, RegistryDeleteRequest delete, bool dryRun, Action<TimeSpan, bool>? progress)
         => Call<DeleteResult>(config, new RegistrySessionRequest { Operation = "delete", OperationId = Guid.NewGuid().ToString("N"), Delete = delete, DryRun = dryRun }, progress);
-    internal static RestoreResult Restore(PrunletConfig config, string id, Action<TimeSpan, bool>? progress)
-        => Call<RestoreResult>(config, new RegistrySessionRequest { Operation = "restore", OperationId = id }, progress);
+    internal static RestoreResult Restore(PrunletConfig config, string id, Action<TimeSpan, bool>? progress, string accessMode = "normal")
+        => Call<RestoreResult>(config, new RegistrySessionRequest { Operation = "restore", OperationId = id, AccessMode = accessMode }, progress);
     internal static DeleteResult Reconcile(PrunletConfig config, string id, Action<TimeSpan, bool>? progress)
         => Call<DeleteResult>(config, new RegistrySessionRequest { Operation = "reconcile", OperationId = id }, progress);
 

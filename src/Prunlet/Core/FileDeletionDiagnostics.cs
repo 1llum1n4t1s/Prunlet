@@ -14,13 +14,15 @@ internal static class FileDeletionDiagnostics
         var native = NativeError(error);
         var message = $"{error.Message} Target: {JsonSerializer.Serialize(path)}; HRESULT 0x{error.HResult:X8}"
             + (native is null ? "." : $"; native error {native}.");
+        if (native == 5 || unchecked((uint)error.HResult) == 0x80070005)
+            message += " Windows access denial can result from security restrictions, pending deletion, or other access conditions; error 5 alone does not identify the cause.";
         message += unchecked((uint)error.HResult) switch
         {
             0x80270021 => " Windows denied access to the source (COPYENGINE_E_ACCESS_DENIED_SRC); this does not identify a locking process.",
             0x80270022 => " Windows denied access to the destination (COPYENGINE_E_ACCESS_DENIED_DEST); this does not identify a locking process.",
             _ => string.Empty
         };
-        if (!inspectLocks || !IsSharingViolation(error)) return message;
+        if (!inspectLocks || !ShouldInspectUsers(error)) return message;
         try { return message + ObserveUsers(path); }
         catch (Exception diagnosticError) when (DiagnosticFailure(diagnosticError))
         {
@@ -35,11 +37,13 @@ internal static class FileDeletionDiagnostics
         return null;
     }
 
-    private static bool IsSharingViolation(Exception error)
+    private static bool ShouldInspectUsers(Exception error)
     {
+        // ロード中のread-only DLLは固定handleからの削除でもアクセス拒否になり得る。
+        // 拒否だけで保持元を断定せず、共有違反と同じ現在値の観測だけを行う。
         for (Exception? current = error; current is not null; current = current.InnerException)
-            if (unchecked((uint)current.HResult) is 0x80270027 or 0x80270028 or 0x80070020 or 0x80070021
-                || current is Win32Exception { NativeErrorCode: 32 or 33 }) return true;
+            if (unchecked((uint)current.HResult) is 0x80270021 or 0x80270027 or 0x80270028 or 0x80070005 or 0x80070020 or 0x80070021
+                || current is Win32Exception { NativeErrorCode: 5 or 32 or 33 }) return true;
         return false;
     }
 

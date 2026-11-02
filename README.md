@@ -30,6 +30,8 @@ CodexからMacなどへ送るPowerShellスクリプトは、[フックの連携�
 
 ## インストールと更新
 
+GitHub APIの未認証枠が上限に達した場合は、既存のログイン済みGitHub CLIを`-UseGitHubCliAuthentication`で明示して利用できます。同じ既定ブランチとcommit SHAを取得する方式で、トークンを取り出さず、ghの自動導入・ログインやcloneへの切替は行いません。
+
 Windows、.NET 10 SDK、PowerShell 7が必要です。インストール元は[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の既定ブランチの最新HEADです。開発用クローンは使用しません。
 
 Windows ARM64では、下の実行コマンドに`-Runtime win-arm64`を追加してください。既定は`win-x64`で、ARM64での未指定は停止します。x64エミュレーションを選ぶ場合も`-Runtime win-x64`の明示指定が必要です。
@@ -143,9 +145,11 @@ prunlet --config <絶対パス> registry-delete --view 32 --value-name= -- HKCU:
 prunlet --config <絶対パス> registry-restore <operation-id>
 ```
 
-退避データ・記録は現在のユーザーとSYSTEMだけがアクセスできる権限で保護し、権限の改変を検出した記録は復元・整理せず保全します。キーのデータと完全なアクセス権の保存には`SeSecurityPrivilege`が必要です。権限不足やトランザクションを利用できない環境では削除前に停止し、自動昇格しません。値の復元では親キーのアクセス権を変更しません。保存形式とトランザクションの設計は[DESIGN.md](DESIGN.md#レジストリの削除と復元)を参照してください。
+退避データ・記録は現在のユーザーとSYSTEMだけがアクセスできる権限で保護し、権限の改変を検出した記録は復元・整理せず保全します。キーのデータと完全なアクセス権の保存には`SeSecurityPrivilege`が必要です。権限不足やトランザクションを利用できない環境では削除前に停止し、自動昇格しません。値の復元では親キーのアクセス権を変更しません。64bit Windows・64bitプロセス・view 64の保護された対象には、削除・dry-run・復元それぞれで`--access-mode backupRestore`を明示できます。現在の実効トークンに`SeBackupPrivilege`と`SeRestorePrivilege`が必要で、ACLや所有権を変更してアクセスを得る方式ではありません。既定は`normal`で、自動切替はしません。[選択条件と限界](docs/integration.md#保護されたレジストリへの明示アクセス)も確認してください。保存形式とトランザクションの設計は[DESIGN.md](DESIGN.md#レジストリの削除と復元)を参照してください。
 
-復元は元のviewへ行い、既存キー・値（空の既定値も含む）を上書き・マージしません。Owner/SACLの復元権限が不足した場合もロールバックして退避を保全します。ルート自体・HKCR/HKCC・リモート・相対指定・レジストリリンク・未知のschema・metadataや検証できない復元記録は拒否します。キーのclassも保存しますが、最終書込み時刻は復元せず、volatileキーも非volatileキーとして復元します。commit後の記録確定前に中断した操作は不明状態として保全し、自動整理・復元を拒否します。
+復元は元のviewへ行い、既存キー・値（空の既定値も含む）を上書き・マージしません。Owner/SACLの復元権限が不足した場合もロールバックして退避を保全します。ルート自体・HKCR/HKCC・リモート・相対指定・任意のレジストリリンク・未知のschema・metadataや検証できない復元記録は拒否します。キーのclassも保存しますが、最終書込み時刻は復元せず、volatileキーも非volatileキーとして復元します。commit後の記録確定前に中断した操作は不明状態として保全し、自動整理・復元を拒否します。
+
+実効ユーザーの`Software\Classes`別名を祖先に持つ要求だけは、実リンクと宛先を検証して扱います。削除・復元と同じトランザクションで別名へ元と同じREG_LINK値を書き込み、差し替えとの競合を検知するため、別名への追加の書込み権限が必要で、最終書込み時刻が変わる場合があります。dry-runはこの書込みを行いません。Classes自身やその他のリンクは対象にしません。対応するパスと安全条件は[設計](DESIGN.md#レジストリの削除と復元)を参照してください。
 
 MSIX由来の仮想viewで6801になる場合は、[通常Windowsの明示セッション](docs/integration.md#通常windowsのレジストリを明示して操作する)を利用できます。利用者が通常デスクトップで期限付きセッションを起動し、専用設定を選んだCLI・MCPから接続します。仮想viewからの自動切替や自動昇格は行わず、仮想view内のキーを通常Windows側の同名キーとして扱いません。
 
@@ -178,8 +182,8 @@ MSIX由来の仮想viewで6801になる場合は、[通常Windowsの明示セッ
 | ツール | 引数 | 用途 |
 | --- | --- | --- |
 | `delete_files` | 同期: `paths`、任意の`dryRun`・`recursive`。待機登録: `action: "enqueue"`・`paths`、任意の`recursive`。照会・取消: `action: "status"` / `"cancel"`・`jobId`のみ | ファイル・フォルダーの同期削除、待機登録・照会・取消。待機登録は`dryRun`非対応 |
-| `delete_registry` | `path`・`view`（`"32"`/`"64"`）、任意の`valueName`・`recursive`・`dryRun` | キーまたは値を保全して削除。空の`valueName`は既定値 |
-| `restore_registry` | `operationId` | レジストリ操作を非上書きで復元 |
+| `delete_registry` | `path`・`view`（`"32"`/`"64"`）、任意の`valueName`・`recursive`・`dryRun`・`accessMode` | キーまたは値を保全して削除。空の`valueName`は既定値。`accessMode`は`normal`または`backupRestore` |
+| `restore_registry` | `operationId`、任意の`accessMode` | レジストリ操作を非上書きで復元。保護アクセスは復元時にも明示選択 |
 | `reconcile_registry` | `operationId` | 切断後に保存済みの結果を読取り確認。削除・復元を再送しない |
 | `list_operations` | なし | レジストリ操作IDの一覧（復元可否は復元時に検証） |
 

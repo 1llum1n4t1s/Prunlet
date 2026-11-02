@@ -53,7 +53,7 @@ exe・configは共通AGENTSのbindingへ置き換える。上のCMD例は空白�
 
 キーは未知の値型も含め型のuint値・生バイト列とOwner・Group・DACL・SACL（Mandatory Labelを含む）を保全する。完全ACL取得に必要な`SeSecurityPrivilege`がトークンにある場合だけ一時有効化し、不足時は削除前に停止する。自動昇格やKTM非対応時のfallbackはない。値の復元は親ACLを変更しない。既存キー・値・空の既定値を上書きせず、復元権限不足はロールバックして退避を保全する。キーのclassも保存するが、最終書込み時刻は復元せず、volatileキーも非volatileキーとして復元する。commit後の記録未確定は不明状態として保全し、自動整理・復元を拒否する。保持期間・容量はレジストリsnapshotを対象に既定7日・1 GiBであり、新規ファイルのゴミ箱項目は含まない。
 
-ルート自体、HKCR/HKCC、リモート、相対指定、レジストリリンク、未知のschema・metadataや検証できない復元記録は拒否する。`Remove-Item`のレジストリ素通し例外はなく、認識した`Remove-ItemProperty`・`rp`・`reg[.exe] delete`も拒否し専用CLIを案内する。拒否された対象をMCPや別APIへ付け替えて再試行しない。
+ルート自体、HKCR/HKCC、リモート、相対指定、任意のレジストリリンク、未知のschema・metadataや検証できない復元記録は拒否する。実効ユーザーの`Software\Classes`別名を祖先に持つ要求だけは、同じSIDのClasses hiveへ向く実リンクと検証でき、同じトランザクション内で元のREG_LINK値を同じ型・bytesで書き込んで競合ガードを取得できる場合に対応する。追加のSetValue権限が必要で、commitにより別名の最終書込み時刻が変わり得る。dry-runはこの書込みをstageしない。Classes自身やその他のリンクは拒否する。`Remove-Item`のレジストリ素通し例外はなく、認識した`Remove-ItemProperty`・`rp`・`reg[.exe] delete`も拒否し専用CLIを案内する。拒否された対象をMCPや別APIへ付け替えて再試行しない。
 
 hookは限定した直接削除コマンドを検知して拒否する補助であり、shellを推測してコマンドを置換しない。外部スクリプト、動的コマンド、他言語のファイルAPIをすべて検出する保証はない。共通指示の読込みや将来すべての呼出しの遵守も、個別の実ホスト検証と区別する。
 
