@@ -30,8 +30,6 @@ CodexからMacなどへ送るPowerShellスクリプトは、[フックの連携�
 
 ## インストールと更新
 
-GitHub APIの未認証枠が上限に達した場合は、既存のログイン済みGitHub CLIを`-UseGitHubCliAuthentication`で明示して利用できます。同じ既定ブランチとcommit SHAを取得する方式で、トークンを取り出さず、ghの自動導入・ログインやcloneへの切替は行いません。
-
 Windows、.NET 10 SDK、PowerShell 7が必要です。インストール元は[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の既定ブランチの最新HEADです。開発用クローンは使用しません。
 
 Windows ARM64では、下の実行コマンドに`-Runtime win-arm64`を追加してください。既定は`win-x64`で、ARM64での未指定は停止します。x64エミュレーションを選ぶ場合も`-Runtime win-x64`の明示指定が必要です。
@@ -43,6 +41,8 @@ $installer = Join-Path $installerDirectory 'Install-Prunlet.ps1'
 Invoke-WebRequest 'https://raw.githubusercontent.com/1llum1n4t1s/Prunlet/main/scripts/Install-Prunlet.ps1' -OutFile $installer
 pwsh -NoProfile -File $installer -RegisterCodex -RegisterAgentInstructions
 ```
+
+GitHub APIの未認証枠が上限に達した場合は、上の`pwsh`コマンドに`-UseGitHubCliAuthentication`を追加すると、既存のログイン済みGitHub CLIを利用できます。ghの自動導入・ログインは行いません。この指定は手動インストーラー用です。
 
 インストーラーはGitHub APIから既定ブランチと最新コミットを取得し、そのコミットのアーカイブを取得してビルドします。導入処理中は取得したSHAでソースを揃えますが、次回の導入・更新は再び最新HEADを解決します。取得失敗やリモートの実装不足では停止し、ローカルクローンへ切り替えません。
 
@@ -149,7 +149,7 @@ prunlet --config <絶対パス> registry-restore <operation-id>
 
 復元は元のviewへ行い、既存キー・値（空の既定値も含む）を上書き・マージしません。Owner/SACLの復元権限が不足した場合もロールバックして退避を保全します。ルート自体・HKCR/HKCC・リモート・相対指定・任意のレジストリリンク・未知のschema・metadataや検証できない復元記録は拒否します。キーのclassも保存しますが、最終書込み時刻は復元せず、volatileキーも非volatileキーとして復元します。commit後の記録確定前に中断した操作は不明状態として保全し、自動整理・復元を拒否します。
 
-実効ユーザーの`Software\Classes`別名を祖先に持つ要求だけは、実リンクと宛先を検証して扱います。削除・復元と同じトランザクションで別名へ元と同じREG_LINK値を書き込み、差し替えとの競合を検知するため、別名への追加の書込み権限が必要で、最終書込み時刻が変わる場合があります。dry-runはこの書込みを行いません。Classes自身やその他のリンクは対象にしません。対応するパスと安全条件は[設計](DESIGN.md#レジストリの削除と復元)を参照してください。
+実効ユーザーの`Software\Classes`別名の配下は、宛先を検証して扱います。削除・復元には別名への追加の書込み権限が必要で、別名の最終書込み時刻が変わる場合があります。dry-runは書込みを行いません。Classes自身やその他のリンクは対象にしません。対応するパスと安全条件は[設計](DESIGN.md#レジストリの削除と復元)を参照してください。
 
 MSIX由来の仮想viewで6801になる場合は、[通常Windowsの明示セッション](docs/integration.md#通常windowsのレジストリを明示して操作する)を利用できます。利用者が通常デスクトップで期限付きセッションを起動し、専用設定を選んだCLI・MCPから接続します。仮想viewからの自動切替や自動昇格は行わず、仮想view内のキーを通常Windows側の同名キーとして扱いません。
 

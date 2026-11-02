@@ -69,7 +69,7 @@ Shellがゴミ箱への移動を成功と返した場合は、返却項目だけ
 
 この機能は指定したキー・値のトランザクション削除と復元を扱い、Windows管理情報の意味や参照関係を修復する機能ではない。AppContainer profileやAppx packageのライフサイクル処理を汎用削除へ付け替えない。`DeleteAppContainerProfile`は失敗時の状態が不定になり得て、Prunletの完全退避・原子的commit・非上書き復元の契約に組み込めていない。StateRepository・AppxAllUserStore・CloudStore・AppCompatCache・BagMRU等の混在データも、形式・版・参照整合を検証する専用処理がないため、製品名の文字列一致だけで清掃対象を決めない。これはこれらのパスをCoreが一律に識別・拒否するという意味ではなく、呼出し元が安全な単独削除を確認できない対象を要求しないための境界である。
 
-レジストリ操作も`Core`へ集約する。CLIは`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <single-key-path>`、MCPは`delete_registry`と`restore_registry`を提供する。CLIの`restore`と`registry-restore`、MCPの`restore_registry`はレジストリ専用である。削除要求はview必須、値名省略はキー、空文字は既定値であり、値削除の再帰指定を拒否する。
+レジストリ操作も`Core`へ集約する。CLIは`registry-delete --view <32|64> [--access-mode <normal|backupRestore>] [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <single-key-path>`、MCPは`delete_registry`と`restore_registry`を提供する。CLIの`restore`と`registry-restore`は`<operation-id> [--access-mode <normal|backupRestore>]`を受け取り、MCPの`restore_registry`とともにレジストリ専用である。削除要求はview必須、値名省略はキー、空文字は既定値であり、値削除の再帰指定を拒否する。
 
 キー名内のcolonはリテラル文字として受理する。`C:#...`や`C:%5C...`もキー名の一部であり、ドライブパスやURLとして解釈・展開しない。相対パス・空segment・wildcardの拒否は維持する。
 
@@ -134,6 +134,8 @@ latest導入時に`capacityDefaultMigrationVersion`が欠落または1未満の�
 ## 導入と検証の境界
 
 利用者向け導入はGitHubの既定ブランチ最新HEADを解決し、取得元・ブランチ・commitを`source-info.json`へ記録する。開発クローン・ローカルビルドをlatest導入の代用にしない。設定の検証には`validate-config`を使い、設定読込とservice構築だけで走査・変更しない。共通指示の生成元は`integration/PRUNLET.md`で、配置済み共通指示の更新とソース変更は別の結果として扱う。
+
+インストーラーの`-UseGitHubCliAuthentication`は、APIの未認証枠を使えない場合などに、既存のGitHub CLIへAPI取得を委ねる明示選択である。既定ブランチ・commit解決の契約は変えず、`gh api --hostname github.com --method GET`を直接起動する。トークンを抽出せず、対話とデバッグ出力を抑止し、認証関連のstderrを記録へ転載しない。ghの導入・ログイン・cloneへの切替は行わず、失敗時は停止する。起動時自動更新の認証経路は変更しない。
 
 ### 起動時自動更新
 
