@@ -28,6 +28,8 @@ Windowsの管理者起動はsandbox権限申請と区別する。許可済みの
 
 ## ビルドと検証
 
+macOSの変更では[macOSの手順](docs/macos.md#ソースからビルドする)で外部出力先へビルドし、[ネイティブ検証の4経路](docs/macos.md#ネイティブ検証の4経路)から影響する経路を実行する。通常release・専用cfgのdebug・libtestの結果を区別し、クロスビルドを対象CPUでの動作確認の代わりにしない。以下のビルド・検証コマンドはWindows向けである。
+
 Windows・`rust-toolchain.toml`指定のRust（MSVC）・C++ビルドツールとWindows SDK・PowerShell 7を使う。ビルドは`scripts/Publish-Prunlet.ps1`に外部の絶対出力先を渡す。Cargoのtarget・TEMP/TMPも外部へ分離し、直接の`cargo build` / `cargo test`でリポジトリへ出力しない。製品runtimeに.NETを要求せず、真正な旧版exeや旧C#検証補助の利用は互換性検証と区別する。
 
 ```powershell
