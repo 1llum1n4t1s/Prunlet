@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.0.30 - 2026-11-03
+
+- 製品runtimeをRustへ移行し、Windowsでの実行に.NETが不要に。
+- macOS向けCLI・MCPを追加し、Trashへの削除と明示的な削除待機キューに対応。
+- Windows更新配布をCloudflare R2へ接続し、GitHubによる検証と旧版向け配布の互換性を維持。
+- Rustの依存検証と、Nodeを使わないCI・Dependabot自動マージへ更新。
+
 ## 1.0.29 - 2026-11-02
 
 - HKCU Classesの検証済み祖先別名を安全に扱い、MuiCacheの指定値の削除・復元に対応。
