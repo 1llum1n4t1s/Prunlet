@@ -7,15 +7,20 @@ param(
     [string]$MoveExecutablePath,
     [string]$BaselineExecutablePath,
     [switch]$LegacyCopyVerification,
+    [string]$RustProbePath,
+    [string]$BuildManifestPath,
+    [string]$ExpectedBuildManifestSha256,
+    [string]$FixtureRoot,
     [ValidateRange(32769, 1000000)][int]$FileCount = 32769,
     [ValidateRange(60, 86400)][int]$ProcessTimeoutSeconds = 1800
 )
 $ErrorActionPreference = 'Stop'
 if (!$LegacyCopyVerification) {
-    $verificationArguments = @{ ExecutablePath = $ExecutablePath; OutputDirectory = $OutputDirectory; ReportPath = $ReportPath; Large = $true; LargeFileCount = $FileCount; CaseFilter = @('*large-*'); ProcessTimeoutSeconds = [Math]::Min($ProcessTimeoutSeconds, 3600) }
-    if ($LegacyExecutablePath) { $verificationArguments.LegacyExecutablePath = $LegacyExecutablePath }
-    if ($MoveExecutablePath) { $verificationArguments.MoveExecutablePath = $MoveExecutablePath }
-    & (Join-Path $PSScriptRoot 'Verify-RecycleBin.ps1') @verificationArguments
+    if($FileCount -gt 65535){throw 'Current recordless LargeFileCount supports 32769..65535. Larger counts belong only to explicit LegacyCopyVerification.'}
+    $verificationArguments = @{ ExecutablePath = $ExecutablePath; OutputDirectory = $OutputDirectory; ReportPath = $ReportPath; Large = $true; LargeFileCount = $FileCount; ProcessTimeoutSeconds = $ProcessTimeoutSeconds; CaseFilter = @('*large-*') }
+    foreach($name in @('RustProbePath','BuildManifestPath','ExpectedBuildManifestSha256','FixtureRoot')){if($PSBoundParameters.ContainsKey($name)){$verificationArguments[$name]=$PSBoundParameters[$name]}}
+    $global:LASTEXITCODE=0
+    & (Join-Path $PSScriptRoot 'Verify-RecordlessFiles.ps1') @verificationArguments
     exit $LASTEXITCODE
 }
 if (!$LegacyExecutablePath) { throw 'LegacyCopyVerification requires the pre-migration LegacyExecutablePath.' }

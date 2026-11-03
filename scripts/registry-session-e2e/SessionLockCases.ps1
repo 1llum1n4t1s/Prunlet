@@ -13,6 +13,31 @@ function TestCliLock {
   return @{heldSeconds=$held;exitCode=$p.ExitCode;stdout=$stdout;stderr=$stderr;operationId=$data.operationId;restore=$r;before=$before;after=(NativeRequest 'observe' @{leaf=$leaf})}
  }finally{if($lock){$lock.Dispose()};if($p){if(!$p.HasExited){$p.Kill($true);$p.WaitForExit()};$p.Dispose()}}
 }
+function TestCliClosedStderr {
+ $leaf='closed-stderr-client';$f=NativeRequest 'create' @{leaf=$leaf};$before=NativeRequest 'observe' @{leaf=$leaf}
+ $lock=[IO.File]::Open((Join-Path $recovery 'maintenance.lock'),[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None);$p=$null
+ try{
+  $p=Child @('registry-delete','--view','64','--value-name=binary','--',$f.path)
+  $out=$p.StandardOutput.ReadToEndAsync();$line=$p.StandardError.ReadLineAsync();$p.StandardInput.Close()
+  Assert ($line.Wait(15000)) 'CLI did not report the accepted recovery-lock wait before closing stderr'
+  $first=$line.GetAwaiter().GetResult();Assert ($first-match'Waiting for recovery lock') 'CLI did not reach accepted Core progress before closing stderr'
+  $p.StandardError.Close()
+  # Coreの5秒間隔の次の進捗通知も、読取側を閉じた状態で通す。
+  Assert (!$p.WaitForExit(6500)) 'CLI exited while recovery lock remained held after stderr was closed'
+  Assert (Same $before (NativeRequest 'observe' @{leaf=$leaf})) 'Closed stderr changed source before lock release'
+  $lock.Dispose();$lock=$null
+  Assert ($p.WaitForExit(30000)) 'CLI with closed stderr did not finish after lock release'
+  $stdout=$out.GetAwaiter().GetResult();$data=$stdout|ConvertFrom-Json -AsHashtable -Depth 50
+  SaveJson (Join-Path $PSScriptRoot 'closed-stderr-client-final.json') @{exitCode=$p.ExitCode;stdout=$stdout;firstProgress=$first;stderrReaderClosed=$true;before=$before;after=(NativeRequest 'observe' @{leaf=$leaf})}
+  Assert ($p.ExitCode-eq 0-and$data.operationId-and$data.items[0].status-eq'deleted'-and$data.items[0].kind-eq'registry-value') 'Closed stderr lost the CLI result or operation ID'
+  $deleted=NativeRequest 'observe' @{leaf=$leaf};Assert (!$deleted.values.ContainsKey('binary')) 'Closed-stderr CLI did not perform the real registry value deletion'
+  $rec=InvokePrunletCli @('registry-reconcile',$data.operationId);Assert ($rec.exitCode-eq 0-and$rec.json.items[0].status-eq'deleted') 'Closed-stderr operation could not be reconciled'
+  Assert (Same $deleted (NativeRequest 'observe' @{leaf=$leaf})) 'Closed-stderr reconcile changed registry state'
+  $restored=InvokePrunletCli @('restore',$data.operationId);Assert ($restored.exitCode-eq 0) 'Closed-stderr operation restore failed'
+  Assert (Same $before (NativeRequest 'observe' @{leaf=$leaf})) 'Closed-stderr roundtrip changed raw values, key class or complete security'
+  return @{exitCode=$p.ExitCode;operationId=$data.operationId;firstProgress=$first;stderrReaderClosed=$true;stdout=$stdout;reconcile=$rec;restore=$restored;before=$before;after=(NativeRequest 'observe' @{leaf=$leaf});deleteWasNotRepeated=$true}
+ }finally{if($lock){$lock.Dispose()};if($p){if(!$p.HasExited){$p.Kill($false);$p.WaitForExit()};$p.Dispose()}}
+}
 function TestMcpLock {
  $leaf='lock-mcp';$f=NativeRequest 'create' @{leaf=$leaf};$before=NativeRequest 'observe' @{leaf=$leaf};$p=McpStart;$lock=$null;$frames=[Collections.Generic.List[object]]::new()
  try{

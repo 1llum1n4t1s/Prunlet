@@ -1,6 +1,6 @@
 # Prunletの開発
 
-現在の構造と設計判断は[DESIGN.md](DESIGN.md)を参照する。削除処理は`src/Prunlet/Core`に集約し、CLI・MCP・フックで別の削除方式を実装しない。
+現在の構造と設計判断は[DESIGN.md](DESIGN.md)を参照する。Rust実装は`src/rust`へ集約し、CLI・MCPは`service::Runtime`を共有する。OS固有の実体・パス・ACLは`platform/windows`と`platform/macos`へ分け、CLI・MCP・フックで別の削除方式を実装しない。移行中に保持する`src/Prunlet`は互換性参照であり、Rust製品からC# backendを呼ばない。
 
 Windowsのファイル・フォルダー・レジストリ削除は、配置済み共通指示のexe・設定の絶対パスを使い、最初から`cmd.exe`・`login: false`でPrunlet CLIを呼ぶ。空白・Unicode・多数・長いファイル対象は絶対パスのUTF-8 JSON一覧を`delete [--dry-run] --paths-file <絶対パス>`で渡す。レジストリは`registry-delete --view <32|64> ... -- <single-key-path>`を使う。exe・設定自体をCMDで安全に表現できない場合は実行前に同じCoreのMCPを選ぶ。拒否された削除を別shell・Prunletへ付け替えて再試行しない。詳細は[連携手順](docs/integration.md)を参照する。
 
@@ -28,11 +28,11 @@ Windowsの管理者起動はsandbox権限申請と区別する。許可済みの
 
 ## ビルドと検証
 
-Windows・.NET 10 SDK・PowerShell 7を使う。ビルドは`scripts/Publish-Prunlet.ps1`に外部の絶対出力先を渡す。直接の`dotnet build` / `dotnet publish`でリポジトリへ出力しない。
+Windows・`rust-toolchain.toml`指定のRust（MSVC）・C++ビルドツールとWindows SDK・PowerShell 7を使う。ビルドは`scripts/Publish-Prunlet.ps1`に外部の絶対出力先を渡す。Cargoのtarget・TEMP/TMPも外部へ分離し、直接の`cargo build` / `cargo test`でリポジトリへ出力しない。製品runtimeに.NETを要求せず、真正な旧版exeや旧C#検証補助の利用は互換性検証と区別する。
 
 ```powershell
 $buildRoot = Join-Path 'D:\Codex\Prunlet' ('build-' + [guid]::NewGuid().ToString('N'))
-pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
+pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot -IncludeVerificationProbe
 ```
 
 出力は`$buildRoot\publish\prunlet.exe`。既定は`win-x64`、ARM64向けは`-Runtime win-arm64`を指定する。metadata・TEMP/TMP・fixture・reportは外部D絶対パスへ隔離し、reportの親を事前作成する。リポジトリおよびCodex homeへ`bin`・`obj`・一時物・検証出力・バックアップを作らない。
@@ -41,15 +41,15 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 
 - ファイル: `scripts/Verify-RecordlessFiles.ps1`へ今回のexeと新しい外部出力・reportを渡す。結果DTO、操作記録不作成、dry-run不変更、Windowsゴミ箱往復、内容/ID/属性/ACL/ADS、リンク先保全・ハードリンク共有、再帰・拒否・不明状態を確認する。
 - フック解析: shell選択・文字列解析・拒否理由を変更した場合は`scripts/Verify-HookParsing.ps1 -ExecutablePath <今回のexe絶対パス> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSON絶対パス> -ConfigPath <設定絶対パス>`を実行する。検査用コマンド文字列を直接実行せず、hookへのJSON入力で許可・拒否とfixture不変更を確認する。拒否理由の`reasonValid`も確認し、検知命令・shell解釈または検査不能の原因、およびshell不明時の候補判定の説明を検証する。範囲と判定は[検証手順](docs/verification.md#通常e2eの検証範囲)に従う。
-- 旧データ移行: `scripts/Verify-FileRecordMigration.ps1`へ今回のexeと真正な旧版exeを渡す。旧schema fixtureを新版で捏造せず、所有済み旧rootの直接Bin破棄、壊れたfile本文の非読取、registry混在/他config/未知非所有領域の保護、dry-run不変更・gate不作成、中断後の自動再送拒否・明示ack、policy 0→2と更新時の後online store回収を確認する。旧file復元・bundle・sidecar・copy・履歴圧縮は成功条件へ残さない。
+- 旧データ移行: `scripts/Verify-FileRecordMigration.ps1`へ今回のexe・同buildの`-RustProbePath`・`-BuildManifestPath`・`-ExpectedBuildManifestSha256`と真正な旧版exeを渡す。synthetic所有marker用`-FixtureAssemblyPath`は候補runtimeとは区別する。旧schema fixtureを新版で捏造せず、所有済み旧rootの直接Bin破棄、壊れたfile本文の非読取、registry混在/他config/未知非所有領域の保護、dry-run不変更・gate不作成、中断後の自動再送拒否・明示ack、policy 0→2と更新時の後online store回収を確認する。旧file復元・bundle・sidecar・copy・履歴圧縮は成功条件へ残さない。
 - 並行・待機: 同一対象・親子・共有ハードリンクの排他、全preflight失敗時保全、process worker上限、入力順を確認する。60秒超ロック待機と解放後続行、CLI stderr/stdout、MCP token付き進捗と最終応答後抑止、EOF後完了を確認する。
 - 削除待機キュー: キュー・実体照合・CLI/MCP入口を変更した場合は`scripts/Verify-DeferredDeleteQueue.ps1 -ExecutablePath <今回のexe絶対パス> -ConfigPath <設定絶対パス> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSON絶対パス>`を実行する。待機・取消・解放後の削除・stdio切断後の継続を確認し、保持期限や各上限などの追加検証範囲は[検証手順](docs/verification.md#一時的なロックとロード中dll)と照合する。通常の同期削除の検証だけで代替しない。
-- 再帰永久削除: 子の実体・時刻照合を変更した場合は`scripts/Verify-HardlinkEntryTimes.ps1`へ`-ExecutablePath`・`-AssemblyPath`・`-ExpectedAssemblySha256`・未使用の外部D絶対パスの`-OutputDirectory`・外部JSONの`-ReportPath`を渡す。CLI/MCPのハードリンク削除と別名の保全、Core境界での変更検知と診断値を区別して確認する。候補assemblyは今回のexeと同じビルドを使う。
+- 再帰永久削除: 子の実体・時刻照合を変更した場合は`scripts/Verify-HardlinkEntryTimes.ps1`へ`-ExecutablePath`・`-RustProbePath`・`-BuildManifestPath`・`-ExpectedBuildManifestSha256`・未使用の外部D絶対パスの`-OutputDirectory`・外部JSONの`-ReportPath`を渡す。CLI/MCPのハードリンク削除と別名の保全、Core境界での変更検知と診断値を区別して確認する。probeは今回のexeと同じ不変更ソースから作り、build manifestのSHA-256を固定する。
 - レジストリ: `scripts/Verify-RegistryRecovery.ps1`と、native sessionの`Verify-RegistrySession.ps1`のPrepare・Start（`-AssertNativeWindows`）・Current・Runを使う。完全ACL/raw bytes・競合・transaction・snapshot保全・専用namespace/予算を確認する。同じexeのcurrent側6801拒否保全と明示native側CLI/MCP正常往復、実token・view/scopeを区別し、権限・KTM・viewの未検証を成功に数えない。
 - 保護アクセス・診断: 保護レジストリのopen・privilege・viewを変更した場合は`Verify-ProtectedRegistryAccess.ps1`と`Verify-ProtectedRegistryViews.ps1`、ファイルのアクセス拒否・削除後確認の診断を変更した場合は`Verify-AccessDeniedFiles.ps1`も実行する。引数とfixture条件は[検証手順](docs/verification.md)に従い、API適合性probeとCLI/MCP E2Eの結果を区別する。
 - snapshot公開: 容量予約・本文のシリアライズ・公開処理を変更した場合は`scripts/Verify-RegistrySnapshotPublication.ps1`も実行する。必須引数と保存境界の検証範囲は[レジストリ検証](docs/verification.md#レジストリの削除と復元)に従い、実レジストリの往復検証とは区別する。
 - 導入: installer・共通指示・登録解除変更では`scripts/Verify-LatestInstall.ps1`を実行する。fixtureと実GitHub、保存内容と実ホストhook読込・承認・guide遵守を区別する。移行開始後の失敗で旧binaryへrollbackせず新exe/設定/登録を保全し、同じCLIで再開できることを確認する。
-- 起動時更新: `integration/start-prunlet-mcp.ps1`・`src/Prunlet/Core/StartupUpdate*`・公開ZIPの生成や登録を変更した場合は、[導入検証](docs/verification.md#latestインストーラー)の起動時更新の範囲も確認する。公開と同じZIPによる複数回更新、使用中の延期、独立hook、途中再開、登録改変の保全、ADSを含む容量上限を検証し、通常の導入検証だけで代替しない。
+- 起動時更新: `integration/start-prunlet-mcp.ps1`・`src/rust/update`・公開ZIPの生成や登録を変更した場合は、[導入検証](docs/verification.md#latestインストーラー)の起動時更新の範囲も確認する。公開と同じZIPによる複数回更新、使用中の延期、独立hook、途中再開、登録改変の保全、ADSを含む容量上限を検証し、通常の導入検証だけで代替しない。
 
 ゴミ箱全体の空化・既存項目の清掃を行わず、今回fixtureだけを扱う。検証後の保持・清掃は[検証手順](docs/verification.md#検証後の保持と清掃)に従い、未清掃パス・理由・再開条件を返す。
 
@@ -61,6 +61,6 @@ Dependabotと依存検証・自動マージのworkflowを変更する場合は�
 
 利用者向け導入は`scripts/Install-Prunlet.ps1`でGitHubの既定ブランチ最新HEADを解決する。開発クローンやローカルビルドをlatest導入の代用にしない。インストール元のリポジトリ・取得ブランチ・コミットは`source-info.json`へ記録する。既存設定は[容量上限の一度だけの移行](DESIGN.md#容量上限の一度だけの移行)を除いて保持する。旧復元データはCoreの明示`migrate`で移行し、通常APIから変更しない。設定読込・dry-runへ暗黙の適用を持ち込まず、移行済み印と移行後の利用者変更を尊重する。導入検証では、旧容量からの移行、未知の設定とACLの保持、再更新時の冪等性、ロック・登録失敗時の原本保全と復旧も確認する。
 
-MCP起動時の自動更新は手動導入とは別の経路である。[更新の設計](DESIGN.md#起動時自動更新)に従い、更新状態・製品排他・配布検証・容量検査を迂回しない。配布物は`scripts/Package-PrunletUpdate.ps1`で生成し、公開タグから生成するrelease workflowとの形式の一致を維持する。公開ZIPは`scripts/Verify-ReleasePackage.ps1 -PackagePath <ZIP絶対パス> -SourceRoot <ソース絶対パス> -PublishDirectory <publish絶対パス> -CommitSha <40桁SHA> -DefaultBranch <既定ブランチ> -Runtime <win-x64|win-arm64> -Repository <owner/repo>`で生成元と照合し、返されたZIP全体のSHA-256がアップロード直前にも一致することを確認する。
+MCP起動時の自動更新は手動導入とは別の経路である。[更新の設計](DESIGN.md#起動時自動更新)に従い、更新状態・製品排他・配布検証・容量検査を迂回しない。配布物は`scripts/Package-PrunletUpdate.ps1`で生成し、公開タグから生成するrelease workflowとの形式の一致を維持する。公開ZIPは`scripts/Verify-ReleasePackage.ps1 -PackagePath <ZIP絶対パス> -SourceRoot <ソース絶対パス> -PublishDirectory <publish絶対パス> -CommitSha <40桁SHA> -DefaultBranch <既定ブランチ> -Runtime <win-x64|win-arm64> -Repository <owner/repo>`で生成元と照合し、返されたZIP全体のSHA-256がアップロード直前にも一致することを確認する。R2への配置・公開URL照合は`Publish-PrunletR2.ps1`を使い、その成功後だけ同一ZIPを旧版互換用のGitHub Release assetへ添付する。公開は明示依頼時だけ行い、[配布の設定](docs/distribution.md)にあるR2資格情報をログへ出さない。R2への変更で旧CLIの内部コマンド・既存stageの意味やGitHub側の信頼検証を変えない。
 
 依存追加、公開、バージョン変更、Gitのコミット・プッシュは今回の依頼に含まれる場合だけ行う。コードコメントは日本語。[README](README.md)は利用者向け、[DESIGN.md](DESIGN.md)は現在の設計、連携と検証の詳細は`docs/`、エージェントの作業規約は本ファイルに置き、同じ説明を複製せず参照する。

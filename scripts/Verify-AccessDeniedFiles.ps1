@@ -1,9 +1,9 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$ExecutablePath, [Parameter(Mandatory)][string]$AssemblyPath, [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedAssemblySha256, [Parameter(Mandatory)][string]$OutputDirectory, [Parameter(Mandatory)][string]$ReportPath)
+param([Parameter(Mandatory)][string]$ExecutablePath,[Parameter(Mandatory)][string]$RustProbePath,[Parameter(Mandatory)][string]$BuildManifestPath,[Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBuildManifestSha256,[Parameter(Mandatory)][string]$OutputDirectory,[Parameter(Mandatory)][string]$ReportPath)
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
-foreach ($path in @($ExecutablePath, $AssemblyPath, $OutputDirectory, $ReportPath)) { if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Absolute paths required.' } }
+foreach ($path in @($ExecutablePath,$RustProbePath,$BuildManifestPath,$OutputDirectory,$ReportPath)) { if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Absolute paths required.' } }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $ReportPath = [IO.Path]::GetFullPath($ReportPath)
 if ($ReportPath.Equals($OutputDirectory.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) -or $ReportPath.StartsWith($OutputDirectory.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'ReportPath must be outside OutputDirectory.' }
@@ -12,16 +12,19 @@ foreach ($path in @($OutputDirectory, $ReportPath)) {
     if ([IO.Path]::GetPathRoot($path) -ine 'D:\' -or (Test-Path -LiteralPath $path)) { throw 'Unused external D output required.' }
     if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) { throw 'Output parent must exist.' }
 }
-if (![IO.File]::Exists($ExecutablePath) -or ![IO.File]::Exists($AssemblyPath)) { throw 'Candidate executable/assembly missing.' }
-$assemblyHash = (Get-FileHash -LiteralPath $AssemblyPath).Hash
-if ($assemblyHash -cne $ExpectedAssemblySha256.ToUpperInvariant()) { throw 'Candidate assembly hash mismatch.' }
-$assembly = [Reflection.Assembly]::LoadFrom($AssemblyPath)
-$settingType = $assembly.GetType('Prunlet.Core.RecycleImmediateDeleteSetting', $true)
+. (Join-Path $PSScriptRoot 'recordless-e2e/RustFileProbe.Common.ps1')
+$buildBinding=Assert-RustFileProbeBinding
+$null=[IO.Directory]::CreateDirectory($OutputDirectory)
 $volumeRoot = [IO.Path]::GetPathRoot($OutputDirectory)
-$setting = $settingType.GetMethod('TryCapture', [Reflection.BindingFlags]'NonPublic,Static').Invoke($null, [object[]]@([string]$OutputDirectory))
-if (!$setting) { throw 'Immediate-delete setting for the effective user/output volume could not be confirmed; no fixtures were created or deleted.' }
-$revalidate = $settingType.GetMethod('Revalidate', [Reflection.BindingFlags]'NonPublic,Instance')
-$preconditions = @{ outputDirectory = $OutputDirectory; reportPath = $ReportPath; settingProbePath = $OutputDirectory; volumeRoot = $volumeRoot; sid = $setting.Sid; volume = $setting.Volume; immediateDeleteConfirmed = $true }
+$settingEnvelope=Invoke-RustFileContract 'file-immediate-delete-setting' $OutputDirectory
+$setting=$settingEnvelope.result
+if (!$setting.confirmed) { throw 'Candidate Rust Core could not confirm immediate-delete configuration; no deletion fixtures were created or deleted.' }
+function Assert-CurrentImmediateSettingA {
+    $current=Invoke-RustFileContract 'file-immediate-delete-setting' $OutputDirectory
+    if(!$current.result.confirmed -or $current.result.sid -cne $setting.sid -or $current.result.volume -cne $setting.volume) { throw 'Effective user or immediate-delete volume setting changed; deletion stopped.' }
+    return $current
+}
+$preconditions = @{ outputDirectory = $OutputDirectory; reportPath = $ReportPath; settingProbePath = $OutputDirectory; volumeRoot = $volumeRoot; sid = $setting.sid; volume = $setting.volume; immediateDeleteConfirmed = $true; nativeProbe=$settingEnvelope }
 $script:fixtureRun = $null
 $script:temp = Join-Path $OutputDirectory 'temp'; $null = [IO.Directory]::CreateDirectory($script:temp)
 $oldTemp = $env:TEMP; $oldTmp = $env:TMP; $env:TEMP = $script:temp; $env:TMP = $script:temp
@@ -29,13 +32,14 @@ $common = Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1'; . $common
 $script:commands = [Collections.Generic.List[object]]::new(); $results = [Collections.Generic.List[object]]::new()
 $helpers = @('NativeShellFixture.cs', 'FixtureNative.cs', 'OwnedBinLocator.cs', 'AccessDeniedFixture.cs') | ForEach-Object { Join-Path $PSScriptRoot "recordless-e2e/$_" }
 $sources = @(@($PSCommandPath, $common, (Join-Path $PSScriptRoot 'Verification-Common.ps1')) + $helpers | ForEach-Object { @{ path = $_; sha256 = (Get-FileHash -LiteralPath $_).Hash } })
+$sources+=@(Get-RustFileProbeSourceHashes)
 try {
     Add-Type -Path $helpers -CompilerOptions '/unsafe'
     foreach ($transport in @('cli', 'mcp')) { foreach ($mode in @('pending-root', 'pending-child', 'acl-preflight')) {
         $name = "$transport-$mode"; $script:observed = @{}; $holder = $null; $parentHolder = $null; $session = $null; $binRoots = @()
         try {
             # 実効user/volume設定を変えず、fixture作成前とCLI/MCP要求前に同じ候補Coreで再照合する。
-            $revalidate.Invoke($setting, [object[]]@([string]$OutputDirectory))
+            $script:observed.settingBeforeFixture=Assert-CurrentImmediateSettingA
             $s = New-ScopeR ($name + '-' + [guid]::NewGuid().ToString('N')) -HostVolume
             $target = [IO.Path]::GetFullPath((File-R $s 'tree/registry.json.bak.10')); $tree = [IO.Path]::GetDirectoryName($target); $sibling = File-R $s 'unrelated'
             $before = Snapshot-R $target; $siblingBefore = Snapshot-R $sibling
@@ -54,7 +58,7 @@ try {
                 Assert-R ($openError -eq 5) 'DACL fixture did not reject the production DELETE|READ_ATTRIBUTES rights'
             }
             $paths = if ($mode -eq 'pending-child') { @($tree) } elseif ($mode -eq 'acl-preflight') { @($sibling, $target) } else { @($target) }
-            $revalidate.Invoke($setting, [object[]]@([string]$OutputDirectory))
+            $script:observed.settingBeforeDeletion=Assert-CurrentImmediateSettingA
             if ($transport -eq 'cli') {
                 $response = Delete-R $s $paths -Recursive; $script:observed.response = $response
                 Assert-R ($response.exitCode -ne 0) 'Expected deletion failure was successful'
@@ -120,7 +124,7 @@ try {
         }
     } }
 } finally {
-    $report = @{ suite = 'access-denied-pending-and-dacl'; executablePath = $ExecutablePath; executableSha256 = (Get-FileHash -LiteralPath $ExecutablePath).Hash; assemblyPath = $AssemblyPath; assemblySha256 = $assemblyHash; preconditions = $preconditions; sources = $sources; expectedCount = 6; executedCount = $results.Count; passed = @($results | Where-Object passed).Count; failed = @($results | Where-Object { !$_.passed }).Count; results = @($results); commands = @($script:commands); retained = $OutputDirectory }
+    $report = @{ suite = 'access-denied-pending-and-dacl'; executablePath = $ExecutablePath; executableSha256 = (Get-FileHash -LiteralPath $ExecutablePath).Hash; rustProbePath=$RustProbePath; sameSourceBuild=$buildBinding; preconditions = $preconditions; sources = $sources; expectedCount = 6; executedCount = $results.Count; passed = @($results | Where-Object passed).Count; failed = @($results | Where-Object { !$_.passed }).Count; results = @($results); commands = @($script:commands); retained = $OutputDirectory }
     Save-R $ReportPath $report; $env:TEMP = $oldTemp; $env:TMP = $oldTmp
 }
 $report | Select-Object passed, failed, expectedCount, executedCount | ConvertTo-Json -Compress

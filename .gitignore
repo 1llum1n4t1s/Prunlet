@@ -2,3 +2,7 @@
 bin/
 obj/
 *.user
+target/
+!src/rust/bin/
+src/rust/bin/*
+!src/rust/bin/*.rs

@@ -4,16 +4,20 @@
 
 ## 構成と責務
 
-- `Core/DeletionService`がファイル削除・レジストリ削除と復元・保守・明示移行を担当する。CLI・MCP・hookに別の削除方式を実装しない。
-- `Program`はCLIの入力検証とJSON出力、`Protocol/McpServer`はstdio JSON-RPCを担当する。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールである。`--config <path> mcp`として起動した場合は、起動前・引数検証の例外もstderrへ出してプロトコルstdoutを保つ。他のCLIでは例外をstdoutのJSONで返し、値名などの引数に`mcp`が含まれるだけでは出力先を変えない。
+- Rust実装は`src/rust`に置く。`service::Runtime`がCLI・MCP共通の要求入口となり、`files`・`registry`・`migration`・`update`へ渡す。Windowsのhandle・SID・security descriptor・KTMは`platform/windows`、macOSのdevice/inode・ACL・Foundation Trashは`platform/macos`が担当する。削除をC#プロセスへ委譲せず、CLI・MCP・hookに別の削除方式を実装しない。
+- `cli.rs`はCLIの入力検証とJSON出力、`protocol/mcp.rs`はstdio JSON-RPCを担当する。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールである。`--config <path> mcp`として起動した場合は、起動前・引数検証の例外もstderrへ出してプロトコルstdoutを保つ。他のCLIでは例外をstdoutのJSONで返し、値名などの引数に`mcp`が含まれるだけでは出力先を変えない。
 - hookは認識した直接削除を検査・拒否し、配置済みCLIを案内する。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
-- Windows Shellがゴミ箱への移動とファイル復元を担当する。Prunletのファイル復元API・通常の履歴圧縮入口は提供しない。
+- Windows ShellまたはmacOS Foundationがゴミ箱への移動を担当し、復元と保持管理はOSへ任せる。Prunletのファイル復元API・通常の履歴圧縮入口は提供しない。
+
+移行中は`src/Prunlet`を旧実装の互換性参照として保持する。C#版で作ったschema 5レジストリ記録と真正な旧版ファイル退避データを検証に利用し、Rust候補へ旧DLLを渡して候補自身の検証と見なさない。製品runtimeに.NETを必要としない。OSごとの対応範囲と制約は[macOSの導入・利用](docs/macos.md)を参照する。
+
+macOSはFoundationのTrash APIを使い、Windowsの永久削除例外やレジストリ形式を適用しない。device/inode・親・名前を処理前後に照合するが、開いたfdで外部のrenameを禁止する保証はない。不一致や結果不明は`ambiguous`で停止する。設定・metadataの保護はPOSIX modeに加えて拡張ACLと実体を検査し、既存ACLの書換えで通さない。キューの対象・実体・結果はworkerメモリーだけに保持する。ユーザーUIDを含む固定8つのMach service名の受信権を受付枠とし、audit tokenと世代nonceで要求・応答の相手を照合する。ファイルにendpoint・job ID・結果を残さず、worker死亡や世代変更では結果不明として再送しない。使用中待機は協調的なadvisory `flock`に限定する。
 
 権限の境界はホストのsandbox承認、Windowsの実トークン、Prunlet Coreの対象検証に分かれる。Prunlet自身は自動昇格しないが、許可された削除についてエージェントが明示的に管理者CMDを起動し、同じ配置済みCLIと設定を使う連携は別の責務である。起動成功だけを削除成功とは扱わず、拒否・結果不明を昇格で迂回しない。起動と結果確認の手順は[連携手順](docs/integration.md#sandboxとゴミ箱へのアクセス)に集約する。
 
 ### フックのshell解析境界
 
-`Protocol/HookRouter`は`Bash`・`exec_command`・`functions.exec_command`のコマンド文字列を検査する。`exec_command`系の明示的な`tool_input.shell`がPowerShellまたはCMDなら、その文字列規則を選択する。shell未指定・未知・Posix系の指定、および`Bash`ではCMD・PowerShell・Posixの複数規則で検査する。未知shellをCMDで実行するWindowsホストがあるため、tool名やshell名だけからPosix実行とは推測しない。静的なshell wrapperのコマンド本文も再帰検査し、認識したPowerShell・CMDのwrapperには対応する規則を使う。
+`protocol/hook.rs`は`Bash`・`exec_command`・`functions.exec_command`のコマンド文字列を検査する。`exec_command`系の明示的な`tool_input.shell`がPowerShellまたはCMDなら、その文字列規則を選択する。shell未指定・未知・Posix系の指定、および`Bash`ではCMD・PowerShell・Posixの複数規則で検査する。未知shellをCMDで実行するWindowsホストがあるため、tool名やshell名だけからPosix実行とは推測しない。静的なshell wrapperのコマンド本文も再帰検査し、認識したPowerShell・CMDのwrapperには対応する規則を使う。
 
 拒否理由の検知情報と解析中のshell規則は要求専用の`HookRouter`インスタンスに保持し、別要求へ持ち越さない。検知した命令・オプションと、その検知に使ったshell解釈を応答へ含め、検査不能な入力には原因を返す。shell未指定・未知の場合は候補の解釈であることを明示し、ローカル削除と断定しない。検索文字列やリモートスクリプトの引用も別shellでは命令になり得るため、CLI案内は許可されたWindows対象に限定する。応答形式と利用時の扱いは[連携手順](docs/integration.md#hookの検査範囲)を参照する。
 
@@ -139,13 +143,19 @@ latest導入時に`capacityDefaultMigrationVersion`が欠落または1未満の�
 
 ### 起動時自動更新
 
-CodexのMCP登録は`integration/start-prunlet-mcp.ps1`をPowerShell 7で起動する。launcherがGitHubへの照会と更新手順の調停を行い、`Core/StartupUpdateCoordinator`が製品・登録・移行の状態遷移を、`StartupUpdatePackage`・`StartupPublishedDownload`がパッケージ検証と取得を、`StartupUpdateBudget`・`StartupUpdateSlot`・`StartupUpdateRotation`が容量と再利用を担当する。`StartupUpdateGate`は通常CLI・MCP・保守の開始前に更新状態を検査する。hook専用の`prunlet-hook.exe`はこのgateを通らず、削除を実行するCLIのパスを受け取って案内する。
+WindowsのCodex MCP登録は`integration/start-prunlet-mcp.ps1`をPowerShell 7で起動する。launcherがGitHubへの照会と更新手順の調停を行い、`update/coordinator.rs`が製品・登録・移行の状態遷移を、`package.rs`・`download.rs`がパッケージ検証と取得を、`budget.rs`・`slot.rs`・`rotation.rs`が容量と再利用を担当する。`gate.rs`は通常CLI・MCP・保守の開始前に更新状態を検査する。hook専用の`prunlet-hook.exe`はこのgateを通らず、削除を実行するCLIのパスを受け取って案内する。
 
 MCP起動時に公開済みlatestを確認し、既存版の子孫で更新protocolと保管形式が互換の候補だけを準備する。既存の製品・登録の所有とhashを確認し、旧CLI/MCPと保守exeを同時にwrite排他できなければ変更せず延期する。hookは独立exeとして継続し、旧プロセスを終了させない。固定の更新状態は製品切替・登録・移行の再開と更新cacheの所有確認・再利用に限り、ファイル操作履歴には使わない。途中状態では通常CLI/MCPと保守を止め、候補からレジストリ移行を再開する。移行開始後は旧exeへrollbackせず、registryが利用可能になってからsource-infoとidleを確定する。書込みや置換が不明なときは保全して自動再送せず、確定したregistryの利用とは分離する。
 
 stageは再帰削除せず、完了した世代の正規製品とmetadataをhashと実体で照合して主streamだけを再利用する。正常な次回更新を、stageが存在するだけで止めない。未知の項目は残して容量へ含め、未確定の切替・移行は先に同じ候補で再開する。
 
-配布元の方針は公開済みGitHub Releaseであり、その発行者を信頼する。`.github/workflows/prunlet-release-package.yml`が公開タグからwin-x64・win-arm64をビルドし、`scripts/Package-PrunletUpdate.ps1`でZIPを作成する。公開前に`Verify-ReleasePackage.ps1`がentryの過不足・重複、metadataの取得元・commit・runtime等、および全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合する。検証済みZIP全体のSHA-256をアップロード直前にも再確認し、同じreleaseへ添付する。既存assetは上書きしない。取得側はタグが既定ブランチ上のcommitを指すこととasset digest・size、パッケージ内のcommit・runtime・製品hashを検証する。digestは転送内容の一致を示し、ソースからビルドされたことを独立に証明しない。Actionsの期限付きartifactを更新の必須条件としない。
+Windowsの公式配布はCloudflare R2を取得先とし、公開済みGitHub Releaseの発行者を信頼の基点として維持する。`.github/workflows/prunlet-release-package.yml`が公開タグからwin-x64・win-arm64をビルドし、`scripts/Package-PrunletUpdate.ps1`でZIPを作成する。公開前に`Verify-ReleasePackage.ps1`がentryの過不足・重複、metadataの取得元・commit・runtime等、および全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合する。`Publish-PrunletR2.ps1`は検証したZIPを固定し、S3互換APIからR2の不変キーへ配置して公開URLの全bytesを照合する。その後に同一ZIPを従来名のGitHub Release assetへ添付する。R2の既存objectとGitHubの既存assetを異なる内容で上書きしない。
+
+取得側は従来どおり、タグが既定ブランチ上のcommitを指すこと、インストール済みcommitからの子孫であること、GitHub assetのdigest・size・IDを検査する。R2 URLは固定ホスト`https://prunlet.kagayoi.com`と`releases/{repository小文字}/{commit小文字}/{runtime}/{ZIP SHA-256小文字}.zip`から導出し、任意のURLを入力しない。GitHubとは独立した保存先にある同じbytesを照合するため、R2に置いたchecksumだけを配布元の証明に使わない。パッケージ内のcommit・runtime・製品hashも検証し、`source-info.json`へ今回選択した配布URLを記録する。検証済みの同一ZIPをcacheから再利用した場合は通信せず、その配布URLを記録する。既存の候補source-infoを異なるURLへ上書きしない。digestは転送内容の一致を示し、ソースからビルドされたことを独立に証明しない。Actionsの期限付きartifactを更新の必須条件としない。
+
+起動時protocolがR2対応を明示する公式リポジトリのRust CLIだけが、新規stageにR2を選択する。検証済みの準備途中stageは作成時の配布先を継承して完了させ、新しいlauncherの既定値で別のURLへ付け替えない。旧CLIと別リポジトリは取得前に従来のGitHub経路を選び、既存5/7引数の内部コマンドとGitHub経路の旧CLIによるstage再開は従来の意味を保つ。R2専用stageを旧CLIへ強制して再準備する操作は未対応で、拒否して保全する。R2取得後の失敗をGitHubへの自動再試行で回避しない。取得失敗時に安全な現在版を継続する境界は変えない。手動installerの最新HEADからのソース取得・ビルド契約と、macOSで起動時更新を提供しない境界も維持する。
+
+CIは純git・PowerShell・GitHub CLIを使い、Node.js製Actionを呼ばない。checkoutはイベントのSHAへ固定し、認証情報を永続化しない。自動マージは信頼済みworkflowの中だけで実行し、PRのコードを読み込んだり実行したりしない。R2の設定・資格情報と公開手順は[配布の設定](docs/distribution.md)へまとめる。
 
 更新用cacheはレジストリ復元領域とは別に合計2 GiBを上限とする。公開ZIP・stage・製品slot・固定candidate/previous・保全した異常世代・各ディレクトリのADS・更新管理ファイルを容量に含め、確保前と完了後に検査する。slotはcache専用で、実行・移動・削除しない。正規hash・長さ・単一linkを同じ排他handleで確認し、通常streamだけをin-place更新する。候補へはそのhandleの通常streamだけをCreateNewコピーする。ADSや不明な部分書込みは保持し、予算不足を自動削除で回避しない。
 
@@ -153,6 +163,10 @@ stageは再帰削除せず、完了した世代の正規製品とmetadataをhash
 
 ## 依存更新の境界
 
-`.github/dependabot.yml`はGitHub ActionsとNuGetの更新を毎週月曜09:00（日本時間）に確認し、minor・patchをまとめ、majorは個別PRにする。`.github/workflows/dependency-validation.yml`はDependabotのPRまたは手動起動を対象に、Windows・.NET 10でrestore・buildとCLI・MCP・hookの通常E2Eを行う。出力はrunnerの一時領域へ分離し、checkoutの認証情報を保持せず、権限はcontentsの読取りに限定する。
+製品とprobeのソース結合はCargo manifest・lock・toolchain・build script、`src/rust`全ファイルとリポジトリ直下の`.cargo`全ファイルを対象にする。Cargo設定の新規追加も入力集合の変化として検知する。探索対象となる祖先と`CARGO_HOME`の`config`・`config.toml`は、ビルド前後の存在とSHA-256を固定してbuild manifestへ記録し、設定本文や資格情報を保存しない。入力のリンクや不明な型は拒否する。
+
+`.github/dependabot.yml`はGitHub Actions・Cargo・Rust toolchainの更新を毎週月曜09:00（日本時間）に確認し、minor・patchをまとめ、majorは個別PRにする。`.github/workflows/dependency-validation.yml`はDependabotのPRまたは手動起動を対象に、Windowsと`rust-toolchain.toml`の指定版でlocked build・テストとCLI・MCP・hookの通常E2Eを行う。ビルド・検証・成果物の記録も同じ指定版を使用する。出力はrunnerの一時領域へ分離し、checkoutの認証情報を保持せず、権限はcontentsの読取りに限定する。
+
+通常E2Eは同じソース入力から作った製品・検証probeのbuild manifestを固定し、62件すべての実行・失敗0・skip 0・`completeVerified`を要求する。即時削除の3件には`New-CIImmediateVolume.ps1`が使い捨てWindows runnerの`RUNNER_TEMP`直下へ新規VHDXを作り、新しいNTFS volume GUIDだけへ即時削除設定を設ける。既存C/Dドライブや既存volume設定を変更しない。通常payloadはユーザープロファイル下、即時削除payloadだけは`-ImmediateFixtureRoot`へ分離する。image・disk・drive・volume GUIDの照合や作成権限を確認できなければ失敗とし、skipで自動マージを通さない。ローカルホストへこのCI専用helperを実行せず、終了時は使い捨てrunner VMを破棄する。macOSは独立したjobでnative testとarm64/x64のMach-O生成を検査する。
 
 `.github/workflows/dependabot-auto-merge.yml`は、書込み権限を持つ処理を信頼済み既定ブランチ側で実行し、PRのコードは実行しない。対象は所有者`1llum1n4t1s`のリポジトリで、同一リポジトリから既定ブランチへ向けたDependabotの非draft PRに限る。依存更新として判定できる差分と署名済みコミットを検査し、workflowの変更は`uses`の参照更新だけを許可する。PRのhead SHAに対応する依存検証の最新実行が成功し、他のcheck・commit statusにも失敗や未完了がなく、競合がない場合だけマージを試みる。直前にhead・既定ブランチのSHAとマージ可能状態を再確認し、変更や未検証状態があれば保留する。GitHub側のマージ要件も維持する。依存検証の成功と書込み処理を分離することで、未検証のPRコードをマージ権限で実行する経路を避ける。

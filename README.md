@@ -1,10 +1,12 @@
 # Prunlet — Anti “blocked by policy”
 
-Prunletは、`blocked by policy`による清掃の停止を減らすために、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約するWindows用ツールです。許可された削除を最初からPrunletへ任せる使い方に揃えます。
+Prunletは、`blocked by policy`による清掃の停止を減らすために、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約するWindows・macOS向けのRust製ツールです。許可された削除を最初からPrunletへ任せる使い方に揃えます。
 
 指定したファイル・フォルダーを通常はWindowsのゴミ箱へ移します。予約名の通常ファイル、Windowsがゴミ箱には大きすぎると判断した対象、および対象ドライブで即時削除が明示設定されWindowsがゴミ箱を利用できないと返した対象は、元の実体と名前を確認できた場合に限り永久削除を試みます。Prunletはファイルの操作記録・操作ID・復元用snapshotを保存せず、ゴミ箱に移った項目の復元と保持期間の管理はWindowsに任せます。レジストリのキー・値は専用snapshotとトランザクションで保全し、操作IDによる非上書き復元を提供します。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
 
 ファイルと空フォルダーを扱い、`--recursive`を明示するとフォルダー全体を削除できます。リンク先は辿りません。上記の判定・設定を確認できないゴミ箱の失敗では永久削除や独自退避へ切り替えません。ハードリンクは生存する別名と内容を共有するため、保存時点の不変コピーではありません。
+
+以下の導入・レジストリ・更新の説明はWindows向けです。macOSではFoundationでTrashへ移動し、永久削除へ切り替えません。CLIと5つのMCPツール名は共通ですが、Windowsレジストリ・native session・Windows用更新パッケージは利用できません。Macの導入、POSIXパス、ACL、使用中ファイルとキューの制約は[macOSの手順](docs/macos.md)を参照してください。
 
 正式なsandbox権限申請に対応し、実効設定で申請が必要かつ許可されるCodexホストでは、実削除を初回から申請付きで実行します。dry-runはゴミ箱へのアクセス許可を保証しません。Windowsの管理者権限が必要な場合は、許可範囲内でエージェントが管理者CMDを起動し、同じ配置済みCLIと設定で実行・結果確認を行います。本人のUAC同意が必要な場合は操作を案内します。Prunlet自身は自動昇格せず、拒否・結果不明を別経路で再試行しません。詳細は[連携手順](docs/integration.md#sandboxとゴミ箱へのアクセス)を参照してください。
 
@@ -30,7 +32,7 @@ CodexからMacなどへ送るPowerShellスクリプトは、[フックの連携�
 
 ## インストールと更新
 
-Windows、.NET 10 SDK、PowerShell 7が必要です。インストール元は[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の既定ブランチの最新HEADです。開発用クローンは使用しません。
+Windows、[rust-toolchain.toml](rust-toolchain.toml)で固定したRust（MSVC）、Visual StudioのC++ビルドツールとWindows SDK、PowerShell 7が必要です。製品の実行に.NETは不要です。インストール元は[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の既定ブランチの最新HEADです。開発用クローンは使用しません。
 
 Windows ARM64では、下の実行コマンドに`-Runtime win-arm64`を追加してください。既定は`win-x64`で、ARM64での未指定は停止します。x64エミュレーションを選ぶ場合も`-Runtime win-x64`の明示指定が必要です。
 
@@ -50,7 +52,7 @@ GitHub APIの未認証枠が上限に達した場合は、上の`pwsh`コマン�
 
 自動更新では、CodexがPrunlet MCPを起動する際に公開済み最新版のバイナリを確認し、旧MCPや保守プロセスが終了しているときに切り替えます。使用中なら終了させず、次のMCP起動時に再確認します。通信や取得に失敗した場合は、更新前の状態が安全に保たれていれば現在の版を使います。
 
-自動更新はGitHub Releaseの発行者を信頼し、取得した配布物の一致を検査します。検証の仕組みと信頼範囲は[起動時自動更新の設計](DESIGN.md#起動時自動更新)を参照してください。
+Windowsの自動更新はCloudflare R2から配布物を取得し、GitHub Releaseの発行者・コミット・配布物のハッシュを検証します。同じZIPをGitHubにも残し、旧版の更新を維持します。R2対応前のCLIと別リポジトリの導入は、従来のGitHub取得を使います。[配布の設定](docs/distribution.md)と[信頼範囲](DESIGN.md#起動時自動更新)を参照してください。
 
 更新データは専用の2 GiB枠で管理します。確認済みの領域を再利用し、未知のデータや中断した出力は保全します。容量不足時は更新を延期し、レジストリの復元データは整理対象にしません。
 

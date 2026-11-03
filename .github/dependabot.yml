@@ -19,8 +19,8 @@ updates:
       - patch
   commit-message:
     prefix: deps
-- package-ecosystem: nuget
-  directory: /src/Prunlet
+- package-ecosystem: cargo
+  directory: /
   schedule:
     interval: weekly
     day: monday
@@ -38,3 +38,20 @@ updates:
     prefix: deps
   allow:
   - dependency-type: all
+- package-ecosystem: rust-toolchain
+  directory: /
+  schedule:
+    interval: weekly
+    day: monday
+    time: '09:00'
+    timezone: Asia/Tokyo
+  open-pull-requests-limit: 5
+  groups:
+    minor-and-patch:
+      patterns:
+      - '*'
+      update-types:
+      - minor
+      - patch
+  commit-message:
+    prefix: deps

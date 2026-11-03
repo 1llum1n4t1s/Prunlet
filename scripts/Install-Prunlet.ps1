@@ -85,7 +85,7 @@ function Assert-ExternalPath([string]$Path, [string]$Name) {
     }
     $cursor = $full
     while ($cursor) {
-        if ((Test-Path -LiteralPath (Join-Path $cursor '.git')) -or (Test-Path -LiteralPath (Join-Path $cursor 'src\Prunlet\Prunlet.csproj'))) { throw "$Name cannot be inside a repository: $full" }
+        if ((Test-Path -LiteralPath (Join-Path $cursor '.git')) -or (Test-Path -LiteralPath (Join-Path $cursor 'Cargo.toml'))) { throw "$Name cannot be inside a repository: $full" }
         $cursor = Split-Path -Parent $cursor
     }
     return $full
@@ -134,7 +134,7 @@ function Expand-CheckedArchive([string]$Archive, [string]$Destination) {
         $rootName = @($roots)[0]
         $root = Join-Path $Destination $rootName
         if (!(Test-Path -LiteralPath $root -PathType Container)) { throw 'Source archive root is not a directory.' }
-        foreach ($required in @('src\Prunlet\Prunlet.csproj', 'scripts\Install-Prunlet.ps1', 'scripts\Publish-Prunlet.ps1', 'integration\start-prunlet-mcp.ps1', 'integration\configuration-common.ps1', 'integration\maintenance-task.ps1', 'integration\uninstall-maintenance.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1', 'integration\install-agent-instructions.ps1', 'integration\PRUNLET.md')) {
+        foreach ($required in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'build.rs', 'src\rust\main.rs', 'src\rust\lib.rs', 'scripts\Install-Prunlet.ps1', 'scripts\Publish-Prunlet.ps1', 'scripts\Publish-PrunletRust.ps1', 'scripts\RustBuildInputs.Common.ps1', 'integration\start-prunlet-mcp.ps1', 'integration\configuration-common.ps1', 'integration\maintenance-task.ps1', 'integration\uninstall-maintenance.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1', 'integration\install-agent-instructions.ps1', 'integration\PRUNLET.md')) {
             if (!(Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Latest source is not installable; required file missing: $required. Publish the source to the repository default branch first." }
         }
         return $root
@@ -154,7 +154,7 @@ $runId = 'install-' + [Guid]::NewGuid().ToString('N')
 $ForbiddenRoots = @((Assert-PlainPath $CodexHome 'CodexHome'), (Join-Path $env:USERPROFILE '.codex'))
 if ($env:CODEX_HOME) { $ForbiddenRoots += Assert-PlainPath $env:CODEX_HOME 'CODEX_HOME' }
 $scriptParent = Split-Path -Parent $PSScriptRoot
-if (Test-Path -LiteralPath (Join-Path $scriptParent 'src\Prunlet\Prunlet.csproj')) { $ForbiddenRoots += $scriptParent }
+if (Test-Path -LiteralPath (Join-Path $scriptParent 'Cargo.toml')) { $ForbiddenRoots += $scriptParent }
 $InstallDirectory = Assert-ExternalPath $InstallDirectory 'InstallDirectory'
 
 if (!$WorkDirectory) {
@@ -182,9 +182,7 @@ $updateBackup = Assert-ExternalPath (Join-Path $UpdateBackupRoot $runId) 'Update
 if ((Test-InTree $updateBackup $InstallDirectory) -or (Test-InTree $InstallDirectory $updateBackup) -or (Test-InTree $updateBackup $WorkDirectory) -or (Test-InTree $WorkDirectory $updateBackup)) { throw 'Update backup must be separate from install and work directories.' }
 if ((Test-InTree $updateBackup $effectiveBackup) -or (Test-InTree $effectiveBackup $updateBackup)) { throw 'Update backup must be separate from recovery data.' }
 if ($RegisterCodex -and $SettingsBackupDirectory) { $SettingsBackupDirectory = Assert-ExternalPath $SettingsBackupDirectory 'SettingsBackupDirectory' }
-if (!(Get-Command dotnet -ErrorAction SilentlyContinue)) { throw '.NET 10 SDK is required. Install the SDK and run this installer again.' }
-$sdks = @(& dotnet --list-sdks)
-if ($LASTEXITCODE -ne 0 -or !($sdks | Where-Object { $_ -match '^10\.' })) { throw '.NET 10 SDK is required; an installed runtime alone cannot build latest source.' }
+if (!(Get-Command cargo -CommandType Application -ErrorAction SilentlyContinue) -and !(Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe') -PathType Leaf)) { throw 'The Rust toolchain specified in rust-toolchain.toml and MSVC C++ build tools with Windows SDK are required; the .NET SDK is not used.' }
 $products = @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\prunlet-hook.exe', 'bin\Install-Prunlet.ps1', 'bin\start-prunlet-mcp.ps1', 'bin\configuration-common.ps1', 'bin\maintenance-task.ps1', 'bin\uninstall-maintenance.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
 $retiredProducts = @('bin\codex-pretooluse.ps1')
 $previousGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
@@ -242,7 +240,7 @@ try {
     . (Join-Path $sourceRoot 'integration\maintenance-task.ps1')
     $maintenanceState = Get-PrunletMaintenanceState (Join-Path $InstallDirectory 'bin\prunlet.exe') $configPath
     $buildRoot = Join-Path $WorkDirectory 'build'
-    & (Join-Path $sourceRoot 'scripts\Publish-Prunlet.ps1') -OutputDirectory $buildRoot -Runtime $Runtime | Out-Null
+    & (Join-Path $sourceRoot 'scripts\Publish-Prunlet.ps1') -OutputDirectory $buildRoot -Runtime $Runtime -SourceCommit $sha | Out-Null
     $exe = Join-Path $buildRoot 'publish\prunlet.exe'
     if (!(Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Build did not produce prunlet.exe.' }
     $maintenanceExe = Join-Path $buildRoot 'publish\prunlet-maintenance.exe'

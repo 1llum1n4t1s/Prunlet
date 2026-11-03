@@ -1,16 +1,19 @@
-﻿param(
+param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
     [string]$MoveExecutablePath,
     [string]$AssemblyPath,
+    [string]$RustProbePath,
     [string]$LegacyRegistryExecutablePath,
+    [string]$LatestRegistryExecutablePath,
     [string]$FixtureRoot,
     [switch]$AssertNativeWindows,
     [ValidateSet('Prepare', 'Start', 'Current', 'Run')][string]$Mode = 'Prepare',
     [ValidateSet(-1, 0, 6801)][int]$ExpectedCurrentSoftwareTransactionError = -1
 )
 $ErrorActionPreference = 'Stop'
+if ($AssemblyPath -and $RustProbePath) { throw 'Select either a C# candidate AssemblyPath or a Rust candidate RustProbePath; do not mix candidate runtimes.' }
 $powerShellHostPath = [IO.Path]::GetFullPath((Join-Path $PSHOME 'pwsh.exe'))
 if (![IO.File]::Exists($powerShellHostPath)) { throw 'Current PowerShell host executable missing.' }
 # 想定する失敗: scope/view混同、生bytes・class・完全ACLの欠落、既存復元先の上書き、
@@ -50,7 +53,7 @@ if ($Mode -eq 'Prepare') {
         $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($principal, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit', [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
     }
     $null = [IO.FileSystemAclExtensions]::CreateDirectory($security, $OutputDirectory)
-    foreach ($name in @('SessionLaunch.ps1','SessionLaunchNative.cs','SessionE2E.Common.ps1','SessionLockCases.ps1','Invoke-SessionE2E.ps1','NativeController.ps1','LimitedSession.ps1','ElevatedClient.ps1','FixtureNative.cs','SessionFixture.cs')) {
+    foreach ($name in @('RustProbe.Common.ps1','CurrentCandidate.ps1','SessionLaunch.ps1','SessionLaunchNative.cs','SessionE2E.Common.ps1','SessionLockCases.ps1','Invoke-SessionE2E.ps1','NativeController.ps1','LimitedSession.ps1','ElevatedClient.ps1','FixtureNative.cs','SessionFixture.cs')) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('registry-session-e2e\' + $name)) -Destination (Join-Path $OutputDirectory $name)
     }
     $null = [IO.Directory]::CreateDirectory((Join-Path $OutputDirectory 'temp'))
@@ -84,12 +87,19 @@ if ($Mode -eq 'Prepare') {
     $preparedSettings = [IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json -AsHashtable
     $preparedSettings.schema = 2; $preparedSettings.nonce = [guid]::NewGuid().ToString('N')
     $preparedSettings.assemblyPath = $AssemblyPath
+    $preparedSettings.candidateRuntime = if ($RustProbePath) { 'rust-libtest' } elseif ($AssemblyPath) { 'dotnet' } else { 'unconfigured' }
+    $preparedSettings.rustSourceRoot = if ($RustProbePath) { $repoRoot } else { $null }
+    $preparedSettings.rustProbePath = $RustProbePath
+    $preparedSettings.rustProbeSha256 = if ($RustProbePath) { (Get-FileHash -LiteralPath $RustProbePath -Algorithm SHA256).Hash } else { $null }
+    if ($RustProbePath) { . (Join-Path $PSScriptRoot 'registry-session-e2e\RustProbe.Common.ps1'); Assert-RustProbe $RustProbePath }
     if ($FixtureRoot) {
         if (![IO.Path]::IsPathFullyQualified($FixtureRoot) -or ![IO.Directory]::Exists($FixtureRoot)) { throw 'FixtureRoot must be an existing absolute directory.' }
         Assert-VerificationDestination $FixtureRoot @($repoRoot,$codexRoot)
     }
     $preparedSettings.fixtureRoot = $FixtureRoot
     $preparedSettings.assemblySha256 = if ($AssemblyPath) { (Get-FileHash -LiteralPath $AssemblyPath).Hash } else { $null }
+    $preparedSettings.latestRegistryExecutablePath = $LatestRegistryExecutablePath
+    $preparedSettings.latestRegistryExecutableSha256 = if ($LatestRegistryExecutablePath) { (Get-FileHash -LiteralPath $LatestRegistryExecutablePath).Hash } else { $null }
     $preparedSettings.legacyRegistryExecutablePath = $LegacyRegistryExecutablePath
     $preparedSettings.legacyRegistryExecutableSha256 = if ($LegacyRegistryExecutablePath) { (Get-FileHash -LiteralPath $LegacyRegistryExecutablePath).Hash } else { $null }
     $preparedSettings.inputs = @()
@@ -101,9 +111,15 @@ if ($Mode -eq 'Prepare') {
         $preparedInputs += Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $name
     }
     $preparedInputs += Join-Path $PSScriptRoot 'registry-session-e2e/RegistryControlCases.ps1'
-    foreach ($dependency in @($AssemblyPath,$LegacyRegistryExecutablePath) | Where-Object { $_ }) {
+    foreach ($dependency in @($AssemblyPath,$RustProbePath,$LegacyRegistryExecutablePath,$LatestRegistryExecutablePath) | Where-Object { $_ }) {
         if (![IO.Path]::IsPathFullyQualified($dependency) -or ![IO.File]::Exists($dependency)) { throw 'Checkpoint dependency must be an existing absolute candidate/baseline path.' }
         $preparedInputs += $dependency
+    }
+    if ($RustProbePath) {
+        $preparedInputs += @([IO.Directory]::EnumerateFiles((Join-Path $repoRoot 'src\rust'),'*.rs',[IO.SearchOption]::AllDirectories))
+        $preparedInputs += Join-Path $repoRoot 'Cargo.toml'
+        $preparedInputs += Join-Path $repoRoot 'Cargo.lock'
+        $preparedInputs += Join-Path $PSScriptRoot 'registry-session-e2e\RustProbe.Common.ps1'
     }
     if ($MoveExecutablePath) { $preparedInputs += $MoveExecutablePath }
     foreach ($preparedInput in ($preparedInputs | Select-Object -Unique)) {
@@ -135,8 +151,8 @@ $script:LaunchPrepared=$settings
 . (Join-Path $OutputDirectory 'SessionE2E.Common.ps1')
 AssertPreparedSettings $settings
 if ($Mode -in @('Start', 'Run') -and ([string]::IsNullOrWhiteSpace($settings.moveExecutablePath) -or
-    [string]::IsNullOrWhiteSpace($settings.assemblyPath) -or [string]::IsNullOrWhiteSpace($settings.legacyRegistryExecutablePath))) {
-    throw 'Full native validation requires Prepare -MoveExecutablePath (genuine schema4 baseline), -AssemblyPath (candidate DLL), and -LegacyRegistryExecutablePath (genuine schema5 baseline). No desktop session was launched by this invocation.'
+    ([string]::IsNullOrWhiteSpace($settings.assemblyPath) -and [string]::IsNullOrWhiteSpace($settings.rustProbePath)) -or [string]::IsNullOrWhiteSpace($settings.legacyRegistryExecutablePath) -or ($settings.rustProbePath -and [string]::IsNullOrWhiteSpace($settings.latestRegistryExecutablePath)))) {
+    throw 'Full native validation requires Prepare -MoveExecutablePath (genuine schema4 baseline), either -AssemblyPath (C# candidate DLL) or -RustProbePath (Rust candidate cfg(test) libtest), and -LegacyRegistryExecutablePath (genuine schema5 baseline); Rust additionally requires -LatestRegistryExecutablePath (genuine C# 1.0.29 producer). No desktop session was launched by this invocation.'
 }
 if (!('SessionE2ENative' -as [type])) { Add-Type -Path (Join-Path $OutputDirectory 'SessionFixture.cs') }
 if (!('SessionLaunchNative' -as [type])) { Add-Type -Path (Join-Path $OutputDirectory 'SessionLaunchNative.cs') }
@@ -151,7 +167,9 @@ if ($Mode -eq 'Current') {
     $currentReport = Join-Path $OutputDirectory 'current-probes-report.json'
     if (Test-Path -LiteralPath $currentReport) { throw 'Current probes already ran; use a new prepared directory.' }
     & (Join-Path $OutputDirectory 'Invoke-SessionE2E.ps1') -ExecutablePath $ExecutablePath -ReportPath $currentReport -CurrentOnly -ExpectedCurrentSoftwareTransactionError $settings.expectedCurrentSoftwareTransactionError
-    if (!$?) { exit 1 }; exit 0
+    if (!$?) { exit 1 }
+    & $powerShellHostPath -NoProfile -File (Join-Path $OutputDirectory 'CurrentCandidate.ps1') -ExecutablePath $ExecutablePath -SourceRoot $repoRoot -OutputDirectory (Join-Path $OutputDirectory 'current-owned-probes') -ReportPath (Join-Path $OutputDirectory 'current-owned-probes-report.json')
+    if ($LASTEXITCODE -ne 0) { exit 1 }; exit 0
 }
 foreach ($name in @('controller-ready.json','limited-ready.json')) {
     if (![IO.File]::Exists((Join-Path $OutputDirectory $name))) { throw "Missing explicit desktop session: $name. Run both prepared desktop commands first." }

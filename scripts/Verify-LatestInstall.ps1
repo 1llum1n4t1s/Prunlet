@@ -176,20 +176,43 @@ $fixtureRoot = Join-Path $OutputDirectory 'fixture'
 $source = Join-Path $fixtureRoot 'Prunlet-fixture'
 New-Item -ItemType Directory -Path $source, (Join-Path $source 'scripts') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'src'), (Join-Path $repoRoot 'integration') -Destination $source -Recurse
-Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Join-Path $repoRoot 'scripts\Install-Prunlet.ps1') -Destination (Join-Path $source 'scripts')
+Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Join-Path $repoRoot 'scripts\Publish-PrunletRust.ps1'), (Join-Path $repoRoot 'scripts\RustBuildInputs.Common.ps1'), (Join-Path $repoRoot 'scripts\Install-Prunlet.ps1') -Destination (Join-Path $source 'scripts')
+if (Test-Path -LiteralPath (Join-Path $repoRoot '.cargo')) { Copy-Item -LiteralPath (Join-Path $repoRoot '.cargo') -Destination $source -Recurse }
+foreach ($name in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'build.rs')) { Copy-Item -LiteralPath (Join-Path $repoRoot $name) -Destination (Join-Path $source $name) }
+# 各workの全Rust入力を同じ不変更sourceと照合し、その実Cargo buildを使う。
+# ソース解凍先ごとの同一LTO再compileを避けるだけで、製品stubや擬似Coreは使わない。
+$previousFixtureSource = $env:PRUNLET_FIXTURE_SOURCE_ROOT
+$env:PRUNLET_FIXTURE_SOURCE_ROOT = $source
+@'
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$OutputDirectory,[string]$Runtime='win-x64',[string]$SourceCommit,[string]$TargetDirectory=$env:PRUNLET_CARGO_TARGET_DIRECTORY,[switch]$IncludeVerificationProbe)
+$ErrorActionPreference='Stop'
+$requested=Split-Path $PSScriptRoot -Parent
+$canonical=$env:PRUNLET_FIXTURE_SOURCE_ROOT
+if(!$canonical -or ![IO.Path]::IsPathFullyQualified($canonical)){throw 'Fixture canonical source is not fixed.'}
+. (Join-Path $canonical 'scripts/RustBuildInputs.Common.ps1')
+$names=@(Get-PrunletRustInputNames $requested)+@('scripts/Publish-PrunletRust.ps1','scripts/RustBuildInputs.Common.ps1')
+$expected=@(Get-PrunletRustInputNames $canonical)+@('scripts/Publish-PrunletRust.ps1','scripts/RustBuildInputs.Common.ps1')
+if(($names -join "`n") -cne ($expected -join "`n")){throw 'Fixture Rust input set differs.'}
+foreach($name in $names){if((Get-FileHash -LiteralPath (Join-Path $requested $name)).Hash -cne (Get-FileHash -LiteralPath (Join-Path $canonical $name)).Hash){throw "Fixture source differs from its canonical build input: $name"}}
+& (Join-Path $canonical 'scripts/Publish-PrunletRust.ps1') @PSBoundParameters
+'@|Set-Content -LiteralPath (Join-Path $source 'scripts/Publish-Prunlet.ps1') -Encoding utf8NoBOM
+$previousCargoTargetDirectory = $env:PRUNLET_CARGO_TARGET_DIRECTORY
+$env:PRUNLET_CARGO_TARGET_DIRECTORY = Join-Path $OutputDirectory 'cargo-target'
 $fixtureGuideSha256 = (Get-FileHash -LiteralPath (Join-Path $source 'integration\PRUNLET.md') -Algorithm SHA256).Hash
 Assert-True ($fixtureGuideSha256 -ceq (Get-FileHash -LiteralPath (Join-Path $repoRoot 'integration\PRUNLET.md') -Algorithm SHA256).Hash) 'Fixture guide differs from the current working tree.'
-# 実行した検証・導入・ビルド・連携元のhashを、C#本文とは別にレポートへ固定する。
-$verificationInputFiles = @(@($PSCommandPath, $installer, (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Join-Path $PSScriptRoot 'Verification-Common.ps1'), (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')) + $recordlessHelpers + @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'integration') -File | ForEach-Object FullName) | Sort-Object -Unique | ForEach-Object {
+# 実行した検証・導入・Rustビルド・連携元のhashをレポートへ固定する。
+$verificationInputFiles = @(@($PSCommandPath, $installer, (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Join-Path $repoRoot 'scripts\Publish-PrunletRust.ps1'), (Join-Path $repoRoot 'scripts\RustBuildInputs.Common.ps1'), (Join-Path $repoRoot 'Cargo.toml'), (Join-Path $repoRoot 'Cargo.lock'), (Join-Path $repoRoot 'rust-toolchain.toml'), (Join-Path $repoRoot 'build.rs'), (Join-Path $PSScriptRoot 'Verification-Common.ps1'), (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')) + $recordlessHelpers + @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'integration') -File | ForEach-Object FullName) | Sort-Object -Unique | ForEach-Object {
     @{ path = [IO.Path]::GetRelativePath($repoRoot, $_); sha256 = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash }
 })
-$fixtureSourceFiles = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'src') -Filter '*.cs' -File -Recurse | ForEach-Object {
-    $relative = [IO.Path]::GetRelativePath($repoRoot, $_.FullName)
-    $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+. (Join-Path $PSScriptRoot 'RustBuildInputs.Common.ps1')
+$fixtureSourceFiles = @(Get-PrunletRustInputNames $repoRoot | ForEach-Object {
+    $relative = $_.Replace('/','\')
+    $hash = (Get-FileHash -LiteralPath (Join-Path $repoRoot $relative) -Algorithm SHA256).Hash
     Assert-True ((Get-FileHash -LiteralPath (Join-Path $source $relative) -Algorithm SHA256).Hash -ceq $hash) "Fixture source differs: $relative"
     @{ path = $relative; sha256 = $hash }
 })
-Assert-True (@($fixtureSourceFiles | Where-Object path -eq 'src\Prunlet\Core\NativeFiles.Moves.cs').Count -eq 1) 'Fixture archive omitted the new native move source.'
+Assert-True (@($fixtureSourceFiles | Where-Object path -eq 'src\rust\platform\windows\mod.rs').Count -eq 1) 'Fixture archive omitted the Rust native filesystem source.'
 $zipPath = Join-Path $OutputDirectory 'fixture.zip'
 [IO.Compression.ZipFile]::CreateFromDirectory($fixtureRoot, $zipPath)
 $global:PrunletLatestFixture = @{ sha = ('a' * 40); zip = $zipPath; requests = [Collections.Generic.List[string]]::new(); failDownload = $false; failCopy = $false }
@@ -975,8 +998,10 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
     Remove-Variable PrunletLatestFixture -Scope Global
     Remove-Item Function:\Get-ScheduledTask, Function:\Export-ScheduledTask, Function:\Register-ScheduledTask, Function:\Unregister-ScheduledTask
     Remove-Variable PrunletMaintenanceFixture -Scope Global
+    $env:PRUNLET_CARGO_TARGET_DIRECTORY = $previousCargoTargetDirectory
+    $env:PRUNLET_FIXTURE_SOURCE_ROOT = $previousFixtureSource
     # junctionと更新バックアップも隔離出力内に残し、結果確認後にPrunletで一括清掃する。
-    [ordered]@{ fileFixtureRun = $fileFixtureRun; verifiedUtc = [DateTimeOffset]::UtcNow.ToString('o'); fixtureSource = 'current working tree including untracked C# files'; fixtureSourceFiles = $fixtureSourceFiles; verificationInputFiles = $verificationInputFiles; fixtureArchiveSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash; fixtureGuideSha256 = $fixtureGuideSha256; publicHeadChecked = [bool]$CheckPublicHead; publicHeadAuthentication = $(if ($UseGitHubCliAuthentication) { 'github-cli' } else { 'unauthenticated' }); failureConditions = $failureConditions; results = @($results.ToArray()); passed = !@($results | Where-Object { !$_.passed }).Count; retention = 'Keep this report as reproducible installer verification evidence; delete when superseded.'; reproduce = 'Run scripts/Verify-LatestInstall.ps1 with new external OutputDirectory and ReportPath.' } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ReportPath -Encoding utf8NoBOM
+    [ordered]@{ fileFixtureRun = $fileFixtureRun; verifiedUtc = [DateTimeOffset]::UtcNow.ToString('o'); fixtureSource = 'current working tree Rust sources and Cargo.lock'; fixtureBuild = 'Each extracted Rust input is hashed against the immutable canonical fixture source; the actual publisher and Cargo reuse identical inputs without product stubs.'; fixtureSourceFiles = $fixtureSourceFiles; verificationInputFiles = $verificationInputFiles; fixtureArchiveSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash; fixtureGuideSha256 = $fixtureGuideSha256; publicHeadChecked = [bool]$CheckPublicHead; publicHeadAuthentication = $(if ($UseGitHubCliAuthentication) { 'github-cli' } else { 'unauthenticated' }); failureConditions = $failureConditions; results = @($results.ToArray()); passed = !@($results | Where-Object { !$_.passed }).Count; retention = 'Keep this report as reproducible installer verification evidence; delete when superseded.'; reproduce = 'Run scripts/Verify-LatestInstall.ps1 with new external OutputDirectory and ReportPath.' } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ReportPath -Encoding utf8NoBOM
 }
 Get-Content -LiteralPath $ReportPath -Raw
 if (@($results | Where-Object { !$_.passed }).Count) { throw 'Latest installer verification failed; read the JSON report.' }

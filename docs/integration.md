@@ -113,6 +113,8 @@ MCP登録の実行内容は次のとおりです。
 
 Codexの`exec_command`はフックへ`Bash`とコマンド文字列を渡し、実行shellを渡しません。`shell: "pwsh"`だけではPowerShellと別shellを区別できないため、そのままのヒアストリングは安全側に拒否されることがあります。SSHの存在や接続先の名前を使った削除の素通し例外は設けません。
 
+このときの`interpretation=CMD`は候補構文で検知したことを示し、SSH先をWindowsと判定したという意味ではありません。拒否された入力は実行されていません。Mac等の認可済み清掃では、対象・使用状況を確認したうえで次の対応形式へ入力を修正します。実行shellの指定だけで解消すると扱ったり、Windows用CLIへリモートのパスを渡したりしません。
+
 Mac等へ送るシェルスクリプトを単引用ヒアストリングに入れた**ローカルPowerShellスクリプト全体**は、shellを起動せずにUTF-16LE Base64へ変換し、単独の`pwsh -NoProfile -EncodedCommand <base64>`として渡します。たとえばCodexのJavaScript実行環境では次の形です。`script`は実際に使うローカルPowerShellスクリプトへ置き換えます。
 
 ```javascript

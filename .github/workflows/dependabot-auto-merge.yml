@@ -32,147 +32,138 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Verify CI and merge Dependabot updates
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      - name: Verify CI and merge Dependabot updates without Node
+        shell: pwsh
         env:
+          GH_TOKEN: ${{ github.token }}
           REQUIRED_WORKFLOWS: '[".github/workflows/dependency-validation.yml"]'
-        with:
-          script: |
-            // GitHub Actions の信頼済み既定ブランチ上で実行する。PR のコードは実行しない。
-            const {owner, repo} = context.repo;
-            const required = JSON.parse(process.env.REQUIRED_WORKFLOWS);
-            const repository = (await github.rest.repos.get({owner, repo})).data;
-            const branch = repository.default_branch;
-            const botId = 49699333;
-            const report = [];
-            const held = (pr, reason) => {
-              core.info(`#${pr.number}: ${reason}`);
-              report.push(`- #${pr.number}: ${reason}`);
-            };
-            
-            function versionOnlyPatch(file) {
-              if (!file.patch || file.status !== 'modified') return false;
-              const lines = file.patch.split('\n').filter(line => /^[+-]/.test(line) && !/^\+\+\+|^---/.test(line));
-              const before = lines.filter(line => line[0] === '-').map(line => line.slice(1));
-              const after = lines.filter(line => line[0] === '+').map(line => line.slice(1));
-              if (!before.length || before.length !== after.length) return false;
-              const normalize = line => line.replace(/(uses:\s*[^\s@]+@)[A-Za-z0-9._/-]+/g, '$1<VERSION>');
-              return before.every((line, i) => /^\s*(?:-\s*)?uses:\s*[^\s@]+@[A-Za-z0-9._/-]+(?:\s*#.*)?$/.test(line)
-                && /^\s*(?:-\s*)?uses:\s*[^\s@]+@[A-Za-z0-9._/-]+(?:\s*#.*)?$/.test(after[i])
-                && normalize(line).replace(/\s+#.*$/, '') === normalize(after[i]).replace(/\s+#.*$/, ''));
-            }
-            
-            async function dependencyFile(file, baseSha, sha) {
-              const name = file.filename;
-              if (/^\.github\/workflows\/[^/]+\.ya?ml$/.test(name)) {
-                return versionOnlyPatch(file);
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 信頼済みworkflowのinline処理だけを実行し、PRをcheckout/importしない。
+          $env:GH_DEBUG = $null
+          if (!$env:GH_TOKEN -or $env:GITHUB_REPOSITORY -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Auto-merge context is invalid.' }
+          $owner,$repo = $env:GITHUB_REPOSITORY.Split('/')
+          $prefix = 'repos/' + $env:GITHUB_REPOSITORY
+          $payload = Get-Content -LiteralPath $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json -AsHashtable -Depth 100
+          $required = @(ConvertFrom-Json -InputObject $env:REQUIRED_WORKFLOWS)
+          $botId = 49699333
+          $report = [Collections.Generic.List[string]]::new()
+          function Held($Pr,[string]$Reason) { Write-Host "#$($Pr.number): $Reason"; $report.Add("- #$($Pr.number): $Reason") }
+          function Api([string]$Endpoint,[switch]$Paginate,[string]$Method='GET',[hashtable]$Fields=@{}) {
+              $arguments = @('api',$Endpoint,'--method',$Method,'--header','Accept: application/vnd.github+json')
+              if ($Paginate) { $arguments += @('--paginate','--slurp') } else { $arguments += '--include' }
+              foreach ($key in $Fields.Keys) { $arguments += @('--raw-field',($key + '=' + [string]$Fields[$key])) }
+              $lines = & gh @arguments
+              $exitCode = $LASTEXITCODE
+              $text = $lines -join "`n"
+              if ($Paginate) {
+                  if ($exitCode -ne 0) { throw 'Paginated GitHub API request failed.' }
+                  return ,(ConvertFrom-Json -InputObject $text -AsHashtable -NoEnumerate -Depth 100)
               }
-              if (/(^|\/)Dockerfile(?:\.[^/]+)?$/.test(name) || /(^|\/)(?:docker-)?compose(?:\.[^/]+)?\.ya?ml$/.test(name)) {
-                if (!file.patch || file.status !== 'modified') return false;
-                const changed = file.patch.split('\n').filter(line => /^[+-]/.test(line) && !/^\+\+\+|^---/.test(line));
-                return changed.length > 0 && changed.every(line => /^[+-]\s*(?:FROM\s|image:\s)/i.test(line));
+              $parts = [regex]::Split($text,'\r?\n\r?\n',2)
+              if ($parts.Count -ne 2 -or $parts[0] -cnotmatch '\AHTTP/\S+ ([0-9]{3})(?: |$)') { throw 'GitHub API response status is missing.' }
+              $status = [int]$Matches[1]
+              if ($status -lt 200 -or $status -ge 300) {
+                  $error = [InvalidOperationException]::new("GitHub API request failed (HTTP $status).")
+                  $error.Data['Status'] = $status
+                  throw $error
               }
-              const manifest = /(^|\/)(?:Package\.swift|Package\.resolved|vcpkg\.json|vcpkg-configuration\.json|rust-toolchain(?:\.toml)?|Directory\.Build\.props|package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|bun\.lockb?|Cargo\.toml|Cargo\.lock|Gemfile|Gemfile\.lock|pubspec\.yaml|pubspec\.lock|global\.json|packages\.config|packages\.lock\.json|Directory\.Packages\.props|requirements[^/]*\.txt|setup\.py|setup\.cfg|pyproject\.toml|poetry\.lock|uv\.lock|Pipfile(?:\.lock)?|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|gradle\.properties|libs\.versions\.toml|gradle-wrapper\.properties|gradle\.lockfile|[^/]+\.lockfile|\.terraform\.lock\.hcl)$/.test(name)
-                || /\.(?:csproj|fsproj|vbproj|tf)$/.test(name);
-              if (manifest) return true;
-              // 既存submoduleのcommit差分だけを許可し、URL変更や通常コードは許可しない。
-              if (file.status !== 'modified' || !file.patch) return false;
-              const lines = file.patch.split('\n').filter(line => /^[+-]/.test(line) && !/^\+\+\+|^---/.test(line));
-              if (lines.length !== 2) return false;
-              const before = lines.find(line => line.startsWith('-'))?.match(/^-Subproject commit ([0-9a-f]{40})$/);
-              const after = lines.find(line => line.startsWith('+'))?.match(/^\+Subproject commit ([0-9a-f]{40})$/);
-              if (!before || !after) return false;
+              if ($exitCode -ne 0) { throw 'GitHub API invocation failed.' }
+              return ,(ConvertFrom-Json -InputObject $parts[1] -AsHashtable -NoEnumerate -Depth 100)
+          }
+          function All([string]$Endpoint,[string]$Property='') {
+              $items = [Collections.Generic.List[object]]::new()
+              foreach ($page in (Api $Endpoint -Paginate)) {
+                  $values = if ($Property) { $page[$Property] } else { $page }
+                  foreach ($item in $values) { $items.Add($item) }
+              }
+              return $items.ToArray()
+          }
+          # JavaScript版の\sと同じ集合を使い、移植でallowlistを広げない。
+          $ws = '\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF'
+          $space = '['+$ws+']'; $notSpaceAt = '[^'+$ws+'@]'
+          $usesLine = '^'+$space+'*(?:-'+$space+'*)?uses:'+$space+'*'+$notSpaceAt+'+@[A-Za-z0-9._/-]+(?:'+$space+'*#.*)?$'
+          $usesReference = '(uses:'+$space+'*'+$notSpaceAt+'+@)[A-Za-z0-9._/-]+'
+          function Changes($File) { return @($File.patch.Split("`n") | Where-Object { $_ -cmatch '^[+-]' -and $_ -cnotmatch '^\+\+\+|^---' }) }
+          function VersionOnly($File) {
+              if (!$File.patch -or $File.status -cne 'modified') { return $false }
+              $lines = @(Changes $File)
+              $before = @($lines | Where-Object { $_.StartsWith('-') } | ForEach-Object { $_.Substring(1) })
+              $after = @($lines | Where-Object { $_.StartsWith('+') } | ForEach-Object { $_.Substring(1) })
+              if (!$before.Count -or $before.Count -ne $after.Count) { return $false }
+              for ($i=0;$i -lt $before.Count;$i++) {
+                  if ($before[$i] -cnotmatch $usesLine -or $after[$i] -cnotmatch $usesLine) { return $false }
+                  $a = [regex]::Replace([regex]::Replace($before[$i],$usesReference,'$1<VERSION>'),$space+'+#.*$','')
+                  $b = [regex]::Replace([regex]::Replace($after[$i],$usesReference,'$1<VERSION>'),$space+'+#.*$','')
+                  if (![string]::Equals($a,$b,[StringComparison]::Ordinal)) { return $false }
+              }
+              return $true
+          }
+          function DependencyFile($File,[string]$BaseSha,[string]$Sha) {
+              $name = $File.filename
+              if ($name -cmatch '^\.github/workflows/[^/]+\.ya?ml$') { return VersionOnly $File }
+              if ($name -cmatch '(^|/)Dockerfile(?:\.[^/]+)?$' -or $name -cmatch '(^|/)(?:docker-)?compose(?:\.[^/]+)?\.ya?ml$') {
+                  if (!$File.patch -or $File.status -cne 'modified') { return $false }
+                  $changed = @(Changes $File)
+                  return $changed.Count -gt 0 -and !@($changed | Where-Object { ![regex]::IsMatch($_,'^[+-]'+$space+'*(?:FROM'+$space+'|image:'+ $space +')',[Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::CultureInvariant) }).Count
+              }
+              if ($name -cmatch '(^|/)(?:Package\.swift|Package\.resolved|vcpkg\.json|vcpkg-configuration\.json|rust-toolchain(?:\.toml)?|Directory\.Build\.props|package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|bun\.lockb?|Cargo\.toml|Cargo\.lock|Gemfile|Gemfile\.lock|pubspec\.yaml|pubspec\.lock|global\.json|packages\.config|packages\.lock\.json|Directory\.Packages\.props|requirements[^/]*\.txt|setup\.py|setup\.cfg|pyproject\.toml|poetry\.lock|uv\.lock|Pipfile(?:\.lock)?|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|gradle\.properties|libs\.versions\.toml|gradle-wrapper\.properties|gradle\.lockfile|[^/]+\.lockfile|\.terraform\.lock\.hcl)$' -or $name -cmatch '\.(?:csproj|fsproj|vbproj|tf)$') { return $true }
+              if ($File.status -cne 'modified' -or !$File.patch) { return $false }
+              $lines = @(Changes $File)
+              if ($lines.Count -ne 2) { return $false }
+              $before = @($lines | Where-Object { $_ -cmatch '^-Subproject commit ([0-9a-f]{40})$' })
+              $after = @($lines | Where-Object { $_ -cmatch '^\+Subproject commit ([0-9a-f]{40})$' })
+              if ($before.Count -ne 1 -or $after.Count -ne 1) { return $false }
+              $oldSha = $before[0].Substring(19); $newSha = $after[0].Substring(19)
+              $path = (($name.Split('/') | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/')
               try {
-                const oldModule = (await github.rest.repos.getContent({owner, repo, path: name, ref: baseSha})).data;
-                const newModule = (await github.rest.repos.getContent({owner, repo, path: name, ref: sha})).data;
-                return Boolean(oldModule.submodule_git_url && oldModule.submodule_git_url === newModule.submodule_git_url
-                  && oldModule.sha === before[1] && newModule.sha === after[1] && file.sha === newModule.sha);
-              } catch (error) {
-                if (error.status !== 404) throw error;
-                return false;
+                  $old = Api "$prefix/contents/${path}?ref=$BaseSha"
+                  $new = Api "$prefix/contents/${path}?ref=$Sha"
+                  return $old.submodule_git_url -and [string]::Equals($old.submodule_git_url,$new.submodule_git_url,[StringComparison]::Ordinal) -and $old.sha -ceq $oldSha -and $new.sha -ceq $newSha -and $File.sha -ceq $new.sha
+              } catch { if ($_.Exception.Data['Status'] -ne 404) { throw }; return $false }
+          }
+          $repository = Api $prefix
+          $branch = $repository.default_branch
+          $encodedBranch = [Uri]::EscapeDataString($branch)
+          if ($env:GITHUB_EVENT_NAME -ceq 'pull_request_target') { $prs = @($payload.pull_request) }
+          else { $prs = @(All "$prefix/pulls?state=open&base=$encodedBranch&per_page=100") }
+          $prs = @($prs | Where-Object { $_.user.login -ceq 'dependabot[bot]' -and $_.user.id -eq $botId -and !$_.draft -and [string]::Equals($_.base.ref,$branch,[StringComparison]::Ordinal) -and $_.head.repo.id -eq $repository.id })
+          if (!$required.Count) { Write-Warning '検証workflowが未設定のため保留します。'; return }
+          $workflows = @($required | ForEach-Object { Api ($prefix+'/actions/workflows/'+[Uri]::EscapeDataString(($_.Split('/')[-1]))) })
+          foreach ($item in $prs) {
+              $pr = Api "$prefix/pulls/$($item.number)"
+              if ($pr.state -cne 'open' -or $pr.draft -or $pr.user.id -ne $botId -or $pr.head.repo.id -ne $repository.id -or ![string]::Equals($pr.base.ref,$branch,[StringComparison]::Ordinal)) { continue }
+              $sha = $pr.head.sha
+              $baseSha = (Api "$prefix/branches/$encodedBranch").commit.sha
+              $files = @(All "$prefix/pulls/$($pr.number)/files?per_page=100")
+              $dependencyOnly = $true
+              foreach ($file in $files) { if (!(DependencyFile $file $baseSha $sha)) { $dependencyOnly=$false; break } }
+              if (!$files.Count -or $files.Count -ne $pr.changed_files -or !$dependencyOnly) { Held $pr '依存更新以外または確認不能の差分のため保留'; continue }
+              $commits = @(All "$prefix/pulls/$($pr.number)/commits?per_page=100")
+              $invalid = @($commits | Where-Object { !$_.commit.verification.verified -or ($_.author.id -ne $botId -and !($_.parents.Count -eq 2 -and @('github-actions[bot]',$owner) -ccontains $_.author.login)) })
+              if (!$commits.Count -or $commits.Count -ne $pr.commits -or $invalid.Count) { Held $pr '署名付きDependabot更新または既定ブランチの統合として確認不能のため保留'; continue }
+              if ($pr.mergeable -eq $false -or $pr.mergeable_state -ceq 'dirty') { Held $pr '競合があるため保留'; continue }
+              $verified = $true
+              foreach ($workflow in $workflows) {
+                  $runs = (Api "$prefix/actions/workflows/$($workflow.id)/runs?head_sha=$sha&per_page=100").workflow_runs
+                  $latest = $runs | Where-Object { @('pull_request','workflow_dispatch') -ccontains $_.event } | Sort-Object @{Expression='id';Descending=$true},@{Expression='run_attempt';Descending=$true} | Select-Object -First 1
+                  if (!$latest -or $latest.status -cne 'completed' -or $latest.conclusion -cne 'success') { Held $pr "$($workflow.name): 当該headの最新CI成功を確認するまで保留"; $verified=$false; break }
               }
-            }
-            
-            let prs;
-            if (context.eventName === 'pull_request_target') {
-              prs = [context.payload.pull_request];
-            } else {
-              prs = await github.paginate(github.rest.pulls.list, {owner, repo, state: 'open', base: branch, per_page: 100});
-            }
-            prs = prs.filter(pr => pr.user?.login === 'dependabot[bot]' && pr.user.id === botId && !pr.draft
-              && pr.base.ref === branch && pr.head.repo?.id === repository.id);
-            if (!required.length) {
-              core.warning('検証 workflow が未設定のためマージを保留します。');
-              return;
-            }
-            const workflows = [];
-            for (const path of required) {
-              workflows.push((await github.rest.actions.getWorkflow({owner, repo, workflow_id: path.split('/').pop()})).data);
-            }
-            
-            for (const item of prs) {
-              let pr = (await github.rest.pulls.get({owner, repo, pull_number: item.number})).data;
-              if (pr.state !== 'open' || pr.draft || pr.user?.id !== botId || pr.head.repo?.id !== repository.id || pr.base.ref !== branch) continue;
-              const sha = pr.head.sha;
-              // PRのbase.shaは作成時点の値を返すことがあるため、既定ブランチを直接取得する。
-              const baseSha = (await github.rest.repos.getBranch({owner, repo, branch})).data.commit.sha;
-              const files = await github.paginate(github.rest.pulls.listFiles, {owner, repo, pull_number: pr.number, per_page: 100});
-              let dependencyOnly = true;
-              for (const file of files) {
-                if (!(await dependencyFile(file, baseSha, sha))) { dependencyOnly = false; break; }
-              }
-              if (!files.length || files.length !== pr.changed_files || !dependencyOnly) {
-                held(pr, '依存更新以外、または自動確認できない差分があるため保留');
-                continue;
-              }
-              const commits = await github.paginate(github.rest.pulls.listCommits, {owner, repo, pull_number: pr.number, per_page: 100});
-              if (!commits.length || commits.length !== pr.commits || commits.some(commit => !commit.commit.verification?.verified
-                || (commit.author?.id !== botId && !(commit.parents.length === 2 && ['github-actions[bot]', owner].includes(commit.author?.login))))) {
-                held(pr, 'Dependabotの署名付き更新または既定ブランチの統合として確認できないコミットがあるため保留');
-                continue;
-              }
-              if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
-                held(pr, '競合があるため保留');
-                continue;
-              }
-              let verified = true;
-              for (const workflow of workflows) {
-                const runs = (await github.rest.actions.listWorkflowRuns({owner, repo, workflow_id: workflow.id, head_sha: sha, per_page: 100})).data.workflow_runs;
-                const latest = runs.filter(run => ['pull_request', 'workflow_dispatch'].includes(run.event))
-                  .sort((a, b) => b.id - a.id || b.run_attempt - a.run_attempt)[0];
-                if (!latest || latest.status !== 'completed' || latest.conclusion !== 'success') {
-                  held(pr, `${workflow.name}: ${latest ? latest.conclusion ?? latest.status : '当該headのCI未実行'} のため待機`);
-                  verified = false;
-                  break;
-                }
-              }
-              if (!verified) continue;
-              const checks = await github.paginate(github.rest.checks.listForRef, {owner, repo, ref: sha, filter: 'latest', per_page: 100});
-              // 同じ自動マージ処理の実行中checkだけを除き、他のcheckの失敗・未完了は保留する。
-              const selfRun = `/actions/runs/${context.runId}`;
-              const others = checks.filter(check => !check.details_url?.includes(selfRun));
-              if (others.some(check => check.status !== 'completed' || !['success', 'neutral', 'skipped'].includes(check.conclusion))) {
-                held(pr, '他のcheckが未完了または失敗しているため保留');
-                continue;
-              }
-              const statuses = (await github.rest.repos.getCombinedStatusForRef({owner, repo, ref: sha, per_page: 100})).data;
-              if (statuses.total_count > 0 && statuses.state !== 'success') {
-                held(pr, `commit statusが${statuses.state}のため保留`);
-                continue;
-              }
-              const currentBase = (await github.rest.repos.getBranch({owner, repo, branch})).data.commit.sha;
-              pr = (await github.rest.pulls.get({owner, repo, pull_number: pr.number})).data;
-              if (pr.state !== 'open' || pr.head.sha !== sha || currentBase !== baseSha || pr.mergeable !== true) {
-                held(pr, 'head/baseまたはマージ可能状態が変化したため再検証を待機');
-                continue;
-              }
-              const mergeMethod = repository.allow_squash_merge ? 'squash' : repository.allow_merge_commit ? 'merge' : 'rebase';
+              if (!$verified) { continue }
+              $checks = @(All "$prefix/commits/$sha/check-runs?filter=latest&per_page=100" 'check_runs')
+              $selfRun = '/actions/runs/'+$env:GITHUB_RUN_ID
+              $others = @($checks | Where-Object { !$_.details_url -or !$_.details_url.Contains($selfRun) })
+              if (@($others | Where-Object { $_.status -cne 'completed' -or @('success','neutral','skipped') -cnotcontains $_.conclusion }).Count) { Held $pr '他のcheckが未完了または失敗しているため保留'; continue }
+              $statuses = Api "$prefix/commits/$sha/status?per_page=100"
+              if ($statuses.total_count -gt 0 -and $statuses.state -cne 'success') { Held $pr 'commit statusが成功していないため保留'; continue }
+              $currentBase = (Api "$prefix/branches/$encodedBranch").commit.sha
+              $pr = Api "$prefix/pulls/$($pr.number)"
+              if ($pr.state -cne 'open' -or $pr.head.sha -cne $sha -or $currentBase -cne $baseSha -or $pr.mergeable -ne $true) { Held $pr 'head/baseまたはmergeableが変化したため再検証まで保留'; continue }
+              $method = if ($repository.allow_squash_merge) {'squash'} elseif ($repository.allow_merge_commit) {'merge'} else {'rebase'}
               try {
-                const result = (await github.rest.pulls.merge({owner, repo, pull_number: pr.number, sha, merge_method: mergeMethod})).data;
-                held(pr, result.merged ? `CI成功後にマージ済み (${result.sha})` : 'GitHubのマージ要件を満たすまで保留');
-              } catch (error) {
-                if (![403, 405, 409, 422].includes(error.status)) throw error;
-                held(pr, `GitHubのマージ要件により保留 (${error.status})`);
-              }
-            }
-            await core.summary.addHeading('Dependabot auto-merge').addRaw(report.join('\n') || '対象PRなし').write();
+                  $result = Api "$prefix/pulls/$($pr.number)/merge" -Method PUT -Fields @{sha=$sha;merge_method=$method}
+                  Held $pr $(if ($result.merged) { "CI成功後にマージ済み ($($result.sha))" } else { 'GitHubのマージ要件を満たすまで保留' })
+              } catch { if (@(403,405,409,422) -notcontains $_.Exception.Data['Status']) { throw }; Held $pr "GitHubのマージ要件により保留 ($($_.Exception.Data['Status']))" }
+          }
+          $summary = '# Dependabot auto-merge'+"`n`n"+$(if ($report.Count) {$report -join "`n"} else {'対象PRなし'})
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8

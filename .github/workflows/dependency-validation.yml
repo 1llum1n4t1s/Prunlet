@@ -21,30 +21,128 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Setup .NET
-        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
-        with:
-          dotnet-version: 10.0.x
-      - name: Restore
+      - name: Checkout the event commit without Node
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          dotnet restore src/Prunlet/Prunlet.csproj -p:BaseIntermediateOutputPath="$env:RUNNER_TEMP/prunlet-obj/" -p:BaseOutputPath="$env:RUNNER_TEMP/prunlet-bin/"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Build
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:GITHUB_REPOSITORY -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid checkout identity.' }
+          if ($env:GITHUB_SERVER_URL -cne 'https://github.com') { throw 'Unexpected checkout server.' }
+          if (!$env:GH_TOKEN) { throw 'Checkout token is absent.' }
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          if (@(Get-ChildItem -LiteralPath $workspace -Force).Count) { throw 'Checkout requires an empty workspace.' }
+          git init --quiet $workspace
+          if ($LASTEXITCODE -ne 0) { throw 'Git initialization failed.' }
+          git -C $workspace remote add origin ("$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git")
+          if ($LASTEXITCODE -ne 0) { throw 'Git origin setup failed.' }
+          $names = @('GIT_CONFIG_COUNT','GIT_CONFIG_KEY_0','GIT_CONFIG_VALUE_0','GIT_TERMINAL_PROMPT','GIT_TRACE','GIT_TRACE_CURL','GIT_CURL_VERBOSE')
+          $saved = @{}; foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
+          try {
+              # 認証はfetchのprocess環境だけに置き、git設定・URL・ログへ保存しない。
+              $env:GIT_CONFIG_COUNT = '1'
+              $env:GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
+              $env:GIT_CONFIG_VALUE_0 = 'AUTHORIZATION: basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('x-access-token:' + $env:GH_TOKEN))
+              $env:GIT_TERMINAL_PROMPT = '0'; $env:GIT_TRACE = '0'; $env:GIT_TRACE_CURL = '0'; $env:GIT_CURL_VERBOSE = '0'
+              git -C $workspace -c credential.helper= fetch --no-tags --depth=1 origin $env:GITHUB_SHA
+              if ($LASTEXITCODE -ne 0) { throw 'Git fetch failed.' }
+          } finally {
+              foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name,$saved[$name],'Process') }
+              $env:GH_TOKEN = $null
+          }
+          git -C $workspace checkout --detach $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Git checkout failed.' }
+          $actual = git -C $workspace rev-parse --verify HEAD
+          if ($LASTEXITCODE -ne 0 -or $actual -cne $env:GITHUB_SHA) { throw 'Checkout differs from the event commit.' }
+      - name: Setup Rust
         run: |
-          dotnet build src/Prunlet/Prunlet.csproj -c Release --no-restore -p:BaseIntermediateOutputPath="$env:RUNNER_TEMP/prunlet-obj/" -p:BaseOutputPath="$env:RUNNER_TEMP/prunlet-bin/"
+          . ./scripts/RustBuildInputs.Common.ps1
+          $toolchain = Get-PrunletRustToolchain $env:GITHUB_WORKSPACE
+          rustup toolchain install $toolchain --profile minimal
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add --toolchain $toolchain x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build and test
+        run: |
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'prunlet-cargo-target'
+          $env:TEMP = Join-Path $env:RUNNER_TEMP 'prunlet-temp'
+          $env:TMP = $env:TEMP
+          New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
+          . ./scripts/RustBuildInputs.Common.ps1
+          $env:RUSTUP_TOOLCHAIN = Get-PrunletRustToolchain $env:GITHUB_WORKSPACE
+          cargo test --locked --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./scripts/Publish-Prunlet.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'prunlet-build') -TargetDirectory $env:CARGO_TARGET_DIR -SourceCommit $env:GITHUB_SHA -IncludeVerificationProbe | Out-Null
       - name: Run CLI MCP and hook E2E
         run: |
-          $report = Join-Path $env:RUNNER_TEMP "prunlet-dependency-verification.json"
-          $runRoot = Join-Path $env:RUNNER_TEMP ("prunlet-e2e-" + [guid]::NewGuid().ToString("N"))
-          & ./scripts/Verify-Prunlet.ps1 -ExecutablePath (Join-Path $env:RUNNER_TEMP "prunlet-bin/Release/net10.0-windows/prunlet.exe") -OutputDirectory $runRoot -ReportPath $report
+          $report = Join-Path $env:RUNNER_TEMP 'prunlet-dependency-verification.json'
+          $runRoot = Join-Path $env:RUNNER_TEMP ('prunlet-e2e-' + [guid]::NewGuid().ToString('N'))
+          $build = Join-Path $env:RUNNER_TEMP 'prunlet-build'
+          $manifest = Join-Path $build 'build-manifest.json'
+          $fixture = Join-Path $env:USERPROFILE 'Prunlet-CI-Fixture'
+          New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+          $immediate = & ./scripts/New-CIImmediateVolume.ps1
+          & ./scripts/Verify-Prunlet.ps1 -ExecutablePath (Join-Path $build 'publish/prunlet.exe') -RustProbePath (Join-Path $build 'verification/prunlet-libtest.exe') -BuildManifestPath $manifest -ExpectedBuildManifestSha256 (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash -FixtureRoot $fixture -ImmediateFixtureRoot $immediate.FixtureRoot -OutputDirectory $runRoot -ReportPath $report
           $verificationExitCode = $LASTEXITCODE
-          if (Test-Path -LiteralPath $report) {
-            $verification = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
-            $verification.results | Select-Object name, passed, skipped, note, error | ConvertTo-Json -Depth 4
-          }
+          if (!(Test-Path -LiteralPath $report -PathType Leaf)) { throw 'Required E2E report was not produced.' }
+          $verification = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+          $verification.results | Select-Object name, passed, skipped, note, error | ConvertTo-Json -Depth 4
           if ($verificationExitCode -ne 0) { exit $verificationExitCode }
+          if (!$verification.completeVerified -or $verification.coverage -cne 'full-default-suite' -or $verification.selectedExpectedCount -ne 62 -or $verification.executedCount -ne 62 -or @($verification.results).Count -ne 62 -or $verification.failed -ne 0 -or $verification.skipped -ne 0 -or @($verification.results | Where-Object { !$_.passed -or $_.skipped }).Count) { throw 'Full 62-case verification with zero failures and zero skips is required; incomplete infrastructure must hold auto-merge.' }
+  validate-macos:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the event commit without Node
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:GITHUB_REPOSITORY -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid checkout identity.' }
+          if ($env:GITHUB_SERVER_URL -cne 'https://github.com') { throw 'Unexpected checkout server.' }
+          if (!$env:GH_TOKEN) { throw 'Checkout token is absent.' }
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          if (@(Get-ChildItem -LiteralPath $workspace -Force).Count) { throw 'Checkout requires an empty workspace.' }
+          git init --quiet $workspace
+          if ($LASTEXITCODE -ne 0) { throw 'Git initialization failed.' }
+          git -C $workspace remote add origin ("$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git")
+          if ($LASTEXITCODE -ne 0) { throw 'Git origin setup failed.' }
+          $names = @('GIT_CONFIG_COUNT','GIT_CONFIG_KEY_0','GIT_CONFIG_VALUE_0','GIT_TERMINAL_PROMPT','GIT_TRACE','GIT_TRACE_CURL','GIT_CURL_VERBOSE')
+          $saved = @{}; foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
+          try {
+              # 認証はfetchのprocess環境だけに置き、git設定・URL・ログへ保存しない。
+              $env:GIT_CONFIG_COUNT = '1'
+              $env:GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
+              $env:GIT_CONFIG_VALUE_0 = 'AUTHORIZATION: basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('x-access-token:' + $env:GH_TOKEN))
+              $env:GIT_TERMINAL_PROMPT = '0'; $env:GIT_TRACE = '0'; $env:GIT_TRACE_CURL = '0'; $env:GIT_CURL_VERBOSE = '0'
+              git -C $workspace -c credential.helper= fetch --no-tags --depth=1 origin $env:GITHUB_SHA
+              if ($LASTEXITCODE -ne 0) { throw 'Git fetch failed.' }
+          } finally {
+              foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name,$saved[$name],'Process') }
+              $env:GH_TOKEN = $null
+          }
+          git -C $workspace checkout --detach $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Git checkout failed.' }
+          $actual = git -C $workspace rev-parse --verify HEAD
+          if ($LASTEXITCODE -ne 0 -or $actual -cne $env:GITHUB_SHA) { throw 'Checkout differs from the event commit.' }
+      - name: Setup Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(python3 scripts/prunlet_macos_package.py toolchain)
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup target add --toolchain "$toolchain" aarch64-apple-darwin x86_64-apple-darwin
+      - name: Test and publish native Mach-O products
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/prunlet-cargo-target"
+          export TMPDIR="$RUNNER_TEMP/prunlet-temp"
+          mkdir -p "$TMPDIR"
+          export RUSTUP_TOOLCHAIN="$(python3 scripts/prunlet_macos_package.py toolchain)"
+          cargo test --locked --lib
+          for runtime in osx-arm64 osx-x64; do
+            bash scripts/Publish-PrunletMac.sh --output-directory "$RUNNER_TEMP/prunlet-$runtime" --target-directory "$CARGO_TARGET_DIR" --runtime "$runtime" --source-commit "$GITHUB_SHA"
+          done

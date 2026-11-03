@@ -23,16 +23,40 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - name: Checkout the released tag
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.release.tag_name }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Setup .NET
-        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
-        with:
-          dotnet-version: 10.0.x
+      - name: Checkout the released tag without Node
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRUNLET_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:GITHUB_REPOSITORY -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid checkout identity.' }
+          if ($env:GITHUB_SERVER_URL -cne 'https://github.com') { throw 'Unexpected checkout server.' }
+          if (!$env:GH_TOKEN) { throw 'Checkout token is absent.' }
+          if ($env:PRUNLET_TAG -cnotmatch '^v?[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?$') { throw 'Unsupported release tag.' }
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          if (@(Get-ChildItem -LiteralPath $workspace -Force).Count) { throw 'Checkout requires an empty workspace.' }
+          git init --quiet $workspace
+          if ($LASTEXITCODE -ne 0) { throw 'Git initialization failed.' }
+          git -C $workspace remote add origin ("$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git")
+          if ($LASTEXITCODE -ne 0) { throw 'Git origin setup failed.' }
+          $names = @('GIT_CONFIG_COUNT','GIT_CONFIG_KEY_0','GIT_CONFIG_VALUE_0','GIT_TERMINAL_PROMPT','GIT_TRACE','GIT_TRACE_CURL','GIT_CURL_VERBOSE')
+          $saved = @{}; foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
+          try {
+              # 認証はfetchのprocess環境だけに置き、git設定・URL・ログへ保存しない。
+              $env:GIT_CONFIG_COUNT = '1'
+              $env:GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
+              $env:GIT_CONFIG_VALUE_0 = 'AUTHORIZATION: basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('x-access-token:' + $env:GH_TOKEN))
+              $env:GIT_TERMINAL_PROMPT = '0'; $env:GIT_TRACE = '0'; $env:GIT_TRACE_CURL = '0'; $env:GIT_CURL_VERBOSE = '0'
+              git -C $workspace -c credential.helper= fetch --force --tags origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
+              if ($LASTEXITCODE -ne 0) { throw 'Git fetch failed.' }
+          } finally {
+              foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name,$saved[$name],'Process') }
+              $env:GH_TOKEN = $null
+          }
+          git -C $workspace checkout --detach ('refs/tags/' + $env:PRUNLET_TAG)
+          if ($LASTEXITCODE -ne 0) { throw 'Git checkout failed.' }
+          $actual = git -C $workspace rev-parse --verify HEAD
+          if ($LASTEXITCODE -ne 0 -or $actual -cne $env:GITHUB_SHA) { throw 'Checkout differs from the event commit.' }
       - name: Verify the released commit
         id: source
         env:
@@ -52,6 +76,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Release commit is not on the default branch.' }
           "commit=$commit" >> $env:GITHUB_OUTPUT
           "branch=$branch" >> $env:GITHUB_OUTPUT
+      - name: Setup Rust
+        env:
+          PRUNLET_RUNTIME: ${{ matrix.runtime }}
+        run: |
+          . ./scripts/RustBuildInputs.Common.ps1
+          $toolchain = Get-PrunletRustToolchain $env:GITHUB_WORKSPACE
+          rustup toolchain install $toolchain --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $target = if ($env:PRUNLET_RUNTIME -eq 'win-arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+          rustup target add --toolchain $toolchain $target
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build the released commit
         env:
           PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
@@ -62,7 +97,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $output = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $env:PRUNLET_RUNTIME)
           $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
-          & ./scripts/Publish-Prunlet.ps1 -OutputDirectory $output -Runtime $env:PRUNLET_RUNTIME | Out-Null
+          & ./scripts/Publish-Prunlet.ps1 -OutputDirectory $output -Runtime $env:PRUNLET_RUNTIME -SourceCommit $env:PRUNLET_COMMIT | Out-Null
           $expectedVersion = $env:PRUNLET_TAG -replace '^v', ''
           foreach ($name in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
             $product = Join-Path $output ('publish/' + $name)
@@ -83,15 +118,41 @@ jobs:
           $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
           $sha256 = & ./scripts/Verify-ReleasePackage.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory (Join-Path $output 'publish') -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME -Repository $env:GITHUB_REPOSITORY
           "sha256=$sha256" >> $env:GITHUB_OUTPUT
-      - name: Attach the same package to the release
+      - name: Publish the verified package to R2
+        id: r2_package
         env:
-          GH_TOKEN: ${{ github.token }}
-          PRUNLET_TAG: ${{ github.event.release.tag_name }}
+          PRUNLET_R2_ACCOUNT_ID: ${{ secrets.PRUNLET_R2_ACCOUNT_ID }}
+          PRUNLET_R2_ACCESS_KEY_ID: ${{ secrets.PRUNLET_R2_ACCESS_KEY_ID }}
+          PRUNLET_R2_SECRET_ACCESS_KEY: ${{ secrets.PRUNLET_R2_SECRET_ACCESS_KEY }}
+          PRUNLET_R2_BUCKET: ${{ vars.PRUNLET_R2_BUCKET }}
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
           PRUNLET_RUNTIME: ${{ matrix.runtime }}
           PRUNLET_EXPECTED_SHA256: ${{ steps.verified_package.outputs.sha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $env:PRUNLET_RUNTIME)
+          $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
+          if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -ine $env:PRUNLET_EXPECTED_SHA256) { throw 'Package changed before R2 publication.' }
+          $publication = & ./scripts/Publish-PrunletR2.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory (Join-Path $output 'publish') -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME -Repository $env:GITHUB_REPOSITORY | ConvertFrom-Json -AsHashtable
+          if ($publication -isnot [Collections.IDictionary] -or $publication.schema -ne 1 -or $publication.verified -isnot [bool] -or !$publication.verified -or $publication.sha256 -ine $env:PRUNLET_EXPECTED_SHA256 -or $publication.bytes -ne (Get-Item -LiteralPath $package).Length -or $publication.commitSha -cne $env:PRUNLET_COMMIT -or $publication.runtime -cne $env:PRUNLET_RUNTIME -or $publication.repository -ine $env:GITHUB_REPOSITORY) { throw 'R2 publication differs from the verified package.' }
+          "sha256=$($publication.sha256.ToUpperInvariant())" >> $env:GITHUB_OUTPUT
+      - name: Attach the same package to GitHub for older clients
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRUNLET_TAG: ${{ github.event.release.tag_name }}
+          PRUNLET_RELEASE_ID: ${{ github.event.release.id }}
+          PRUNLET_RUNTIME: ${{ matrix.runtime }}
+          PRUNLET_EXPECTED_SHA256: ${{ steps.r2_package.outputs.sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
           $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
           if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -cne $env:PRUNLET_EXPECTED_SHA256) { throw 'Package changed after verification.' }
+          if ($env:PRUNLET_RELEASE_ID -cnotmatch '^[1-9][0-9]*$') { throw 'Invalid release event identity.' }
           gh release upload $env:PRUNLET_TAG $package --repo $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed; an existing asset was not overwritten.' }
+          $assetPages = gh api --hostname github.com --method GET --paginate --slurp "repos/$env:GITHUB_REPOSITORY/releases/$env:PRUNLET_RELEASE_ID/assets?per_page=100" | ConvertFrom-Json -AsHashtable -NoEnumerate
+          if ($LASTEXITCODE -ne 0) { throw 'Uploaded release asset could not be verified; do not resend automatically.' }
+          $name = [IO.Path]::GetFileName($package)
+          $assets = @(foreach ($page in $assetPages) { foreach ($asset in $page) { if ($asset.name -ceq $name) { $asset } } })
+          if ($assets.Count -ne 1 -or $assets[0].state -cne 'uploaded' -or $assets[0].size -ne (Get-Item -LiteralPath $package).Length -or $assets[0].digest -cne ('sha256:' + $env:PRUNLET_EXPECTED_SHA256.ToLowerInvariant())) { throw 'GitHub mirror digest or size differs from the R2 package; publication is incomplete.' }

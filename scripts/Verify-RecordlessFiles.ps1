@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$ExecutablePath,[Parameter(Mandatory)][string]$OutputDirectory,[Parameter(Mandatory)][string]$ReportPath,[ValidateNotNullOrEmpty()][string[]]$CaseFilter=@('*'),[switch]$Large,[ValidateRange(32769,65535)][int]$LargeFileCount=32769,[string]$AssemblyPath,[string]$ExpectedAssemblySha256,[string]$FixtureRoot)
+param([Parameter(Mandatory)][string]$ExecutablePath,[Parameter(Mandatory)][string]$OutputDirectory,[Parameter(Mandatory)][string]$ReportPath,[ValidateNotNullOrEmpty()][string[]]$CaseFilter=@('*'),[switch]$Large,[ValidateRange(60,86400)][int]$ProcessTimeoutSeconds=240,[ValidateRange(32769,65535)][int]$LargeFileCount=32769,[string]$RustProbePath,[string]$BuildManifestPath,[string]$ExpectedBuildManifestSha256,[string]$FixtureRoot,[string]$ImmediateFixtureRoot)
 $ErrorActionPreference='Stop'
 # 想定する失敗: private file journal/PIDL/stage生成、dry-runの変更、Shellと設定が照合できない永久削除、
 # nativeID/ACL/全stream/link関係の欠落、衝突上書き、preflight一部削除、並列入力順の破損、
@@ -12,15 +12,18 @@ $repo=[IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 foreach($path in @($ExecutablePath,$OutputDirectory,$ReportPath)){if(![IO.Path]::IsPathFullyQualified($path)){throw 'Absolute paths required'}}
 foreach($path in @($OutputDirectory,$ReportPath)){Assert-VerificationDestination $path @($repo,(Join-Path $env:USERPROFILE '.codex'));if(![IO.Path]::GetPathRoot($path).Equals('D:\',[StringComparison]::OrdinalIgnoreCase)){throw 'External D output required'};if(Test-Path -LiteralPath $path){throw 'Unused output/report required'};if(![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))){throw 'Output parent must exist'}}
 if(![IO.File]::Exists($ExecutablePath)){throw 'Executable missing'}
-if([bool]$AssemblyPath-ne[bool]$ExpectedAssemblySha256){throw 'AssemblyPath and ExpectedAssemblySha256 must be supplied together'}
-if($AssemblyPath){if(![IO.Path]::IsPathFullyQualified($AssemblyPath)-or![IO.File]::Exists($AssemblyPath)){throw 'Absolute candidate assembly required'};if((Get-FileHash -LiteralPath $AssemblyPath).Hash-cne$ExpectedAssemblySha256){throw 'Candidate assembly hash mismatch'}}
+$probeArguments=@($RustProbePath,$BuildManifestPath,$ExpectedBuildManifestSha256)|Where-Object {![string]::IsNullOrEmpty($_)}
+if($probeArguments.Count -notin @(0,3)){throw 'RustProbePath, BuildManifestPath and ExpectedBuildManifestSha256 must be supplied together'}
+. (Join-Path $PSScriptRoot 'recordless-e2e/RustFileProbe.Common.ps1')
+$buildBinding=$(if($RustProbePath){Assert-RustFileProbeBinding}else{$null})
 $script:fixtureRun=$null;if($FixtureRoot){$script:fixtureRun=New-VerificationFixtureRun -FixtureRoot $FixtureRoot -ForbiddenRoots @($repo,(Join-Path $env:USERPROFILE '.codex')) -NamePrefix 'recordless'}
+$script:immediateFixtureRun=$null;if($ImmediateFixtureRoot){$script:immediateFixtureRun=New-VerificationFixtureRun -FixtureRoot $ImmediateFixtureRoot -ForbiddenRoots @($repo,(Join-Path $env:USERPROFILE '.codex'),$OutputDirectory) -NamePrefix 'recordless-immediate'}
 $null=[IO.Directory]::CreateDirectory($OutputDirectory);$script:temp=Join-Path $OutputDirectory 'temp';$null=[IO.Directory]::CreateDirectory($script:temp)
 $oldTemp=$env:TEMP;$oldTmp=$env:TMP;$env:TEMP=$script:temp;$env:TMP=$script:temp
 $helperFiles=@('NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs')|ForEach-Object {Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $_}
-$common=Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1';. $common
-$rendezvousHost=Join-Path $PSScriptRoot 'recordless-e2e/OversizeBatchRendezvousHost.ps1';$initialSourceHash=(Get-FileHash $PSCommandPath).Hash;$initialSources=@(@($PSCommandPath,$common,(Join-Path $PSScriptRoot 'Verification-Fixture.ps1'),$rendezvousHost,(Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs'))+$helperFiles|ForEach-Object {@{path=$_;sha256=(Get-FileHash $_).Hash}});$results=[Collections.Generic.List[object]]::new();$script:commands=[Collections.Generic.List[object]]::new();$catalog=[Collections.Generic.List[string]]::new();$excluded=[Collections.Generic.List[string]]::new()
-function Case-R([string]$Name,[scriptblock]$Body,[switch]$RequiresLarge,[switch]$RequiresAssembly){$catalog.Add($Name);if(($RequiresLarge-and!$Large)-or($RequiresAssembly-and!$AssemblyPath)-or!@($CaseFilter|Where-Object {$Name-like$_}).Count){$excluded.Add($Name);return};$script:observed=@{};$script:skipReason=$null;$clock=[Diagnostics.Stopwatch]::StartNew();try{& $Body;$results.Add(@{name=$Name;passed=$(if($script:skipReason){$null}else{$true});skipped=[bool]$script:skipReason;note=$script:skipReason;observed=$script:observed;elapsedMs=$clock.ElapsedMilliseconds})}catch{$results.Add(@{name=$Name;passed=$false;error=$_.Exception.Message;stack=$_.ScriptStackTrace;observed=$script:observed;elapsedMs=$clock.ElapsedMilliseconds})}}
+$common=Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1';. $common -CliTimeoutSeconds $ProcessTimeoutSeconds
+$initialSourceHash=(Get-FileHash $PSCommandPath).Hash;$initialSources=@(@($PSCommandPath,$common,(Join-Path $PSScriptRoot 'Verification-Fixture.ps1'),(Join-Path $PSScriptRoot 'recordless-e2e/RustFileProbe.Common.ps1'),(Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs'))+$helperFiles|ForEach-Object {@{path=$_;sha256=(Get-FileHash $_).Hash}});$initialSources+=@(Get-RustFileProbeSourceHashes);$results=[Collections.Generic.List[object]]::new();$script:commands=[Collections.Generic.List[object]]::new();$catalog=[Collections.Generic.List[string]]::new();$excluded=[Collections.Generic.List[string]]::new()
+function Case-R([string]$Name,[scriptblock]$Body,[switch]$RequiresLarge,[switch]$RequiresProbe){$catalog.Add($Name);if(($RequiresLarge-and!$Large)-or($RequiresProbe-and!$RustProbePath)-or!@($CaseFilter|Where-Object {$Name-like$_}).Count){$excluded.Add($Name);return};$script:observed=@{};$script:skipReason=$null;$clock=[Diagnostics.Stopwatch]::StartNew();try{& $Body;$results.Add(@{name=$Name;passed=$(if($script:skipReason){$null}else{$true});skipped=[bool]$script:skipReason;note=$script:skipReason;observed=$script:observed;elapsedMs=$clock.ElapsedMilliseconds})}catch{$results.Add(@{name=$Name;passed=$false;error=$_.Exception.Message;stack=$_.ScriptStackTrace;observed=$script:observed;elapsedMs=$clock.ElapsedMilliseconds})}}
 function Initialize-SparseR {
  if (!('PrunletSparseE2E' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs') }
 }
@@ -107,6 +110,7 @@ function Test-OversizeAliasBatchR([switch]$Tree) {
  }
 }
 function Test-OversizeCrossDirectoryAliasesR([switch]$Mcp,[ValidateSet('','rendezvous','child-race','locked-child','guard-probe','time-probe','external-change','external-attributes','external-masked-change')][string]$CoreMode=''){
+ if($CoreMode){$s=New-ScopeR ('oversize-native-'+$CoreMode);$script:observed.native=Invoke-RustFileContract ('file-oversize-'+$CoreMode) $s.files;No-FileRecordsR $s;return}
  Initialize-SparseR;$s=New-ScopeR $(if($Mcp){'oversize-cross-directory-mcp'}elseif($CoreMode){'oversize-cross-directory-core-'+$CoreMode}else{'oversize-cross-directory-cli'});$roots=@((Join-Path $s.files 'second-root'),(Join-Path $s.files 'first-root'));$rootInfo=[Collections.Generic.List[object]]::new()
  foreach($root in $roots){$null=[IO.Directory]::CreateDirectory($root);$id=[Prunlet.RecordlessE2E.FixtureNative]::Identity($root);$rootInfo.Add(@{path=$root;id=$id;attributes=[int](Get-Item -LiteralPath $root -Force).Attributes;security=[Convert]::ToBase64String((Get-Acl -LiteralPath $root).GetSecurityDescriptorBinaryForm());prior=[string[]]@([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($id)|ForEach-Object Pidl);sparsePath=(Join-Path $root 'huge-sparse');sparse=$null})}
  $survivor=File-R $s 'surviving-alias';$aliases=@($roots|ForEach-Object {$root=$_;0..31|ForEach-Object {Join-Path $root ('alias-'+$_.ToString('D2'))}})+@($survivor);$session=$null;$aliasBefore=$null;$aliasPrior=@()
@@ -118,36 +122,7 @@ function Test-OversizeCrossDirectoryAliasesR([switch]$Mcp,[ValidateSet('','rende
   if($Mcp){$session=Open-McpR $s;Init-McpR $session;$dry=Call-McpR $session 2 'delete_files' @{paths=@($roots);dryRun=$true;recursive=$true};Assert-R (!$dry.failed) 'MCP cross-directory dry-run failed'}else{$dry=Delete-R $s $roots -DryRun -Recursive;Assert-R ($dry.exitCode-eq0) 'CLI cross-directory dry-run failed'}
   $script:observed.dry=$dry;Assert-WireR $dry $roots @('would_recycle','would_recycle') $true
   foreach($root in $rootInfo){Assert-R ([Prunlet.RecordlessE2E.FixtureNative]::Identity($root.path)-ceq$root.id-and[int](Get-Item -LiteralPath $root.path -Force).Attributes-eq$root.attributes-and[Convert]::ToBase64String((Get-Acl -LiteralPath $root.path).GetSecurityDescriptorBinaryForm())-ceq$root.security) 'Dry-run changed root identity or security';Assert-SparseProofR $root.sparse.proof ([PrunletSparseE2E]::CaptureProof($root.sparsePath)) 1;$read=[IO.File]::OpenRead($root.sparsePath);try{$bytes=[byte[]]::new($root.sparse.prefix.Length);$read.ReadExactly($bytes);Assert-R ([Convert]::ToBase64String($bytes)-ceq[Convert]::ToBase64String($root.sparse.prefix)) 'Dry-run changed sparse prefix'}finally{$read.Dispose()};Assert-NoNewBinR $root.id $root.prior;Assert-NoNewBinR $root.sparse.proof.Id $root.sparse.prior};foreach($alias in $aliases){$null=Assert-SnapshotR $alias $aliasBefore};Assert-NoNewBinR $aliasBefore[0].Id $aliasPrior
-  if($CoreMode){
-   $result=& $rendezvousHost -AssemblyPath $AssemblyPath -ExpectedAssemblySha256 $ExpectedAssemblySha256 -ConfigPath $s.config -TargetPaths $roots -Mode $CoreMode
-   $script:observed.coreRendezvous=$result
-   Assert-R ($result.checkpointCount-eq2-and!$result.failure) 'Real Shell oversized checkpoints did not both arrive'
-   if($CoreMode-eq'locked-child'){
-    Assert-R ($result.lockAcquired-and$result.lockReleased-and$result.reportedError-and$result.result.Items.Count-eq2) 'Locked-child fixture or non-success missing'
-    Assert-R ($result.result.Items[0].Status-ceq'ambiguous'-and$result.result.Items[1].Status-ceq'permanently_deleted') 'Failure did not release gate for independent root'
-    Assert-R ([IO.Directory]::Exists($roots[0])-and![IO.Directory]::Exists($roots[1])) 'Failure/success roots mismatch'
-    $proof=Snapshot-R $survivor;Assert-R ($proof[0].Id-ceq$aliasBefore[0].Id) 'External alias identity changed';No-FileRecordsR $s;return
-   }
-   Assert-R ($result.released-and$result.elapsedMs-lt20000) 'Oversized checkpoints did not rendezvous within 20 seconds'
-   if($CoreMode-eq'external-masked-change'){
-    Assert-R ($result.writerDenied-and!$result.externalChangeInjected) 'A masked external stream write was accepted during hardlink deletion'
-   }
-   if($CoreMode-eq'external-change'-and$result.writerDenied){Assert-R (!$result.externalChangeInjected) 'Denied stream write was reported as injected'}
-   if($CoreMode-in@('external-change','external-attributes')-and!($CoreMode-eq'external-change'-and$result.writerDenied)){
-    Assert-R ($result.externalChangeInjected-and$result.reportedError-and$result.result.Items.Count-eq2) 'Injected external change or non-success missing'
-    Assert-R ($result.result.Items[0].Status-ceq'ambiguous'-and$result.result.Items[1].Status-ceq'ambiguous') 'Changed hardlink did not stop both roots'
-    $proof=Snapshot-R $survivor
-    foreach($field in @('Id','SecurityBase64','Directory','ReparseTag','ReparseBase64')){Assert-R ($proof[0].$field-ceq$aliasBefore[0].$field) ('External alias '+$field+' changed')}
-    if($CoreMode-eq'external-attributes'){Assert-R ($proof[0].Attributes-ne$aliasBefore[0].Attributes) 'Injected attribute change was not retained';$aliasBefore[0].Attributes=$proof[0].Attributes}else{Assert-R ($proof[0].Attributes-eq$aliasBefore[0].Attributes) 'External alias attributes changed'}
-    Assert-R (($proof[0].Streams|ConvertTo-Json -Depth 10 -Compress)-ceq($aliasBefore[0].Streams|ConvertTo-Json -Depth 10 -Compress)) 'External alias content was not restored'
-    No-FileRecordsR $s;return
-   }
-   if($CoreMode-eq'child-race'){Assert-R ($result.childWaitTimedOut-and!$result.childConflict) 'Shared child opened while another root held its alias'}
-   if($CoreMode-eq'guard-probe'){Assert-R ($result.pendingWriterDenied-and$result.writerAttempted-and$result.writerDenied-and$result.writerAllowedAfter) 'Hardlink writer was not blocked until the guard was released'}
-   Assert-R (!$result.reportedError-and$result.result.Items.Count-eq2-and!$result.result.DryRun) 'Core cross-directory deletion failed'
-   foreach($index in 0..1){Assert-R ($result.result.Items[$index].Path-ceq$roots[$index]-and$result.result.Items[$index].Status-ceq'permanently_deleted') 'Core input-order/path/status mismatch'}
-   Assert-R ((Get-FileHash -LiteralPath $AssemblyPath).Hash-ceq$ExpectedAssemblySha256) 'Candidate assembly changed'
-  }elseif($Mcp){$result=Call-McpR $session 3 'delete_files' @{paths=@($roots);recursive=$true};$script:observed.delete=$result;Assert-R (!$result.failed) 'MCP cross-directory deletion failed';Assert-WireR $result $roots @('permanently_deleted','permanently_deleted')}else{$result=Delete-R $s $roots -Recursive;$script:observed.delete=$result;Assert-R ($result.exitCode-eq0) 'CLI cross-directory deletion failed';Assert-WireR $result $roots @('permanently_deleted','permanently_deleted')}
+  if($Mcp){$result=Call-McpR $session 3 'delete_files' @{paths=@($roots);recursive=$true};$script:observed.delete=$result;Assert-R (!$result.failed) 'MCP cross-directory deletion failed';Assert-WireR $result $roots @('permanently_deleted','permanently_deleted')}else{$result=Delete-R $s $roots -Recursive;$script:observed.delete=$result;Assert-R ($result.exitCode-eq0) 'CLI cross-directory deletion failed';Assert-WireR $result $roots @('permanently_deleted','permanently_deleted')}
   foreach($root in $rootInfo){Assert-R (![IO.Directory]::Exists($root.path)-and![IO.File]::Exists($root.sparsePath)) 'Oversized root remains';Assert-NoNewBinR $root.id $root.prior;Assert-NoNewBinR $root.sparse.proof.Id $root.sparse.prior};Assert-NoNewBinR $aliasBefore[0].Id $aliasPrior
   $proof=Snapshot-R $survivor;Assert-R ($proof.Count-eq1-and$proof[0].NumberOfLinks-eq1) 'Surviving alias link count changed';foreach($field in @('Id','SecurityBase64','Attributes','Directory','ReparseTag','ReparseBase64')){Assert-R ($proof[0].$field-ceq$aliasBefore[0].$field) ('Surviving alias '+$field+' changed')};Assert-R (($proof[0].Streams|ConvertTo-Json -Depth 10 -Compress)-ceq($aliasBefore[0].Streams|ConvertTo-Json -Depth 10 -Compress)) 'Surviving alias content changed';$script:observed.survivingAlias=$proof;No-FileRecordsR $s
  }catch{$script:observed.bodyError=$_.Exception.ToString();throw}finally{
@@ -169,22 +144,22 @@ try{
  Add-Type -Path $helperFiles -CompilerOptions '/unsafe'
  foreach($useMcp in @($false,$true)){
   $transport=if($useMcp){'mcp'}else{'cli'}
-  Case-R ($transport+'-immediate-delete-configured-volume') -RequiresAssembly {
-   $s=New-ScopeR ($transport+'-immediate-delete') -HostVolume;$p=File-R $s 'small-file';$root=Join-Path $s.files 'tree';$null=[IO.Directory]::CreateDirectory($root);$child=Join-Path $root 'child';[IO.File]::WriteAllText($child,'immediate-delete child');$outside=File-R $s 'outside';$link=Join-Path $root 'outside-link';$null=New-Item -ItemType Junction -Path $link -Target $s.files;$crossLink=Join-Path $s.files 'cross-volume-link';$null=New-Item -ItemType Junction -Path $crossLink -Target $env:WINDIR;$windowsId=[Prunlet.RecordlessE2E.FixtureNative]::Identity($env:WINDIR)
-   $assembly=[Reflection.Assembly]::LoadFrom($AssemblyPath);$settingType=$assembly.GetType('Prunlet.Core.RecycleImmediateDeleteSetting',$true);$settingArgs=[object[]]::new(1);$settingArgs[0]=[string]$p;$setting=$settingType.GetMethod('TryCapture',[Reflection.BindingFlags]'NonPublic,Static').Invoke($null,$settingArgs)
-   if(!$setting){$script:skipReason='Volume has no supported explicit immediate-delete setting; settings were not changed';return}
-   $script:observed.immediateDeleteSetting=@{sid=$setting.Sid;volume=$setting.Volume};$before=Snapshot-R $p;$treeBefore=Snapshot-R $root;$outsideBefore=Snapshot-R $outside;$prior=Before-BinR $before;$treePrior=Before-BinR $treeBefore;$metadata=Metadata-R $s.metadata
+  Case-R ($transport+'-immediate-delete-configured-volume') -RequiresProbe {
+   $s=New-ScopeR ($transport+'-immediate-delete') -HostVolume -ImmediateVolume;$p=File-R $s 'small-file';$root=Join-Path $s.files 'tree';$null=[IO.Directory]::CreateDirectory($root);$child=Join-Path $root 'child';[IO.File]::WriteAllText($child,'immediate-delete child');$outside=File-R $s 'outside';$link=Join-Path $root 'outside-link';$null=New-Item -ItemType Junction -Path $link -Target $s.files;$crossLink=Join-Path $s.files 'cross-volume-link';$null=New-Item -ItemType Junction -Path $crossLink -Target $env:WINDIR;$windowsId=[Prunlet.RecordlessE2E.FixtureNative]::Identity($env:WINDIR)
+   $settingProbe=Invoke-RustFileContract 'file-immediate-delete-setting' $s.files;$setting=$settingProbe.result
+   if(!$setting.confirmed){$script:skipReason='Volume has no supported explicit immediate-delete setting; settings were not changed';return}
+   $script:observed.immediateDeleteSetting=$settingProbe;$before=Snapshot-R $p;$treeBefore=Snapshot-R $root;$outsideBefore=Snapshot-R $outside;$prior=Before-BinR $before;$treePrior=Before-BinR $treeBefore;$metadata=Metadata-R $s.metadata
    $dry=Delete-R $s @($p,$root,$crossLink) -Recursive -DryRun;$script:observed.dry=$dry;Assert-WireR $dry @($p,$root,$crossLink) @('would_recycle','would_recycle','would_recycle') $true;Assert-R ($dry.exitCode-eq0-and(Metadata-R $s.metadata)-ceq$metadata) 'Immediate-delete dry-run changed metadata';$null=Assert-SnapshotR $p $before;$null=Assert-SnapshotR $root $treeBefore
    if($useMcp){$session=Open-McpR $s;try{Init-McpR $session;$r=Call-McpR $session 2 'delete_files' @{paths=@($p,$root,$crossLink);recursive=$true};Assert-R (!$r.failed) 'Immediate-delete MCP failed'}finally{Close-McpR $session}}else{$r=Delete-R $s @($p,$root,$crossLink) -Recursive;Assert-R ($r.exitCode-eq0) 'Immediate-delete CLI failed'}
    $script:observed.delete=$r;Assert-WireR $r @($p,$root,$crossLink) @('permanently_deleted','permanently_deleted','permanently_deleted');Assert-R (![IO.File]::Exists($p)-and![IO.Directory]::Exists($root)) 'Immediate-delete source remained';Assert-R (!(Test-Path -LiteralPath $crossLink)-and([Prunlet.RecordlessE2E.FixtureNative]::Identity($env:WINDIR)-ceq$windowsId)) 'Cross-volume junction or its target changed incorrectly';$null=Assert-SnapshotR $outside $outsideBefore;Assert-NoNewBinR $before[0].Id $prior;Assert-NoNewBinR $treeBefore[0].Id $treePrior;No-FileRecordsR $s
   }
  }
- Case-R 'core-immediate-delete-replacement-retained' -RequiresAssembly {
-  $s=New-ScopeR 'immediate-delete-replacement' -HostVolume;$p=File-R $s 'small-file';$moved=Join-Path $s.files 'original-moved';$before=Snapshot-R $p;$prior=Before-BinR $before
-  $assembly=[Reflection.Assembly]::LoadFrom($AssemblyPath);$settingType=$assembly.GetType('Prunlet.Core.RecycleImmediateDeleteSetting',$true);$settingArgs=[object[]]::new(1);$settingArgs[0]=[string]$p;$setting=$settingType.GetMethod('TryCapture',[Reflection.BindingFlags]'NonPublic,Static').Invoke($null,$settingArgs)
-  if(!$setting){$script:skipReason='Volume has no supported explicit immediate-delete setting; settings were not changed';return}
-  $hostPath=Join-Path $PSScriptRoot 'recordless-e2e/OversizeCheckpointHost.ps1';$r=& $hostPath -AssemblyPath $AssemblyPath -ExpectedAssemblySha256 $ExpectedAssemblySha256 -ConfigPath $s.config -TargetPath $p -MovedPath $moved -Mode replace;$script:observed.core=$r
-  Assert-R ($r.checkpointCount-eq1-and$r.reportedError-and$r.result.Items[0].Status-ceq'ambiguous') 'Replacement after Shell failure was not ambiguous';$null=Assert-SnapshotR $p $r.replacement;$null=Assert-SnapshotR $moved $before;Assert-NoNewBinR $before[0].Id $prior;No-FileRecordsR $s
+ Case-R 'core-immediate-delete-replacement-retained' -RequiresProbe {
+  $s=New-ScopeR 'immediate-delete-replacement' -HostVolume -ImmediateVolume
+  $setting=Invoke-RustFileContract 'file-immediate-delete-setting' $s.files
+  if(!$setting.result.confirmed){$script:skipReason='Volume has no supported explicit immediate-delete setting; settings were not changed';return}
+  $script:observed.native=Invoke-RustFileContract 'file-immediate-delete-replacement' $s.files
+  No-FileRecordsR $s
  }
  Case-R 'cli-reserved-file-mixed-dry-and-permanent' {
   $s=New-ScopeR 'reserved-cli';$p=Join-Path $s.files 'NUL';$xp='\\?\'+$p;[IO.File]::WriteAllBytes($xp,[byte[]](1..144));$ordinary=File-R $s 'ordinary';$missing=Join-Path $s.files 'LPT2.txt'
@@ -290,14 +265,14 @@ try{
  Case-R 'cli-oversized-directory-hardlink-aliases' {Test-OversizeAliasBatchR -Tree}
  Case-R 'cli-oversized-cross-directory-hardlink-aliases' {Test-OversizeCrossDirectoryAliasesR}
  Case-R 'mcp-oversized-cross-directory-hardlink-aliases' {Test-OversizeCrossDirectoryAliasesR -Mcp}
- Case-R 'core-oversized-cross-directory-rendezvous' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'rendezvous'} -RequiresAssembly
- Case-R 'core-oversized-cross-directory-child-race' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'child-race'} -RequiresAssembly
- Case-R 'core-oversized-cross-directory-locked-child' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'locked-child'} -RequiresAssembly
- Case-R 'core-oversized-cross-directory-guard-probe' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'guard-probe'} -RequiresAssembly
- Case-R 'core-oversized-cross-directory-time-probe' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'time-probe'} -RequiresAssembly
- Case-R 'core-oversized-cross-directory-external-change' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'external-change'} -RequiresAssembly
- Case-R 'core-oversized-cross-directory-external-attributes' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'external-attributes'} -RequiresAssembly
- Case-R 'core-oversized-cross-directory-external-masked-change' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'external-masked-change'} -RequiresAssembly
+ Case-R 'core-oversized-cross-directory-rendezvous' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'rendezvous'} -RequiresProbe
+ Case-R 'core-oversized-cross-directory-child-race' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'child-race'} -RequiresProbe
+ Case-R 'core-oversized-cross-directory-locked-child' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'locked-child'} -RequiresProbe
+ Case-R 'core-oversized-cross-directory-guard-probe' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'guard-probe'} -RequiresProbe
+ Case-R 'core-oversized-cross-directory-time-probe' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'time-probe'} -RequiresProbe
+ Case-R 'core-oversized-cross-directory-external-change' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'external-change'} -RequiresProbe
+ Case-R 'core-oversized-cross-directory-external-attributes' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'external-attributes'} -RequiresProbe
+ Case-R 'core-oversized-cross-directory-external-masked-change' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'external-masked-change'} -RequiresProbe
  Case-R 'cli-case-sensitive-directory-preserves-both-names' {
   $s=New-ScopeR 'case-sensitive';$p=Join-Path $s.files 'case-sensitive';$null=[IO.Directory]::CreateDirectory($p);$beforeRoot=Snapshot-R $p
   $fsutil=Join-Path $env:SystemRoot 'System32/fsutil.exe';$output=@(& $fsutil file SetCaseSensitiveInfo $p enable 2>&1);$code=$LASTEXITCODE;$script:observed.enable=@{exitCode=$code;output=$output}
@@ -354,9 +329,10 @@ try{
  Case-R 'cli-large-native-recordless-windows-roundtrip' {$s=New-ScopeR 'large';foreach($index in 0..($LargeFileCount-1)){$null=File-R $s ('tree/file-'+$index.ToString('D5')) 32};$p=Join-Path $s.files 'tree';$before=Snapshot-R $p;$prior=Before-BinR $before;$r=Delete-R $s @($p) -Recursive;$script:observed.fileCount=$LargeFileCount;Assert-WireR $r @($p) @('recycled');Assert-R ($r.exitCode-eq0) 'Large recordless Shell recycle failed';$null=Restore-BinR $s $p $before $prior} -RequiresLarge
 }
 finally{
-  $selected=@($catalog|Where-Object {$name=$_;(@($CaseFilter|Where-Object {$name-like$_}).Count-and($Large-or$name-cne'cli-large-native-recordless-windows-roundtrip')-and($AssemblyPath-or($name-notlike'core-oversized-cross-directory-*'-and$name-notlike'*-immediate-delete-*')))});if(!$selected.Count){$results.Add(@{name='no-selected-cases';passed=$false;error='CaseFilter matched no cases or requires AssemblyPath and ExpectedAssemblySha256'})};if($catalog.Count-ne63-or$results.Count-ne$selected.Count){$results.Add(@{name='coverage-count';passed=$false;error='Catalog expected 63 or selected/executed counts differ'})}
+  $selected=@($catalog|Where-Object {$name=$_;(@($CaseFilter|Where-Object {$name-like$_}).Count-and($Large-or$name-cne'cli-large-native-recordless-windows-roundtrip')-and($RustProbePath-or($name-notlike'core-oversized-cross-directory-*'-and$name-notlike'*-immediate-delete-*')))});if(!$selected.Count){$results.Add(@{name='no-selected-cases';passed=$false;error='CaseFilter matched no cases or Rust native probes were not supplied'})};if($catalog.Count-ne63-or$results.Count-ne$selected.Count){$results.Add(@{name='coverage-count';passed=$false;error='Catalog expected 63 or selected/executed counts differ'})}
  $sourceFiles=@($PSCommandPath,$common)+$helperFiles
-  $report=@{suite='recordless-file-windows-bin';fixtureRun=$script:fixtureRun;suiteStage='CLI-MCP-hook-and-optional-Core-boundary';sourceSha256=$initialSourceHash;sources=$initialSources;executablePath=$ExecutablePath;executableSha256=(Get-FileHash $ExecutablePath).Hash;assemblyPath=$AssemblyPath;assemblySha256=$ExpectedAssemblySha256;catalog=@($catalog);expectedCatalogCount=63;expectedDefaultCount=51;expectedDefaultWithAssemblyCount=62;largeRequested=[bool]$Large;largeFileCount=$LargeFileCount;actualCatalogCount=$catalog.Count;selectedExpectedCount=$selected.Count;executedCount=$results.Count;excluded=@($excluded);caseFilter=$CaseFilter;coverage=$(if(@($excluded|Where-Object {($_-cne'cli-large-native-recordless-windows-roundtrip'-or$Large)-and(($_-notlike'core-oversized-cross-directory-*'-and$_-notlike'*-immediate-delete-*')-or$AssemblyPath)}).Count){'selected-subset'}else{$(if($Large){'full-large-suite'}else{'full-default-suite'})});passed=@($results|Where-Object passed).Count;failed=@($results|Where-Object {!$_.passed-and!$_.skipped}).Count;skipped=@($results|Where-Object skipped).Count;completeVerified=(@($results|Where-Object {!$_.passed}).Count-eq0);results=@($results);commands=@($script:commands);retained=$OutputDirectory;unverified=@('Native root pin/read-denied and legacy migration require separate suite boundaries. Core rendezvous requires the candidate assembly and does not prove CLI/MCP scheduling.')};Save-R $ReportPath $report;$env:TEMP=$oldTemp;$env:TMP=$oldTmp
+  $unverified=[Collections.Generic.List[string]]::new();if(!$RustProbePath){$unverified.Add('Eleven Rust native boundary/immediate-setting cases were not executed; CLI/MCP-only success is not full verification.')};if(!$Large){$unverified.Add('Optional large-directory DOS-size stress was not requested.')};$unverified.Add('Native registry authorization and legacy data migration use separate verification suites.')
+  $report=@{suite='recordless-file-windows-bin';fixtureRun=$script:fixtureRun;immediateFixtureRun=$script:immediateFixtureRun;suiteStage='CLI-MCP-hook-and-same-source-Rust-native-boundaries';sourceSha256=$initialSourceHash;sources=$initialSources;executablePath=$ExecutablePath;executableSha256=(Get-FileHash $ExecutablePath).Hash;rustProbePath=$RustProbePath;sameSourceBuild=$buildBinding;catalog=@($catalog);expectedCatalogCount=63;expectedCLIOnlyCount=51;expectedDefaultWithProbeCount=62;largeRequested=[bool]$Large;largeFileCount=$LargeFileCount;processTimeoutSeconds=$ProcessTimeoutSeconds;actualCatalogCount=$catalog.Count;selectedExpectedCount=$selected.Count;executedCount=$results.Count;excluded=@($excluded);caseFilter=$CaseFilter;coverage=$(if(!$RustProbePath){'CLI-MCP-only-native-boundaries-unverified'}elseif(@($excluded|Where-Object {$_-cne'cli-large-native-recordless-windows-roundtrip'-or$Large}).Count){'selected-subset'}elseif($Large){'full-large-suite'}else{'full-default-suite'});passed=@($results|Where-Object passed).Count;failed=@($results|Where-Object {!$_.passed-and!$_.skipped}).Count;skipped=@($results|Where-Object skipped).Count;completeVerified=([bool]$RustProbePath-and@($results|Where-Object {!$_.passed}).Count-eq0-and$selected.Count-eq$(if($Large){63}else{62}));results=@($results);commands=@($script:commands);retained=$OutputDirectory;unverified=@($unverified)};Save-R $ReportPath $report;$env:TEMP=$oldTemp;$env:TMP=$oldTmp
 }
 $report|Select-Object passed,failed,skipped,selectedExpectedCount,executedCount|ConvertTo-Json
-if($report.failed){exit 1}
+if($report.failed){exit 1}else{exit 0}

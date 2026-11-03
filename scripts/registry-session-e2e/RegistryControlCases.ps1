@@ -1,7 +1,7 @@
 # 失敗仮説: 未公開controlの昇格、部分本文の上書き、fresh inventory不足時の削除、
 # publication owner/body停止時のsnapshot消失。真正producerと実候補の公開APIだけを使う。
 function Load-ControlFixture {
-    Assert-True ($AssemblyPath -and [IO.File]::Exists($AssemblyPath) -and $LegacyRegistryExecutablePath -and [IO.File]::Exists($LegacyRegistryExecutablePath)) 'Checkpoint cases require the actual candidate DLL and genuine registry baseline.'
+    Assert-True ((($AssemblyPath -and [IO.File]::Exists($AssemblyPath)) -or ($RustProbePath -and [IO.File]::Exists($RustProbePath))) -and $LegacyRegistryExecutablePath -and [IO.File]::Exists($LegacyRegistryExecutablePath)) 'Checkpoint cases require the actual candidate Rust probe or C# DLL and genuine registry baseline.'
     Assert-True ([Diagnostics.FileVersionInfo]::GetVersionInfo($LegacyRegistryExecutablePath).ProductVersion -match '^1\.0\.15(?:[.+-]|$)') 'Registry producer must be genuine 1.0.15.'
     . (Join-Path $PSScriptRoot '..\recordless-e2e\Common.ps1')
     if (!('Prunlet.RecordlessE2E.FixtureNative' -as [type])) { Add-Type -Path @('NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs' | ForEach-Object { Join-Path (Join-Path $PSScriptRoot '..\recordless-e2e') $_ }) -CompilerOptions '/unsafe' }
@@ -24,6 +24,7 @@ function New-OldRegistryControlFixture([bool]$Expire) {
     $script:Config=$legacyConfig;$script:Recovery=$legacyRoot;return @{Id=$id;OldRoot=$record;Namespace=(Join-Path $legacyRoot '.registry-records-v1');SourceBefore=$sourceBefore}
 }
 function Stop-RegistryCheckpoint([string]$Id,[string]$Phase,[string]$Action,[string]$Event='RegistryControlCheckpoint') {
+    if ($RustProbePath) { Stop-RustRegistryCheckpoint $Id $Phase $Action $Event; return }
     $signal=Join-Path $script:CaseRoot 'owned-checkpoint.txt';$hostPath=Join-Path $PSScriptRoot '..\recordless-e2e\RegistryCheckpointHost.ps1';$info=[Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
     foreach($argument in @('-NoProfile','-File',$hostPath,'-AssemblyPath',$AssemblyPath,'-ExpectedAssemblySha256',(Get-FileHash $AssemblyPath).Hash,'-ConfigPath',$script:Config,'-EventName',$Event,'-Checkpoint',$Phase,'-OperationId',$Id,'-Action',$Action,'-SignalPath',$signal)){$info.ArgumentList.Add($argument)}
     $info.Environment['TEMP']=Join-Path $script:CaseRoot 'temp';$info.Environment['TMP']=$info.Environment['TEMP'];$child=[Diagnostics.Process]::Start($info);$stdout=$child.StandardOutput.ReadToEndAsync();$stderr=$child.StandardError.ReadToEndAsync();$clock=[Diagnostics.Stopwatch]::StartNew()
@@ -37,6 +38,33 @@ function Invoke-ControlResume($Fixture,[bool]$Expired) {
     $root=Join-Path $Fixture.Namespace $Fixture.Id;if($Expired){Assert-True (!(Test-Path -LiteralPath $root)-and!@(Get-ChildItem -LiteralPath $Fixture.Namespace -Filter ($Fixture.Id+'.*') -Force).Count) 'Expired terminal/control inventory was not fully reconciled'}else{Assert-True ([IO.Directory]::Exists($root)-and[IO.File]::Exists((Join-Path $Fixture.Namespace ($Fixture.Id+'.terminal.json')))) 'Closed registry record missing after recovery'}
     $again=Invoke-RegistryCli @('maintain','--apply');Assert-True ($again.ExitCode-eq0-and$again.Json.capacityKnown-and(Snapshot)-ceq$Fixture.SourceBefore) 'Control resume was not idempotent'
     Save-Json (Join-Path $script:CaseRoot 'control-post-resume.json') @{registrySource=(Snapshot);namespace=(Snapshot-R $Fixture.Namespace);expired=$Expired;legacySourceAbsent=!(Test-Path -LiteralPath $Fixture.OldRoot)}
+}
+if($RustProbePath -and $LatestRegistryExecutablePath){
+    Case 'latest-csharp-producer-rust-current-cross-restore' {
+        Assert-True ([IO.File]::Exists($LatestRegistryExecutablePath)) 'Genuine C# 1.0.29 producer missing'
+        Assert-True ([Diagnostics.FileVersionInfo]::GetVersionInfo($LatestRegistryExecutablePath).ProductVersion -match '^1\.0\.29(?:[.+-]|$)') 'Latest registry producer must be genuine C# 1.0.29'
+        Assert-True (!(Get-FileHash $LatestRegistryExecutablePath).Hash.Equals((Get-FileHash $ExecutablePath).Hash,[StringComparison]::OrdinalIgnoreCase)) 'Rust candidate must not substitute for the genuine C# producer'
+        Fixture;$before=Snapshot
+        $originalKey=[PrunletRegistryE2E]::Open($script:Relative,64);try{$beforeClass=[PrunletRegistryE2E]::KeyClass($originalKey)}finally{$originalKey.Dispose()}
+        $producerRoot=Join-Path $script:CaseRoot 'latest-csharp-metadata';$null=[IO.Directory]::CreateDirectory($producerRoot)
+        $producerConfig=Join-Path $script:CaseRoot 'latest-csharp-config.json'
+        $init=Invoke-ControlBinary $LatestRegistryExecutablePath $producerConfig @('init','--backup-directory',$producerRoot)
+        Assert-True ($init.ExitCode-eq0) 'Genuine C# latest init failed'
+        $prepared=Invoke-ControlBinary $LatestRegistryExecutablePath $producerConfig @('migrate','--apply')
+        Assert-True ($prepared.ExitCode-eq0-and$prepared.Json.registryReady) 'Genuine C# latest namespace preparation failed'
+        $producerSettings=Read-Json $producerConfig
+        Assert-True (!$producerSettings.ContainsKey('registryScope')-or$producerSettings.registryScope-ceq'current') 'Cross-restore must retain current/unknown scope, never infer nativeWindows'
+        $deleted=Invoke-ControlBinary $LatestRegistryExecutablePath $producerConfig @('registry-delete','--view','64','--recursive','--',$script:Path)
+        Assert-True ($deleted.ExitCode-eq0-and$deleted.Json.operationId-and!(Exists)) 'Genuine C# latest did not delete the owned fixture'
+        $id=$deleted.Json.operationId
+        $restored=Invoke-ControlBinary $ExecutablePath $producerConfig @('registry-restore',$id)
+        Assert-True ($restored.ExitCode-eq0-and(Exists)-and(Snapshot)-ceq$before) 'Rust cross-restore did not preserve genuine latest full raw/security snapshot'
+        $restoredKey=[PrunletRegistryE2E]::Open($script:Relative,64);try{$afterClass=[PrunletRegistryE2E]::KeyClass($restoredKey)}finally{$restoredKey.Dispose()}
+        Assert-True ($afterClass-ceq$beforeClass) 'Rust cross-restore changed the genuine key class'
+        $reconciled=Invoke-ControlBinary $ExecutablePath $producerConfig @('registry-reconcile',$id)
+        Assert-True ($reconciled.ExitCode-eq0-and$reconciled.Json.items[0].status-ceq'restored') 'Rust did not reconcile the genuine latest restored receipt'
+        Save-Json (Join-Path $script:CaseRoot 'latest-cross-restore-evidence.json') @{producerPath=$LatestRegistryExecutablePath;producerSha256=(Get-FileHash $LatestRegistryExecutablePath).Hash;consumerPath=$ExecutablePath;consumerSha256=(Get-FileHash $ExecutablePath).Hash;scope='Both producer and consumer are standalone current Core in the actual native desktop process; missing scope remains current/unknown';operationId=$id;rawOwnerGroupDaclSaclClassPreserved=$true;before=$before;after=(Snapshot);keyClass=$afterClass;producerDelete=$deleted;consumerRestore=$restored;reconcile=$reconciled}
+    }
 }
 foreach($kind in @('migration','terminal','terminal-cleanup')) {foreach($phase in @('prefix','published')) {
     Case ('registry-control-'+$kind+'-'+$phase+'-crash-resume') {
