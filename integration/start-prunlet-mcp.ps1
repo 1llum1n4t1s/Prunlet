@@ -366,7 +366,6 @@ function Invoke-UpdateCoordinator([string]$Stage, [string]$Config, [string]$Code
 }
 
 try {
-    [PrunletMcpJob]::Start()
     foreach ($path in @($ExecutablePath, $ConfigPath, $CodexHome)) {
         if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Prunlet MCP paths must be absolute.' }
     }
@@ -446,7 +445,22 @@ try {
             $mutex.Dispose()
         }
     }
-    & $ExecutablePath --config $ConfigPath mcp
+    $useProxy = $false
+    if ($managed) {
+        $mcpProtocolJson = & $ExecutablePath --startup-update-protocol
+        if ($LASTEXITCODE -eq 0) {
+            $mcpProtocol = $mcpProtocolJson | ConvertFrom-Json -AsHashtable
+            $useProxy = $mcpProtocol.ContainsKey('mcpProxy') -and $mcpProtocol.mcpProxy -eq 2 -and $mcpProtocol.mcpBackendLease -eq 1
+        }
+    }
+    if ($useProxy) {
+        $proxy = & $ExecutablePath --config $ConfigPath __prepare-mcp-proxy | ConvertFrom-Json -AsHashtable
+        if ($LASTEXITCODE -ne 0 -or $proxy.protocol -ne 1 -or $proxy.status -cne 'prepared' -or ![IO.Path]::IsPathFullyQualified($proxy.executablePath)) { throw 'A verified MCP proxy generation could not be prepared.' }
+        & $proxy.executablePath --config $ConfigPath __mcp-proxy
+    } else {
+        [PrunletMcpJob]::Start()
+        & $ExecutablePath --config $ConfigPath mcp
+    }
     exit $LASTEXITCODE
 } catch {
     [Console]::Error.WriteLine('Prunlet MCP could not start safely: ' + $_.Exception.Message)

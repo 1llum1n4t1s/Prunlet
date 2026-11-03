@@ -10,6 +10,10 @@ pub mod gate;
 mod http;
 #[cfg(windows)]
 pub mod integration;
+#[cfg(windows)]
+pub mod mcp_backend;
+#[cfg(windows)]
+pub mod mcp_generation;
 pub mod package;
 #[cfg(windows)]
 pub mod rotation;

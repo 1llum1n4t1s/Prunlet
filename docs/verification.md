@@ -115,6 +115,14 @@ R2 publisherは`scripts/Verify-PrunletR2Publisher.ps1 -PackagePath <固定した
 
 共通指示の登録では、明示オプションなしの不変更、既存AGENTSの保持、配置済みexe・設定のbinding、既知の旧MCP優先ブロックとguideハッシュに一致する移行、冪等な登録と解除、利用者編集の保護、登録途中の失敗時の復旧を隔離したCodex homeで確認します。旧配置済みPowerShell backendの退役では、製品バックアップとCoreによるWindowsゴミ箱への削除を照合します。実ユーザーの共通AGENTS本文はこのE2Eで変更しません。実登録後は、専用guide・管理マーカー・bindingの保存内容、新しいチャットでの読込、最初からCMD CLIが選ばれた実動作を分けて確認してください。
 
+### Windows managed MCPの世代切替
+
+世代cache回収の変更では`mcp-cache-maintain`のdry-run不変更と`--apply`を隔離fixtureで確認し、現在世代・使用中proxy/queue worker・未知項目の保持、pending/retiredの`retained`と非再送、同じCoreSnapshotの全ID照合と内部GenerationCleanupPermitの限定適用、通常CLI/MCPによるcache・他metadataの保護、Coreゴミ箱経路、2 GiB上限時の新規割当停止と既存の検証済み世代の通常要求継続を確認する。固定private空gate `.prunlet-mcp-cleanup-in-progress`の削除前create-new・flush、元の正確な1対象の`recycled`/`permanently_deleted`時だけのgate解除、Err・`failed`・`ambiguous`・中断でのgate保持と残候補停止も確認する。既存gateではapply全停止・`cleanupBlocked`非zero終了・dry-runの`retained`、同hash世代の非再送、過去pending/retired領域の保持を確認する。CLI専用`--ack-interrupted-cleanup`ではowned cacheとprivate・空・単一hard link・ADSなしのgate、同名同実体のpinと同handle解除、gate以外の不変更を確認する。`--apply`併用拒否、ack単独の世代不削除、別applyによる回収、MCP・installer・通常起動の暗黙ack不在、不正gateの保全も確認する。これらのgate caseとnative E2Eは実行結果を別途確認し、未実行を成功としない。世代切替driverの成功だけで代替しない。
+
+`scripts/Verify-SeamlessMcp.ps1 -ExecutablePath <今回のexe絶対パス> -PriorPackagePath <新ABI互換の別ビルド世代ZIP絶対パス> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSON絶対パス>`を実行する。reportの親を事前作成する。`mcpProxy2`・`mcpBackendLease1`互換な2つの正規ビルド世代を用意し、同じsource・versionから別の`SourceCommit`を指定してPE出自を区別するfixtureとして使う。公開旧版との互換検証とは区別し、ZIPの生成元・hash・build manifestを呼出し側で確認する。同一stdio接続での世代変更、installer mutex中の応答延期、旧queue workerの保持と新世代からのstatus/cancel、shadow・所有markerの改ざんとjunctionの拒否・対象保全を確認する。終了コードと外部JSONのpassed/failed、保持fixtureを読む。
+
+このdriverは新ABI互換の2世代で切替を検証する。installerや配布package全体の更新、公開旧版との互換検証を代替しない。proxy hard kill後のbackend read lease保持は新caseの実行結果で別途確認し、未実行を成功としない。mutex中の無応答は応答延期の観測であり、backend未実行を直接観測するものではない。送信済要求の子異常終了時の非再送、inflight drainには決定的な停止用seamでの追加検証が必要で、競合するkill試行で合格にしない。queue寿命・並列要求・保持・ACL攻撃競合は専用driverと区別する。Codex実ホストの初回再接続と継続接続は別途確認し、アプリ再起動不要をこのdriverだけで保証しない。
+
 ## 一時的なロックとロード中DLL
 
 `scripts/Verify-HardlinkEntryTimes.ps1`で、ハードリンクの列挙時刻が古い場合のCLI/MCP削除と外部別名の保全、全兄弟の基準捕捉後に後続の子を更新した場合の停止を確認する。多数の入力rootが同じ少数の実体を共有するケースでは、CLI・MCPそれぞれ256入力と外部1400別名を使い、自己削除のinspection解放に伴う時刻更新を外部変更と誤判定しないこと、外部別名のID・ACL・属性・全streamを保持することも確認する。`-FixtureRoot`は通常検証と同じ外部fixture境界で検証し、ビルド・metadata・JSON・reportはDに置く。差し替え試行が共有違反で阻止された場合は元内容の保全と削除の正常完了を確認し、別IDの拒否と診断値はCore境界で別に検査する。エラー内の子の絶対パス、列挙値・基準値・実測値・期待変更時刻も検査する。Core境界には候補assemblyとSHA-256を明示し、CLI/MCPの実プロセス結果と区別する。

@@ -17,6 +17,8 @@ pub struct Runtime {
     pub config: Config,
     // registry privilege要求とfile workerの並走を防ぎ、file要求間は並列を許す。
     gate: RwLock<()>,
+    #[cfg(windows)]
+    mcp_context: Option<crate::update::mcp_backend::Context>,
 }
 
 impl Runtime {
@@ -24,12 +26,31 @@ impl Runtime {
         Self {
             config,
             gate: RwLock::new(()),
+            #[cfg(windows)]
+            mcp_context: None,
         }
+    }
+    pub fn for_mcp(config: Config) -> Result<Self> {
+        #[cfg(windows)]
+        let context = crate::update::mcp_backend::Context::from_proxy(&config.path)?;
+        let runtime = Self::new(config);
+        #[cfg(windows)]
+        let runtime = Self {
+            mcp_context: context,
+            ..runtime
+        };
+        Ok(runtime)
     }
 }
 
 impl Backend for Runtime {
     fn execute(&self, command: &str, args: &Value, progress: Option<Progress>) -> Result<Value> {
+        #[cfg(windows)]
+        let _mcp_scope = self
+            .mcp_context
+            .as_ref()
+            .map(|context| context.acquire(&self.config.path))
+            .transpose()?;
         let progress: Option<Progress> = Some(Arc::new(move |value: Value| {
             if let Some(message) = value.get("message").and_then(Value::as_str) {
                 // 通知先の切断で処理結果や照合IDを失わない。

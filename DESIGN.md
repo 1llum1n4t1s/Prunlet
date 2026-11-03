@@ -163,6 +163,20 @@ CIは純git・PowerShell・GitHub CLIを使い、Node.js製Actionを呼ばない
 
 ビルドと検証の実行規約・必須コマンドは[AGENTS.md](AGENTS.md#ビルドと検証)、各経路の検証範囲とfixtureの保持・清掃は[検証手順](docs/verification.md)を正本とする。
 
+#### Windows managed MCPの世代切替
+
+Windowsの登録済みmanaged入口は、検証した製品をprivateな`.prunlet-mcp-generations/<exe SHA-256>/prunlet.exe`へ固定してstable proxyを起動する。proxyはホストとのstdio接続と要求IDを保ち、各世代のpersistent MCP子へ中継する。直接の`mcp`コマンドと非managed配置は従来の動作を維持し、macOSに自動上書き更新を追加しない。
+
+各要求の送信前にinstaller mutex、更新state、`source-info.json`と製品hashを再検証する。ABIは`mcpProxy2`と`mcpBackendLease1`を必要とする。proxyに加え、副作用を実行するbackend自身も要求中のcanonical製品と`source-info.json`をread leaseで固定し、実親PID・親の作成時刻・expected hash・idle状態を照合する。proxyが強制終了してもbackendは処理完了までleaseを保持し、製品切替を防ぐ。installer実行中や更新未完了では要求を未送信のまま待機し、最大600秒で待機を打ち切る。送信済み要求の結果不明や子の異常終了では自動再送しない。
+
+世代が変わったらinflight要求の応答をdrainし、旧子へEOFを送り正常終了を確認してから新子を起動する。保持したinitializeとinitialized通知を内部で再送し、利用者の要求は元のIDで送る。1接続で実処理する子は1世代に限定してprocess worker上限を保ち、既に独立起動した旧世代のqueue workerは停止せず保持する。 寿命の正本はproxyのEOF drain、子へのEOF、終端確認とする。新managed proxyにはPrunlet独自の`KILL_ON_JOB_CLOSE`を追加せず、旧版・非managed MCPだけが従来のJobを使う。未知の上位host Jobによる強制終了は従来の`unavailable`・結果不明の境界として扱う。queue workerの起動は元のルーチンを維持し、新たなnative breakawayを追加しない。
+
+shadow配置にはprivate ACL、所有marker、hash検証を適用し、リンク・ADS・所有不一致を拒否して保全する。世代cacheも既存の更新用2 GiB枠へ計上する。実装責務は`update/mcp_generation.rs`と`protocol/mcp_proxy.rs`に分ける。
+
+未使用世代の回収はWindows CLIの`mcp-cache-maintain`でdry-runし、`mcp-cache-maintain --apply`で明示適用する。レジストリ専用の`purge`とは別の操作で、所有とhash・実体を照合できる未使用世代だけを既存Coreの削除経路へ渡す。Windowsが子handle保持中のfolder renameを拒否するため、新しいretired名へ改名してから削除する方式は使わない。検証済み世代ディレクトリ・実行ファイル・markerの3 guardを保持し、同じCoreSnapshotの全IDを照合して、当該要求だけの内部`GenerationCleanupPermit`（exact root・ID）をPreparedへ渡す。これは通常cache保護に対する限定例外であり、通常CLI/MCPはpermitなしで保護を維持する。他のmetadata・backupの保護は解除しない。通常はWindowsゴミ箱へ移し、永久削除はCoreのサイズ超過・確認済み即時削除設定等の既存契約に従う。現在のcanonical世代、proxy・queue workerが使用中の世代、未知の項目は保持する。過去のpending・retired領域は一覧で`retained`として保持し、自動再送しない。現在の回収経路は削除前にcache直下の固定private空gate `.prunlet-mcp-cleanup-in-progress`をcreate-new・flushして永続化する。元の正確な1対象だけが`recycled`または`permanently_deleted`となったことを確認した場合に限りgateを除去する。Err・`failed`・`ambiguous`・中断ではgateを保持して残候補の回収を止める。既存gateがあれば`--apply`は回収全体を停止し、`cleanupBlocked`を非zero終了で示す。dry-runは`retained`で示す。同じhashの世代を再び回収対象にして結果不明の削除を再送しない。元対象とWindowsゴミ箱を確認した利用者は、CLI専用の`mcp-cache-maintain --ack-interrupted-cleanup`で明示ackできる。owned cacheとprivate・空・単一hard link・ADSなしのgateを検証し、同名・同実体をpinした同じhandleでgateだけを解除する。`--apply`との併用は拒否し、ack単独では世代を削除しない。再回収は別要求の`--apply`で行う。MCP・installer・通常起動から暗黙ackしない。2 GiB上限で新規割当を止めても、既存の検証済み世代による通常要求は継続できる。容量不足時はdry-runの一覧を確認して未使用世代を明示回収し、不明な結果は元対象とWindowsゴミ箱を確認する。
+
+旧C# MCPからこの入口への初回移行は、一度MCP接続を張り直す必要がある。Codex実ホストでの再接続操作は未検証であり、アプリ再起動不要とは断言しない。登録とhookの読込み確認は別途行う。
+
 ## 依存更新の境界
 
 製品とprobeのソース結合はCargo manifest・lock・toolchain・build script、`src/rust`全ファイルとリポジトリ直下の`.cargo`全ファイルを対象にする。Cargo設定の新規追加も入力集合の変化として検知する。探索対象となる祖先と`CARGO_HOME`の`config`・`config.toml`は、ビルド前後の存在とSHA-256を固定してbuild manifestへ記録し、設定本文や資格情報を保存しない。入力のリンクや不明な型は拒否する。

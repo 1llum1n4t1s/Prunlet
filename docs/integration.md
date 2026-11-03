@@ -99,7 +99,24 @@ $rollback = Join-Path $env:LOCALAPPDATA 'Codex\TaskArtifacts\Prunlet\integration
 
 フックの登録後はCodexで`/hooks`を開き、Prunlet hookの定義を確認して信頼してください。`install-codex.ps1`はhookのtrust記録やAGENTS.mdを変更しません。共通AGENTSを変更するのは上記の明示オプションです。Codexを再起動してMCP・共通指示・hookの読込みを確認します。
 
-MCP登録の実行内容は次のとおりです。
+Windowsのmanaged登録は`start-prunlet-mcp.ps1`を起動し、検証済みprivate世代のproxyを通してMCPへ接続します。配置更新後の次要求で子の世代を切り替える条件と、未送信待機・結果不明時の扱いは[世代切替の設計](../DESIGN.md#windows-managed-mcpの世代切替)を参照してください。旧C# MCPからの初回移行では一度接続を張り直します。Codex実ホストの再接続操作は未検証のため、アプリ再起動不要とは案内しません。
+
+更新用2 GiB枠が不足して新しい実行世代を作れない場合も、既存の検証済み世代の通常要求は継続できます。未使用世代は次のWindows CLIで確認し、一覧を確認してから明示回収します。レジストリの`purge`とは別の操作です。 以下の`C:\Users\<user>\...`は実際の配置済みexe・設定のbindingの絶対パスに置き換え、最初からCMD（エージェントは`shell=cmd.exe`・`login=false`）で直接実行してください。`--apply`は実削除を行うため、PowerShellラッパーを経由させません。
+
+```cmd
+"C:\Users\<user>\.local\Prunlet\bin\prunlet.exe" --config "C:\Users\<user>\.local\Prunlet\config.json" mcp-cache-maintain
+"C:\Users\<user>\.local\Prunlet\bin\prunlet.exe" --config "C:\Users\<user>\.local\Prunlet\config.json" mcp-cache-maintain --apply
+```
+
+この入口は`mcpProxy2`・`mcpBackendLease1`に対応する世代間で切り替えます。proxyが強制終了しても、実処理中のbackendは完了まで配置元のread leaseを保持します。未知の上位host Jobによる強制終了は`unavailable`・結果不明として扱い、自動再送しません。
+
+現在の世代や使用中のproxy・queue worker、未知の項目は保持します。回収は既存Coreのゴミ箱契約に従い、永久削除の例外も同じ条件です。過去のpending・retired領域は`retained`として保全します。現在の回収では削除前にcache直下へ固定gate `.prunlet-mcp-cleanup-in-progress`を作成し、元の1対象の`recycled`または`permanently_deleted`を確認した場合だけ解除します。失敗・不明・中断ではgateを残して残候補の回収を止め、次の`--apply`も全停止し、`cleanupBlocked`で非zero終了します。dry-runの`retained`とgateを確認し、元対象とWindowsゴミ箱を調べてください。元対象とWindowsゴミ箱を確認した後だけ、次のCLI専用ackを明示実行できます。gateの所有・private属性・空・単一hard link・ADSなしと同一実体を確認し、gateだけを解除します。ackは世代を削除せず、`--apply`との併用もできません。回収する場合はack後に別途`--apply`を実行し、結果を確認してください。MCP・installer・通常起動は暗黙ackしません。
+
+```cmd
+"C:\Users\<user>\.local\Prunlet\bin\prunlet.exe" --config "C:\Users\<user>\.local\Prunlet\config.json" mcp-cache-maintain --ack-interrupted-cleanup
+```
+
+直接起動する場合は次のとおりです。この入口と非managed配置はproxyによる世代切替の対象外です。
 
 ```powershell
 & $exe --config $config mcp

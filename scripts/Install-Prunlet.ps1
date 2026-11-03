@@ -19,6 +19,32 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class PrunletInstallPathIdentity
+{
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern uint GetFinalPathNameByHandle(SafeFileHandle handle, StringBuilder name, uint length, uint flags);
+    public static string Resolve(string path)
+    {
+        using var handle = CreateFile(path, 0x80, 3, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+        if (handle.IsInvalid) throw new Win32Exception();
+        var name = new StringBuilder(32768);
+        uint length = GetFinalPathNameByHandle(handle, name, (uint)name.Capacity, 0);
+        if (length == 0 || length >= name.Capacity) throw new Win32Exception();
+        string value = name.ToString();
+        if (value.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) return @"\\" + value.Substring(8);
+        return value.StartsWith(@"\\?\", StringComparison.Ordinal) ? value.Substring(4) : value;
+    }
+}
+'@
+
 function Invoke-PrunletGitHubCli([string]$Endpoint) {
     $command = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if (!$command) { throw 'GitHub CLI authentication requires an existing gh executable.' }
@@ -76,7 +102,17 @@ function Assert-PlainPath([string]$Path, [string]$Name) {
         }
         $cursor = Split-Path -Parent $cursor
     }
-    return $full
+    # 8.3名やドライブ別名でもCoreと同じ実体名から排他キーを作る。
+    $existingAncestor = $full
+    $suffix = [Collections.Generic.Stack[string]]::new()
+    while (!(Test-Path -LiteralPath $existingAncestor)) {
+        $suffix.Push([IO.Path]::GetFileName($existingAncestor))
+        $existingAncestor = [IO.Path]::GetDirectoryName($existingAncestor)
+        if (!$existingAncestor) { throw "$Name has no existing ancestor." }
+    }
+    $canonical = [PrunletInstallPathIdentity]::Resolve($existingAncestor)
+    while ($suffix.Count) { $canonical = Join-Path $canonical $suffix.Pop() }
+    return $canonical.TrimEnd('\', '/')
 }
 function Assert-ExternalPath([string]$Path, [string]$Name) {
     $full = Assert-PlainPath $Path $Name
@@ -282,6 +318,33 @@ try {
     }
     if ($saved.Count) {
         [ordered]@{ purpose = 'Restore product files after this update; config and recovery are excluded.'; installDirectory = $InstallDirectory; savedFiles = @($saved.Keys); cleanup = 'Delete after confirming this installation works.' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $updateBackup 'backup-info.json') -Encoding utf8NoBOM
+    }
+    # proxyは要求完了までcanonical製品を読取り固定する。新要求は既存installer mutexで待機する。
+    # 全pinが解放されたことを確認してから置換し、実行中の要求を中断しない。
+    $idleWait = [Diagnostics.Stopwatch]::StartNew()
+    $nextIdleNotice = [TimeSpan]::FromSeconds(30)
+    while ($true) {
+        $productPins = [Collections.Generic.List[IO.FileStream]]::new()
+        $busy = $false
+        try {
+            foreach ($product in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
+                $path = Join-Path $InstallDirectory ('bin\' + $product)
+                if (![IO.File]::Exists($path)) { continue }
+                $productPins.Add([IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, ([IO.FileShare]::Read -bor [IO.FileShare]::Delete)))
+            }
+        } catch [IO.IOException] {
+            if (($_.Exception.HResult -band 0xffff) -notin @(32, 33)) { throw }
+            $busy = $true
+        } finally {
+            foreach ($pin in $productPins) { $pin.Dispose() }
+        }
+        if (!$busy) { break }
+        if ($idleWait.Elapsed -gt [TimeSpan]::FromMinutes(10)) { throw 'Prunlet products are still busy; no product was replaced.' }
+        if ($idleWait.Elapsed -ge $nextIdleNotice) {
+            [Console]::Error.WriteLine('Prunlet installation is waiting for an active request to finish; no request was interrupted.')
+            $nextIdleNotice = $idleWait.Elapsed.Add([TimeSpan]::FromSeconds(30))
+        }
+        Start-Sleep -Milliseconds 250
     }
     New-TrackedDirectory (Join-Path $InstallDirectory 'bin')
     foreach ($relative in $products) {

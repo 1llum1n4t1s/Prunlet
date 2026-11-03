@@ -167,11 +167,78 @@ fn protected_roots(config: &Config, target: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     roots.push(mount.join("$Recycle.Bin"));
+    if config
+        .path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("config.json"))
+    {
+        if let Some(installation) = config.path.parent() {
+            roots.push(path::resolve(
+                &installation.join(crate::update::mcp_generation::CACHE),
+                true,
+                false,
+            )?);
+        }
+    }
+    // 設定を別名で読む場合も、稼働中製品自身の配置世代は保護する。
+    let executable = std::env::current_exe()?;
+    if let Some(parent) = executable.parent() {
+        let installation = if parent
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
+        {
+            parent.parent()
+        } else if parent
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == crate::update::mcp_generation::CACHE)
+        {
+            parent.parent().and_then(Path::parent)
+        } else {
+            None
+        };
+        if let Some(installation) = installation {
+            roots.push(path::resolve(
+                &installation.join(crate::update::mcp_generation::CACHE),
+                true,
+                false,
+            )?);
+        }
+    }
     Ok(roots)
 }
 fn check_target(config: &Config, path: &Path, directory: bool) -> Result<()> {
+    check_target_with_generation(config, path, directory, None)
+}
+#[derive(Clone)]
+struct GenerationCleanupPermit {
+    target: PathBuf,
+    identity: FileIdentity,
+}
+fn check_target_with_generation(
+    config: &Config,
+    path: &Path,
+    directory: bool,
+    generation: Option<&GenerationCleanupPermit>,
+) -> Result<()> {
     for (index, root) in protected_roots(config, path)?.into_iter().enumerate() {
         if path::within(path, &root) || (directory && path::within(&root, path)) {
+            if index != 0
+                && root
+                    .file_name()
+                    .is_some_and(|name| name == crate::update::mcp_generation::CACHE)
+            {
+                if let Some(permit) = generation.filter(|permit| permit.target == path) {
+                    let current = inspect(path)?.ok_or_else(|| {
+                        anyhow::anyhow!("Owned MCP generation disappeared before preflight.")
+                    })?;
+                    anyhow::ensure!(
+                        permit.identity == current.identity()?,
+                        "Owned MCP generation changed before cleanup; nothing was deleted."
+                    );
+                    continue;
+                }
+            }
             if index == 0 {
                 bail!("Target is inside or contains the metadata recovery directory");
             }
@@ -181,6 +248,14 @@ fn check_target(config: &Config, path: &Path, directory: bool) -> Result<()> {
             {
                 bail!(
                     "Windows Recycle Bin storage is protected; use the Windows Recycle Bin to manage its contents"
+                );
+            }
+            if root
+                .file_name()
+                .is_some_and(|name| name == crate::update::mcp_generation::CACHE)
+            {
+                bail!(
+                    "MCP runtime generations are protected while connections or queued workers may use them"
                 );
             }
             bail!("Target is inside or contains a volume recovery directory");
@@ -211,6 +286,7 @@ struct Prepared {
     root: Option<PinnedFile>,
     reserved: bool,
     reparse: Option<Vec<u8>>,
+    generation_cleanup: Option<GenerationCleanupPermit>,
 }
 fn verify_handle(fixed: &PinnedFile, path: &Path, expected: &FileIdentity) -> Result<()> {
     let actual = fixed.identity()?;
@@ -230,19 +306,30 @@ fn empty_directory(path: &Path) -> Result<bool> {
     let fixed = PinnedFile::open(path, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, 3)?;
     native::directory_is_empty(fixed.raw())
 }
+#[cfg(test)]
 fn prepare(
     config: &Config,
     path: &Path,
     recursive: bool,
     exclusive: bool,
 ) -> Result<Option<Prepared>> {
+    prepare_with_generation(config, path, recursive, exclusive, None)
+}
+fn prepare_with_generation(
+    config: &Config,
+    path: &Path,
+    recursive: bool,
+    exclusive: bool,
+    generation_cleanup: Option<GenerationCleanupPermit>,
+) -> Result<Option<Prepared>> {
     let original = inspect(path)?;
-    check_target(
+    check_target_with_generation(
         config,
         path,
         original
             .as_ref()
             .is_some_and(|entry| entry.initial_identity().is_directory()),
+        generation_cleanup.as_ref(),
     )?;
     let Some(original) = original else {
         return Ok(None);
@@ -287,6 +374,7 @@ fn prepare(
         root,
         reserved,
         reparse,
+        generation_cleanup,
     }))
 }
 pub fn execute(config: &Config, args: &Value, progress: Option<Progress>) -> Result<Value> {
@@ -317,6 +405,17 @@ pub fn delete(
     progress: Option<Progress>,
     snapshots: Option<&Mutex<Vec<Snapshot>>>,
 ) -> Result<DeleteResult> {
+    delete_with_generation(config, paths, dry_run, recursive, progress, snapshots, None)
+}
+fn delete_with_generation(
+    config: &Config,
+    paths: &[PathBuf],
+    dry_run: bool,
+    recursive: bool,
+    progress: Option<Progress>,
+    snapshots: Option<&Mutex<Vec<Snapshot>>>,
+    generation: Option<&GenerationCleanupPermit>,
+) -> Result<DeleteResult> {
     let first = delete_inner(
         config,
         paths,
@@ -325,12 +424,72 @@ pub fn delete(
         false,
         progress.clone(),
         snapshots,
+        generation,
     )?;
     match first {
         Some(result) => Ok(result),
-        None => delete_inner(config, paths, dry_run, recursive, true, progress, snapshots)?
-            .ok_or_else(|| anyhow::anyhow!("Exclusive preflight did not complete")),
+        None => delete_inner(
+            config, paths, dry_run, recursive, true, progress, snapshots, generation,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("Exclusive preflight did not complete")),
     }
+}
+/// 所有確認した世代の固定handleを、通常削除のsnapshot照合へ引き継ぐ。
+pub(crate) fn recycle_owned_mcp_generation(
+    config: &Config,
+    directory: PinnedFile,
+    executable: PinnedFile,
+    marker: PinnedFile,
+) -> Result<serde_json::Value> {
+    let target = directory.path.clone();
+    anyhow::ensure!(
+        target
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|v| v == crate::update::mcp_generation::CACHE)
+            && target
+                .file_name()
+                .and_then(|v| v.to_str())
+                .is_some_and(|v| v.len() == 64 && v.bytes().all(|c| c.is_ascii_hexdigit())),
+        "Only a typed owned MCP generation can use this deletion boundary."
+    );
+    directory.verify_named()?;
+    let snapshot = Snapshot::capture(&target, true)?;
+    anyhow::ensure!(
+        snapshot.entries.len() == 3,
+        "Retired MCP generation has unknown members."
+    );
+    for entry in &snapshot.entries {
+        let expected = if entry.path == target {
+            directory.identity()?
+        } else if entry.path == target.join("prunlet.exe") {
+            executable.identity()?
+        } else if entry.path == target.join(".prunlet-mcp-owner.json") {
+            marker.identity()?
+        } else {
+            anyhow::bail!("Retired MCP generation has an unknown member.");
+        };
+        anyhow::ensure!(
+            entry.identity == expected,
+            "Retired MCP generation changed before deletion preflight; nothing was deleted."
+        );
+    }
+    snapshot.verify()?;
+    let permit = GenerationCleanupPermit {
+        target: target.clone(),
+        identity: directory.identity()?,
+    };
+    drop((directory, executable, marker));
+    let snapshots = Mutex::new(vec![snapshot]);
+    Ok(serde_json::to_value(delete_with_generation(
+        config,
+        &[target],
+        false,
+        true,
+        None,
+        Some(&snapshots),
+        Some(&permit),
+    )?)?)
 }
 fn verify_snapshots(snapshots: Option<&Mutex<Vec<Snapshot>>>) -> Result<()> {
     if let Some(snapshots) = snapshots {
@@ -465,6 +624,7 @@ fn delete_inner(
     exclusive: bool,
     progress: Option<Progress>,
     snapshots: Option<&Mutex<Vec<Snapshot>>>,
+    generation: Option<&GenerationCleanupPermit>,
 ) -> Result<Option<DeleteResult>> {
     let _coordination = if dry_run {
         None
@@ -493,7 +653,7 @@ fn delete_inner(
     let mut hardlinks = false;
     for (index, path) in paths.iter().enumerate() {
         let _slot = WorkerSlot::acquire();
-        match prepare(config, path, recursive, exclusive) {
+        match prepare_with_generation(config, path, recursive, exclusive, generation.cloned()) {
             Ok(Some(entry)) => {
                 let item = &mut result.items[index];
                 item.kind = kind(&entry.identity)?.into();
@@ -1024,7 +1184,12 @@ fn permanent_delete(
     states: &PermanentState,
     snapshots: Option<&Mutex<Vec<Snapshot>>>,
 ) -> Result<()> {
-    check_target(config, &root.path, root.identity.is_directory())?;
+    check_target_with_generation(
+        config,
+        &root.path,
+        root.identity.is_directory(),
+        root.generation_cleanup.as_ref(),
+    )?;
     let parent = root
         .parents
         .handles

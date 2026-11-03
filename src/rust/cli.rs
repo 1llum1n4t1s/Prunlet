@@ -114,7 +114,7 @@ fn write_error(error: &anyhow::Error, stderr: bool) {
 fn run_inner(args: &[String]) -> Result<i32> {
     if args == ["--startup-update-protocol"] {
         let protocol = if cfg!(windows) {
-            json!({"protocol":1,"storageEpoch":1,"distributionSources":["github","r2"]})
+            json!({"protocol":1,"storageEpoch":1,"distributionSources":["github","r2"],"mcpProxy":2,"mcpBackendLease":1})
         } else {
             json!({"protocol":1,"storageEpoch":1})
         };
@@ -163,7 +163,46 @@ fn run_inner(args: &[String]) -> Result<i32> {
         write_json(&json!({"valid":true}))?;
         return Ok(0);
     }
-    let runtime = Arc::new(Runtime::new(config));
+    #[cfg(windows)]
+    if command == "mcp-cache-maintain" {
+        ensure!(
+            tail.is_empty() || tail == ["--apply"] || tail == ["--ack-interrupted-cleanup"],
+            "Use mcp-cache-maintain [--apply | --ack-interrupted-cleanup]. Acknowledgement cannot be combined with --apply."
+        );
+        let value = if tail == ["--ack-interrupted-cleanup"] {
+            crate::update::mcp_generation::acknowledge_cleanup(&config)?
+        } else {
+            crate::update::mcp_generation::maintain(&config, tail == ["--apply"])?
+        };
+        let failed = command_failed(command, &value);
+        write_json(&value)?;
+        return Ok(if failed { 1 } else { 0 });
+    }
+    #[cfg(windows)]
+    if command == "__prepare-mcp-proxy" {
+        ensure!(
+            tail.is_empty(),
+            "MCP proxy preparation accepts no arguments."
+        );
+        write_json(&crate::update::mcp_generation::prepare(&config.path)?)?;
+        return Ok(0);
+    }
+    #[cfg(windows)]
+    if command == "__mcp-proxy" {
+        ensure!(tail.is_empty(), "MCP proxy accepts no arguments.");
+        let _proxy = crate::update::mcp_generation::pin_proxy(&config.path)?;
+        let resolver_config = config.path.clone();
+        crate::protocol::mcp_proxy::run(
+            &config.path,
+            Arc::new(move || crate::update::mcp_generation::resolve(&resolver_config)),
+        )?;
+        return Ok(0);
+    }
+    let runtime = Arc::new(if command == "mcp" {
+        Runtime::for_mcp(config)?
+    } else {
+        Runtime::new(config)
+    });
     if command == "mcp" {
         ensure!(tail.is_empty(), "MCP accepts no arguments.");
         crate::protocol::mcp::run(runtime)?;
@@ -483,6 +522,11 @@ fn parse_registry_delete(args: &[String]) -> Result<Value> {
 }
 
 fn command_failed(command: &str, value: &Value) -> bool {
+    if command == "mcp-cache-maintain" {
+        return (value.get("dryRun") != Some(&Value::Bool(true))
+            && value.get("cleanupBlocked") == Some(&Value::Bool(true)))
+            || has_errors(value);
+    }
     // 更新の途中phaseはlauncherが次段を実行するための正常応答。
     if command == "__apply-startup-update" {
         return matches!(
@@ -515,6 +559,26 @@ pub fn has_errors(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_cleanup_blocked_is_non_success_even_when_items_are_retained() {
+        assert!(command_failed(
+            "mcp-cache-maintain",
+            &json!({"dryRun":false,"cleanupBlocked":true,"items":[{"status":"retained"}]})
+        ));
+        assert!(!command_failed(
+            "mcp-cache-maintain",
+            &json!({"dryRun":false,"cleanupBlocked":false,"status":"acknowledged","items":[]})
+        ));
+        assert!(!command_failed(
+            "mcp-cache-maintain",
+            &json!({"dryRun":true,"cleanupBlocked":true,"items":[{"status":"retained"}]})
+        ));
+        assert!(command_failed(
+            "mcp-cache-maintain",
+            &json!({"dryRun":true,"cleanupBlocked":true,"items":[{"status":"failed"}]})
+        ));
+    }
 
     #[test]
     fn startup_integration_phase_keeps_launcher_running() {
@@ -593,4 +657,4 @@ mod tests {
     }
 }
 
-const HELP: &str = "Prunlet — native Windows/macOS file deletion and Windows registry recovery.\nprunlet --config <absolute-json-path> init --backup-directory <directory>\nprunlet --config <absolute-json-path> validate-config\nprunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>\nprunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]\nprunlet --config <absolute-json-path> delete-queue [--recursive] --paths-file <absolute-json-file>\nprunlet --config <absolute-json-path> delete-queue-status <job-id>\nprunlet --config <absolute-json-path> delete-queue-cancel <job-id>\nprunlet --config <absolute-json-path> registry-delete --view <32|64> [--access-mode <normal|backupRestore>] [--value-name=<name>] [--recursive] [--dry-run] -- <registry-key-path>\nprunlet --config <absolute-json-path> registry-restore <operation-id> [--access-mode <normal|backupRestore>]\nprunlet --config <absolute-json-path> registry-reconcile <operation-id>\nprunlet --config <absolute-json-path> registry-session --minutes <1..60> --assert-native-windows\nprunlet --config <absolute-json-path> operations\nprunlet --config <absolute-json-path> maintain [--dry-run|--apply] [--audit-records]\nprunlet --config <absolute-json-path> purge <operation-id> [--dry-run|--apply]\nprunlet --config <absolute-json-path> migrate [--dry-run|--apply]\nprunlet --config <absolute-json-path> mcp\nprunlet --config <absolute-json-path> hook\nFile deletion creates no recovery record. Uncertain results are not retried. Registry operations are Windows-only.\n";
+const HELP: &str = "Prunlet — native Windows/macOS file deletion and Windows registry recovery.\nprunlet --config <absolute-json-path> init --backup-directory <directory>\nprunlet --config <absolute-json-path> validate-config\nprunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>\nprunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]\nprunlet --config <absolute-json-path> delete-queue [--recursive] --paths-file <absolute-json-file>\nprunlet --config <absolute-json-path> delete-queue-status <job-id>\nprunlet --config <absolute-json-path> delete-queue-cancel <job-id>\nprunlet --config <absolute-json-path> registry-delete --view <32|64> [--access-mode <normal|backupRestore>] [--value-name=<name>] [--recursive] [--dry-run] -- <registry-key-path>\nprunlet --config <absolute-json-path> registry-restore <operation-id> [--access-mode <normal|backupRestore>]\nprunlet --config <absolute-json-path> registry-reconcile <operation-id>\nprunlet --config <absolute-json-path> registry-session --minutes <1..60> --assert-native-windows\nprunlet --config <absolute-json-path> operations\nprunlet --config <absolute-json-path> maintain [--dry-run|--apply] [--audit-records]\nprunlet --config <absolute-json-path> purge <operation-id> [--dry-run|--apply]\nprunlet --config <absolute-json-path> migrate [--dry-run|--apply]\nprunlet --config <absolute-json-path> mcp-cache-maintain [--apply | --ack-interrupted-cleanup] (Windows managed MCP generations; acknowledgement only clears the gate)\nprunlet --config <absolute-json-path> mcp\nprunlet --config <absolute-json-path> hook\nFile deletion creates no recovery record. Uncertain results are not retried. Registry operations are Windows-only.\n";

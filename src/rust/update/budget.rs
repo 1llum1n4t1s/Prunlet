@@ -120,7 +120,11 @@ pub fn measure(root: &Path) -> Result<u64> {
     let _parents = path::pin_directories(root)?;
     let mut total = 0;
     let mut count = 0;
-    for name in [".prunlet-update-stage", ".prunlet-update-slots"] {
+    for name in [
+        ".prunlet-update-stage",
+        ".prunlet-update-slots",
+        super::mcp_generation::CACHE,
+    ] {
         let target = root.join(name);
         if exists(&target)? {
             tree(&target, 0, &mut total, &mut count)?;
@@ -149,6 +153,12 @@ pub fn measure(root: &Path) -> Result<u64> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
+        if name.starts_with(super::mcp_generation::PENDING_PREFIX)
+            || name.starts_with(super::mcp_generation::RETIRED_PREFIX)
+        {
+            tree(&entry.path(), 0, &mut total, &mut count)?;
+            continue;
+        }
         if name == STATE_NAME || name == "source-info.candidate.json" || pending.is_match(&name) {
             count += 1;
             add(&mut total, measure_file(&entry.path())?)?;

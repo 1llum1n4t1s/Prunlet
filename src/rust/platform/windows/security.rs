@@ -297,7 +297,14 @@ pub fn create_private_file(path: &Path) -> Result<OwnedHandle> {
 pub fn create_private_directory(path: &Path) -> Result<OwnedHandle> {
     create_private(path, true)
 }
+/// 子を公開するまでディレクトリ自身への書込み・リンク化・renameを他handleへ許さない。
+pub fn create_private_fixed_directory(path: &Path) -> Result<OwnedHandle> {
+    create_private_shared(path, true, FILE_SHARE_READ)
+}
 fn create_private(path: &Path, directory: bool) -> Result<OwnedHandle> {
+    create_private_shared(path, directory, if directory { 3 } else { 1 })
+}
+fn create_private_shared(path: &Path, directory: bool, share: u32) -> Result<OwnedHandle> {
     unsafe {
         let owner = current_user_sid()?;
         let flags = if directory { "OICI" } else { "" };
@@ -350,7 +357,7 @@ fn create_private(path: &Path, directory: bool) -> Result<OwnedHandle> {
             } else {
                 FILE_ATTRIBUTE_ARCHIVE
             },
-            if directory { 3 } else { 1 },
+            share,
             2,
             if directory { 0x00200021 } else { 0x00200060 },
             null(),

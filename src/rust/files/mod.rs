@@ -7,6 +7,8 @@ pub mod coordination;
 mod queue;
 #[cfg(windows)]
 mod recordless;
+#[cfg(windows)]
+pub(crate) use recordless::recycle_owned_mcp_generation;
 
 pub fn execute(
     config: &Config,
