@@ -105,7 +105,9 @@ $rollback = Join-Path $env:LOCALAPPDATA 'Codex\TaskArtifacts\Prunlet\integration
 
 設定ファイルの上書き前に、`-BackupDirectory`へ元ファイルと復元記録を保存します。この保存先はCodexHome、ユーザーの`.codex`、リポジトリの外に置いてください。Prunletの削除バックアップとは別の用途です。変更対象の`features`と`mcp_servers`にquoted key、表名の内部空白、dotted root keyがある場合や、複数行文字列を含むTOMLは、既存値を保持するため自動更新を拒否します。その場合は手動登録が必要です。プロジェクトのtrust tableなど、変更対象以外のquoted tableは保持します。設定ファイルの更新中にI/Oエラーが起きた場合は、表示された保存先の復元記録を確認してください。
 
-フックの登録後はCodexで`/hooks`を開き、Prunlet hookの定義を確認して信頼してください。`install-codex.ps1`はhookのtrust記録やAGENTS.mdを変更しません。共通AGENTSを変更するのは上記の明示オプションです。Codexを再起動してMCP・共通指示・hookの読込みを確認します。
+フックの登録後はCodexのフック設定画面でPrunlet hookの定義を確認して信頼してください。`install-codex.ps1`はhookのtrust記録やAGENTS.mdを変更しません。共通AGENTSを変更するのは上記の明示オプションです。初回登録ではMCP・共通指示・hookの読込みをそれぞれ確認します。
+
+登録済みhookの有効・無効はCodexのフック設定画面で切り替えます。APIを使う場合は、対象チャットを処理中の実ホストの`config/batchWrite`で、対象識別子`key`に対応する`hooks.state.${JSON.stringify(key)}.enabled`を`reloadUserConfig: true`とともに更新します。`config.toml`の直接編集による保存や、別途起動したapp-serverでの確認だけでは、実ホストへの反映を確認できません。`okOverridden`応答を切替成功と扱わず、上書き元を確認します。同じ実ホストの`hooks/list`へ対象`threadId`を渡した結果や、切替後の次の実呼出しで反映を確認してください。このstate切替ではCodex再起動を標準手順にせず、新規登録・定義変更の信頼確認やMCP・共通指示の読込みとは区別します。
 
 Windowsのmanaged登録は`start-prunlet-mcp.ps1`を起動し、検証済みprivate世代のproxyを通してMCPへ接続します。配置更新後の次要求で子の世代を切り替える条件と、未送信待機・結果不明時の扱いは[世代切替の設計](../DESIGN.md#windows-managed-mcpの世代切替)を参照してください。旧C# MCPからの初回移行では一度接続を張り直します。Codex実ホストの再接続操作は未検証のため、アプリ再起動不要とは案内しません。
 
