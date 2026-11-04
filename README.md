@@ -17,7 +17,7 @@ AIが生成した`Remove-Item`や`rm`などの削除コマンドで清掃が止�
 Codexでは、次の順序で利用します。
 
 1. 下の[インストールと更新](#インストールと更新)のコマンドを、`-RegisterCodex -RegisterAgentInstructions`付きで実行します。CLI・MCP・フックと、Prunlet CLIを最初から使う共通指示を登録します。
-2. Codexで`/hooks`を開いてPrunletフックを信頼し、Codexを再起動して登録内容を読み込みます。
+2. Codexのフック設定画面でPrunletフックの定義を確認して信頼し、MCP・共通指示・フックの読込みをそれぞれ確認します。詳しくは[登録手順](docs/integration.md#登録)を参照してください。
 3. 通常どおり作業や清掃を依頼します。共通指示は、配置済みCLIと設定の絶対パスを使い、CMD（`shell: cmd.exe`、`login: false`）からPrunletを直接呼び出すようCodexへ指示します。各リポジトリへ同じ指示を追加する必要はありません。
 
 清掃を明示して依頼する場合は、たとえば次のように伝えます。
@@ -54,7 +54,7 @@ Windowsの自動更新はCloudflare R2から配布物を取得し、GitHub Relea
 
 更新データとMCPの世代cacheは専用の2 GiB枠で管理します。確認済みの領域を再利用し、未知のデータや中断した出力は保全します。容量不足時は更新を延期し、レジストリの復元データは整理対象にしません。未使用のMCP世代はCLIの`mcp-cache-maintain`で一覧を確認し、`--apply`で明示的に回収できます。回収が中断・結果不明で停止した場合は元対象とWindowsゴミ箱を確認し、確認後だけ`--ack-interrupted-cleanup`で停止状態を解除します。この解除だけでは世代を削除しません。コマンドと再開手順は[連携手順](docs/integration.md#登録)を参照してください。
 
-`-RegisterCodex`を指定した導入・更新後は、Codexで`/hooks`を開いてPrunletフックの定義を確認し、信頼してください。インストーラーは信頼設定を変更せず、結果の`requiresHookTrust`でこの操作が必要なことを通知します。Codexを再起動し、MCP・共通指示・フックの読込みを確認してください。登録と解除の詳細は[連携手順](docs/integration.md#登録)を参照してください。
+`-RegisterCodex`を指定した導入・更新の結果にある`requiresHookTrust`は、上記のフック定義の確認・信頼が必要なことを示します。インストーラーは信頼設定を変更しません。登録済みフックの有効・無効はCodexのフック設定画面で切り替え、次の呼出しで反映を確認してください。この切替にCodexの再起動は通常不要です。新規登録・定義変更の信頼確認やMCP・共通指示の読込みとは別の操作です。登録・切替・解除の詳細は[連携手順](docs/integration.md#登録)を参照してください。
 
 上の`-RegisterAgentInstructions`は、Codex homeの`PRUNLET.md`と、共通`AGENTS.md`の専用参照・配置済みexeと設定の絶対パスを登録する明示オプションです。各リポジトリへ追記せず、最初からCMD上のPrunlet CLIで削除するようCodexへ指示します。exe・設定のパス自体をCMDで安全に表現できない場合は、実行前に同じCoreを使うMCPを選びます。共通指示を変更したくない場合はこのオプションを外してください。
 
@@ -185,7 +185,7 @@ MSIX由来の仮想viewで6801になる場合は、[通常Windowsの明示セッ
 
 | ツール | 引数 | 用途 |
 | --- | --- | --- |
-| `delete_files` | 同期: `paths`、任意の`dryRun`・`recursive`。待機登録: `action: "enqueue"`・`paths`、任意の`recursive`。照会・取消: `action: "status"` / `"cancel"`・`jobId`のみ | ファイル・フォルダーの同期削除、待機登録・照会・取消。待機登録は`dryRun`非対応 |
+| `delete_files` | 同期: `paths`、任意の`dryRun`・`recursive`・`permanentReservedTree`。待機登録: `action: "enqueue"`・`paths`、任意の`recursive`。照会・取消: `action: "status"` / `"cancel"`・`jobId`のみ | ファイル・フォルダーの同期削除、待機登録・照会・取消。`permanentReservedTree`の条件は[予約名を含むフォルダーの永久削除](#予約名を含むフォルダーを永久削除する)を参照。待機登録は`dryRun`・`permanentReservedTree`非対応 |
 | `delete_registry` | `path`・`view`（`"32"`/`"64"`）、任意の`valueName`・`recursive`・`dryRun`・`accessMode` | キーまたは値を保全して削除。空の`valueName`は既定値。`accessMode`は`normal`または`backupRestore` |
 | `restore_registry` | `operationId`、任意の`accessMode` | レジストリ操作を非上書きで復元。保護アクセスは復元時にも明示選択 |
 | `reconcile_registry` | `operationId` | 切断後に保存済みの結果を読取り確認。削除・復元を再送しない |
