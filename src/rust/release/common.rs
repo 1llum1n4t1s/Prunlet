@@ -131,6 +131,54 @@ impl Pins {
         self.retained.push(handle.try_clone()?);
         Ok(handle)
     }
+    // Cargoの通常成果物はdepsとのhardlinkになり得る。source等のsingle-link制約は緩めない。
+    pub fn cargo_artifact(&mut self, release: &Path, path: &Path) -> Result<File> {
+        let parent = path.parent().context("Cargo artifact requires a parent.")?;
+        let name = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .context("Cargo artifact name must be Unicode.")?;
+        let exact_parent = |expected: &Path| in_tree(parent, expected) && in_tree(expected, parent);
+        let runtime = exact_parent(release)
+            && matches!(
+                name,
+                "prunlet.exe" | "prunlet-maintenance.exe" | "prunlet-hook.exe"
+            );
+        let probe = exact_parent(&release.join("deps"))
+            && name
+                .strip_prefix("prunlet-")
+                .and_then(|v| v.strip_suffix(".exe"))
+                .is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_hexdigit()));
+        ensure!(
+            runtime || probe,
+            "Cargo artifact is outside its expected product location."
+        );
+        self.directory(parent)?;
+        // 全aliasの書込み・削除を拒否した同じ実体をcopy/hash/PE検証の終了まで保持する。
+        let handle = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .with_context(|| format!("Cannot pin Cargo artifact: {}", path.display()))?;
+        let metadata = info(&handle)?;
+        ensure!(
+            metadata.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | 0x10) == 0
+                && metadata.nNumberOfLinks > 0,
+            "Cargo artifact must be a plain file."
+        );
+        self.retained.push(handle.try_clone()?);
+        Ok(handle)
+    }
+    pub fn copied_artifact(&self, file: &File) -> Result<()> {
+        let metadata = info(file)?;
+        ensure!(
+            metadata.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | 0x10) == 0
+                && metadata.nNumberOfLinks == 1,
+            "Copied artifact must be a plain, singly linked file."
+        );
+        Ok(())
+    }
     pub fn new_file(&mut self, path: &Path) -> Result<File> {
         self.directory(path.parent().context("Output requires a parent.")?)?;
         let name = path

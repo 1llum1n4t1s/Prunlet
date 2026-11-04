@@ -206,6 +206,30 @@ fn execute(mut command: Command) -> Result<Vec<Value>> {
     );
     Ok(messages)
 }
+fn product_artifact(messages: &[Value], name: &str, expected: &Path) -> Result<PathBuf> {
+    let artifacts: Vec<_> = messages
+        .iter()
+        .filter(|v| {
+            v["reason"] == "compiler-artifact"
+                && v["target"]["name"] == name
+                && v["profile"]["test"] == false
+                && v["target"]["kind"]
+                    .as_array()
+                    .is_some_and(|k| k.iter().any(|v| v == "bin"))
+        })
+        .filter_map(|v| v["executable"].as_str())
+        .collect();
+    ensure!(
+        artifacts.len() == 1,
+        "Expected exactly one Cargo executable for {name}."
+    );
+    let artifact = absolute(artifacts[0])?;
+    ensure!(
+        in_tree(&artifact, expected) && in_tree(expected, &artifact),
+        "Cargo executable differs from the expected product path."
+    );
+    Ok(artifact)
+}
 struct BuildLock(windows_sys::Win32::Foundation::HANDLE);
 impl BuildLock {
     fn acquire(target: &Path) -> Result<Self> {
@@ -329,21 +353,36 @@ pub fn run(args: &Args) -> Result<()> {
             "prunlet-hook",
             "--message-format=json-render-diagnostics",
         ]);
-    execute(command)?;
+    let messages = execute(command)?;
+    let release = target_dir.join(target).join("release");
+    let mut artifacts = BTreeMap::new();
+    for name in ["prunlet", "prunlet-maintenance", "prunlet-hook"] {
+        artifacts.insert(
+            name,
+            product_artifact(&messages, name, &release.join(format!("{name}.exe")))?,
+        );
+    }
     let mut products = BTreeMap::new();
     for name in ["prunlet.exe", "prunlet-maintenance.exe", "prunlet-hook.exe"] {
         // hookは現行updaterと同じCLI実体を使う。個別binも明示buildしてcompile契約を保つ。
         let input_name = if name == "prunlet-hook.exe" {
-            "prunlet.exe"
+            "prunlet"
         } else {
-            name
+            name.strip_suffix(".exe").unwrap()
         };
-        let mut input = pins.file(&target_dir.join(target).join("release").join(input_name))?;
+        let mut input = pins.cargo_artifact(&release, &artifacts[input_name])?;
+        let input_hash = hash(&mut input)?;
         pe(&read(&mut input, MAX_ZIP)?, runtime, &version, commit)?;
         let mut destination = pins.new_file(&publish.join(name))?;
         std::io::copy(&mut input, &mut destination)?;
         destination.sync_all()?;
-        products.insert(name.to_owned(), hash(&mut destination)?.to_lowercase());
+        pins.copied_artifact(&destination)?;
+        let copied_hash = hash(&mut destination)?;
+        ensure!(
+            copied_hash == input_hash,
+            "Published product bytes differ from the pinned Cargo artifact."
+        );
+        products.insert(name.to_owned(), copied_hash.to_lowercase());
     }
     let probe = args
         .values
@@ -384,10 +423,17 @@ pub fn run(args: &Args) -> Result<()> {
             artifacts.len() == 1,
             "Expected exactly one libtest verification artifact."
         );
-        let mut input = pins.file(Path::new(artifacts[0]))?;
+        let artifact = absolute(artifacts[0])?;
+        let mut input = pins.cargo_artifact(&release, &artifact)?;
+        let input_hash = hash(&mut input)?;
         let mut destination = pins.new_file(&verification.join("prunlet-libtest.exe"))?;
         std::io::copy(&mut input, &mut destination)?;
         destination.sync_all()?;
+        pins.copied_artifact(&destination)?;
+        ensure!(
+            hash(&mut destination)? == input_hash,
+            "Verification probe bytes differ from the pinned Cargo artifact."
+        );
         // 既存dev検証manifestの入力集合は維持し、release来歴だけ同梱sourceへ拡張する。
         let legacy_before: Vec<_> = before
             .iter()
