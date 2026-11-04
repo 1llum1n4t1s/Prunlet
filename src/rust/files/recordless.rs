@@ -277,6 +277,44 @@ fn kind(id: &FileIdentity) -> Result<&'static str> {
         _ => bail!("Unsupported reparse point"),
     })
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeleteMode {
+    Normal,
+    PermanentReservedTree,
+}
+const RESERVED_TREE_ENTRY_LIMIT: usize = 4095;
+const RESERVED_TREE_DEPTH_LIMIT: usize = 64;
+const RESERVED_TREE_DIRECTORY_HANDLE_LIMIT: usize = 8192;
+const RESERVED_TREE_STREAM_HANDLE_LIMIT: usize = 4095;
+struct CaptureBudget {
+    mode: DeleteMode,
+    remaining_entries: usize,
+}
+fn reserved_tree_depth(path: &Path) -> Result<usize> {
+    let text = path.to_str().context("Path is not valid Unicode")?;
+    let text = text.strip_prefix("\\\\?\\").unwrap_or(text);
+    let depth = text
+        .trim_end_matches(['\\', '/'])
+        .split(['\\', '/'])
+        .count();
+    anyhow::ensure!(
+        depth <= RESERVED_TREE_DEPTH_LIMIT,
+        "Permanent reserved-tree paths are limited to 64 absolute components"
+    );
+    Ok(depth)
+}
+fn reserve_directory_handles(remaining: &mut usize, count: usize) -> Result<()> {
+    anyhow::ensure!(
+        count <= *remaining,
+        "Permanent reserved-tree batch exceeds the 8192 retained directory-handle limit"
+    );
+    *remaining -= count;
+    Ok(())
+}
+struct PermanentTree {
+    snapshot: Snapshot,
+    directory_pins: Vec<Option<PinnedFile>>,
+}
 struct Prepared {
     path: PathBuf,
     parents: DirectoryLease,
@@ -287,6 +325,7 @@ struct Prepared {
     reserved: bool,
     reparse: Option<Vec<u8>>,
     generation_cleanup: Option<GenerationCleanupPermit>,
+    permanent_tree: Option<PermanentTree>,
 }
 fn verify_handle(fixed: &PinnedFile, path: &Path, expected: &FileIdentity) -> Result<()> {
     let actual = fixed.identity()?;
@@ -375,18 +414,53 @@ fn prepare_with_generation(
         reserved,
         reparse,
         generation_cleanup,
+        permanent_tree: None,
     }))
 }
 pub fn execute(config: &Config, args: &Value, progress: Option<Progress>) -> Result<Value> {
+    let permanent_reserved_tree = match args.get("permanentReservedTree") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => bail!("permanentReservedTree must be boolean"),
+    };
+    if permanent_reserved_tree && args["recursive"] != true {
+        bail!("permanentReservedTree requires recursive=true");
+    }
+    if permanent_reserved_tree {
+        // resolve自身の祖先lease確保より先に、未解決入力の深さを上限内へ制限する。
+        let input = args["paths"].as_array().context("paths must be an array")?;
+        anyhow::ensure!(
+            !input.is_empty() && input.len() <= 256,
+            "Specify between 1 and 256 paths"
+        );
+        for value in input {
+            reserved_tree_depth(Path::new(
+                value.as_str().context("Each path must be a string")?,
+            ))?;
+        }
+    }
     let paths = normalize_paths(config, args)?;
-    let result = delete(
-        config,
-        &paths,
-        args["dryRun"].as_bool().unwrap_or(false),
-        args["recursive"].as_bool().unwrap_or(false),
-        progress,
-        None,
-    )?;
+    let result = if permanent_reserved_tree {
+        delete_with_generation(
+            config,
+            &paths,
+            args["dryRun"].as_bool().unwrap_or(false),
+            true,
+            progress,
+            None,
+            None,
+            DeleteMode::PermanentReservedTree,
+        )?
+    } else {
+        delete(
+            config,
+            &paths,
+            args["dryRun"].as_bool().unwrap_or(false),
+            args["recursive"].as_bool().unwrap_or(false),
+            progress,
+            None,
+        )?
+    };
     Ok(serde_json::to_value(result)?)
 }
 pub fn validate_queued_paths(config: &Config, paths: &[PathBuf]) -> Result<()> {
@@ -405,7 +479,16 @@ pub fn delete(
     progress: Option<Progress>,
     snapshots: Option<&Mutex<Vec<Snapshot>>>,
 ) -> Result<DeleteResult> {
-    delete_with_generation(config, paths, dry_run, recursive, progress, snapshots, None)
+    delete_with_generation(
+        config,
+        paths,
+        dry_run,
+        recursive,
+        progress,
+        snapshots,
+        None,
+        DeleteMode::Normal,
+    )
 }
 fn delete_with_generation(
     config: &Config,
@@ -415,6 +498,7 @@ fn delete_with_generation(
     progress: Option<Progress>,
     snapshots: Option<&Mutex<Vec<Snapshot>>>,
     generation: Option<&GenerationCleanupPermit>,
+    mode: DeleteMode,
 ) -> Result<DeleteResult> {
     let first = delete_inner(
         config,
@@ -425,11 +509,12 @@ fn delete_with_generation(
         progress.clone(),
         snapshots,
         generation,
+        mode,
     )?;
     match first {
         Some(result) => Ok(result),
         None => delete_inner(
-            config, paths, dry_run, recursive, true, progress, snapshots, generation,
+            config, paths, dry_run, recursive, true, progress, snapshots, generation, mode,
         )?
         .ok_or_else(|| anyhow::anyhow!("Exclusive preflight did not complete")),
     }
@@ -489,6 +574,7 @@ pub(crate) fn recycle_owned_mcp_generation(
         None,
         Some(&snapshots),
         Some(&permit),
+        DeleteMode::Normal,
     )?)?)
 }
 fn verify_snapshots(snapshots: Option<&Mutex<Vec<Snapshot>>>) -> Result<()> {
@@ -625,7 +711,9 @@ fn delete_inner(
     progress: Option<Progress>,
     snapshots: Option<&Mutex<Vec<Snapshot>>>,
     generation: Option<&GenerationCleanupPermit>,
+    mode: DeleteMode,
 ) -> Result<Option<DeleteResult>> {
+    let permanent_reserved_tree = mode == DeleteMode::PermanentReservedTree;
     let _coordination = if dry_run {
         None
     } else {
@@ -650,14 +738,95 @@ fn delete_inner(
         warnings: vec![],
     };
     let mut prepared = vec![];
+    let mut remaining_entries = RESERVED_TREE_ENTRY_LIMIT;
+    let mut remaining_directory_handles = RESERVED_TREE_DIRECTORY_HANDLE_LIMIT;
     let mut hardlinks = false;
     for (index, path) in paths.iter().enumerate() {
+        if permanent_reserved_tree {
+            let resources = reserved_tree_depth(path).and_then(|depth| {
+                // root祖先leaseはdepth-1、snapshotの親handleは1。確保前に全batch予算へ算入する。
+                reserve_directory_handles(&mut remaining_directory_handles, depth)
+            });
+            if let Err(error) = resources {
+                result.items[index].error = Some(error.to_string());
+                prepared.push(None);
+                continue;
+            }
+        }
         let _slot = WorkerSlot::acquire();
         match prepare_with_generation(config, path, recursive, exclusive, generation.cloned()) {
-            Ok(Some(entry)) => {
+            Ok(Some(mut entry)) => {
+                result.items[index].kind = kind(&entry.identity)?.into();
+                if permanent_reserved_tree {
+                    let validation = (|| -> Result<Option<PermanentTree>> {
+                        if !entry.identity.is_directory()
+                            || entry.identity.is_reparse()
+                            || entry.reserved
+                        {
+                            bail!(
+                                "Permanent reserved-tree deletion requires an ordinary non-reserved directory root"
+                            );
+                        }
+                        // 通常claimのroot DELETE handleは列挙handleと共有できない。
+                        // 元inspectionと親leaseを保持し、捕捉したrootを同じ基準へ再照合する。
+                        entry.root.take();
+                        let snapshot =
+                            Snapshot::capture_with_limit(path, true, remaining_entries, mode)?;
+                        anyhow::ensure!(
+                            snapshot.entries[0].identity == entry.identity,
+                            "Reserved-tree root changed between preparation and capture"
+                        );
+                        if !snapshot.entries.iter().skip(1).any(|child| {
+                            path::is_reserved_name(
+                                child
+                                    .path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or(""),
+                            )
+                        }) {
+                            bail!(
+                                "Permanent reserved-tree deletion requires an actual reserved-name descendant"
+                            );
+                        }
+                        remaining_entries -= snapshot.entries.len();
+                        if !exclusive
+                            && snapshot.entries.iter().any(|child| {
+                                child.identity.links > 1
+                                    && !child.identity.is_directory()
+                                    && !child.identity.is_reparse()
+                            })
+                        {
+                            // 副作用前に全claimとsnapshotを破棄し、既存の排他経路で捕捉し直す。
+                            return Ok(None);
+                        }
+                        snapshot.probe()?;
+                        let directories = snapshot
+                            .entries
+                            .iter()
+                            .filter(|child| {
+                                child.identity.is_directory() && !child.identity.is_reparse()
+                            })
+                            .count();
+                        reserve_directory_handles(&mut remaining_directory_handles, directories)?;
+                        let directory_pins = pin_tree_directories(&snapshot.entries)?;
+                        Ok(Some(PermanentTree {
+                            snapshot,
+                            directory_pins,
+                        }))
+                    })();
+                    match validation {
+                        Ok(Some(tree)) => entry.permanent_tree = Some(tree),
+                        Ok(None) => return Ok(None),
+                        Err(error) => {
+                            result.items[index].error = Some(diagnose_with(path, &error, !dry_run));
+                            prepared.push(None);
+                            continue;
+                        }
+                    }
+                }
                 let item = &mut result.items[index];
-                item.kind = kind(&entry.identity)?.into();
-                item.status = if entry.reserved {
+                item.status = if entry.reserved || permanent_reserved_tree {
                     "would_permanently_delete"
                 } else {
                     "would_recycle"
@@ -667,6 +836,14 @@ fn delete_inner(
                 prepared.push(Some(entry));
             }
             Ok(None) => {
+                if permanent_reserved_tree {
+                    result.items[index].error = Some(
+                        "Permanent reserved-tree deletion requires an existing directory root"
+                            .into(),
+                    );
+                    prepared.push(None);
+                    continue;
+                }
                 result.items[index].status = "already_absent".into();
                 prepared.push(None);
             }
@@ -679,6 +856,37 @@ fn delete_inner(
     if hardlinks && !exclusive {
         return Ok(None);
     }
+    let explicit_state =
+        if permanent_reserved_tree && !result.items.iter().any(|item| item.status == "failed") {
+            let state =
+                PermanentState::from_completed(BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
+            let mut stream_budget = RESERVED_TREE_STREAM_HANDLE_LIMIT;
+            for entry in prepared.iter().flatten() {
+                let plan = entry
+                    .permanent_tree
+                    .as_ref()
+                    .context("Missing reserved-tree preflight")?;
+                prepare_tree_hardlinks(
+                    &plan.snapshot.entries,
+                    &entry.path,
+                    &state,
+                    Some(&mut stream_budget),
+                )?;
+            }
+            #[cfg(test)]
+            verification_checkpoint("reserved-tree-preflight-complete", &paths[0])?;
+            for entry in prepared.iter().flatten() {
+                entry
+                    .permanent_tree
+                    .as_ref()
+                    .context("Missing reserved-tree preflight")?
+                    .snapshot
+                    .verify_reserved_tree()?;
+            }
+            Some(state)
+        } else {
+            None
+        };
     if dry_run {
         if result.items.iter().any(|x| x.status == "would_recycle") {
             result.warnings.push("Dry-run cannot determine whether Windows will recycle an item; an oversized file or directory, or an item on a volume configured for immediate deletion, may be permanently deleted.".into());
@@ -696,6 +904,17 @@ fn delete_inner(
                 .join(" ")
         );
     }
+    // 明示モードでは全rootの列挙と実体照合を済ませてから最初の変更へ進む。
+    if permanent_reserved_tree {
+        for entry in prepared.iter().flatten() {
+            entry
+                .permanent_tree
+                .as_ref()
+                .context("Missing reserved-tree preflight")?
+                .snapshot
+                .verify_reserved_tree()?;
+        }
+    }
     let mut permanent: Vec<(usize, Option<ImmediateDeleteSetting>, bool)> = vec![];
     // 共有hardlinkは排他batchを保持し、全Shell完了後に限定された永久削除へ進む。
     let mut changed: BTreeMap<(u64, [u8; 16]), FileIdentity> = BTreeMap::new();
@@ -703,7 +922,7 @@ fn delete_inner(
     let mut permanent_guards: BTreeMap<(u64, [u8; 16]), HardlinkGuard> = BTreeMap::new();
     let mut concurrent: BTreeMap<usize, (Result<RecycleOutcome>, bool)> = BTreeMap::new();
     let token = native::EffectiveToken::capture()?;
-    if !exclusive {
+    if !exclusive && !permanent_reserved_tree {
         for (base, chunk) in prepared.chunks_mut(4).enumerate() {
             let completed = std::thread::scope(|scope| -> Result<Vec<_>> {
                 let mut tasks = vec![];
@@ -747,7 +966,7 @@ fn delete_inner(
             continue;
         };
         entry.root.take();
-        if entry.reserved {
+        if entry.reserved || permanent_reserved_tree {
             permanent.push((index, None, false));
             continue;
         }
@@ -820,6 +1039,7 @@ fn delete_inner(
                                 stream_handles: vec![],
                                 unprotected_root: None,
                                 recycled: true,
+                                stream_limit: None,
                             });
                     } else {
                         entry.original.take();
@@ -858,7 +1078,8 @@ fn delete_inner(
             }
         }
     }
-    let permanent_state = PermanentState::from_completed(changed, permanent_guards, uncertain);
+    let permanent_state = explicit_state
+        .unwrap_or_else(|| PermanentState::from_completed(changed, permanent_guards, uncertain));
     // rootは最大4 workerで並列実行し、同じFileIDの照合からdisposition後の確定までは個別に排他する。
     for chunk in permanent.chunks(4) {
         let completed = std::thread::scope(|scope| {
@@ -1002,6 +1223,7 @@ struct HardlinkGuard {
     stream_handles: Vec<native::OwnedHandle>,
     unprotected_root: Option<PathBuf>,
     recycled: bool,
+    stream_limit: Option<usize>,
 }
 fn access_denied(error: &anyhow::Error) -> bool {
     error.chain().any(|e| {
@@ -1031,8 +1253,12 @@ fn open_hardlink_guard(path: &Path) -> Result<Option<PinnedFile>> {
 fn retain_hardlink_streams(
     path: &Path,
     base: &PinnedFile,
+    maximum: Option<usize>,
 ) -> Result<(Vec<native::NamedStream>, Vec<native::OwnedHandle>)> {
-    let names = native::named_streams(base.raw())?;
+    let names = match maximum {
+        Some(limit) => native::named_streams_bounded(base.raw(), limit)?,
+        None => native::named_streams(base.raw())?,
+    };
     let expected = base.identity()?;
     let mut handles = vec![];
     for stream in &names {
@@ -1049,7 +1275,11 @@ fn retain_hardlink_streams(
         }
         handles.push(handle);
     }
-    if native::named_streams(base.raw())? != names {
+    let current = match maximum {
+        Some(_) => native::named_streams_bounded(base.raw(), names.len())?,
+        None => native::named_streams(base.raw())?,
+    };
+    if current != names {
         bail!("Alternate hardlink stream list changed while being retained");
     }
     Ok((names, handles))
@@ -1065,10 +1295,22 @@ impl HardlinkGuard {
             return Ok(true);
         }
         Ok(self.streams.as_ref().is_some_and(|names| {
-            native::named_streams(self.base.raw()).is_ok_and(|actual| actual == *names)
+            match self.stream_limit {
+                Some(limit) => native::named_streams_bounded(self.base.raw(), limit),
+                None => native::named_streams(self.base.raw()),
+            }
+            .is_ok_and(|actual| actual == *names)
         }))
     }
     fn capture(path: &Path, identity: &FileIdentity, root: &Path) -> Result<Self> {
+        Self::capture_with_stream_budget(path, identity, root, None)
+    }
+    fn capture_with_stream_budget(
+        path: &Path,
+        identity: &FileIdentity,
+        root: &Path,
+        budget: Option<&mut usize>,
+    ) -> Result<Self> {
         let protected = open_hardlink_guard(path)?;
         let unprotected = protected.is_none();
         let base = match protected {
@@ -1076,14 +1318,28 @@ impl HardlinkGuard {
             None => PinnedFile::open(path, FILE_READ_ATTRIBUTES, 7)?,
         };
         verify_handle(&base, path, identity)?;
-        let retained = if unprotected {
+        let bounded = budget.is_some();
+        let retained = if let Some(budget) = budget {
+            anyhow::ensure!(
+                !unprotected,
+                "Reserved-tree hardlinks require retained stream write guards"
+            );
+            let retained = retain_hardlink_streams(path, &base, Some(*budget))?;
+            *budget -= retained.1.len();
+            Some(retained)
+        } else if unprotected {
             None
         } else {
-            retain_hardlink_streams(path, &base).ok()
+            retain_hardlink_streams(path, &base, None).ok()
         };
         let (streams, stream_handles, unprotected_root) = match retained {
             Some((names, handles)) => (Some(names), handles, None),
             None => (None, vec![], Some(root.to_owned())),
+        };
+        let stream_limit = if bounded {
+            streams.as_ref().map(Vec::len)
+        } else {
+            None
         };
         Ok(Self {
             base,
@@ -1091,6 +1347,7 @@ impl HardlinkGuard {
             stream_handles,
             unprotected_root,
             recycled: false,
+            stream_limit,
         })
     }
     fn upgrade_recycled(
@@ -1115,7 +1372,7 @@ impl HardlinkGuard {
                 if candidate.identity()?.change_time != expected.change_time {
                     bail!("Recycled hardlink changed while its write guard was acquired");
                 }
-                match retain_hardlink_streams(path, &candidate) {
+                match retain_hardlink_streams(path, &candidate, None) {
                     Ok((names, handles)) => {
                         self.base = candidate;
                         self.streams = Some(names);
@@ -1175,6 +1432,60 @@ impl PermanentState {
             .clone())
     }
 }
+fn pin_tree_directories(tree: &[TreeEntry]) -> Result<Vec<Option<PinnedFile>>> {
+    tree.iter()
+        .map(|entry| {
+            if entry.identity.is_directory() && !entry.identity.is_reparse() {
+                let pin = PinnedFile::open(&entry.path, FILE_READ_ATTRIBUTES, 3)?;
+                verify_handle(&pin, &entry.path, &entry.identity)?;
+                Ok(Some(pin))
+            } else {
+                Ok(None)
+            }
+        })
+        .collect()
+}
+fn prepare_tree_hardlinks(
+    tree: &[TreeEntry],
+    root: &Path,
+    states: &PermanentState,
+    mut stream_budget: Option<&mut usize>,
+) -> Result<()> {
+    for entry in tree {
+        if entry.identity.links > 1
+            && !entry.identity.is_directory()
+            && !entry.identity.is_reparse()
+        {
+            let state = states.member((entry.identity.volume, entry.identity.id))?;
+            #[cfg(test)]
+            verification_checkpoint("hardlink-state-waiting", &entry.path)?;
+            #[cfg(test)]
+            if matches!(state.try_lock(), Err(std::sync::TryLockError::WouldBlock)) {
+                verification_checkpoint("hardlink-state-contended", &entry.path)?;
+            }
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Shared file state unavailable"))?;
+            if state.guard.is_none() {
+                state.guard = Some(match stream_budget.as_deref_mut() {
+                    Some(budget) => HardlinkGuard::capture_with_stream_budget(
+                        &entry.path,
+                        &entry.identity,
+                        root,
+                        Some(budget),
+                    )?,
+                    None => HardlinkGuard::capture(&entry.path, &entry.identity, root)?,
+                });
+            }
+            if !state.guard.as_ref().unwrap().can_continue(root) {
+                bail!(
+                    "A shared hardlink without retained write guards cannot continue in another root"
+                );
+            }
+        }
+    }
+    Ok(())
+}
 fn permanent_delete(
     config: &Config,
     root: &mut Prepared,
@@ -1201,8 +1512,14 @@ fn permanent_delete(
     {
         bail!("Permanent delete parent identity changed");
     }
-    let mut tree = vec![];
-    capture_tree(&root.path, recursive, &mut tree, usize::MAX, None)?;
+    let (mut tree, directory_pins) = if let Some(plan) = root.permanent_tree.take() {
+        plan.snapshot.verify()?;
+        (plan.snapshot.entries, Some(plan.directory_pins))
+    } else {
+        let mut tree = vec![];
+        capture_tree(&root.path, recursive, &mut tree, usize::MAX, None)?;
+        (tree, None)
+    };
     if !root.identity.same_object(&tree[0].identity)
         || root.identity.attributes != tree[0].identity.attributes
     {
@@ -1214,41 +1531,14 @@ fn permanent_delete(
     }
     // 捕捉後に親を別実体へ差し替えられても、子のhardlink IDだけでは通さない。
     // 全directoryの名前を先に固定し、各directory自身の削除直前まで保持する。
-    let mut directory_pins: Vec<Option<PinnedFile>> = Vec::with_capacity(tree.len());
-    for entry in &tree {
-        if entry.identity.is_directory() && !entry.identity.is_reparse() {
-            let pin = PinnedFile::open(&entry.path, FILE_READ_ATTRIBUTES, 3)?;
-            verify_handle(&pin, &entry.path, &entry.identity)?;
-            directory_pins.push(Some(pin));
-        } else {
-            directory_pins.push(None);
+    let mut directory_pins = match directory_pins {
+        Some(pins) => pins,
+        None => {
+            let pins = pin_tree_directories(&tree)?;
+            prepare_tree_hardlinks(&tree, &root.path, states, None)?;
+            pins
         }
-    }
-    for entry in &tree {
-        if entry.identity.links > 1
-            && !entry.identity.is_directory()
-            && !entry.identity.is_reparse()
-        {
-            let key = (entry.identity.volume, entry.identity.id);
-            let state = states.member(key)?;
-            #[cfg(test)]
-            verification_checkpoint("hardlink-state-waiting", &entry.path)?;
-            #[cfg(test)]
-            if matches!(state.try_lock(), Err(std::sync::TryLockError::WouldBlock)) {
-                verification_checkpoint("hardlink-state-contended", &entry.path)?;
-            }
-            let mut state = state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Shared file state unavailable"))?;
-            if state.guard.is_none() {
-                state.guard = Some(HardlinkGuard::capture(
-                    &entry.path,
-                    &entry.identity,
-                    &root.path,
-                )?);
-            }
-        }
-    }
+    };
     for index in (0..tree.len()).rev() {
         let entry = &mut tree[index];
         directory_pins[index].take();
@@ -1410,6 +1700,24 @@ fn capture_tree(
     limit: usize,
     enumerated: Option<(&FileIdentity, &native::DirectoryEntry)>,
 ) -> Result<()> {
+    let mut budget = CaptureBudget {
+        mode: DeleteMode::Normal,
+        remaining_entries: usize::MAX,
+    };
+    capture_tree_with_mode(path, recursive, tree, limit, enumerated, &mut budget)
+}
+fn capture_tree_with_mode(
+    path: &Path,
+    recursive: bool,
+    tree: &mut Vec<TreeEntry>,
+    limit: usize,
+    enumerated: Option<(&FileIdentity, &native::DirectoryEntry)>,
+    budget: &mut CaptureBudget,
+) -> Result<()> {
+    let mode = budget.mode;
+    if mode == DeleteMode::PermanentReservedTree {
+        reserved_tree_depth(path)?;
+    }
     if tree.len() >= limit {
         bail!("Deletion snapshot exceeds its entry limit");
     }
@@ -1431,12 +1739,14 @@ fn capture_tree(
         {
             bail!("Captured child parent changed before baseline capture");
         }
-        verify_enumerated_child(&id, expected_parent.volume, entry).with_context(|| {
-            format!(
-                "Cannot capture directory entry baseline '{}'",
-                path.display()
-            )
-        })?;
+        verify_enumerated_child_with_mode(&id, expected_parent.volume, entry, mode).with_context(
+            || {
+                format!(
+                    "Cannot capture directory entry baseline '{}'",
+                    path.display()
+                )
+            },
+        )?;
     }
     kind(&id)?;
     let reparse = if id.is_reparse() {
@@ -1457,7 +1767,14 @@ fn capture_tree(
         let _directory = path::pin_directories(path)?;
         let enumerator = PinnedFile::open(path, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, 3)?;
         enumerator.reject_case_sensitive()?;
-        let entries = native::directory_entries(enumerator.raw())?;
+        let entries = if mode == DeleteMode::PermanentReservedTree {
+            let entries =
+                native::directory_entries_bounded(enumerator.raw(), budget.remaining_entries)?;
+            budget.remaining_entries -= entries.len();
+            entries
+        } else {
+            native::directory_entries(enumerator.raw())?
+        };
         if !recursive && !entries.is_empty() {
             bail!("Nonempty directories require explicit recursive deletion");
         }
@@ -1465,21 +1782,40 @@ fn capture_tree(
         tree[index].children.sort();
         for entry in entries {
             let child = path.join(&entry.name);
-            capture_tree(&child, recursive, tree, limit, Some((&id, &entry)))?;
+            capture_tree_with_mode(&child, recursive, tree, limit, Some((&id, &entry)), budget)?;
         }
     }
     Ok(())
 }
 // NTFSのdirectory列挙にはhardlink名に残った古い時刻が返る。
 // 時刻の基準は、列挙IDと照合した後に保持した元handleからだけ取得する。
+#[cfg(test)]
 fn verify_enumerated_child(
     actual: &FileIdentity,
     volume: u64,
     entry: &native::DirectoryEntry,
 ) -> Result<()> {
+    verify_enumerated_child_with_mode(actual, volume, entry, DeleteMode::Normal)
+}
+fn verify_enumerated_child_with_mode(
+    actual: &FileIdentity,
+    volume: u64,
+    entry: &native::DirectoryEntry,
+    mode: DeleteMode,
+) -> Result<()> {
+    // NTFSの別hardlink名には古いREADONLYだけが残り得る。明示モードの捕捉前に限り、
+    // 同一IDの通常hardlinkを開いた実体の全属性を基準にする。構造・捕捉後の照合は緩めない。
+    let stale_readonly = mode == DeleteMode::PermanentReservedTree
+        && actual.links > 1
+        && !actual.is_directory()
+        && !actual.is_reparse()
+        && entry.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0
+        && actual.reparse_tag == 0
+        && entry.reparse_tag == 0
+        && (actual.attributes ^ entry.attributes) & !FILE_ATTRIBUTE_READONLY == 0;
     if actual.volume != volume
         || actual.id != entry.id
-        || actual.attributes != entry.attributes
+        || (!stale_readonly && actual.attributes != entry.attributes)
         || actual.reparse_tag != entry.reparse_tag
     {
         bail!(
@@ -1498,12 +1834,39 @@ fn verify_enumerated_child(
 pub struct Snapshot {
     entries: Vec<TreeEntry>,
     parent: PinnedFile,
+    mode: DeleteMode,
 }
 impl Snapshot {
+    fn verify_reserved_tree(&self) -> Result<()> {
+        self.verify()?;
+        for entry in &self.entries {
+            if entry
+                .original
+                .as_ref()
+                .context("Missing reserved-tree inspection")?
+                .identity()?
+                != entry.identity
+            {
+                bail!(
+                    "Reserved-tree entry changed after preflight: {}",
+                    entry.path.display()
+                );
+            }
+        }
+        Ok(())
+    }
     pub fn root(&self) -> &Path {
         &self.entries[0].path
     }
     pub fn capture(path: &Path, recursive: bool) -> Result<Self> {
+        Self::capture_with_limit(path, recursive, 4095, DeleteMode::Normal)
+    }
+    fn capture_with_limit(
+        path: &Path,
+        recursive: bool,
+        limit: usize,
+        mode: DeleteMode,
+    ) -> Result<Self> {
         let parent = PinnedFile::open(
             path.parent()
                 .ok_or_else(|| anyhow::anyhow!("Missing snapshot parent"))?,
@@ -1511,8 +1874,16 @@ impl Snapshot {
             7,
         )?;
         let mut entries = vec![];
-        capture_tree(path, recursive, &mut entries, 4095, None)?;
-        let snapshot = Self { entries, parent };
+        let mut budget = CaptureBudget {
+            mode,
+            remaining_entries: limit.saturating_sub(1),
+        };
+        capture_tree_with_mode(path, recursive, &mut entries, limit, None, &mut budget)?;
+        let snapshot = Self {
+            entries,
+            parent,
+            mode,
+        };
         snapshot.verify()?;
         Ok(snapshot)
     }
@@ -1549,7 +1920,11 @@ impl Snapshot {
                 let _directories = path::pin_directories(&entry.path)?;
                 let current =
                     PinnedFile::open(&entry.path, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, 3)?;
-                let mut children = native::directory_names(current.raw())?;
+                let mut children = if self.mode == DeleteMode::PermanentReservedTree {
+                    native::directory_names_bounded(current.raw(), entry.children.len())?
+                } else {
+                    native::directory_names(current.raw())?
+                };
                 children.sort();
                 if children != entry.children {
                     bail!("Queued directory membership changed");
@@ -1589,6 +1964,9 @@ pub(super) fn verification_native_contract(case: &str, fixture_root: &str) -> Re
     let fixture = path::absolute(Path::new(fixture_root))?;
     let _parents = path::pin_directories(&fixture)?;
     match case {
+        "file-reserved-tree-preflight-races" => {
+            return tests::reserved_tree_preflight_races(&fixture);
+        }
         case if case.starts_with("file-before-recycle-") => {
             return tests::before_recycle_contract(
                 case.trim_start_matches("file-before-recycle-"),
@@ -1639,6 +2017,260 @@ pub(super) fn verification_native_contract(case: &str, fixture_root: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reserved_tree_readonly_baseline_policy_preserves_structural_guards() -> Result<()> {
+        let actual = FileIdentity {
+            volume: 1,
+            id: [7; 16],
+            attributes: FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_READONLY,
+            reparse_tag: 0,
+            links: 2,
+            size: 1,
+            creation_time: 1,
+            last_write_time: 2,
+            change_time: 3,
+        };
+        let entry = native::DirectoryEntry {
+            name: "NUL".into(),
+            id: actual.id,
+            attributes: FILE_ATTRIBUTE_ARCHIVE,
+            reparse_tag: 0,
+            creation_time: 1,
+            last_write_time: 2,
+            change_time: 3,
+        };
+        assert!(verify_enumerated_child(&actual, actual.volume, &entry).is_err());
+        verify_enumerated_child_with_mode(
+            &actual,
+            actual.volume,
+            &entry,
+            DeleteMode::PermanentReservedTree,
+        )?;
+        for case in 0..6 {
+            let mut rejected = actual.clone();
+            match case {
+                0 => rejected.id = [8; 16],
+                1 => rejected.volume += 1,
+                2 => rejected.attributes |= FILE_ATTRIBUTE_DIRECTORY,
+                3 => {
+                    rejected.attributes |= FILE_ATTRIBUTE_REPARSE_POINT;
+                    rejected.reparse_tag = 0xA000000C;
+                }
+                4 => rejected.attributes |= FILE_ATTRIBUTE_HIDDEN,
+                5 => rejected.links = 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                verify_enumerated_child_with_mode(
+                    &rejected,
+                    actual.volume,
+                    &entry,
+                    DeleteMode::PermanentReservedTree
+                )
+                .is_err()
+            );
+        }
+        let mut link_entry = entry.clone();
+        link_entry.attributes |= FILE_ATTRIBUTE_REPARSE_POINT;
+        assert!(
+            verify_enumerated_child_with_mode(
+                &actual,
+                actual.volume,
+                &link_entry,
+                DeleteMode::PermanentReservedTree
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+    pub(super) fn reserved_tree_preflight_races(fixture: &Path) -> Result<Value> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _serial = PERMANENT_TEST_SERIAL.lock().unwrap();
+        for mode in ["write", "membership", "replace", "readonly"] {
+            let base = fixture.join(mode);
+            let first = base.join("first");
+            let second = base.join("second");
+            let metadata_base = self::fixture("reserved-tree-race-metadata")?;
+            let metadata = metadata_base.join("metadata");
+            for directory in [&base, &first, &second, &metadata] {
+                std::fs::create_dir(directory)?;
+            }
+            for directory in [&first, &second] {
+                std::fs::write(
+                    format!("\\\\?\\{}\\NUL", directory.display()),
+                    b"owned reserved file",
+                )?;
+            }
+            let payload = second.join("ordinary");
+            std::fs::write(&payload, b"baseline")?;
+            let original = PinnedFile::open(&first, FILE_READ_ATTRIBUTES, 7)?.identity()?;
+            let config = Config {
+                path: metadata_base.join("config.json"),
+                data: crate::config::ConfigData {
+                    backup_directory: metadata.to_string_lossy().into(),
+                    ..Default::default()
+                },
+            };
+            let checkpoint = Arc::new(AtomicBool::new(false));
+            let disposition = Arc::new(AtomicBool::new(false));
+            let observed = checkpoint.clone();
+            let mutation = disposition.clone();
+            let target = second.clone();
+            let payload_copy = payload.clone();
+            *FILE_CHECKPOINT.lock().unwrap() = Some(Arc::new(move |phase, _| {
+                if phase == "permanent-child-pinned" {
+                    mutation.store(true, Ordering::SeqCst);
+                }
+                if phase == "reserved-tree-preflight-complete" {
+                    observed.store(true, Ordering::SeqCst);
+                    match mode {
+                        "write" => {
+                            std::fs::write(&payload_copy, b"external writer changed baseline")?
+                        }
+                        "membership" => {
+                            std::fs::write(target.join("new-child"), b"external member")?
+                        }
+                        "readonly" => {
+                            let mut permissions = std::fs::metadata(&payload_copy)?.permissions();
+                            permissions.set_readonly(true);
+                            std::fs::set_permissions(&payload_copy, permissions)?;
+                        }
+                        "replace" => {
+                            anyhow::ensure!(
+                                std::fs::rename(&target, target.with_extension("moved")).is_err(),
+                                "Directory replacement was not blocked by retained pins"
+                            );
+                            bail!(
+                                "Verification stops after blocked replacement; no disposition allowed"
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Ok(())
+            }));
+            let result = execute(
+                &config,
+                &serde_json::json!({"paths":[first,second],"recursive":true,"permanentReservedTree":true}),
+                None,
+            );
+            *FILE_CHECKPOINT.lock().unwrap() = None;
+            anyhow::ensure!(
+                result.is_err()
+                    && checkpoint.load(Ordering::SeqCst)
+                    && !disposition.load(Ordering::SeqCst),
+                "Preflight race must stop the entire batch before disposition: {mode}"
+            );
+            anyhow::ensure!(
+                first.exists()
+                    && second.exists()
+                    && inspect(&first)?.context("Missing first root")?.identity()? == original,
+                "Preflight race changed the untouched root"
+            );
+        }
+        let resources = reserved_tree_resource_contract()?;
+        Ok(
+            serde_json::json!({"passed":true,"cases":["write","membership","replace","readonly"],"resources":resources,"allStoppedBeforeDisposition":true,"scope":"same-source cfg(test) native Core; actual CLI/MCP covered separately"}),
+        )
+    }
+    fn reserved_tree_resource_contract() -> Result<Value> {
+        let root = fixture("reserved-tree-resource-bounds")?;
+        let metadata = root.join("metadata");
+        std::fs::create_dir(&metadata)?;
+        let config = Config {
+            path: root.join("config.json"),
+            data: crate::config::ConfigData {
+                backup_directory: metadata.to_string_lossy().into(),
+                ..Default::default()
+            },
+        };
+        let control = root.join("control");
+        std::fs::create_dir(&control)?;
+        let control_file = format!("\\\\?\\{}\\NUL", control.display());
+        std::fs::write(&control_file, b"unchanged control")?;
+        let mut parent = root.join("depth");
+        std::fs::create_dir(&parent)?;
+        while reserved_tree_depth(&parent)? < 62 {
+            parent.push("d");
+            std::fs::create_dir(&parent)?;
+        }
+        let deep = parent.join("depth63").join("depth64");
+        std::fs::create_dir_all(&deep)?;
+        let deep_file = format!("\\\\?\\{}\\NUL", deep.display());
+        std::fs::write(&deep_file, b"depth boundary")?;
+        let too_deep = deep.join("depth65");
+        std::fs::create_dir(&too_deep)?;
+        std::fs::write(format!("\\\\?\\{}\\NUL", too_deep.display()), b"depth65")?;
+        for target in [&deep, &too_deep] {
+            let result = execute(
+                &config,
+                &serde_json::json!({"paths":[control,target],"recursive":true,"permanentReservedTree":true}),
+                None,
+            );
+            anyhow::ensure!(
+                result.is_err(),
+                "A depth65 root or child must fail before disposition"
+            );
+            anyhow::ensure!(
+                std::fs::read(&control_file)? == b"unchanged control"
+                    && std::fs::read(&deep_file)? == b"depth boundary",
+                "Depth rejection changed the batch"
+            );
+        }
+        let mut targets = vec![];
+        for index in 0..129 {
+            let target = parent.join(format!("root{index}"));
+            std::fs::create_dir(&target)?;
+            std::fs::write(format!("\\\\?\\{}\\NUL", target.display()), b"pin budget")?;
+            targets.push(target);
+        }
+        let result = execute(
+            &config,
+            &serde_json::json!({"paths":targets,"recursive":true,"permanentReservedTree":true}),
+            None,
+        );
+        anyhow::ensure!(
+            result.is_err_and(|error| error.to_string().contains("8192")),
+            "The global directory pin budget was not enforced before disposition"
+        );
+        for target in &targets {
+            anyhow::ensure!(
+                std::fs::read(format!("\\\\?\\{}\\NUL", target.display()))? == b"pin budget",
+                "Pin budget rejection changed the batch"
+            );
+        }
+        let stream_root = root.join("streams");
+        std::fs::create_dir(&stream_root)?;
+        let source = format!("\\\\?\\{}\\NUL", stream_root.display());
+        let survivor = root.join("stream-survivor");
+        std::fs::write(&source, b"stream baseline")?;
+        std::fs::hard_link(&source, &survivor)?;
+        for index in 0u32..4096 {
+            std::fs::write(format!("{source}:proof{index}"), index.to_le_bytes())?;
+        }
+        let result = execute(
+            &config,
+            &serde_json::json!({"paths":[control,stream_root],"recursive":true,"permanentReservedTree":true}),
+            None,
+        );
+        anyhow::ensure!(
+            result.is_err_and(|error| format!("{error:#}").contains("stream-guard limit")),
+            "Stream guard budget must not fall back to an unprotected plan"
+        );
+        anyhow::ensure!(
+            std::fs::read(&control_file)? == b"unchanged control"
+                && std::fs::read(&survivor)? == b"stream baseline",
+            "Stream budget rejection changed the batch"
+        );
+        let held = PinnedFile::open(&survivor, FILE_READ_ATTRIBUTES, 7)?;
+        anyhow::ensure!(
+            native::named_streams(held.raw())?.len() == 4096 && held.identity()?.links == 2,
+            "Stream budget rejection lost a stream or alias"
+        );
+        Ok(
+            serde_json::json!({"retainedFixtureRoot":root,"depth65RootRejected":true,"depth65ChildRejected":true,"directoryHandleBudget":8192,"directoryBudgetBatchRoots":129,"streamGuardBudget":4095,"streamCountRetained":4096}),
+        )
+    }
     #[test]
     fn access_denial_diagnostic_preserves_native_code_and_uncertain_cause() {
         let error = anyhow::Error::new(std::io::Error::from_raw_os_error(5))

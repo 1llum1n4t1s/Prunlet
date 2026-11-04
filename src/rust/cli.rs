@@ -294,20 +294,37 @@ fn targets(args: &[String], offset: usize) -> Result<Vec<String>> {
 fn parse_command(command: &str, args: &[String]) -> Result<Value> {
     match command {
         "delete" => {
-            let (mut dry_run, mut recursive, mut offset) = (false, false, 0);
+            let (mut dry_run, mut recursive, mut permanent_reserved_tree, mut offset) =
+                (false, false, false, 0);
             while offset < args.len()
-                && matches!(args[offset].as_str(), "--dry-run" | "--recursive")
+                && matches!(
+                    args[offset].as_str(),
+                    "--dry-run" | "--recursive" | "--permanent-reserved-tree"
+                )
             {
                 match args[offset].as_str() {
                     "--dry-run" if !dry_run => dry_run = true,
                     "--recursive" if !recursive => recursive = true,
+                    "--permanent-reserved-tree" if !permanent_reserved_tree => {
+                        permanent_reserved_tree = true
+                    }
                     _ => bail!("Repeated delete option: {}", args[offset]),
                 };
                 offset += 1;
             }
-            Ok(json!({"paths":targets(args,offset)?,"dryRun":dry_run,"recursive":recursive}))
+            ensure!(
+                !permanent_reserved_tree || recursive,
+                "--permanent-reserved-tree requires --recursive"
+            );
+            Ok(
+                json!({"paths":targets(args,offset)?,"dryRun":dry_run,"recursive":recursive,"permanentReservedTree":permanent_reserved_tree}),
+            )
         }
         "delete-queue" => {
+            ensure!(
+                !args.iter().any(|arg| arg == "--permanent-reserved-tree"),
+                "--permanent-reserved-tree is supported only for synchronous deletion"
+            );
             let recursive = args.first().is_some_and(|a| a == "--recursive");
             Ok(
                 json!({"paths":targets(args,usize::from(recursive))?,"recursive":recursive,"action":"enqueue"}),
@@ -657,4 +674,4 @@ mod tests {
     }
 }
 
-const HELP: &str = "Prunlet — native Windows/macOS file deletion and Windows registry recovery.\nprunlet --config <absolute-json-path> init --backup-directory <directory>\nprunlet --config <absolute-json-path> validate-config\nprunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>\nprunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]\nprunlet --config <absolute-json-path> delete-queue [--recursive] --paths-file <absolute-json-file>\nprunlet --config <absolute-json-path> delete-queue-status <job-id>\nprunlet --config <absolute-json-path> delete-queue-cancel <job-id>\nprunlet --config <absolute-json-path> registry-delete --view <32|64> [--access-mode <normal|backupRestore>] [--value-name=<name>] [--recursive] [--dry-run] -- <registry-key-path>\nprunlet --config <absolute-json-path> registry-restore <operation-id> [--access-mode <normal|backupRestore>]\nprunlet --config <absolute-json-path> registry-reconcile <operation-id>\nprunlet --config <absolute-json-path> registry-session --minutes <1..60> --assert-native-windows\nprunlet --config <absolute-json-path> operations\nprunlet --config <absolute-json-path> maintain [--dry-run|--apply] [--audit-records]\nprunlet --config <absolute-json-path> purge <operation-id> [--dry-run|--apply]\nprunlet --config <absolute-json-path> migrate [--dry-run|--apply]\nprunlet --config <absolute-json-path> mcp-cache-maintain [--apply | --ack-interrupted-cleanup] (Windows managed MCP generations; acknowledgement only clears the gate)\nprunlet --config <absolute-json-path> mcp\nprunlet --config <absolute-json-path> hook\nFile deletion creates no recovery record. Uncertain results are not retried. Registry operations are Windows-only.\n";
+const HELP: &str = "Prunlet — native Windows/macOS file deletion and Windows registry recovery.\nprunlet --config <absolute-json-path> init --backup-directory <directory>\nprunlet --config <absolute-json-path> validate-config\nprunlet --config <absolute-json-path> delete [--dry-run] [--recursive] [--permanent-reserved-tree] --paths-file <absolute-json-file>\nprunlet --config <absolute-json-path> delete [--dry-run] [--recursive] [--permanent-reserved-tree] -- <absolute-path> [...]\nprunlet --config <absolute-json-path> delete-queue [--recursive] --paths-file <absolute-json-file>\nprunlet --config <absolute-json-path> delete-queue-status <job-id>\nprunlet --config <absolute-json-path> delete-queue-cancel <job-id>\nprunlet --config <absolute-json-path> registry-delete --view <32|64> [--access-mode <normal|backupRestore>] [--value-name=<name>] [--recursive] [--dry-run] -- <registry-key-path>\nprunlet --config <absolute-json-path> registry-restore <operation-id> [--access-mode <normal|backupRestore>]\nprunlet --config <absolute-json-path> registry-reconcile <operation-id>\nprunlet --config <absolute-json-path> registry-session --minutes <1..60> --assert-native-windows\nprunlet --config <absolute-json-path> operations\nprunlet --config <absolute-json-path> maintain [--dry-run|--apply] [--audit-records]\nprunlet --config <absolute-json-path> purge <operation-id> [--dry-run|--apply]\nprunlet --config <absolute-json-path> migrate [--dry-run|--apply]\nprunlet --config <absolute-json-path> mcp-cache-maintain [--apply | --ack-interrupted-cleanup] (Windows managed MCP generations; acknowledgement only clears the gate)\nprunlet --config <absolute-json-path> mcp\nprunlet --config <absolute-json-path> hook\nFile deletion creates no recovery record. Uncertain results are not retried. Registry operations are Windows-only.\n";

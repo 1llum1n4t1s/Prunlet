@@ -91,7 +91,7 @@ fn command(params: &Value) -> std::result::Result<(&'static str, Value), (i32, S
                     if action.is_some() {
                         &["action", "paths", "recursive"]
                     } else {
-                        &["paths", "dryRun", "recursive"]
+                        &["paths", "dryRun", "recursive", "permanentReservedTree"]
                     },
                 )?;
                 let paths = args
@@ -101,7 +101,10 @@ fn command(params: &Value) -> std::result::Result<(&'static str, Value), (i32, S
                 if paths.is_empty() || paths.len() > 256 || paths.iter().any(|v| !v.is_string()) {
                     return Err(invalid("Paths must contain 1 to 256 strings."));
                 }
-                booleans(&args, &["dryRun", "recursive"])?;
+                booleans(&args, &["dryRun", "recursive", "permanentReservedTree"])?;
+                if args["permanentReservedTree"] == true && args["recursive"] != true {
+                    return Err(invalid("permanentReservedTree requires recursive=true."));
+                }
                 if action.is_some() {
                     "delete-queue"
                 } else {
@@ -333,7 +336,7 @@ pub fn run(backend: Arc<dyn Backend>) -> Result<()> {
     let workers = finish(&mut pending);
     result.and(workers)
 }
-const INSTRUCTIONS: &str = "Use delete_files for explicitly authorized absolute native paths. Files normally go to Windows Recycle Bin or macOS Trash without Prunlet operation records. An ordinary file with a Windows reserved final name is permanently deleted after identity checks without using the bin; dry-run reports would_permanently_delete. If Windows reports that an ordinary item is too large for the bin and its original identity is confirmed, Prunlet attempts permanent deletion. Prunlet may also permanently delete a normal item only when Windows reports the bin unavailable, the effective-user per-volume immediate-delete setting is confirmed again immediately before deletion, and original identity is unchanged. Other recycling failures never trigger permanent deletion. Dry-run cannot predict an ordinary item's bin-size outcome. Confirmed removal returns permanently_deleted. Other dry-runs return would_recycle, completed bin moves return recycled, and missing targets return already_absent. Failed or ambiguous results are not success. For ambiguous results, inspect the original source and OS bin without resending deletion. Set recursive=true for directory contents. Metadata and legacy recovery storage remain protected. Never expand wildcards or follow link targets. Hard links share surviving content. On macOS, queued deletion waits only for cooperating advisory flock holders; merely opening a file or mapping a dylib does not delay deletion. Registry tools are Windows-only and unsupported on macOS. They require explicit view 32 or 64, full ACL snapshots and transactions, without automatic elevation or nontransactional fallback. Registry retention defaults to 7 days and 1 GiB and never applies to the OS bin. Existing host approvals and policies still apply.";
+const INSTRUCTIONS: &str = "Use delete_files for explicitly authorized absolute native paths. Files normally go to Windows Recycle Bin or macOS Trash without Prunlet operation records. An ordinary file with a Windows reserved final name is permanently deleted after identity checks without using the bin; dry-run reports would_permanently_delete. If Windows reports that an ordinary item is too large for the bin and its original identity is confirmed, Prunlet attempts permanent deletion. Prunlet may also permanently delete a normal item only when Windows reports the bin unavailable, the effective-user per-volume immediate-delete setting is confirmed again immediately before deletion, and original identity is unchanged. Other recycling failures never trigger permanent deletion. Dry-run cannot predict an ordinary item's bin-size outcome. Confirmed removal returns permanently_deleted. Other dry-runs return would_recycle, completed bin moves return recycled, and missing targets return already_absent. Failed or ambiguous results are not success. For ambiguous results, inspect the original source and OS bin without resending deletion. Set recursive=true for directory contents. On Windows, permanentReservedTree=true explicitly selects permanent deletion of a normal directory root with an actual reserved-name descendant, with recursive=true and at most 4095 total entries across all roots. It is synchronous-only, defaults to false, never calls the bin, and is never selected as a fallback after failure. Metadata and legacy recovery storage remain protected. Never expand wildcards or follow link targets. Hard links share surviving content. On macOS, queued deletion waits only for cooperating advisory flock holders; merely opening a file or mapping a dylib does not delay deletion. Registry tools are Windows-only and unsupported on macOS. They require explicit view 32 or 64, full ACL snapshots and transactions, without automatic elevation or nontransactional fallback. Registry retention defaults to 7 days and 1 GiB and never applies to the OS bin. Existing host approvals and policies still apply.";
 fn tools() -> Value {
     serde_json::from_str(include_str!("tools.json")).expect("embedded MCP schemas")
 }

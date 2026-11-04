@@ -4,6 +4,10 @@
 
 ## 構成と責務
 
+明示モードの通常ファイルhardlinkでは、列挙ID・volume・親・名前・非directory/非reparse構造が一致し、現在のlink数が複数で、捕捉前の属性差がREADONLYだけの場合に限り、開いた元handleの全属性を基準にする。[NTFSの別名には変更経由link以外のdirectory entry属性が古いまま残り得る](https://learn.microsoft.com/en-us/windows/win32/fileio/hard-links-and-junctions)。捕捉後の属性・時刻は厳密に再照合し、通常・queueの列挙属性比較は変更しない。明示モードも通常claimで開始し、子のhardlinkを検出した場合は変更前に全snapshotとclaimを破棄し、既存の排他経路で全rootを捕捉し直す。列挙途中でも残り項目上限を検査し、stream上限超過を未保護fallbackへ変換しない。
+
+Windowsの同期要求は、明示した`--permanent-reserved-tree`（MCPの`permanentReservedTree: true`）で予約名を含む木の限定永久削除を選べる。`recursive`が必須で、各rootは実在する予約名以外の通常ディレクトリーであり、リンク先を追わず列挙した子孫に実在する予約名が1件以上必要である。全root合計4,095項目・ドライブルートを含むパス要素64個・保持するdirectory固定handle合計8,192本・共有hardlinkのADS guard合計4,095本を上限とし、全rootの元handle・親・名前・属性・member集合、DELETE権限probe、ディレクトリーの固定、共有hardlinkとstream guardを変更前に確定・再照合する。元の木をworkerへ引き渡し、新しい基準へ捕捉し直さず既存の固定永久削除を使う。Shellは呼ばず、失敗後のfallbackとして選ばない。defaultはfalse、キューとmacOSは非対応であり、通常経路の予約名末尾・祖先・reparseや保護領域のガードを緩めない。dry-runも同じ事前検証を行い`would_permanently_delete`を返す。事前検証失敗は全対象を保全し、開始後の不明状態は`ambiguous`で停止して自動再送しない。
+
 - Rust実装は`src/rust`に置く。`service::Runtime`がCLI・MCP共通の要求入口となり、`files`・`registry`・`migration`・`update`へ渡す。Windowsのhandle・SID・security descriptor・KTMは`platform/windows`、macOSのdevice/inode・ACL・Foundation Trashは`platform/macos`が担当する。削除をC#プロセスへ委譲せず、CLI・MCP・hookに別の削除方式を実装しない。
 - `cli.rs`はCLIの入力検証とJSON出力、`protocol/mcp.rs`はstdio JSON-RPCを担当する。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールである。`--config <path> mcp`として起動した場合は、起動前・引数検証の例外もstderrへ出してプロトコルstdoutを保つ。他のCLIでは例外をstdoutのJSONで返し、値名などの引数に`mcp`が含まれるだけでは出力先を変えない。
 - hookは認識した直接削除を検査・拒否し、配置済みCLIを案内する。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
@@ -22,6 +26,8 @@ macOSはFoundationのTrash APIを使い、Windowsの永久削除例外やレジ�
 拒否理由の検知情報と解析中のshell規則は要求専用の`Inspector`インスタンスに保持し、別要求へ持ち越さない。検知した命令・オプションと、その検知に使ったshell解釈を応答へ含め、検査不能な入力には原因を返す。Windowsのshell未指定・未知の場合は候補の解釈であることを明示し、ローカル削除と断定しない。検索文字列やリモートスクリプトの引用も別shellでは命令になり得るため、Windows用CLI案内は許可されたWindows対象に限定する。macOSでは配置済みCLIと設定のパスをPosix引用で案内する。応答形式と利用時の扱いは[連携手順](docs/integration.md#hookの検査範囲)を参照する。
 
 CMD規則では`#`をコメントとして扱わず、後続のコマンド区切り以降も検査する。静的な`IF`は`/i`・`not`、`exist`・`defined`・`errorlevel`・`cmdextversion`、`==`と`EQU/NEQ/LSS/LEQ/GTR/GEQ`の条件直後のコマンドを検査する。条件の真偽は評価せず、比較値や`echo`の引数を削除コマンドとは扱わない。wrapper本文の再構成では、引用内の`==`と引用外の比較演算子、空の引用文字列を区別して保つ。
+
+hookは入力を変換せず、`updatedInput`による自動救済を行わない。送信側JavaScriptでPowerShell原文全体を単独EncodedCommandへ変換し、canonicalを実行要求へ渡してホストのhook検査を受ける。後続の入力書換えとの合成はホストと他hookに依存し、一般に生成文字列と実行文字列の一致を保証しない。単引用ヒアストリングに包まれたJavaScriptをstdinへ渡す形式も外側全体を対象とし、shellやSSH先を推測する例外を追加しない。producer手順は[連携手順](docs/integration.md#hookの検査範囲)を正本とする。
 
 PowerShellのヒアストリングは行頭の終端までを文字列として読み、終端前後のローカルコマンドを検査する。Codexの実ホストは`exec_command`を`Bash`として渡し、実行shellをフック入力に含めない。同じ文字列がshellによって実行コードにもデータにもなるため、shell不明のままPowerShellとは決め打ちしない。単独の静的な`pwsh -NoProfile -EncodedCommand <canonical UTF-16LE Base64>`は復号してPowerShellとして限定検査し、未対応の動的呼出し・展開・別shell等は拒否する。復号本文の完全な単引用リテラルを使った`&`呼出しは実行名へ戻して同じ削除・wrapper検査へ渡し、引数や前後のローカル処理の検査を続ける。認識した省略形やwrapperは限定形式として扱わず、不正・未終端のヒアストリングも拒否する。SSHの存在や接続先による素通し例外は設けない。未認識の外部wrapper、外部scriptの内容・動的なコマンド名・他言語のAPIまで検査する保証はない。利用時の書き方は[連携手順](docs/integration.md)、解析の実プロセス検証は[検証手順](docs/verification.md#通常e2eの検証範囲)を参照する。
 

@@ -348,11 +348,20 @@ pub struct DirectoryEntry {
     pub last_write_time: i64,
     pub change_time: i64,
 }
+pub fn directory_entries(handle: HANDLE) -> Result<Vec<DirectoryEntry>> {
+    directory_entries_bounded(handle, usize::MAX)
+}
+pub fn directory_names_bounded(handle: HANDLE, maximum: usize) -> Result<Vec<String>> {
+    Ok(directory_entries_bounded(handle, maximum)?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect())
+}
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "HANDLEはOSが検証するopaque値であり、呼出元メモリを参照しない"
 )]
-pub fn directory_entries(handle: HANDLE) -> Result<Vec<DirectoryEntry>> {
+pub fn directory_entries_bounded(handle: HANDLE, maximum: usize) -> Result<Vec<DirectoryEntry>> {
     let mut result = vec![];
     let mut first = true;
     let mut buffer = vec![0u8; 65536];
@@ -397,6 +406,10 @@ pub fn directory_entries(handle: HANDLE) -> Result<Vec<DirectoryEntry>> {
                     .collect::<Vec<_>>(),
             )?;
             if name != "." && name != ".." {
+                anyhow::ensure!(
+                    result.len() < maximum,
+                    "Directory enumeration exceeds the reserved-tree entry limit"
+                );
                 if name.contains(['\\', '/', ':', '\0']) {
                     bail!("Invalid directory identity component");
                 }
@@ -623,11 +636,14 @@ pub fn named_stream_bytes(handle: HANDLE) -> Result<u64> {
                 .ok_or_else(|| anyhow::anyhow!("Stream size overflow"))
         })
 }
+pub fn named_streams(handle: HANDLE) -> Result<Vec<NamedStream>> {
+    named_streams_bounded(handle, usize::MAX)
+}
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "HANDLEはOSが検証するopaque値であり、呼出元メモリを参照しない"
 )]
-pub fn named_streams(handle: HANDLE) -> Result<Vec<NamedStream>> {
+pub fn named_streams_bounded(handle: HANDLE, maximum: usize) -> Result<Vec<NamedStream>> {
     let mut size = 1024usize;
     loop {
         let mut buffer = vec![0u8; size];
@@ -669,6 +685,10 @@ pub fn named_streams(handle: HANDLE) -> Result<Vec<NamedStream>> {
                     .collect::<Vec<_>>(),
             )?;
             if name != "::$DATA" {
+                anyhow::ensure!(
+                    streams.len() < maximum,
+                    "Named-stream enumeration exceeds the reserved-tree stream-guard limit"
+                );
                 let name = name
                     .strip_prefix(':')
                     .and_then(|x| x.strip_suffix(":$DATA"))

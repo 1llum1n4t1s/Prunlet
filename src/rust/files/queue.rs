@@ -25,6 +25,10 @@ const MAX_FRAME: usize = 1024 * 1024;
 // 受理入力の上限と、保持した最終結果の照会上限を分離する。
 // 入力は256path/1MiB、各診断はWindowsの最大path長で有界であり128MiBへ収まる。
 const MAX_RESPONSE_FRAME: usize = 128 * 1024 * 1024;
+#[cfg(test)]
+type MissingPipeHook = Box<dyn FnOnce() -> Result<()> + Send>;
+#[cfg(test)]
+static CONTACT_MISSING_HOOK: Mutex<Option<(String, MissingPipeHook)>> = Mutex::new(None);
 fn validate_id(id: &str) -> Result<()> {
     if id.len() != 32
         || !id
@@ -405,11 +409,30 @@ pub fn contact(args: &Value, cancel: bool) -> Result<Value> {
                 break unsafe { OwnedHandle::from_raw(raw)? };
             }
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(231) || Instant::now() >= deadline {
+            if !matches!(error.raw_os_error(), Some(2 | 231)) || Instant::now() >= deadline {
                 return Err(error.into());
             }
-            unsafe {
-                WaitNamedPipeW(name.as_ptr(), 100);
+            if error.raw_os_error() == Some(2) {
+                #[cfg(test)]
+                {
+                    let hook = {
+                        let mut hook = CONTACT_MISSING_HOOK.lock().unwrap();
+                        if hook.as_ref().is_some_and(|(expected, _)| expected == id) {
+                            hook.take().map(|(_, callback)| callback)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(hook) = hook {
+                        hook()?;
+                    }
+                }
+                // 応答後のpipe作り直しの隙間だけを待つ。接続・送信後の要求は再送しない。
+                std::thread::sleep(Duration::from_millis(20));
+            } else {
+                unsafe {
+                    WaitNamedPipeW(name.as_ptr(), 100);
+                }
             }
         };
         let mut mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
@@ -729,6 +752,73 @@ fn stop_pending_on_server_failure(state: &Mutex<Value>, error: &anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn contact_waits_for_exact_missing_pipe_gap_and_sends_one_status_frame() -> Result<()> {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let first = new_pipe(&id, true)?;
+        drop(first);
+        let (missing_sender, missing_receiver) = std::sync::mpsc::channel();
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+        *CONTACT_MISSING_HOOK.lock().unwrap() = Some((
+            id.clone(),
+            Box::new(move || {
+                missing_sender
+                    .send(())
+                    .context("Missing-pipe observation receiver disappeared")?;
+                ready_receiver
+                    .recv_timeout(Duration::from_secs(3))
+                    .context("Recreated-pipe permit missing")?;
+                Ok(())
+            }),
+        ));
+        std::thread::scope(|scope| -> Result<()> {
+            let request_id = id.clone();
+            let client = scope.spawn(move || contact(&json!({"jobId":request_id}), false));
+            missing_receiver
+                .recv_timeout(Duration::from_secs(3))
+                .context("Client did not observe ERROR_FILE_NOT_FOUND before reconnection")?;
+            let pipe = new_pipe(&id, true)?;
+            ready_sender.send(())?;
+            accept(pipe.raw())?;
+            peer_user(pipe.raw(), true, &security::current_user_sid()?)?;
+            anyhow::ensure!(
+                pipe_read_frame(pipe.raw(), MAX_FRAME)? == "status",
+                "Expected one status frame after reconnection"
+            );
+            let mut response = initial(&id);
+            response["status"] = json!("cancelled");
+            expiry(&mut response);
+            pipe_write_frame(pipe.raw(), &response)?;
+            let result = client
+                .join()
+                .map_err(|_| anyhow::anyhow!("Contact test client panicked"))??;
+            anyhow::ensure!(
+                result["status"] == "cancelled",
+                "Recreated pipe did not retain the terminal result"
+            );
+            let mut available = 0;
+            let peek = unsafe {
+                PeekNamedPipe(
+                    pipe.raw(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            anyhow::ensure!(
+                available == 0 && (peek != 0 || unsafe { GetLastError() } == ERROR_BROKEN_PIPE),
+                "A connected request was resent"
+            );
+            Ok(())
+        })?;
+        anyhow::ensure!(
+            CONTACT_MISSING_HOOK.lock().unwrap().is_none(),
+            "Missing-pipe checkpoint was not consumed"
+        );
+        Ok(())
+    }
     #[test]
     fn disconnected_status_peer_preserves_pending_job_and_release_completes() -> Result<()> {
         for immediate_close in [false, true] {

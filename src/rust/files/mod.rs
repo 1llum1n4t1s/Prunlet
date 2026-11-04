@@ -16,6 +16,27 @@ pub fn execute(
     args: &Value,
     progress: Option<Progress>,
 ) -> Result<Value> {
+    if let Some(value) = args.get("permanentReservedTree") {
+        anyhow::ensure!(value.is_boolean(), "permanentReservedTree must be boolean");
+        anyhow::ensure!(
+            command == "delete",
+            "permanentReservedTree is supported only for synchronous deletion"
+        );
+        if value == true {
+            anyhow::ensure!(
+                cfg!(windows),
+                "permanentReservedTree is supported only on Windows"
+            );
+            anyhow::ensure!(
+                args["recursive"] == true,
+                "permanentReservedTree requires recursive=true"
+            );
+            anyhow::ensure!(
+                args.get("dryRun").is_none_or(Value::is_boolean),
+                "dryRun must be boolean"
+            );
+        }
+    }
     #[cfg(windows)]
     {
         match command {

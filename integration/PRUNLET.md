@@ -1,6 +1,8 @@
 <!-- Prunlet managed agent instructions -->
 # Prunlet — Windowsのファイル・フォルダー・レジストリ削除
 
+Windowsの同期要求では、利用者が永久削除を明示許可し、各通常名の通常ディレクトリーrootが実在する予約名子孫を含む場合だけ、`--recursive --permanent-reserved-tree`（MCPの`recursive: true, permanentReservedTree: true`）を事前選択できる。全root合計4,095項目・ドライブルートを含むパス要素64個・保持するdirectory固定handle合計8,192本・共有hardlinkのADS guard合計4,095本までを固定・検証し、Shellを呼ばず永久削除する限定モードであり、キュー・macOSは非対応である。既往の失敗から自動切替・再送しない。詳細は製品の連携手順「予約名を含む木の明示的な永久削除」を参照する。
+
 許可されたWindowsファイル・フォルダー削除には、最初からPrunlet CLIを使う。共通AGENTS.mdに「Prunlet CLI」として記録した、インストール済みexeと設定の絶対パスを使い、shellは `cmd.exe`、loginは `false` とする。Prunlet CLIをPowerShellから呼ぶラッパー、PATH上の同名exe、開発クローンやローカルビルドへの差替えは使わない。
 
 `exec_command`が正式なsandbox権限要求に対応し、現在の実効設定でその要求が必要かつ許可されるホストでは、ファイル・フォルダーの実削除を、初回から `sandbox_permissions: "require_escalated"` を指定して要求する。Windowsのゴミ箱への移動には対象だけでなくゴミ箱へのアクセスも必要で、通常sandboxでは対象への権限があってもゴミ箱への書込みが拒否される場合がある。これはホストの承認・審査を受けるための要求であり、WindowsのUAC昇格や管理者実行ではない。Prunletによる自動昇格や承認・管理ポリシーの上書きは行わない。要求が不要・未対応・禁止のホストでは現在の実効設定と正式な承認経路に従い、その違いだけでWindowsの管理者起動を断念しない。
@@ -55,6 +57,32 @@ exe・configは共通AGENTSのbindingへ置き換える。上のCMD例は空白�
 
 ルート自体、HKCR/HKCC、リモート、相対指定、任意のレジストリリンク、未知のschema・metadataや検証できない復元記録は拒否する。実効ユーザーの`Software\Classes`別名を祖先に持つ要求だけは、同じSIDのClasses hiveへ向く実リンクと検証でき、同じトランザクション内で元のREG_LINK値を同じ型・bytesで書き込んで競合ガードを取得できる場合に対応する。追加のSetValue権限が必要で、commitにより別名の最終書込み時刻が変わり得る。dry-runはこの書込みをstageしない。Classes自身やその他のリンクは拒否する。`Remove-Item`のレジストリ素通し例外はなく、認識した`Remove-ItemProperty`・`rp`・`reg[.exe] delete`も拒否し専用CLIを案内する。拒否された対象をMCPや別APIへ付け替えて再試行しない。
 
-hookは限定した直接削除コマンドを検知して拒否する補助であり、shellを推測してコマンドを置換しない。外部スクリプト、動的コマンド、他言語のファイルAPIをすべて検出する保証はない。共通指示の読込みや将来すべての呼出しの遵守も、個別の実ホスト検証と区別する。
+hookは限定した直接削除コマンドを検知して拒否する補助であり、入力の変換や`updatedInput`による救済を行わない。外部スクリプト、動的コマンド、他言語のファイルAPIをすべて検出する保証はない。共通指示の読込みや将来すべての呼出しの遵守も、個別の実ホスト検証と区別する。
 
-Codexのフック入力には`exec_command`の実行shellが渡らず、`shell: "pwsh"`だけではMac等に送るヒアストリング内の`rm`を区別できない。ローカルPowerShellスクリプト全体をshellを起動せずUTF-16LE Base64へ変換し、単独の`pwsh -NoProfile -EncodedCommand <base64>`で渡す。先頭にASCIIコメント行を置いてGit Bashのパス変換を避ける。Prunletはこの形式を復号して限定検査し、ローカルの直接削除・不正入力・解析不能な展開等は拒否する。Base64は秘密を隠さない。裸のヒアストリングやSSHの存在だけでは素通しせず、拒否された実削除を別形式へ付け替えて再送しない。具体例と検査範囲はリポジトリの連携手順を参照する。
+Mac等へPowerShellから送るスクリプトは、`functions.exec`のJavaScript等で**shellへ渡す前に全文を変換する**。単引用ヒアストリングへ入れたJavaScriptも、外側の`@'`から`| node --input-type=module`までが対象である。原文をshell・Node・準備用CLIへpipeして変換しない。`originalRequest`はまだ送信せず、元要求の`cmd`・`shell`・`login`・`workdir`・実行環境指定等の全引数を持つJSオブジェクトとして保持し、`cmd`だけを差し替えて送る。例の`shell`と`login`は新規要求用の既定例であり、既存指定を上書きしない。原文のバッククォート・ドル記号・改行をJSの補間で変えない。
+
+```javascript
+const originalRequest = {
+  cmd: "@'\nconsole.log('hello from Node');\n'@ | node --input-type=module",
+  shell: "pwsh",
+  login: false,
+};
+const raw = originalRequest.cmd;
+const script = "# Prunlet\n" + raw;
+const bytes = new Uint8Array(script.length * 2);
+for (let i = 0; i < script.length; i++) {
+  const unit = script.charCodeAt(i);
+  bytes[i * 2] = unit & 255;
+  bytes[i * 2 + 1] = unit >>> 8;
+}
+const cmd = `pwsh -NoProfile -EncodedCommand ${bytes.toBase64()}`;
+if (cmd.length > 8000) throw new Error("EncodedCommand exceeds the conservative Windows command-line budget");
+const result = await tools.exec_command({ ...originalRequest, cmd });
+text({ output: result.output, exit_code: result.exit_code, session_id: result.session_id });
+if (result.session_id !== undefined) {
+  const progress = await tools.write_stdin({ session_id: result.session_id, chars: "", yield_time_ms: 30000 });
+  text({ output: progress.output, exit_code: progress.exit_code, session_id: progress.session_id });
+}
+```
+
+`functions.exec`が`Script running with cell ID ...`を返した場合は、まず`functions.wait`でそのcellの完了を待つ。cellが動いている間は別cellから同じsessionをpollしない。cell完了後も`session_id`が返ったら、その最新の同じsessionへ空`chars`の`tools.write_stdin`で続け、終了コードを確認する。元コマンドを実行し直さない。実行環境に`pwsh`と本文が必要とする`node`等がなければ原文へfallbackしない。hookへ実行shellが渡らないため、`shell: "pwsh"`だけでは曖昧さは解消しない。Prunletは送信されたcanonicalを復号して限定検査し、ローカルの直接削除・不正入力・解析不能な展開を拒否する。他hookの入力更新との合成はホストと他hookに依存する。Base64は秘密を隠さない。SSHの存在だけで素通しせず、実際の削除拒否や不明結果を別形式へ付け替えて再送しない。検査範囲の詳細は[連携手順](https://github.com/1llum1n4t1s/Prunlet/blob/main/docs/integration.md#hookの検査範囲)を参照する。
