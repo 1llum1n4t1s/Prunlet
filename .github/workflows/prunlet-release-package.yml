@@ -133,5 +133,5 @@ jobs:
           bytes="$(stat -c %s "$(cygpath -u "$package")")"
           expected="sha256:${PRUNLET_EXPECTED_SHA256,,}"
           # 既存assetを上書きせず、全pageの名前一致が一件でdigest・sizeも一致することを確認する。
-          result="$(gh api --hostname github.com --method GET --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$PRUNLET_RELEASE_ID/assets?per_page=100" --jq "[.[][] | select(.name == \"$name\")] | if length == 1 and .[0].state == \"uploaded\" and .[0].size == $bytes and .[0].digest == \"$expected\" then \"verified\" else \"mismatch\" end")"
+          result="$(gh api --hostname github.com --method GET --paginate "repos/$GITHUB_REPOSITORY/releases/$PRUNLET_RELEASE_ID/assets?per_page=100" --jq ".[] | select(.name == \"$name\") | if .state == \"uploaded\" and .size == $bytes and .digest == \"$expected\" then \"verified\" else \"mismatch\" end")"
           [[ "$result" == verified ]] || { echo 'GitHub mirror digest or size differs; publication is incomplete. Do not resend automatically.' >&2; exit 1; }
