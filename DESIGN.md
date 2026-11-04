@@ -4,10 +4,6 @@
 
 ## 構成と責務
 
-明示モードの通常ファイルhardlinkでは、列挙ID・volume・親・名前・非directory/非reparse構造が一致し、現在のlink数が複数で、捕捉前の属性差がREADONLYだけの場合に限り、開いた元handleの全属性を基準にする。[NTFSの別名には変更経由link以外のdirectory entry属性が古いまま残り得る](https://learn.microsoft.com/en-us/windows/win32/fileio/hard-links-and-junctions)。捕捉後の属性・時刻は厳密に再照合し、通常・queueの列挙属性比較は変更しない。明示モードも通常claimで開始し、子のhardlinkを検出した場合は変更前に全snapshotとclaimを破棄し、既存の排他経路で全rootを捕捉し直す。列挙途中でも残り項目上限を検査し、stream上限超過を未保護fallbackへ変換しない。
-
-Windowsの同期要求は、明示した`--permanent-reserved-tree`（MCPの`permanentReservedTree: true`）で予約名を含む木の限定永久削除を選べる。`recursive`が必須で、各rootは実在する予約名以外の通常ディレクトリーであり、リンク先を追わず列挙した子孫に実在する予約名が1件以上必要である。全root合計4,095項目・ドライブルートを含むパス要素64個・保持するdirectory固定handle合計8,192本・共有hardlinkのADS guard合計4,095本を上限とし、全rootの元handle・親・名前・属性・member集合、DELETE権限probe、ディレクトリーの固定、共有hardlinkとstream guardを変更前に確定・再照合する。元の木をworkerへ引き渡し、新しい基準へ捕捉し直さず既存の固定永久削除を使う。Shellは呼ばず、失敗後のfallbackとして選ばない。defaultはfalse、キューとmacOSは非対応であり、通常経路の予約名末尾・祖先・reparseや保護領域のガードを緩めない。dry-runも同じ事前検証を行い`would_permanently_delete`を返す。事前検証失敗は全対象を保全し、開始後の不明状態は`ambiguous`で停止して自動再送しない。
-
 - Rust実装は`src/rust`に置く。`service::Runtime`がCLI・MCP共通の要求入口となり、`files`・`registry`・`migration`・`update`へ渡す。Windowsのhandle・SID・security descriptor・KTMは`platform/windows`、macOSのdevice/inode・ACL・Foundation Trashは`platform/macos`が担当する。削除をC#プロセスへ委譲せず、CLI・MCP・hookに別の削除方式を実装しない。
 - `cli.rs`はCLIの入力検証とJSON出力、`protocol/mcp.rs`はstdio JSON-RPCを担当する。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールである。`--config <path> mcp`として起動した場合は、起動前・引数検証の例外もstderrへ出してプロトコルstdoutを保つ。他のCLIでは例外をstdoutのJSONで返し、値名などの引数に`mcp`が含まれるだけでは出力先を変えない。
 - hookは認識した直接削除を検査・拒否し、配置済みCLIを案内する。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
@@ -47,7 +43,7 @@ PowerShellのヒアストリングは行頭の終端までを文字列として�
 
 Shellがゴミ箱への移動を成功と返した場合は、返却項目だけを一時的に開き、保持した元実体のFile IDと照合する。識別できない場合や不一致は`ambiguous`とし、記録やゴミ箱全体の走査は行わない。この照合は事後の検出であり、Shell直前の名前差し替えによって別実体がゴミ箱へ移ること自体は防げない。
 
-ファイル削除は`FileDeleteResult`のJSON契約に従い、`dryRun`・`items`・`warnings`を持つ。項目は`path`・`kind`・`status`・任意の`error`だけであり、状態は`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`である。`permanently_deleted`は対象の元名をゴミ箱へ移さず削除したことを示し、別ハードリンクやバックアップの消去は保証しない。dry-runは予約名の通常ファイルをwould_permanently_deleteで示し、それ以外はWindowsの最終判定を予測できないことを警告する。`failed`・`ambiguous`はCLIの非ゼロ終了とMCPの`isError`へ反映する。結果不明時は同じ削除を再送せず、元対象とWindowsのゴミ箱を確認する。
+ファイル削除は`FileDeleteResult`のJSON契約に従い、`dryRun`・`items`・`warnings`を持つ。項目は`path`・`kind`・`status`・任意の`error`だけであり、状態は`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`である。`permanently_deleted`は対象の元名をゴミ箱へ移さず削除したことを示し、別ハードリンクやバックアップの消去は保証しない。dry-runは予約名の通常ファイルと、事前検証を通過した明示的な予約名の木を`would_permanently_delete`で示す。通常経路のそれ以外はWindowsの最終判定を予測できないことを警告する。`failed`・`ambiguous`はCLIの非ゼロ終了とMCPの`isError`へ反映する。結果不明時は同じ削除を再送せず、元対象とWindowsのゴミ箱を確認する。
 
 復元と保持期間の管理はWindowsのゴミ箱で行う。Windowsが完全削除した実体をPrunletが復元できるとは扱わない。ハードリンクの別名は実体を共有し、生存する外部別名からの書込みがゴミ箱内にも反映される。通常属性・ADS・case-sensitiveな名前とACLはWindowsが移す同じオブジェクトの状態であり、Prunletが保存時点の不変コピーやACL再適用を提供するものではない。
 
@@ -58,6 +54,12 @@ Shellがゴミ箱への移動を成功と返した場合は、返却項目だけ
 失敗時の診断は`platform/windows/diagnostics.rs`が担当し、`files/recordless.rs`が各項目の`error`へ付加してCLI・MCPへ返す。共有・ロック違反と削除元へのアクセス拒否では保持元を観測し、dry-runではプロセス照会を行わない。アクセス拒否だけで保持元や原因を断定しない。診断は失敗後の現在値であり、診断不能でも元の削除結果を維持する。保持元の特定を削除の再試行やプロセス停止へ結び付けない。照会方法と観測範囲の制約は[連携手順](docs/integration.md#使用中のファイルと同時実行)を参照する。
 
 固定実体への永久削除要求が受理された後、削除handleを解放してから名前の確認に失敗した場合は、その到達段階と確認できなかったentryをエラーへ含める。Win32 5はACLの制限や削除待ちなど複数の理由で返り得るため、番号だけでは原因を決めない。確認不能は引き続き`ambiguous`として扱い、名前の消失や削除完了を推測しない。
+
+### 予約名を含む木の明示的な永久削除
+
+Windowsの同期要求は、明示した`--permanent-reserved-tree`（MCPの`permanentReservedTree: true`）で予約名を含む木の限定永久削除を選べる。`recursive`が必須で、各rootは実在する予約名以外の通常ディレクトリーであり、リンク先を追わず列挙した子孫に実在する予約名が1件以上必要である。全root合計4,095項目・ドライブルートを含むパス要素64個・保持するdirectory固定handle合計8,192本・共有hardlinkのADS guard合計4,095本を上限とし、全rootの元handle・親・名前・属性・member集合、DELETE権限probe、ディレクトリーの固定、共有hardlinkとstream guardを変更前に確定・再照合する。元の木をworkerへ引き渡し、新しい基準へ捕捉し直さず既存の固定永久削除を使う。Shellは呼ばず、失敗後のfallbackとして選ばない。defaultはfalse、キューとmacOSは非対応であり、通常経路の予約名末尾・祖先・reparseや保護領域のガードを緩めない。dry-runも同じ事前検証を行い`would_permanently_delete`を返す。事前検証失敗は全対象を保全し、開始後の不明状態は`ambiguous`で停止して自動再送しない。
+
+明示モードの通常ファイルhardlinkでは、列挙ID・volume・親・名前・非directory/非reparse構造が一致し、現在のlink数が複数で、捕捉前の属性差がREADONLYだけの場合に限り、開いた元handleの全属性を基準にする。[NTFSの別名には変更経由link以外のdirectory entry属性が古いまま残り得る](https://learn.microsoft.com/en-us/windows/win32/fileio/hard-links-and-junctions)。捕捉後の属性・時刻は厳密に再照合し、通常・queueの列挙属性比較は変更しない。明示モードも通常claimで開始し、子のhardlinkを検出した場合は変更前に全snapshotとclaimを破棄し、既存の排他経路で全rootを捕捉し直す。列挙途中でも残り項目上限を検査し、stream上限超過を未保護fallbackへ変換しない。
 
 ### 明示的な削除待機キュー
 
@@ -157,13 +159,15 @@ MCP起動時に公開済みlatestを確認し、既存版の子孫で更新proto
 
 stageは再帰削除せず、完了した世代の正規製品とmetadataをhashと実体で照合して主streamだけを再利用する。正常な次回更新を、stageが存在するだけで止めない。未知の項目は残して容量へ含め、未確定の切替・移行は先に同じ候補で再開する。
 
-Windowsの公式配布はCloudflare R2を取得先とし、公開済みGitHub Releaseの発行者を信頼の基点として維持する。`.github/workflows/prunlet-release-package.yml`が公開タグからwin-x64・win-arm64をビルドし、`scripts/Package-PrunletUpdate.ps1`でZIPを作成する。公開前に`Verify-ReleasePackage.ps1`がentryの過不足・重複、metadataの取得元・commit・runtime等、および全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合する。`Publish-PrunletR2.ps1`は検証したZIPを固定し、S3互換APIからR2の不変キーへ配置して公開URLの全bytesを照合する。その後に同一ZIPを従来名のGitHub Release assetへ添付する。R2の既存objectとGitHubの既存assetを異なる内容で上書きしない。
+Windowsの公式配布はCloudflare R2を取得先とし、公開済みGitHub Releaseの発行者を信頼の基点として維持する。`.github/workflows/prunlet-release-package.yml`は公開タグへソースを固定し、固定toolchainからbootstrapしたRust製`prunlet-release`でwin-x64・win-arm64を生成・検証・公開する。`src/rust/release/build.rs`がビルドと来歴、`package.rs`がZIPの生成・照合、`r2.rs`がS3互換APIへの配置と公開URLの全bytes照合を担当する。既存のPowerShell配布入口は同じRust CLIを起動するbridgeであり、ZIP・署名・HTTP・来歴の処理を重複実装しない。
+
+公開用のbuild・package・verify・publish-r2はGit HEADと全製品入力を拘束し、`build-provenance.json`でtoolchain・Cargo環境入力・生成物を結び付ける。Cargoの成果物はハードリンクになり得るため、所定の成果物だけを実体固定して通常streamを新規ファイルへコピーし、公開側は単一linkを要求する。ZIPはentryの過不足・重複、取得元・commit・runtime、全payloadの長さ・SHA-256と生成元を照合し、製品3本の実物handleに対するAuthenticodeはNotSignedまたはValidだけを許容する。R2公開の成功後だけ同一ZIPを従来名のGitHub Release assetへ添付し、アップロード前のZIP再照合と添付後のdigest・size確認を行う。R2の既存objectとGitHubの既存assetを異なる内容で上書きしない。実行コマンドとbootstrapの環境分離は[配布手順](docs/distribution.md#rust製リリースcli)を参照する。
 
 取得側は従来どおり、タグが既定ブランチ上のcommitを指すこと、インストール済みcommitからの子孫であること、GitHub assetのdigest・size・IDを検査する。R2 URLは固定ホスト`https://prunlet.kagayoi.com`と`releases/{repository小文字}/{commit小文字}/{runtime}/{ZIP SHA-256小文字}.zip`から導出し、任意のURLを入力しない。GitHubとは独立した保存先にある同じbytesを照合するため、R2に置いたchecksumだけを配布元の証明に使わない。パッケージ内のcommit・runtime・製品hashも検証し、`source-info.json`へ今回選択した配布URLを記録する。検証済みの同一ZIPをcacheから再利用した場合は通信せず、その配布URLを記録する。既存の候補source-infoを異なるURLへ上書きしない。digestは転送内容の一致を示し、ソースからビルドされたことを独立に証明しない。Actionsの期限付きartifactを更新の必須条件としない。
 
 起動時protocolがR2対応を明示する公式リポジトリのRust CLIだけが、新規stageにR2を選択する。検証済みの準備途中stageは作成時の配布先を継承して完了させ、新しいlauncherの既定値で別のURLへ付け替えない。旧CLIと別リポジトリは取得前に従来のGitHub経路を選び、既存5/7引数の内部コマンドとGitHub経路の旧CLIによるstage再開は従来の意味を保つ。R2専用stageを旧CLIへ強制して再準備する操作は未対応で、拒否して保全する。R2取得後の失敗をGitHubへの自動再試行で回避しない。取得失敗時に安全な現在版を継続する境界は変えない。手動installerの最新HEADからのソース取得・ビルド契約と、macOSで起動時更新を提供しない境界も維持する。
 
-CIは純git・PowerShell・GitHub CLIを使い、Node.js製Actionを呼ばない。checkoutはイベントのSHAへ固定し、認証情報を永続化しない。自動マージは信頼済みworkflowの中だけで実行し、PRのコードを読み込んだり実行したりしない。R2の設定・資格情報と公開手順は[配布の設定](docs/distribution.md)へまとめる。
+配布CIはGit・Git Bash・Rust製リリースCLI・GitHub CLIを使い、Node.js製Actionを呼ばない。checkoutはイベントのSHAへ固定し、認証情報を永続化しない。自動マージの権限分離は[依存更新の境界](#依存更新の境界)、R2の設定・資格情報と公開手順は[配布の設定](docs/distribution.md)を参照する。
 
 更新用cacheはレジストリ復元領域とは別に合計2 GiBを上限とする。公開ZIP・stage・製品slot・固定candidate/previous・保全した異常世代・各ディレクトリのADS・更新管理ファイルを容量に含め、確保前と完了後に検査する。slotはcache専用で、実行・移動・削除しない。正規hash・長さ・単一linkを同じ排他handleで確認し、通常streamだけをin-place更新する。候補へはそのhandleの通常streamだけをCreateNewコピーする。ADSや不明な部分書込みは保持し、予算不足を自動削除で回避しない。
 

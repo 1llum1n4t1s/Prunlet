@@ -28,7 +28,7 @@ Windowsの管理者起動はsandbox権限申請と区別する。許可済みの
 
 ## ビルドと検証
 
-利用者が明示許可した場合だけ、Windowsの同期要求で`--recursive --permanent-reserved-tree`（MCPは`recursive: true, permanentReservedTree: true`）を使える。これは実在する予約名子孫を含む通常名の通常ディレクトリーに限定した事前選択であり、通常経路の「予約名の通常ファイル」例外や、失敗からの自動fallbackを広げない。全root合計4,095項目・ドライブルートを含むパス要素64個・保持するdirectory固定handle合計8,192本・共有hardlinkのADS guard合計4,095本の事前検証と既存の保護・実体照合を維持し、Shellは使わず、キュー・macOSでは拒否する。詳細は[連携手順](docs/integration.md#予約名を含む木の明示的な永久削除)を参照する。関連変更では`tests/permanent_reserved_trees.rs`の8ケースと通常の記録なしファイルE2Eを実行する。このblackbox統合テストは製品の`src/rust`とは分け、[検証手順](docs/verification.md)の固定入力で実CLI・MCPと同一ソースprobeを確認する。
+利用者が明示許可した場合だけ、Windowsの同期要求で`--recursive --permanent-reserved-tree`（MCPは`recursive: true, permanentReservedTree: true`）を事前選択する。失敗からのfallbackに使わず、[専用設計](DESIGN.md#予約名を含む木の明示的な永久削除)の対象条件・上限・実体照合を維持する。利用時は[連携手順](docs/integration.md#予約名を含む木の明示的な永久削除)を読む。関連変更では`tests/permanent_reserved_trees.rs`の8ケースと通常の記録なしファイルE2Eを実行する。このblackbox統合テストは製品の`src/rust`とは分け、[検証手順](docs/verification.md)の固定入力で実CLI・MCPと同一ソースprobeを確認する。
 
 macOSの変更では[macOSの手順](docs/macos.md#ソースからビルドする)で外部出力先へビルドし、[ネイティブ検証の4経路](docs/macos.md#ネイティブ検証の4経路)から影響する経路を実行する。通常release・専用cfgのdebug・libtestの結果を区別し、クロスビルドを対象CPUでの動作確認の代わりにしない。以下のビルド・検証コマンドはWindows向けである。
 
