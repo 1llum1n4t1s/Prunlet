@@ -14,7 +14,9 @@ Rust候補の内部境界は、`scripts/Publish-Prunlet.ps1 -OutputDirectory <�
 
 ## 通常E2Eの検証範囲
 
-フックのshell文字列解析は`scripts/Verify-HookParsing.ps1`に今回のexeと未使用の外部出力先・reportを渡して確認する。Mac向けSSH送信のヒアストリングを含む入力は実行せず、hookプロセスのstdinへJSONとして送り、許可・拒否、stdout/stderr、終了コードとfixture不変更を照合する。Codexの`Bash`とshell欠落、単独EncodedCommandの復号、認識した別名・不正値・外側wrapperの拒否、復号本文の直接削除と解析不能な展開、明示PowerShell、CMD、shell不明を区別する。SSH先での実削除を成功条件へ置き換えない。
+shell前のproducer手順は`tests/hook_remote_input.rs`で、`PRUNLET_HOOK_EXE`へ検証する配置済みCLIの絶対パスを固定して確認する。Cargo target・TEMP/TMPを外部Dへ分け、同じRust/MSVC/static CRT設定で`cargo test --test hook_remote_input --locked --release --target x86_64-pc-windows-msvc --target-dir <外部D> -- --ignored --nocapture --test-threads=1`を実行する。5テスト全件と終了コード0を確認する。歴史上拒否された原文はdenyを維持し、全文のUTF-16LE変換結果と原文のroundtrip、生成canonicalの通過、encoded本文内の直接削除拒否、明示shellとmetadataの従来動作を確認する。既存`hook-posix.json`のWindows期待値と必要なCMD/PowerShell期待値もJSONだけで再利用する。元コマンドは実行せず、実CLIのhook stdinへJSONとして渡す。旧PowerShell検証helperは実行しない。
+
+Codex実ホストでは、shell前に生成した無害なliteral markerのcanonicalだけを実行し、実PowerShellのCommandLineが生成したEncodedCommandと一致することと終了コードを別途確認する。元のSSH清掃や危険な回帰fixtureは実行しない。配置済みCLIのhash、hook検査結果、実ホストの実行を区別し、hookによる入力更新には依存しない。
 
 スパースfixtureのC#は`scripts/recordless-e2e/SparseFixture.cs`を共通入力とし、各runnerはこの実ファイルのpathとSHA-256を記録する。旧runnerのhere-stringやAST配置を検証入力として使わない。
 
@@ -105,7 +107,7 @@ GitHub応答を検証用アーカイブへ差し替え、実際のインスト�
 
 launcher世代をまたぐ再開は`Verify-PreparedDistributionResume.ps1`へcurrent・legacy両ZIPと旧launcherの絶対パス・期待SHA-256（`-CurrentPackagePath`・`-ExpectedCurrentPackageSha256`・`-LegacyPackagePath`・`-ExpectedLegacyPackageSha256`・`-LegacyLauncherPath`・`-ExpectedLegacyLauncherSha256`）、未使用の`-OutputDirectory`・`-ReportPath`を渡して確認します。旧launcherの検証済みコピーにタイミング用checkpointを一か所だけ加え、事前検査後に実MCPが起動して切替が延期される条件を再現します。元本と派生版のSHA・差分を記録し、新launcherが元の配布先とsource-infoのbytesを保って完了することを検査します。GitHubの回答と系譜はfixtureで、本番公開・実際のGit系譜・無変更の旧launcherだけによる再現と区別します。
 
-R2 publisherは`scripts/Verify-PrunletR2Publisher.ps1 -PackagePath <固定したZIP絶対パス> -OutputDirectory <未使用の外部D絶対パス>`で検証します。既知のSigV4署名、実HttpClientと模擬handlerによるstream送信、非上書きPUT、既存objectと公開URLの全bytes照合、応答不明時の停止、秘密の非出力とfile pinを確認します。これは本番R2への書込み・認証・ドメイン・キャッシュの検証を代替しません。最終ZIPには既存の`Verify-ReleasePackage.ps1`による全12入力の照合も実行します。公開時の設定と確認順序は[配布の設定](distribution.md)を参照してください。
+R2 publisherの正本はRust製`prunlet-release`です。固定したソース・commit・runtime・build provenanceから`package`で作成した実物ZIPを、`verify`で全12 payload・PE/version・ソース・publish出力と照合します。公開用buildは`--release-source true`を明示し、その前後にGit HEADと全製品入力の一致を確認します。`package`・`verify`・`publish-r2`でも同梱scripts・integrationを含む製品入力のHEAD一致とdirty・untracked・ignoredの拒否を必須とし、GitHub添付の直前に`verify`を再実行します。製品3本のAuthenticodeは実物handleを固定したWinVerifyTrustで確認し、NotSignedまたはValidを許容して無効な署名を拒否します。公開工程では`publish-r2`が同じZIPを再検証し、非上書きPUTまたは既存objectの全bytes照合を経て、公開URLの全bytes・長さ・SHA-256を確認します。その成功後だけ同じZIPをGitHub Releaseへ添付し、GitHubのdigest・sizeを照合します。引数・資格情報・確認順序は[配布の設定](distribution.md#rust製リリースcli)、実行経路は[release workflow](../.github/workflows/prunlet-release-package.yml)を参照してください。旧.NET HttpClientの模擬handlerによるSigV4・通信失敗・秘密非出力のfixture結果は、新しいWinHTTP providerの検証結果に含めません。新WinHTTP provider向けの障害条件fixtureは未整備です。実公開時の成功は未実行の障害条件検証を代替しません。
 
 定期整理はTask Scheduler境界を隔離して、毎日03:00と現在のユーザーのログオンの両トリガー、有効状態、`StartWhenAvailable`、電池使用時の実行許可、既存タスク設定の保持をXMLで検証します。PCの電源断・スリープ・ログオフを伴う取り逃し回復の実動作は、この検証の対象外です。
 
@@ -144,5 +146,11 @@ R2 publisherは`scripts/Verify-PrunletR2Publisher.ps1 -PackagePath <固定した
 起動時保守の性能は、旧ファイル数を増やしてもレジストリ専用namespaceの走査へ限定されることを計測する。明示移行時間と定常保守時間を分け、CLIの計測を実ログオン全体の改善と混同しない。通常容量走査と`--audit-records`による完全監査を区別する。
 
 ## 検証後の保持と清掃
+
+予約名を含む木の明示モードを変更した場合は、Rustの`tests/permanent_reserved_trees.rs`を使う。環境変数`PRUNLET_E2E_EXE`に検証する配置済みCLI、`PRUNLET_E2E_PROBE`に同じ不変更ソースのprobe、`PRUNLET_E2E_MANIFEST`と`PRUNLET_E2E_MANIFEST_SHA256`にbuild manifestと固定SHA-256を指定する。`PRUNLET_E2E_OUTPUT`は未使用の外部D絶対パス、`PRUNLET_E2E_FIXTURE_ROOT`は既存の外部NTFSディレクトリーとし、後者の一意な子だけにfixtureを作る。TEMP/TMPとCargo targetも外部Dへ分ける。
+
+`cargo test --test permanent_reserved_trees --no-run --locked --release --target x86_64-pc-windows-msvc --target-dir <外部DのCargo target>`でrunnerをコンパイルし、同じ引数から`--no-run`を除いて末尾へ`-- permanent_reserved_trees_e2e --exact --ignored --nocapture --test-threads=1`を加えて実行する。対象buildに合わせたCargo設定・静的CRT設定を維持する。runnerはexe・probe・manifest・全製品入力のhashと祖先を固定し、前後照合する。実CLIはRustの`Command`からCMDへ直接渡し、MCPも実プロセスを使う。製品Coreをrunnerから直接呼んで削除しない。`<PRUNLET_E2E_OUTPUT>/report.json`の8件実行・`passed: 8`・`failed: 0`・`completeVerified: true`とプロセス終了コード0を確認する。
+
+8ケースでCLI/MCPの実行、nested予約名のfile/directory、外部junction・hardlinkとADS/ACL/属性の保全、dry-run不変更、通常名のみの木・root種別・保護領域・boolean・queueの拒否、全batch事前検査と4,095項目上限を確認する。同一ソースprobeのCore境界では、書込み・member変更・捕捉後属性変更・親差し替えの変更前停止、深さ65のroot/子・8,192固定handleを超える129 root・4,096 ADSによる全batch不変更を区別して確認する。runnerは失敗・不明を自動再送せずfixtureを保持する。reportの正確な所有パスと残状態を照合し、配置済みCLIで清掃する。通常の記録なしE2E、queue、共通指示の導入検証も必要範囲で実行し、既存の環境失敗や未実行を成功扱いにしない。
 
 結果と再現方法は会話内へ残し、再検証に必要なJSON・入力・ログだけを外部作業領域へ保持する。今回のfixtureだけを対象として、利用中プロセス・リンク・混在を確認してからPrunletで清掃する。ゴミ箱全体を空にせず、旧領域や不明な残存データを手動削除しない。保全対象・未清掃パス・理由・再開条件を報告する。

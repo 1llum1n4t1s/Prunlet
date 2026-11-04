@@ -22,9 +22,9 @@ object keyは`releases/1llum1n4t1s/prunlet/<commit>/<runtime>/<ZIP SHA-256>.zip`
 
 通常の修正では公開しない。正式リリースを依頼された場合に、公開タグへ固定したworkflowが次の順に実行する。
 
-1. タグ・イベントSHA・既定ブランチの祖先関係を確認し、指定されたRust toolchainでビルドする。
-2. `Package-PrunletUpdate.ps1`でZIPを生成し、`Verify-ReleasePackage.ps1`で同梱全ファイルを今回のソースとpublish出力へ照合する。
-3. `Publish-PrunletR2.ps1`で再検証した同一ZIPを固定してR2へ配置し、公開URLから取得した全bytesの長さ・SHA-256を照合する。
+1. タグ・イベントSHA・既定ブランチの祖先関係と製品versionを確認する。`rust-toolchain.toml`の固定toolchainでホスト用`prunlet-release`だけを外部targetへbootstrapし、`prunlet-release build --release-source true`で指定runtimeの製品3本と`build-provenance.json`を生成する。ビルド前後でGit HEADが指定commitと一致することと、同梱scripts・integrationを含む全製品入力がHEADの追跡内容と一致することを確認し、対象入力のdirty・untracked・ignoredファイルを拒否する。
+2. `prunlet-release package`でZIPを生成し、`prunlet-release verify`で同梱全ファイル・PE/version・ソース・build provenanceを今回のpublish出力へ照合する。既存の12 payloadと`package.json`の形式を維持する。
+3. `prunlet-release publish-r2`で再検証した同一ZIPを固定してR2へ配置し、公開URLから取得した全bytesの長さ・SHA-256を照合する。資格情報は上記の環境変数で渡す。
 4. 返されたSHA-256と手元のZIPを再確認して、従来名`prunlet-update-<runtime>.zip`で同じGitHub Releaseへ添付する。既存assetを上書きしない。
 
 R2の新規配置は`If-None-Match: *`を付ける。[R2の条件付き書込み](https://developers.cloudflare.com/r2/api/s3/api/#conditional-operations)で既存objectの上書きを防ぐ。既存objectはS3側の全bytesと公開URLの全bytesが一致する場合だけ再利用する。内容が異なる場合、HTTPエラー、応答が不明な場合は停止し、objectを削除して再試行しない。R2の成功だけでは公開完了とせず、GitHub側の同一ZIPとdigestを確認する。
@@ -37,8 +37,19 @@ GitHubのタグ・祖先関係・digest・size・asset IDを認証した後に�
 
 R2対応を広告しない旧CLIと、公式以外のリポジトリは従来のGitHub取得を事前に選ぶ。GitHub経路の既存内部コマンドと更新stageはその意味を保つ。準備途中の検証済みstageは元の配布先を継承するため、旧launcherが作ったGitHub stageも新launcherで再開できる。R2専用stageを旧CLIで再準備する操作は拒否して保全する。R2取得の失敗からGitHubへ自動的に切り替えず、安全な現在版を継続できるかは既存の更新状態に従って判定する。`source-info.json`の`downloadUrl`は今回選択した検証済み配布先で、同じZIPをcacheから再利用する場合もそのURLを記録する。
 
-CIのソース取得と自動マージも純git・PowerShell・`gh`で実行する。Node.js、npm、Wranglerは配布に要求しない。GitHub hosted runnerに別用途のNodeが入っていることと、このworkflowの依存は区別する。
+リリースCIのソース取得と工程の接続はGit Bash・純git・`gh`で行い、ビルド・package・verify・R2処理の中心はRust製`prunlet-release`に置く。Node.js、npm、Wranglerは配布に要求しない。GitHub hosted runnerに別用途のNodeが入っていることと、このworkflowの依存は区別する。インストーラーと開発用probeのPowerShell入口はSDK起動用の薄いbridgeとして維持し、この移行をインストーラー全体の移植とは扱わない。
+
+## Rust製リリースCLI
+
+bootstrapは固定toolchain・`--locked --release --bin prunlet-release`で行う。Cargo targetとTEMP/TMPはリポジトリ外の絶対パスへ隔離し、Windowsでは`CARGO_ENCODED_RUSTFLAGS`に`-C`・区切り文字U+001F・`target-feature=+crt-static`を設定する。bootstrapしたexeの絶対パスを以降の全工程で固定して使う。
+
+```text
+prunlet-release.exe build --source <ソース絶対パス> --output <外部出力絶対パス> --commit <40桁SHA> --branch <既定ブランチ> --runtime <win-x64|win-arm64> --repository 1llum1n4t1s/Prunlet --release-source true
+prunlet-release.exe package --source <ソース絶対パス> --publish <外部出力絶対パス>/publish --package <ZIP絶対パス> --commit <40桁SHA> --branch <既定ブランチ> --runtime <win-x64|win-arm64> --repository 1llum1n4t1s/Prunlet
+```
+
+`verify`と`publish-r2`は`package`と同じ引数を受け取る。これらの公開用コマンドはGit HEADと全製品入力の照合を必須とし、GitHub添付の直前にも`verify`を再実行する。`verify`はZIP全体の大文字SHA-256を1行で返す。`publish-r2`はschema 1の公開結果JSONを返し、`verified`・SHA-256・bytes・commit・runtime・repositoryを照合してから同じZIPをGitHubへ添付する。`build`は任意の`--target-directory <外部絶対パス>`も受け取り、既定の出力先は`<output>/publish`、provenanceは`<output>/build-provenance.json`である。製品3本のAuthenticodeは固定した実物handleに対してWinVerifyTrustで確認し、`NotSigned`と`Valid`だけを許容する。無効な署名は拒否し、未署名を署名済みとは扱わない。インストーラー用のarchiveビルドは`--release-source`の既定値falseを使い、公開用のGit拘束と区別する。
 
 ## 公開前の確認
 
-[検証手順](verification.md#latestインストーラー)の起動時更新E2Eと、R2 publisher・CI用の隔離fixture検証を使う。fixture成功は本番R2の資格情報・ドメイン・キャッシュ・GitHubの実権限を確認した結果ではない。初回公開時は公開URLの全bytes、GitHub mirrorのdigest・size、旧CLIからの更新と新CLIのR2取得を実際に確認する。
+[検証手順](verification.md#latestインストーラー)に、起動時更新の既存E2EとRust製R2 publisherの検証範囲を分けて記載する。旧.NET providerのfixture結果を新しいWinHTTP providerの検証結果として扱わない。新WinHTTP provider向けの障害条件fixtureは未整備である。公開時は実物ZIPの`verify`、公開URLの全bytes、GitHub mirrorのdigest・sizeを確認する。旧CLIからの更新と新CLIのR2取得は、公開処理の成功と区別して扱う。

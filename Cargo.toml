@@ -1,6 +1,6 @@
 [package]
 name = "prunlet"
-version = "1.0.31"
+version = "1.0.32"
 edition = "2024"
 rust-version = "1.99.1"
 publish = false
@@ -21,6 +21,10 @@ path = "src/rust/bin/hook.rs"
 [[bin]]
 name = "prunlet-maintenance"
 path = "src/rust/bin/maintenance.rs"
+
+[[bin]]
+name = "prunlet-release"
+path = "src/rust/bin/release.rs"
 
 [dependencies]
 anyhow = "1"
