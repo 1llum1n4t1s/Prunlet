@@ -33,11 +33,17 @@ foreach ($name in $inputs.Keys) { [void]$expected.Add($name) }
 
 $packageStream = [IO.File]::Open($PackagePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
 try {
+    if ($packageStream.Length -lt 1 -or $packageStream.Length -gt 512MB) { throw 'Package exceeds the existing Windows updater size limit.' }
     $archive = [IO.Compression.ZipArchive]::new($packageStream, [IO.Compression.ZipArchiveMode]::Read, $true)
     try {
         $entries = [Collections.Generic.Dictionary[string, IO.Compression.ZipArchiveEntry]]::new([StringComparer]::Ordinal)
         $caseFolded = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($entry in $archive.Entries) {
+            # 公開済みWindowsクライアントのサイズ・外部属性制約も送信前に照合する。
+            $limit = if ($entry.FullName.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { 256MB } else { 4MB }
+            if ($entry.Length -gt $limit -or ($entry.ExternalAttributes -band 0x400) -ne 0 -or (($entry.ExternalAttributes -shr 16) -band 0xf000) -eq 0xa000) {
+                throw "Package entry is unsupported by existing Windows updaters: $($entry.FullName)"
+            }
             if (!$expected.Contains($entry.FullName) -or !$caseFolded.Add($entry.FullName)) {
                 throw "Unexpected or duplicate package entry: $($entry.FullName)"
             }

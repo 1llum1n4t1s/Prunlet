@@ -69,6 +69,8 @@ jobs:
             if (![IO.File]::Exists($product)) { throw "Published product missing: $name" }
             $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($product).ProductVersion
             if (($version -split '\+')[0] -cne $expectedVersion) { throw "Published product version differs: $name $version" }
+            $signature = Get-AuthenticodeSignature -LiteralPath $product
+            if ($signature.Status -notin @('NotSigned', 'Valid')) { throw "Published product signature is invalid: $name" }
           }
           & ./scripts/Package-PrunletUpdate.ps1 -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory (Join-Path $output 'publish') -OutputPath $package -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME | Out-Null
       - name: Verify the release package

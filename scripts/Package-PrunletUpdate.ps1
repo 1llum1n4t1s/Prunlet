@@ -84,7 +84,7 @@ function Assert-Machine([IO.FileStream]$Stream, [string]$ExpectedRuntime) {
         if ($Stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5a4d) { throw 'Product is not a PE executable.' }
         $Stream.Position = 0x3c
         $offset = $reader.ReadUInt32()
-        if ($offset -gt $Stream.Length - 6) { throw 'Product has an invalid PE header offset.' }
+        if ($offset -lt 64 -or $offset -gt 1MB -or $offset -gt $Stream.Length - 6) { throw 'Product has an invalid PE header offset.' }
         $Stream.Position = $offset
         if ($reader.ReadUInt32() -ne 0x00004550) { throw 'Product has an invalid PE signature.' }
         $machine = $reader.ReadUInt16()
