@@ -59,7 +59,7 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot 
 
 ## 導入と文書
 
-Dependabotと依存検証・自動マージのworkflowを変更する場合は、[依存更新の境界](DESIGN.md#依存更新の境界)にある検証条件と権限分離を維持する。依存検証CIの成功は、変更内容に応じた上記の追加E2Eを代替しない。
+Dependabotと依存検証のworkflowを変更する場合は、[依存更新の境界](DESIGN.md#依存更新の境界)にある検証条件と権限分離を維持する。依存検証CIの成功は、変更内容に応じた上記の追加E2Eを代替しない。
 
 対外表記ではREADME冒頭の副題を併記する。今後のX告知では本文と紹介画像に同じ副題を毎回含め、GitHubの説明欄も同じ表記に揃える。X告知本文には、README冒頭に沿った紹介文を毎回1文入れる。その紹介文には、`blocked by policy`による清掃の停止を減らす目的と、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約する使い方を含める。
 

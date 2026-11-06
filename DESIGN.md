@@ -167,7 +167,7 @@ Windowsの公式配布はCloudflare R2を取得先とし、公開済みGitHub Re
 
 起動時protocolがR2対応を明示する公式リポジトリのRust CLIだけが、新規stageにR2を選択する。検証済みの準備途中stageは作成時の配布先を継承して完了させ、新しいlauncherの既定値で別のURLへ付け替えない。旧CLIと別リポジトリは取得前に従来のGitHub経路を選び、既存5/7引数の内部コマンドとGitHub経路の旧CLIによるstage再開は従来の意味を保つ。R2専用stageを旧CLIへ強制して再準備する操作は未対応で、拒否して保全する。R2取得後の失敗をGitHubへの自動再試行で回避しない。取得失敗時に安全な現在版を継続する境界は変えない。手動installerの最新HEADからのソース取得・ビルド契約と、macOSで起動時更新を提供しない境界も維持する。
 
-配布CIはGit・Git Bash・Rust製リリースCLI・GitHub CLIを使い、Node.js製Actionを呼ばない。checkoutはイベントのSHAへ固定し、認証情報を永続化しない。自動マージの権限分離は[依存更新の境界](#依存更新の境界)、R2の設定・資格情報と公開手順は[配布の設定](docs/distribution.md)を参照する。
+配布CIはGit・Git Bash・Rust製リリースCLI・GitHub CLIを使い、Node.js製Actionを呼ばない。checkoutはイベントのSHAへ固定し、認証情報を永続化しない。依存検証は[依存更新の境界](#依存更新の境界)、R2の設定・資格情報と公開手順は[配布の設定](docs/distribution.md)を参照する。
 
 更新用cacheはレジストリ復元領域とは別に合計2 GiBを上限とする。公開ZIP・stage・製品slot・固定candidate/previous・保全した異常世代・各ディレクトリのADS・更新管理ファイルを容量に含め、確保前と完了後に検査する。slotはcache専用で、実行・移動・削除しない。正規hash・長さ・単一linkを同じ排他handleで確認し、通常streamだけをin-place更新する。候補へはそのhandleの通常streamだけをCreateNewコピーする。ADSや不明な部分書込みは保持し、予算不足を自動削除で回避しない。
 
@@ -193,6 +193,4 @@ shadow配置にはprivate ACL、所有marker、hash検証を適用し、リン�
 
 `.github/dependabot.yml`はGitHub Actions・Cargo・Rust toolchainの更新を毎週月曜09:00（日本時間）に確認し、minor・patchをまとめ、majorは個別PRにする。`.github/workflows/dependency-validation.yml`はDependabotのPRまたは手動起動を対象に、Windowsと`rust-toolchain.toml`の指定版でlocked build・テストとCLI・MCP・hookの通常E2Eを行う。ビルド・検証・成果物の記録も同じ指定版を使用する。出力はrunnerの一時領域へ分離し、checkoutの認証情報を保持せず、権限はcontentsの読取りに限定する。
 
-通常E2Eは同じソース入力から作った製品・検証probeのbuild manifestを固定し、62件すべての実行・失敗0・skip 0・`completeVerified`を要求する。即時削除の3件には`New-CIImmediateVolume.ps1`が使い捨てWindows runnerの`RUNNER_TEMP`直下へ新規VHDXを作り、新しいNTFS volume GUIDだけへ即時削除設定を設ける。既存C/Dドライブや既存volume設定を変更しない。通常payloadはユーザープロファイル下、即時削除payloadだけは`-ImmediateFixtureRoot`へ分離する。image・disk・drive・volume GUIDの照合や作成権限を確認できなければ失敗とし、skipで自動マージを通さない。ローカルホストへこのCI専用helperを実行せず、終了時は使い捨てrunner VMを破棄する。macOSは独立したjobでnative testとarm64/x64のMach-O生成を検査する。
-
-`.github/workflows/dependabot-auto-merge.yml`は、書込み権限を持つ処理を信頼済み既定ブランチ側で実行し、PRのコードは実行しない。対象は所有者`1llum1n4t1s`のリポジトリで、同一リポジトリから既定ブランチへ向けたDependabotの非draft PRに限る。依存更新として判定できる差分と署名済みコミットを検査し、workflowの変更は`uses`の参照更新だけを許可する。PRのhead SHAに対応する依存検証の最新実行が成功し、他のcheck・commit statusにも失敗や未完了がなく、競合がない場合だけマージを試みる。直前にhead・既定ブランチのSHAとマージ可能状態を再確認し、変更や未検証状態があれば保留する。GitHub側のマージ要件も維持する。依存検証の成功と書込み処理を分離することで、未検証のPRコードをマージ権限で実行する経路を避ける。
+通常E2Eは同じソース入力から作った製品・検証probeのbuild manifestを固定し、62件すべての実行・失敗0・skip 0・`completeVerified`を要求する。即時削除の3件には`New-CIImmediateVolume.ps1`が使い捨てWindows runnerの`RUNNER_TEMP`直下へ新規VHDXを作り、新しいNTFS volume GUIDだけへ即時削除設定を設ける。既存C/Dドライブや既存volume設定を変更しない。通常payloadはユーザープロファイル下、即時削除payloadだけは`-ImmediateFixtureRoot`へ分離する。image・disk・drive・volume GUIDの照合や作成権限を確認できなければ失敗とし、skipで検証を通さない。ローカルホストへこのCI専用helperを実行せず、終了時は使い捨てrunner VMを破棄する。macOSは独立したjobでnative testとarm64/x64のMach-O生成を検査する。
