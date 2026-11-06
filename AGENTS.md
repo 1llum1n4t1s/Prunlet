@@ -6,7 +6,7 @@ Windowsのファイル・フォルダー・レジストリ削除は、配置済�
 
 ファイル・フォルダーは通常Windowsのゴミ箱へ移し、操作記録自体を作らない。末尾名がWindows予約名の実在する通常ファイルだけは、元実体と親・名前・属性を固定して照合し、追加確認やShell試行なしで永久削除する。予約名の祖先・ディレクトリ・reparse pointはこの例外に含めない。通常名の対象は、Windowsが対象をゴミ箱には大きすぎると明示した場合、またはゴミ箱利用不可を返し対象ボリュームの即時削除設定を確認できた場合で、保持した実体と再固定した名前・親・属性が一致した場合だけ、同じ要求内で元の名前を永久削除する。対象ボリュームの即時削除設定は実効ユーザーとボリュームを照合し、各削除直前に再確認する。設定の原子的固定はできない。サイズ超過と確認済み即時削除設定以外の失敗や不明な結果からは永久削除へ切り替えない。操作ID・PIDL・File ID・内容hash・size・ACL snapshotを復元用に永続化せず、manifest・monitor・index・retirement・復元stageを新規作成しない。処理中の実体照合に使う一時handle・File IDとは区別する。ゴミ箱に移った項目の復元と保持管理はWindowsへ任せ、CLI/MCPのファイル復元を追加しない。共通の固定`maintenance.lock`は排他用であり操作記録ではない。`allowedRoots`は互換入力で、削除対象フォルダーの許可リストを設けない。独自退避・コピーfallback・自動昇格・リンク先走査を追加しない。中央metadata・レジストリ専用namespace・未移行の旧領域とその祖先を保護する。
 
-`FileDeleteResult`は`dryRun`・`items`・`warnings`、各項目は`path`・`kind`・`status`・任意`error`である。状態は`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`で、`failed`と`ambiguous`は非成功として返す。Shellが返した項目を一時的に開き、事前に保持した元のFile IDと照合できない場合は`ambiguous`とする。dry-runは予約名の通常ファイルをwould_permanently_deleteで示す。それ以外では永久削除の要否を予測できないことを警告する。不明な削除を自動再送せず、元対象とWindowsゴミ箱を確認する。
+ファイル結果のDTO・状態・dry-runの契約は[削除のデータフロー](DESIGN.md#削除と復元のデータフロー)を維持し、`failed`と`ambiguous`を非成功として返す。不明な削除を自動再送せず、元対象とWindowsゴミ箱を確認する。
 
 レジストリは[専用設計](DESIGN.md#レジストリの削除と復元)のstage・snapshot・永続化・commit順、完全security bytes照合、schema 5の作成時からの非公開ACL、曖昧状態の保全を維持する。非トランザクション削除へのfallbackを追加しない。`restore`（`registry-restore`の別名）・`operations`・`purge`・`maintain`はレジストリ専用で、MCPは5ツールを維持する。レジストリ記録は`backupDirectory/.registry-records-v1/{id}`へ置き、manifestの`MetadataRoot`は共通基点を保持する。
 
@@ -55,7 +55,7 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 
 ## 導入と文書
 
-Dependabotと依存検証・自動マージのworkflowを変更する場合は、[依存更新の境界](DESIGN.md#依存更新の境界)にある検証条件と権限分離を維持する。依存検証CIの成功は、変更内容に応じた上記の追加E2Eを代替しない。
+Dependabotと依存検証のworkflowを変更する場合は、[依存更新の境界](DESIGN.md#依存更新の境界)にある検証条件と読取り権限の境界を維持する。依存検証CIの成功は、変更内容に応じた上記の追加E2Eを代替しない。
 
 対外表記ではREADME冒頭の副題を併記する。今後のX告知では本文と紹介画像に同じ副題を毎回含め、GitHubの説明欄も同じ表記に揃える。X告知本文には、README冒頭に沿った紹介文を毎回1文入れる。その紹介文には、`blocked by policy`による清掃の停止を減らす目的と、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約する使い方を含める。
 

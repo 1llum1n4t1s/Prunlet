@@ -4,9 +4,12 @@
 
 ## 構成と責務
 
+製品コードは`src/Prunlet`のC#実装で、`Prunlet.csproj`は`net10.0-windows`を対象とする。`scripts/Publish-Prunlet.ps1`はWindows x64・ARM64向けにランタイム同梱の単一ファイルexeを生成する。
+
 - `Core/DeletionService`がファイル削除・レジストリ削除と復元・保守・明示移行を担当する。CLI・MCP・hookに別の削除方式を実装しない。
 - `Program`はCLIの入力検証とJSON出力、`Protocol/McpServer`はstdio JSON-RPCを担当する。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールである。`--config <path> mcp`として起動した場合は、起動前・引数検証の例外もstderrへ出してプロトコルstdoutを保つ。他のCLIでは例外をstdoutのJSONで返し、値名などの引数に`mcp`が含まれるだけでは出力先を変えない。
-- hookは認識した直接削除を検査・拒否し、配置済みCLIを案内する。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
+- `Protocol/HookRouter`は認識した直接削除を検査・拒否し、配置済みCLIを案内する。専用入口`prunlet-hook.exe`はCLIと同じバイナリを別名で配置する。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
+- `prunlet-maintenance.exe`は同じCoreをGUI subsystemで発行した定期保守入口で、`--config <path> maintain --apply`だけを受け付ける。コンソールを作らずにレジストリ復元データを整理する。
 - Windows Shellがゴミ箱への移動とファイル復元を担当する。Prunletのファイル復元API・通常の履歴圧縮入口は提供しない。
 
 権限の境界はホストのsandbox承認、Windowsの実トークン、Prunlet Coreの対象検証に分かれる。Prunlet自身は自動昇格しないが、許可された削除についてエージェントが明示的に管理者CMDを起動し、同じ配置済みCLIと設定を使う連携は別の責務である。起動成功だけを削除成功とは扱わず、拒否・結果不明を昇格で迂回しない。起動と結果確認の手順は[連携手順](docs/integration.md#sandboxとゴミ箱へのアクセス)に集約する。
