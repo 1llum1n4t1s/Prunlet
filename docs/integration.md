@@ -1,12 +1,6 @@
 # Codexとの連携
 
-## 予約名を含む木の明示的な永久削除
-
-Windows限定で、利用者が永久削除を明示許可した通常名の通常ディレクトリーには、同期CLIの`delete --recursive --permanent-reserved-tree --paths-file <絶対パスのUTF-8 JSON一覧>`、またはMCPの`delete_files`へ`recursive: true, permanentReservedTree: true`を指定できます。各rootには、リンク先を追わず確認できる実在の予約名子孫が1件以上必要です。予約名そのもののroot・ファイルroot・reparse root・予約名祖先・保護領域は許可されません。全root合計4,095項目・ドライブルートを含むパス要素64個・保持するdirectory固定handle合計8,192本・共有hardlinkのADS guard合計4,095本を超える木は変更前に拒否します。
-
-全rootの元実体・名前・属性・構成とDELETE権限、共有hardlinkの保全条件を事前検査してから、Shellを呼ばず固定した元名を永久削除します。dry-runは同じ検査を行い`would_permanently_delete`を返し、確認できた削除だけ`permanently_deleted`です。ゴミ箱から復元できません。defaultはfalseで、キューとmacOSでは使えません。既往の失敗から自動で切り替えず、不明状態は元対象とWindowsゴミ箱を確認し、同じ操作を自動再送しません。
-
-PrunletはWindows向けCLIとstdio MCPを同じexeで提供します。Codexの`PreToolUse` hookは同じビルドから配置した独立exeで入力を検査し、認識した直接削除を拒否してCLI手順を案内します。入力の自動置換や削除は実行しません。リモート送信で曖昧になる入力は、[hookの検査範囲](#hookの検査範囲)の手順でshellへ渡す前に変換します。PowerShellはMCP起動時の更新確認と導入・登録・ビルド・E2Eで使います。
+PrunletはWindows向けCLIとstdio MCPを同じexeで提供します。Codexの`PreToolUse` hookは同じビルドから配置した独立exeで入力を検査し、認識した直接削除を拒否してCLI手順を案内します。入力の自動置換や削除は実行しません。PowerShellはMCP起動時の更新確認と導入・登録・ビルド・E2Eで使います。
 
 ## 準備
 
@@ -16,9 +10,7 @@ PrunletはWindows向けCLIとstdio MCPを同じexeで提供します。Codexの`
 
 ## エージェント共通指示
 
-`-RegisterCodex -RegisterAgentInstructions`を明示すると、Codex homeの`PRUNLET.md`を配置し、共通`AGENTS.md`の先頭へ管理マーカー付きの参照と、配置済みexe・設定の絶対パスを追加します。各リポジトリへの記載は不要です。Windowsのファイル・フォルダー削除では最初から`cmd.exe`・`login: false`のPrunlet CLIを使います。空白・Unicode・多数・長い対象パスは`--paths-file`で渡します。exe・設定のパス自体をCMDで安全に表現できない場合は、実行前に同じCoreのMCPを選びます。拒否された削除を別shellやPrunletへ付け替えて再試行しません。
-
-この管理ブロックの読込条件はWindows対象の削除であり、SSH先のMac/Linuxへの削除要求には適用されません。送信前手順を常時読込元から参照する場合は、利用者の明示許可で管理ブロック外の共通ユーザー規則へ「Prunlet CLI bindingがある環境では、WindowsからSSH経由でMac/Linuxへ削除要求を送る前にも、共通PRUNLET.mdの送信前手順を読む。」を追加します。これはinstallerが管理する指示ではなく、既存ブロックの所有・旧版照合を変更しません。bindingがなくなればこの個人ルールは不適用です。Windows用CLIをSSH先の削除に使う指示ではありません。
+`-RegisterCodex -RegisterAgentInstructions`を明示すると、Codex homeの`PRUNLET.md`を配置し、共通`AGENTS.md`の先頭へ管理マーカー付きの参照と、配置済みexe・設定の絶対パスを追加します。各リポジトリへの記載は不要です。ファイル・フォルダー削除では最初から`cmd.exe`・`login: false`のPrunlet CLIを使います。空白・Unicode・多数・長い対象パスは`--paths-file`で渡します。exe・設定のパス自体をCMDで安全に表現できない場合は、実行前に同じCoreのMCPを選びます。拒否された削除を別shellやPrunletへ付け替えて再試行しません。
 
 この登録は共通AGENTSの専用ブロックを変更するため明示オプションにしています。旧ファイル専用CLIブロックと旧MCP優先ブロックは既知の正確な内容とguideのハッシュを照合して移行します。既存本文を保持し、重複・不完全な管理マーカーや利用者が編集した指示を検出した場合は自動更新を拒否します。更新時に登録が途中で失敗した場合は、MCP・hookに加えてAGENTSと専用指示も復旧対象になります。
 
@@ -105,28 +97,9 @@ $rollback = Join-Path $env:LOCALAPPDATA 'Codex\TaskArtifacts\Prunlet\integration
 
 設定ファイルの上書き前に、`-BackupDirectory`へ元ファイルと復元記録を保存します。この保存先はCodexHome、ユーザーの`.codex`、リポジトリの外に置いてください。Prunletの削除バックアップとは別の用途です。変更対象の`features`と`mcp_servers`にquoted key、表名の内部空白、dotted root keyがある場合や、複数行文字列を含むTOMLは、既存値を保持するため自動更新を拒否します。その場合は手動登録が必要です。プロジェクトのtrust tableなど、変更対象以外のquoted tableは保持します。設定ファイルの更新中にI/Oエラーが起きた場合は、表示された保存先の復元記録を確認してください。
 
-フックの登録後はCodexのフック設定画面でPrunlet hookの定義を確認して信頼してください。`install-codex.ps1`はhookのtrust記録やAGENTS.mdを変更しません。共通AGENTSを変更するのは上記の明示オプションです。初回登録ではMCP・共通指示・hookの読込みをそれぞれ確認します。
+フックの登録後はCodexで`/hooks`を開き、Prunlet hookの定義を確認して信頼してください。`install-codex.ps1`はhookのtrust記録やAGENTS.mdを変更しません。共通AGENTSを変更するのは上記の明示オプションです。Codexを再起動してMCP・共通指示・hookの読込みを確認します。
 
-登録済みhookの有効・無効はCodexのフック設定画面で切り替えます。APIを使う場合は、対象チャットを処理中の実ホストの`config/batchWrite`で、対象識別子`key`に対応する`hooks.state.${JSON.stringify(key)}.enabled`を`reloadUserConfig: true`とともに更新します。`config.toml`の直接編集による保存や、別途起動したapp-serverでの確認だけでは、実ホストへの反映を確認できません。`okOverridden`応答を切替成功と扱わず、上書き元を確認します。同じ実ホストの`hooks/list`へ対象`threadId`を渡した結果や、切替後の次の実呼出しで反映を確認してください。このstate切替ではCodex再起動を標準手順にせず、新規登録・定義変更の信頼確認やMCP・共通指示の読込みとは区別します。
-
-Windowsのmanaged登録は`start-prunlet-mcp.ps1`を起動し、検証済みprivate世代のproxyを通してMCPへ接続します。配置更新後の次要求で子の世代を切り替える条件と、未送信待機・結果不明時の扱いは[世代切替の設計](../DESIGN.md#windows-managed-mcpの世代切替)を参照してください。旧C# MCPからの初回移行では一度接続を張り直します。Codex実ホストの再接続操作は未検証のため、アプリ再起動不要とは案内しません。
-
-更新用2 GiB枠が不足して新しい実行世代を作れない場合も、既存の検証済み世代の通常要求は継続できます。未使用世代は次のWindows CLIで確認し、一覧を確認してから明示回収します。レジストリの`purge`とは別の操作です。 以下の`C:\Users\<user>\...`は実際の配置済みexe・設定のbindingの絶対パスに置き換え、最初からCMD（エージェントは`shell=cmd.exe`・`login=false`）で直接実行してください。`--apply`は実削除を行うため、PowerShellラッパーを経由させません。
-
-```cmd
-"C:\Users\<user>\.local\Prunlet\bin\prunlet.exe" --config "C:\Users\<user>\.local\Prunlet\config.json" mcp-cache-maintain
-"C:\Users\<user>\.local\Prunlet\bin\prunlet.exe" --config "C:\Users\<user>\.local\Prunlet\config.json" mcp-cache-maintain --apply
-```
-
-この入口は`mcpProxy2`・`mcpBackendLease1`に対応する世代間で切り替えます。proxyが強制終了しても、実処理中のbackendは完了まで配置元のread leaseを保持します。未知の上位host Jobによる強制終了は`unavailable`・結果不明として扱い、自動再送しません。
-
-現在の世代や使用中のproxy・queue worker、未知の項目は保持します。回収は既存Coreのゴミ箱契約に従い、永久削除の例外も同じ条件です。過去のpending・retired領域は`retained`として保全します。現在の回収では削除前にcache直下へ固定gate `.prunlet-mcp-cleanup-in-progress`を作成し、元の1対象の`recycled`または`permanently_deleted`を確認した場合だけ解除します。失敗・不明・中断ではgateを残して残候補の回収を止め、次の`--apply`も全停止し、`cleanupBlocked`で非zero終了します。dry-runの`retained`とgateを確認し、元対象とWindowsゴミ箱を調べてください。元対象とWindowsゴミ箱を確認した後だけ、次のCLI専用ackを明示実行できます。gateの所有・private属性・空・単一hard link・ADSなしと同一実体を確認し、gateだけを解除します。ackは世代を削除せず、`--apply`との併用もできません。回収する場合はack後に別途`--apply`を実行し、結果を確認してください。MCP・installer・通常起動は暗黙ackしません。
-
-```cmd
-"C:\Users\<user>\.local\Prunlet\bin\prunlet.exe" --config "C:\Users\<user>\.local\Prunlet\config.json" mcp-cache-maintain --ack-interrupted-cleanup
-```
-
-直接起動する場合は次のとおりです。この入口と非managed配置はproxyによる世代切替の対象外です。
+MCP登録の実行内容は次のとおりです。
 
 ```powershell
 & $exe --config $config mcp
@@ -140,22 +113,10 @@ Windowsのmanaged登録は`start-prunlet-mcp.ps1`を起動し、検証済みpriv
 
 Codexの`exec_command`はフックへ`Bash`とコマンド文字列を渡し、実行shellを渡しません。`shell: "pwsh"`だけではPowerShellと別shellを区別できないため、そのままのヒアストリングは安全側に拒否されることがあります。SSHの存在や接続先の名前を使った削除の素通し例外は設けません。
 
-曖昧な原文を実行器へ渡す前に、`functions.exec`などshellを起動しないJavaScript環境で全文を変換します。単引用ヒアストリングへ入れたJavaScriptを`node`へpipeする形式も、外側の`@'`から`| node --input-type=module`までのPowerShell原文全体が対象です。原文をPowerShell・Node・準備用CLIへ先にpipeして変換しないでください。hookは入力を書き換えず、`updatedInput`による救済にも依存しません。
-
-Codexでは`environment_id`などがhook入力から脱落する場合があります。実行先OSやSSH先を推測せず、選択した実行環境に`pwsh`と、本文が必要とする`node`等があることを確認します。生成入力が実行できなくても原文へfallbackせず、自動再送しません。
-
-このときの`interpretation=CMD`は候補構文で検知したことを示し、SSH先をWindowsと判定したという意味ではありません。拒否された入力は実行されていません。Mac等の認可済み清掃では、対象・使用状況を確認したうえで次の対応形式へ入力を修正します。実行shellの指定だけで解消すると扱ったり、Windows用CLIへリモートのパスを渡したりしません。
-
-**PowerShell原文全体**に先頭ASCIIコメントを加え、shellを起動せずにUTF-16LE Base64へ変換し、単独の`pwsh -NoProfile -EncodedCommand <base64>`として渡します。Codexの`functions.exec`では次の形です。`originalRequest`はまだ実行器へ送らず、元要求の`cmd`・`shell`・`login`・`workdir`・実行環境指定等の全引数を持つJSオブジェクトとして保持します。例の`shell`と`login`は新規要求用の既定例であり、既存要求の指定を上書きしません。JS文字列を作る際も原文のバッククォート・ドル記号・改行を保持し、テンプレート文字列の補間で変えないでください。
+Mac等へ送るシェルスクリプトを単引用ヒアストリングに入れた**ローカルPowerShellスクリプト全体**は、shellを起動せずにUTF-16LE Base64へ変換し、単独の`pwsh -NoProfile -EncodedCommand <base64>`として渡します。たとえばCodexのJavaScript実行環境では次の形です。`script`は実際に使うローカルPowerShellスクリプトへ置き換えます。
 
 ```javascript
-const originalRequest = {
-  cmd: "@'\nconsole.log('hello from Node');\n'@ | node --input-type=module",
-  shell: "pwsh",
-  login: false,
-};
-const raw = originalRequest.cmd;
-const script = "# Prunlet\n" + raw;
+const script = "# Prunlet\n" + "$remote = @'\nprintf 'hello from Mac\\n'\n'@\n& 'C:\\Program Files\\Git\\usr\\bin\\ssh.exe' mac $remote";
 const bytes = new Uint8Array(script.length * 2);
 for (let i = 0; i < script.length; i++) {
   const unit = script.charCodeAt(i);
@@ -163,19 +124,9 @@ for (let i = 0; i < script.length; i++) {
   bytes[i * 2 + 1] = unit >>> 8;
 }
 const encoded = bytes.toBase64();
-const cmd = `pwsh -NoProfile -EncodedCommand ${encoded}`;
-if (cmd.length > 8000) throw new Error("EncodedCommand exceeds the conservative Windows command-line budget");
-const result = await tools.exec_command({ ...originalRequest, cmd });
-text({ output: result.output, exit_code: result.exit_code, session_id: result.session_id });
-if (result.session_id !== undefined) {
-  const progress = await tools.write_stdin({ session_id: result.session_id, chars: "", yield_time_ms: 30000 });
-  text({ output: progress.output, exit_code: progress.exit_code, session_id: progress.session_id });
-}
+const result = await tools.exec_command({ cmd: `pwsh -NoProfile -EncodedCommand ${encoded}`, shell: "pwsh", login: false });
+text(result.output);
 ```
-
-`functions.exec`自体が`Script running with cell ID ...`を返した場合は、先に`functions.wait`でそのcellの完了を待ちます。cellが動いている間は別のcellから同じsessionをpollしません。cell完了後も`session_id`が返っていればまだコマンドは未完了なので、最新の同じsessionへ`tools.write_stdin`の空`chars`で続けて終了コードを確認します。待機中に元コマンドを実行し直しません。
-
-producerはcanonicalを実行要求へ渡し、ホストのhook検査を受けます。他hookが入力を書き換える場合の合成はホストと他hookに依存するため、生成した文字列がそのまま実行される一般保証ではありません。実ホストでの無害な入力による確認と区別します。
 
 先頭のASCIIコメントはGit Bashによる先頭スラッシュのパス変換を避けます。Base64は暗号化ではないため、秘密をコマンドやログへ埋め込まないでください。フックはこの単独・無引用の形式だけを厳密に復号し、PowerShellの文字列とローカルの直接削除を検査します。認識した省略形やwrapper、動的な引数、追加コマンド、不正なBase64・UTF-16は拒否します。復号本文では、`& 'C:\Program Files\Git\usr\bin\ssh.exe'`のような完全な単引用リテラルの実行名も検査します。同じ構文でのローカル削除、`reg`、別shellや`Start-Process`の呼び出しは拒否します。引用した`reg`は動的な動詞やネイティブ引数の解釈を保証できないため、照会も含めて従来どおり拒否します。SSHへの単引用文字列・単引用ヒアストリングの引数はデータとして扱い、その前後のローカルコマンドは引き続き検査します。未対応構文（展開文字列の`$()`、ブロックコメント、ハッシュ表、スマート引用符、Unicode escape、変数・式・部分引用を使う動的な実行名、末尾に空白やドットのある実行名など）は安全側に拒否します。shell不明の元コマンドをSSH名だけで許可する例外はありません。未認識の外部wrapper・動的生成・外部スクリプト・他言語APIを含むすべての削除を検出する保証はありません。
 
@@ -197,7 +148,7 @@ producerはcanonicalを実行要求へ渡し、ホストのhook検査を受け�
 
 拒否理由には、検知した命令・オプションと判定時のshell解釈を含めます。shell情報がない・未対応の場合は候補としての解釈であり、ローカル削除と確定したものではないと説明します。検索文字列やリモートスクリプトの引用が別shellで命令と解釈される可能性を区別し、Windows用CLIの案内をリモート削除へ適用しません。検査不能な構文や入力は、その原因を返します。
 
-拒否時は配置済みexe・設定で、ファイルには`delete --paths-file <absolute-json-file>`、レジストリには`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <single-key-path>`を最初からCMDで使う手順を案内します。レジストリで成功した`operationId`を保持し、`registry-restore <operationId>`（`restore`もレジストリ専用の別名）で非上書き復元します。ファイル・フォルダーは操作IDを保存せず、`recycled`の項目だけをWindowsのゴミ箱で復元できます。MCP代替入口は`delete_registry`・`restore_registry`です。view必須、既定値の空文字、完全ACLの権限とKTMの境界は[README](../README.md#レジストリの削除復元)を参照してください。削除許可とホスト承認を維持し、拒否対象を別経路で再試行しません。hook自身は削除・入力の自動置換・PowerShell backend起動を行いません。リモートdataの曖昧さによる拒否は、上記のshell前変換で実行器へ渡す入力自体を修正します。実際の削除拒否や不明結果の再送とは区別します。
+拒否時は配置済みexe・設定で、ファイルには`delete --paths-file <absolute-json-file>`、レジストリには`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <single-key-path>`を最初からCMDで使う手順を案内します。レジストリで成功した`operationId`を保持し、`registry-restore <operationId>`（`restore`もレジストリ専用の別名）で非上書き復元します。ファイル・フォルダーは操作IDを保存せず、`recycled`の項目だけをWindowsのゴミ箱で復元できます。MCP代替入口は`delete_registry`・`restore_registry`です。view必須、既定値の空文字、完全ACLの権限とKTMの境界は[README](../README.md#レジストリの削除復元)を参照してください。削除許可とホスト承認を維持し、拒否対象を別経路で再試行しません。hook自身は削除・自動置換・PowerShell backend起動を行いません。
 
 MCPの1行とhookの入力全体は、UTF-16の文字数で1,048,576文字まで受理します。MCPは空白だけの行を従来どおり無視します。それ以外の超過行は残りを改行まで読み捨ててエラーを返し、次の要求を処理します。hookは上限超過を検出するとEOFを待たず拒否します。読み取り中も保持する入力をこの上限までに抑えます。
 

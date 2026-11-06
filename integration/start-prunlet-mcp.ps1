@@ -147,15 +147,6 @@ function Test-CandidateExecutables([string]$Stage) {
     if ($hook.hookSpecificOutput.permissionDecision -cne 'deny') { throw 'Published hook did not return a fail-closed response.' }
 }
 
-function Get-PublishedDistributionSource([string]$Repository, [string]$Executable) {
-    # forkと旧CLIは取得前にGitHubを選ぶ。R2失敗後の切替は行わない。
-    if ($Repository -ine '1llum1n4t1s/Prunlet') { return 'github' }
-    $protocol = (Invoke-CandidateProbe $Executable @('--startup-update-protocol') 0) | ConvertFrom-Json -AsHashtable
-    if ($protocol.protocol -ne 1 -or $protocol.storageEpoch -ne 1) { throw 'Installed executable has an incompatible startup protocol.' }
-    if ($protocol.ContainsKey('distributionSources') -and @($protocol.distributionSources) -ccontains 'r2') { return 'r2' }
-    return 'github'
-}
-
 function Open-CandidateGuards([string]$Stage, [string]$StatePath) {
     $guards = [Collections.Generic.List[IO.FileStream]]::new()
     try {
@@ -366,6 +357,7 @@ function Invoke-UpdateCoordinator([string]$Stage, [string]$Config, [string]$Code
 }
 
 try {
+    [PrunletMcpJob]::Start()
     foreach ($path in @($ExecutablePath, $ConfigPath, $CodexHome)) {
         if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Prunlet MCP paths must be absolute.' }
     }
@@ -415,16 +407,9 @@ try {
                     if ($LASTEXITCODE -ne 0 -or ($begin | ConvertFrom-Json -AsHashtable).status -notin @('ready', 'existing')) { throw 'Published update state could not be prepared.' }
                     $beginResult = $begin | ConvertFrom-Json -AsHashtable
                     if ($beginResult.ContainsKey('warnings')) { foreach ($warning in $beginResult.warnings) { [Console]::Error.WriteLine('Prunlet update: ' + $warning) } }
-                    $distribution = Get-PublishedDistributionSource ([string]$sourceInfo.repository) $ExecutablePath
-                    $downloadArguments = @($sourceInfo.repository, $release.commit, $release.assetId, $release.assetSha256, $release.assetBytes)
-                    $prepareArguments = @($sourceInfo.repository, $release.branch, $release.commit, $sourceInfo.runtime, $release.assetSha256, $release.assetBytes, $release.assetId)
-                    if ($distribution -ceq 'r2') {
-                        $downloadArguments += @('r2', $sourceInfo.runtime)
-                        $prepareArguments += 'r2'
-                    }
-                    $received = & $ExecutablePath --config $ConfigPath __download-published-package @downloadArguments
+                    $received = & $ExecutablePath --config $ConfigPath __download-published-package $sourceInfo.repository $release.commit $release.assetId $release.assetSha256 $release.assetBytes
                     if ($LASTEXITCODE -ne 0 -or ($received | ConvertFrom-Json -AsHashtable).status -cne 'downloaded') { throw 'Published package download was not confirmed.' }
-                    $prepared = & $ExecutablePath --config $ConfigPath __prepare-published-package @prepareArguments
+                    $prepared = & $ExecutablePath --config $ConfigPath __prepare-published-package $sourceInfo.repository $release.branch $release.commit $sourceInfo.runtime $release.assetSha256 $release.assetBytes $release.assetId
                     if ($LASTEXITCODE -ne 0) { throw 'Published package preparation did not complete.' }
                     $result = $prepared | ConvertFrom-Json -AsHashtable
                     if ($result.ContainsKey('warnings')) { foreach ($warning in $result.warnings) { [Console]::Error.WriteLine('Prunlet update: ' + $warning) } }
@@ -445,22 +430,7 @@ try {
             $mutex.Dispose()
         }
     }
-    $useProxy = $false
-    if ($managed) {
-        $mcpProtocolJson = & $ExecutablePath --startup-update-protocol
-        if ($LASTEXITCODE -eq 0) {
-            $mcpProtocol = $mcpProtocolJson | ConvertFrom-Json -AsHashtable
-            $useProxy = $mcpProtocol.ContainsKey('mcpProxy') -and $mcpProtocol.mcpProxy -eq 2 -and $mcpProtocol.mcpBackendLease -eq 1
-        }
-    }
-    if ($useProxy) {
-        $proxy = & $ExecutablePath --config $ConfigPath __prepare-mcp-proxy | ConvertFrom-Json -AsHashtable
-        if ($LASTEXITCODE -ne 0 -or $proxy.protocol -ne 1 -or $proxy.status -cne 'prepared' -or ![IO.Path]::IsPathFullyQualified($proxy.executablePath)) { throw 'A verified MCP proxy generation could not be prepared.' }
-        & $proxy.executablePath --config $ConfigPath __mcp-proxy
-    } else {
-        [PrunletMcpJob]::Start()
-        & $ExecutablePath --config $ConfigPath mcp
-    }
+    & $ExecutablePath --config $ConfigPath mcp
     exit $LASTEXITCODE
 } catch {
     [Console]::Error.WriteLine('Prunlet MCP could not start safely: ' + $_.Exception.Message)

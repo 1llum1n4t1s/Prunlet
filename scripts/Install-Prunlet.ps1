@@ -19,32 +19,6 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using System.Text;
-using Microsoft.Win32.SafeHandles;
-public static class PrunletInstallPathIdentity
-{
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern uint GetFinalPathNameByHandle(SafeFileHandle handle, StringBuilder name, uint length, uint flags);
-    public static string Resolve(string path)
-    {
-        using var handle = CreateFile(path, 0x80, 3, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
-        if (handle.IsInvalid) throw new Win32Exception();
-        var name = new StringBuilder(32768);
-        uint length = GetFinalPathNameByHandle(handle, name, (uint)name.Capacity, 0);
-        if (length == 0 || length >= name.Capacity) throw new Win32Exception();
-        string value = name.ToString();
-        if (value.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) return @"\\" + value.Substring(8);
-        return value.StartsWith(@"\\?\", StringComparison.Ordinal) ? value.Substring(4) : value;
-    }
-}
-'@
-
 function Invoke-PrunletGitHubCli([string]$Endpoint) {
     $command = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if (!$command) { throw 'GitHub CLI authentication requires an existing gh executable.' }
@@ -102,17 +76,7 @@ function Assert-PlainPath([string]$Path, [string]$Name) {
         }
         $cursor = Split-Path -Parent $cursor
     }
-    # 8.3名やドライブ別名でもCoreと同じ実体名から排他キーを作る。
-    $existingAncestor = $full
-    $suffix = [Collections.Generic.Stack[string]]::new()
-    while (!(Test-Path -LiteralPath $existingAncestor)) {
-        $suffix.Push([IO.Path]::GetFileName($existingAncestor))
-        $existingAncestor = [IO.Path]::GetDirectoryName($existingAncestor)
-        if (!$existingAncestor) { throw "$Name has no existing ancestor." }
-    }
-    $canonical = [PrunletInstallPathIdentity]::Resolve($existingAncestor)
-    while ($suffix.Count) { $canonical = Join-Path $canonical $suffix.Pop() }
-    return $canonical.TrimEnd('\', '/')
+    return $full
 }
 function Assert-ExternalPath([string]$Path, [string]$Name) {
     $full = Assert-PlainPath $Path $Name
@@ -121,7 +85,7 @@ function Assert-ExternalPath([string]$Path, [string]$Name) {
     }
     $cursor = $full
     while ($cursor) {
-        if ((Test-Path -LiteralPath (Join-Path $cursor '.git')) -or (Test-Path -LiteralPath (Join-Path $cursor 'Cargo.toml'))) { throw "$Name cannot be inside a repository: $full" }
+        if ((Test-Path -LiteralPath (Join-Path $cursor '.git')) -or (Test-Path -LiteralPath (Join-Path $cursor 'src\Prunlet\Prunlet.csproj'))) { throw "$Name cannot be inside a repository: $full" }
         $cursor = Split-Path -Parent $cursor
     }
     return $full
@@ -170,7 +134,7 @@ function Expand-CheckedArchive([string]$Archive, [string]$Destination) {
         $rootName = @($roots)[0]
         $root = Join-Path $Destination $rootName
         if (!(Test-Path -LiteralPath $root -PathType Container)) { throw 'Source archive root is not a directory.' }
-        foreach ($required in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'build.rs', 'src\rust\main.rs', 'src\rust\lib.rs', 'scripts\Install-Prunlet.ps1', 'scripts\Publish-Prunlet.ps1', 'scripts\Publish-PrunletRust.ps1', 'scripts\RustBuildInputs.Common.ps1', 'integration\start-prunlet-mcp.ps1', 'integration\configuration-common.ps1', 'integration\maintenance-task.ps1', 'integration\uninstall-maintenance.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1', 'integration\install-agent-instructions.ps1', 'integration\PRUNLET.md')) {
+        foreach ($required in @('src\Prunlet\Prunlet.csproj', 'scripts\Install-Prunlet.ps1', 'scripts\Publish-Prunlet.ps1', 'integration\start-prunlet-mcp.ps1', 'integration\configuration-common.ps1', 'integration\maintenance-task.ps1', 'integration\uninstall-maintenance.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1', 'integration\install-agent-instructions.ps1', 'integration\PRUNLET.md')) {
             if (!(Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Latest source is not installable; required file missing: $required. Publish the source to the repository default branch first." }
         }
         return $root
@@ -190,7 +154,7 @@ $runId = 'install-' + [Guid]::NewGuid().ToString('N')
 $ForbiddenRoots = @((Assert-PlainPath $CodexHome 'CodexHome'), (Join-Path $env:USERPROFILE '.codex'))
 if ($env:CODEX_HOME) { $ForbiddenRoots += Assert-PlainPath $env:CODEX_HOME 'CODEX_HOME' }
 $scriptParent = Split-Path -Parent $PSScriptRoot
-if (Test-Path -LiteralPath (Join-Path $scriptParent 'Cargo.toml')) { $ForbiddenRoots += $scriptParent }
+if (Test-Path -LiteralPath (Join-Path $scriptParent 'src\Prunlet\Prunlet.csproj')) { $ForbiddenRoots += $scriptParent }
 $InstallDirectory = Assert-ExternalPath $InstallDirectory 'InstallDirectory'
 
 if (!$WorkDirectory) {
@@ -218,7 +182,9 @@ $updateBackup = Assert-ExternalPath (Join-Path $UpdateBackupRoot $runId) 'Update
 if ((Test-InTree $updateBackup $InstallDirectory) -or (Test-InTree $InstallDirectory $updateBackup) -or (Test-InTree $updateBackup $WorkDirectory) -or (Test-InTree $WorkDirectory $updateBackup)) { throw 'Update backup must be separate from install and work directories.' }
 if ((Test-InTree $updateBackup $effectiveBackup) -or (Test-InTree $effectiveBackup $updateBackup)) { throw 'Update backup must be separate from recovery data.' }
 if ($RegisterCodex -and $SettingsBackupDirectory) { $SettingsBackupDirectory = Assert-ExternalPath $SettingsBackupDirectory 'SettingsBackupDirectory' }
-if (!(Get-Command cargo -CommandType Application -ErrorAction SilentlyContinue) -and !(Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe') -PathType Leaf)) { throw 'The Rust toolchain specified in rust-toolchain.toml and MSVC C++ build tools with Windows SDK are required; the .NET SDK is not used.' }
+if (!(Get-Command dotnet -ErrorAction SilentlyContinue)) { throw '.NET 10 SDK is required. Install the SDK and run this installer again.' }
+$sdks = @(& dotnet --list-sdks)
+if ($LASTEXITCODE -ne 0 -or !($sdks | Where-Object { $_ -match '^10\.' })) { throw '.NET 10 SDK is required; an installed runtime alone cannot build latest source.' }
 $products = @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\prunlet-hook.exe', 'bin\Install-Prunlet.ps1', 'bin\start-prunlet-mcp.ps1', 'bin\configuration-common.ps1', 'bin\maintenance-task.ps1', 'bin\uninstall-maintenance.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
 $retiredProducts = @('bin\codex-pretooluse.ps1')
 $previousGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
@@ -276,7 +242,7 @@ try {
     . (Join-Path $sourceRoot 'integration\maintenance-task.ps1')
     $maintenanceState = Get-PrunletMaintenanceState (Join-Path $InstallDirectory 'bin\prunlet.exe') $configPath
     $buildRoot = Join-Path $WorkDirectory 'build'
-    & (Join-Path $sourceRoot 'scripts\Publish-Prunlet.ps1') -OutputDirectory $buildRoot -Runtime $Runtime -SourceCommit $sha | Out-Null
+    & (Join-Path $sourceRoot 'scripts\Publish-Prunlet.ps1') -OutputDirectory $buildRoot -Runtime $Runtime | Out-Null
     $exe = Join-Path $buildRoot 'publish\prunlet.exe'
     if (!(Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Build did not produce prunlet.exe.' }
     $maintenanceExe = Join-Path $buildRoot 'publish\prunlet-maintenance.exe'
@@ -318,33 +284,6 @@ try {
     }
     if ($saved.Count) {
         [ordered]@{ purpose = 'Restore product files after this update; config and recovery are excluded.'; installDirectory = $InstallDirectory; savedFiles = @($saved.Keys); cleanup = 'Delete after confirming this installation works.' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $updateBackup 'backup-info.json') -Encoding utf8NoBOM
-    }
-    # proxyは要求完了までcanonical製品を読取り固定する。新要求は既存installer mutexで待機する。
-    # 全pinが解放されたことを確認してから置換し、実行中の要求を中断しない。
-    $idleWait = [Diagnostics.Stopwatch]::StartNew()
-    $nextIdleNotice = [TimeSpan]::FromSeconds(30)
-    while ($true) {
-        $productPins = [Collections.Generic.List[IO.FileStream]]::new()
-        $busy = $false
-        try {
-            foreach ($product in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
-                $path = Join-Path $InstallDirectory ('bin\' + $product)
-                if (![IO.File]::Exists($path)) { continue }
-                $productPins.Add([IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, ([IO.FileShare]::Read -bor [IO.FileShare]::Delete)))
-            }
-        } catch [IO.IOException] {
-            if (($_.Exception.HResult -band 0xffff) -notin @(32, 33)) { throw }
-            $busy = $true
-        } finally {
-            foreach ($pin in $productPins) { $pin.Dispose() }
-        }
-        if (!$busy) { break }
-        if ($idleWait.Elapsed -gt [TimeSpan]::FromMinutes(10)) { throw 'Prunlet products are still busy; no product was replaced.' }
-        if ($idleWait.Elapsed -ge $nextIdleNotice) {
-            [Console]::Error.WriteLine('Prunlet installation is waiting for an active request to finish; no request was interrupted.')
-            $nextIdleNotice = $idleWait.Elapsed.Add([TimeSpan]::FromSeconds(30))
-        }
-        Start-Sleep -Milliseconds 250
     }
     New-TrackedDirectory (Join-Path $InstallDirectory 'bin')
     foreach ($relative in $products) {

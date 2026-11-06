@@ -54,7 +54,7 @@ try{
   }}
   Check 'administrator-default-hkcu-registry-recovery-suite' {
    Assert (![string]::IsNullOrWhiteSpace($s.moveExecutablePath)) 'Full default HKCU suite requires Prepare -MoveExecutablePath with the genuine schema4 baseline'
-   Assert ((![string]::IsNullOrWhiteSpace($s.assemblyPath)-or![string]::IsNullOrWhiteSpace($s.rustProbePath))-and![string]::IsNullOrWhiteSpace($s.legacyRegistryExecutablePath)) 'Full registry checkpoint suite requires the prepared actual candidate Rust probe or C# DLL and genuine schema5 baseline'
+   Assert (![string]::IsNullOrWhiteSpace($s.assemblyPath)-and![string]::IsNullOrWhiteSpace($s.legacyRegistryExecutablePath)) 'Full registry checkpoint suite requires the prepared candidate DLL and genuine schema5 baseline'
    $suiteOutput=Join-Path $PSScriptRoot 'registry-default';$suiteReport=Join-Path $PSScriptRoot 'registry-default-report.json'
    $hostPath=[IO.Path]::GetFullPath((Join-Path $PSHOME 'pwsh.exe'))
    Assert ($hostPath.Equals($s.powerShellHostPath,[StringComparison]::OrdinalIgnoreCase)) 'Administrator client host differs from Prepare'
@@ -63,9 +63,7 @@ try{
    $info.Environment['TEMP']=$env:TEMP;$info.Environment['TMP']=$env:TMP
    foreach($argument in @('-NoProfile','-File',$s.registryVerificationScriptPath,'-ExecutablePath',$s.executablePath,'-MoveExecutablePath',$s.moveExecutablePath,'-RegistryFixtureRoot','HKCU\Software\PrunletE2E','-OutputDirectory',$suiteOutput,'-ReportPath',$suiteReport)){$info.ArgumentList.Add($argument)}
    if($s.assemblyPath){$info.ArgumentList.Add('-AssemblyPath');$info.ArgumentList.Add($s.assemblyPath)}
-   if($s.rustProbePath){$info.ArgumentList.Add('-RustProbePath');$info.ArgumentList.Add($s.rustProbePath)}
    if($s.legacyRegistryExecutablePath){$info.ArgumentList.Add('-LegacyRegistryExecutablePath');$info.ArgumentList.Add($s.legacyRegistryExecutablePath)}
-   if($s.latestRegistryExecutablePath){$info.ArgumentList.Add('-LatestRegistryExecutablePath');$info.ArgumentList.Add($s.latestRegistryExecutablePath)}
    if($s.fixtureRoot){$info.ArgumentList.Add('-FixtureRoot');$info.ArgumentList.Add($s.fixtureRoot)}
    $suite=[Diagnostics.Process]::new();$suite.StartInfo=$info
    try{

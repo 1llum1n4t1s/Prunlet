@@ -3,9 +3,7 @@ param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Alias('BaselineMoveExecutablePath')][string]$MoveExecutablePath,
     [string]$AssemblyPath,
-    [string]$RustProbePath,
     [string]$LegacyRegistryExecutablePath,
-    [string]$LatestRegistryExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
     [string]$FixtureRoot,
@@ -21,9 +19,7 @@ $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
 . (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')
-if ($AssemblyPath -and $RustProbePath) { throw 'Candidate C# DLL and Rust probe cannot be mixed.' }
-if ($RustProbePath) { . (Join-Path $PSScriptRoot 'registry-session-e2e\RustProbe.Common.ps1'); Assert-RustProbe $RustProbePath }
-foreach ($path in @($ExecutablePath, $MoveExecutablePath, $AssemblyPath, $RustProbePath, $LegacyRegistryExecutablePath, $LatestRegistryExecutablePath, $OutputDirectory, $ReportPath) | Where-Object { $_ }) {
+foreach ($path in @($ExecutablePath, $MoveExecutablePath, $AssemblyPath, $LegacyRegistryExecutablePath, $OutputDirectory, $ReportPath) | Where-Object { $_ }) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Executable/output/report paths must be absolute.' }
 }
 $ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath)
@@ -270,11 +266,6 @@ public static class PrunletRegistryE2E {
   byte[] basic=new byte[4096];uint length;int status=NtQueryKey(key.Handle,0,basic,(uint)basic.Length,out length);
   if(status<0)throw new Win32Exception((int)RtlNtStatusToDosError(status));return BitConverter.ToInt64(basic,0);
  }
- public static string KeyClass(RegistryKey key) {
-  uint required;NtQueryKey(key.Handle,2,null,0,out required);if(required<44||required>131072)throw new Exception("Invalid owned key class size");
-  byte[] data=new byte[required];int status=NtQueryKey(key.Handle,2,data,required,out required);if(status<0)throw new Win32Exception((int)RtlNtStatusToDosError(status));
-  int offset=BitConverter.ToInt32(data,12),length=BitConverter.ToInt32(data,16);if(length==0)return "";if(offset<44||length<0||(length&1)!=0||offset>data.Length-length)throw new Exception("Invalid owned key class bounds");return System.Text.Encoding.Unicode.GetString(data,offset,length);
- }
  public static void DenyFixtureSetValue(string relative,RegistryKey key) {
   CheckPermissionFixture(relative);
   string sid=System.Security.Principal.WindowsIdentity.GetCurrent().User.Value;
@@ -362,7 +353,7 @@ if (@($preflight | Where-Object { !$_.Available }).Count) {
     }
     $reason = 'Read-only KTM preflight unavailable; no registry fixture creation was attempted. Registry behavior remains unverified in this process context.'
     Save-Json $ReportPath @{
-        schema=1; timestampUtc=[DateTimeOffset]::UtcNow.ToString('O'); executablePath=$ExecutablePath; rustProbePath=$RustProbePath; rustProbeSha256=$(if($RustProbePath){Digest $RustProbePath}else{$null}); moveExecutablePath=$MoveExecutablePath
+        schema=1; timestampUtc=[DateTimeOffset]::UtcNow.ToString('O'); executablePath=$ExecutablePath; moveExecutablePath=$MoveExecutablePath
         passed=0; failed=1; skipped=0; excludedCount=0; createdFixture=$false
         results=@(@{ name='read-only-ktm-preflight'; passed=$false; error=$reason; probes=$preflight })
         preflight=$preflight; securityPrivilegeEnabled=$securityPrivilege; registryFixtureRoot=$RegistryFixtureRoot
@@ -778,30 +769,6 @@ if ($AssemblyPath) {
         } finally { $link.Dispose(); $plain.Dispose(); $child.Dispose(); $target.Dispose(); $parent.Dispose() }
     }
 }
-if ($RustProbePath) {
-    Case 'core-classes-alias-proof-permission-and-staged-commit-conflict' {
-        $evidence=Invoke-RustNativeContract 'classes-alias-guard' $runPath
-        Assert-True ($evidence.result.retainedVolatileLinkRoot -ceq ($fixtureHive+'\'+$linkRelative)) 'Rust probe volatile link root escaped the owned sibling'
-        $script:createdLinkFixture=$true
-        Save-Json (Join-Path $script:CaseRoot 'classes-guard-evidence.json') $evidence
-    }
-    Case 'core-incomplete-links-cannot-be-used-as-ordinary-keys' {
-        $evidence=Invoke-RustNativeContract 'incomplete-links' $runPath
-        Assert-True ($evidence.result.retainedVolatileLinkRoot -ceq ($fixtureHive+'\'+$linkRelative)) 'Rust probe volatile link root escaped the owned sibling'
-        $script:createdLinkFixture=$true
-        Save-Json (Join-Path $script:CaseRoot 'incomplete-link-evidence.json') $evidence
-    }
-    Case 'core-snapshot-publication-fault-rolls-back-staged-value' {
-        $evidence=Invoke-RustNativeContract 'snapshot-publication-rollback' $runPath
-        # このprobeはリンク領域ではなく、固定した通常fixture直下の新規GUID子だけを使う。
-        Assert-True ($evidence.result.fixture -cmatch ('\A'+[regex]::Escape($runPath+'\rust-publication-fault-')+'[0-9a-f]{32}\z')) 'Rust publication probe escaped the owned fixture child'
-        $metadataParent=Join-Path $script:CaseRoot 'temp'
-        Assert-True ($evidence.result.metadataFixture -cmatch ('\A'+[regex]::Escape($metadataParent+'\registry-publication-fault-')+'[0-9a-f]{32}\\registry-snapshot\.json\z')) 'Rust publication metadata escaped the owned temporary child'
-        $proof=$evidence.result.evidence
-        Assert-True ($proof.realTransactionStaged -eq $true -and $proof.actualPersistedBytesCorrupted -eq $true -and $proof.nativeCommitCalled -eq $false -and $proof.originalRegistryRawBytesAndFullSecurityPreserved -eq $true -and $proof.privateAclFromCreation -eq $true -and $proof.expectedSha256 -cmatch '\A[0-9a-f]{64}\z' -and $proof.actualSha256 -cmatch '\A[0-9a-f]{64}\z' -and $proof.expectedSha256 -cne $proof.actualSha256) 'Rust publication rollback did not establish the native transaction and preservation proof'
-        Save-Json (Join-Path $script:CaseRoot 'staged-publication-rollback-evidence.json') $evidence
-    }
-}
 Case 'explicit-views-do-not-touch-distinct-other-view' {
     Fixture -View 64; $before64 = Snapshot 64
     # SYSTEMとHKCU\Softwareの共有viewでは、同名の別fixtureを作って上書きしない。
@@ -1201,10 +1168,10 @@ if ($createdFixture) {
 $passed = @($results | Where-Object passed).Count; $skipped = @($results | Where-Object skipped).Count; $failed = $results.Count - $passed - $skipped
 $unverified = @('Actual OS Classes alias destination swaps are not performed; the production guard/commit race and source rename/replacement are probed only on dedicated volatile links. Exact privilege-deficient token behavior requires separate native probes.','KTM crash timing requires separate integration probes.','Distinct WOW64 view isolation requires separate views; shared views do not verify isolation. See view-observation.json.')
 if (!@($results | Where-Object { $_.name -eq 'volatile-registry-links-and-link-like-value-refused' -and $_.passed }).Count) { $unverified += 'Actual target/ancestor registry link and ordinary REG_LINK value rejection was not verified because its case was excluded or failed.' }
-if (!@($results | Where-Object { $_.name -eq 'core-classes-alias-proof-permission-and-staged-commit-conflict' -and $_.passed }).Count) { $unverified += 'Production Classes alias guard, SetValue denial, dry-run no-write, and staged-target rollback after the final check were not verified; supply the actual candidate RustProbePath or C# AssemblyPath and include its case.' }
+if (!@($results | Where-Object { $_.name -eq 'core-classes-alias-proof-permission-and-staged-commit-conflict' -and $_.passed }).Count) { $unverified += 'Production Classes alias guard, SetValue denial, dry-run no-write, and staged-target rollback after the final check were not verified; supply AssemblyPath and include its case.' }
 if (!@($results | Where-Object { $_.name -eq 'classes-alias-cli-values-and-direct-child-keys-both-views' -and $_.passed }).Count -or !@($results | Where-Object { $_.name -eq 'mcp-schema-errors-roundtrip-and-iserror' -and $_.passed }).Count) { $unverified += 'Classes descendant CLI/MCP values and direct-child keys in both views were not fully verified.' }
 if (!@($results | Where-Object { $_.name -eq 'recordless-files-excluded-from-registry-capacity-and-restore-type-guards' -and $_.passed }).Count) { $unverified += 'Windows-managed file exclusion from registry retention was not verified because its case was excluded, skipped, or failed.' }
 if ($machineFixture) { $unverified += 'Normal HKCU roundtrip was not verified by this HKLM SYSTEM run; HKCU ERROR_RM_NOT_ACTIVE preservation requires a separate probe.' }
-Save-Json $ReportPath @{ schema=1; fileFixtureRun=$script:fileFixtureRun; timestampUtc=[DateTimeOffset]::UtcNow.ToString('O'); executablePath=$ExecutablePath; rustProbePath=$RustProbePath; rustProbeSha256=$(if($RustProbePath){Digest $RustProbePath}else{$null}); moveExecutablePath=$MoveExecutablePath; passed=$passed; failed=$failed; skipped=$skipped; excludedCount=$excluded; results=@($results); preflight=$preflight; createdFixture=$createdFixture; securityPrivilegeEnabled=$securityPrivilege; registryFixtureRoot=$RegistryFixtureRoot; registryFixture=$runPath; cleanup=$cleanup; retainedDirectory=$OutputDirectory; unverified=$unverified }
+Save-Json $ReportPath @{ schema=1; fileFixtureRun=$script:fileFixtureRun; timestampUtc=[DateTimeOffset]::UtcNow.ToString('O'); executablePath=$ExecutablePath; moveExecutablePath=$MoveExecutablePath; passed=$passed; failed=$failed; skipped=$skipped; excludedCount=$excluded; results=@($results); preflight=$preflight; createdFixture=$createdFixture; securityPrivilegeEnabled=$securityPrivilege; registryFixtureRoot=$RegistryFixtureRoot; registryFixture=$runPath; cleanup=$cleanup; retainedDirectory=$OutputDirectory; unverified=$unverified }
 [ordered]@{ passed=$passed; failed=$failed; skipped=$skipped; excludedCount=$excluded; reportPath=$ReportPath; remainingRegistryPath=$cleanup.remainingRegistryPath; remainingClassesPath=$cleanup.remainingClassesPath; retainedVolatileLinkPath=$cleanup.retainedVolatileLinkPath } | ConvertTo-Json
 if ($failed) { exit 1 }; exit 0

@@ -1,9 +1,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
-    [Parameter(Mandatory)][string]$RustProbePath,
-    [Parameter(Mandatory)][string]$BuildManifestPath,
-    [Parameter(Mandatory)][string]$ExpectedBuildManifestSha256,
+    [Parameter(Mandatory)][string]$AssemblyPath,
+    [Parameter(Mandatory)][string]$ExpectedAssemblySha256,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
     [switch]$Large,
@@ -14,7 +13,7 @@ $repo = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
 . (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')
 if (!$IsWindows -or [Environment]::Version.Major -ne 10) { throw 'Native Windows and .NET 10 PowerShell required' }
-foreach ($path in @($ExecutablePath,$RustProbePath,$BuildManifestPath,$OutputDirectory,$ReportPath)) {
+foreach ($path in @($ExecutablePath, $AssemblyPath, $OutputDirectory, $ReportPath)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Absolute paths required' }
 }
 foreach ($path in @($OutputDirectory, $ReportPath)) {
@@ -23,8 +22,8 @@ foreach ($path in @($OutputDirectory, $ReportPath)) {
     if (Test-Path -LiteralPath $path) { throw 'Unused output/report required' }
     if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) { throw 'Output parent must exist' }
 }
-. (Join-Path $PSScriptRoot 'recordless-e2e/RustFileProbe.Common.ps1')
-$buildBinding=Assert-RustFileProbeBinding
+if (![IO.File]::Exists($ExecutablePath) -or ![IO.File]::Exists($AssemblyPath)) { throw 'Candidate executable/assembly missing' }
+if ((Get-FileHash -LiteralPath $AssemblyPath).Hash -cne $ExpectedAssemblySha256) { throw 'Candidate assembly hash mismatch' }
 $script:fixtureRun = $null
 if ($FixtureRoot) { $script:fixtureRun = New-VerificationFixtureRun -FixtureRoot $FixtureRoot -ForbiddenRoots @($repo, (Join-Path $env:USERPROFILE '.codex')) -NamePrefix 'hardlink-times' }
 $null = [IO.Directory]::CreateDirectory($OutputDirectory)
@@ -38,7 +37,6 @@ $script:commands = [Collections.Generic.List[object]]::new()
 $results = [Collections.Generic.List[object]]::new()
 $helpers = @('NativeShellFixture.cs', 'FixtureNative.cs', 'OwnedBinLocator.cs', 'SparseFixture.cs') | ForEach-Object { Join-Path $PSScriptRoot "recordless-e2e/$_" }
 $sourceHashes = @(@($PSCommandPath, $common, (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')) + $helpers | ForEach-Object { @{ path = $_; sha256 = (Get-FileHash -LiteralPath $_).Hash } })
-$sourceHashes+=@(Get-RustFileProbeSourceHashes)
 try {
     Add-Type -Path $helpers -CompilerOptions '/unsafe'
     # 公開CLI/MCPに検証専用APIを増やさず、同じCoreの既存内部checkpointだけで競合を同期する。
@@ -47,6 +45,7 @@ using System;
 using System.Collections;
 using System.ComponentModel;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 public static class HardlinkEntryTimesProbe {
@@ -85,6 +84,51 @@ public static class HardlinkEntryTimesProbe {
                 int next=BitConverter.ToInt32(data,offset);if(next==0)break;offset+=next;
             }
         }
+    }
+    public static object Race(string assemblyPath,string configPath,string root,string child,string mode) {
+        var assembly=Assembly.LoadFrom(assemblyPath);
+        var configType=assembly.GetType("Prunlet.Core.PrunletConfig",true);
+        var serviceType=assembly.GetType("Prunlet.Core.DeletionService",true);
+        var config=configType.GetMethod("Load").Invoke(null,new object[]{configPath});
+        var service=Activator.CreateInstance(serviceType,new object[]{config});
+        var checkpoint=serviceType.GetEvent("OversizedDeleteCheckpoint",BindingFlags.NonPublic|BindingFlags.Static) ?? throw new MissingMemberException("Checkpoint missing");
+        bool injected=false,earlierChildPinned=false,replacementBlocked=false,originalPreserved=false;Times before=default,after=default;
+        Action<string,string> handler=(phase,path)=>{
+            if(phase=="child-pinned" && path.Equals(Path.Combine(root,"a-first"),StringComparison.OrdinalIgnoreCase)) earlierChildPinned=true;
+            if(phase!="directory-baselines-captured" || !path.Equals(root,StringComparison.OrdinalIgnoreCase) || injected) return;
+            before=Read(child);
+            if(mode=="time") Change(child);
+            else {
+                try {File.Move(child,child+".original");File.WriteAllText(child,"replacement identity must survive");}
+                catch(IOException ex) when(ex.HResult==unchecked((int)0x80070020)) {
+                    replacementBlocked=true;
+                    originalPreserved=File.Exists(child) && !File.Exists(child+".original") && File.ReadAllText(child)=="original child content";
+                }
+            }
+            after=Read(child);injected=true;
+        };
+        checkpoint.GetAddMethod(true).Invoke(null,new object[]{handler});
+        object result;
+        try { result=serviceType.GetMethod("Delete",new[]{typeof(string[]),typeof(bool),typeof(bool)}).Invoke(service,new object[]{new[]{root},false,true}); }
+        finally {checkpoint.GetRemoveMethod(true).Invoke(null,new object[]{handler});}
+        return new {injected,earlierChildPinned,replacementBlocked,originalPreserved,before,after,result};
+    }
+    public static string DifferentIdentity(string assemblyPath,string expectedPath,string actualPath) {
+        var assembly=Assembly.LoadFrom(assemblyPath);
+        var native=assembly.GetType("Prunlet.Core.NativeFiles",true);
+        var flags=BindingFlags.NonPublic|BindingFlags.Static;
+        using var directory=Open(Path.GetDirectoryName(expectedPath),0x81);
+        object entry=null;
+        foreach(var value in (IEnumerable)native.GetMethod("ReadPinnedDirectory",flags).Invoke(null,new object[]{directory}))
+            if((string)value.GetType().GetProperty("Name").GetValue(value)==Path.GetFileName(expectedPath))entry=value;
+        if(entry==null)throw new IOException("Expected fixture not enumerated");
+        using var expected=Open(expectedPath,0x80);using var actual=Open(actualPath,0x80);
+        var identity=native.GetMethod("MoveIdentity",flags).Invoke(null,new object[]{expected});
+        var volume=identity.GetType().GetProperty("VolumeSerialNumber").GetValue(identity);
+        var baseline=native.GetMethod("CapturePinnedEntryBaseline",flags).Invoke(null,new object[]{expected,expectedPath,volume,entry});
+        try {native.GetMethod("VerifyPinnedEntryTimes",flags).Invoke(null,new object[]{actual,expectedPath,volume,entry,baseline,null});}
+        catch(TargetInvocationException ex) when(ex.InnerException is IOException) {return ex.InnerException.Message;}
+        throw new IOException("Different identity was accepted");
     }
 }
 '@
@@ -182,16 +226,44 @@ public static class HardlinkEntryTimesProbe {
             No-FileRecordsR $s
         }
     }
-    Case-H 'baseline-race-time' {
-        $s=New-ScopeR 'baseline-race-time'
-        $script:observed.nativeHeldBaseline=Invoke-RustFileContract 'file-hardlink-entry-times' $s.files
-        $script:observed.native=Invoke-RustFileContract 'file-oversize-child-baseline-race' $s.files
-        No-FileRecordsR $s
-    }
-    Case-H 'baseline-race-replacement' {
-        $s=New-ScopeR 'baseline-race-replacement'
-        $script:observed.native=Invoke-RustFileContract 'file-parent-replacement' $s.files
-        No-FileRecordsR $s
+    foreach ($mode in @('time', 'replacement')) {
+        Case-H "baseline-race-$mode" {
+            $s = New-ScopeR "baseline-race-$mode"
+            $root = Join-Path $s.files 'tree'; $null = [IO.Directory]::CreateDirectory($root)
+            [IO.File]::WriteAllText((Join-Path $root 'a-first'), 'earlier sibling')
+            $child = Join-Path $root 'b-probe'
+            [IO.File]::WriteAllText($child, 'original child content')
+            $null = New-SparseH (Join-Path $root 'z-oversized-sparse')
+            $race = [HardlinkEntryTimesProbe]::Race($AssemblyPath, $s.config, $root, $child, $mode)
+            $script:observed.race = $race
+            Assert-R $race.injected 'Baseline checkpoint was not reached'
+            Assert-R $race.earlierChildPinned 'Fixture did not reach an earlier sibling before changed child'
+            $item = @($race.result.Items)[0]
+            if ($mode -eq 'replacement' -and $race.replacementBlocked) {
+                Assert-R $race.originalPreserved 'Blocked rename did not preserve original fixture'
+                Assert-R ($item.Status -ceq 'permanently_deleted' -and ![IO.Directory]::Exists($root)) 'Deletion did not complete after blocked rename'
+                $expected = File-R $s 'expected-identity'
+                $actual = File-R $s 'different-identity'
+                $identityError = [HardlinkEntryTimesProbe]::DifferentIdentity($AssemblyPath, $expected, $actual)
+                $script:observed.identityBoundaryError = $identityError
+                Assert-R ($identityError.Contains($expected) -and $identityError -match 'Baseline\[' -and $identityError -match 'Actual\[') 'Identity helper error omitted path/expected/actual'
+                $script:observed.replacementOutcome = 'Rename prevented by sharing; separate Core helper rejected different identity'
+                No-FileRecordsR $s
+                return
+            }
+            Assert-R ($item.Status -in @('failed', 'ambiguous')) 'Race was accepted as successful deletion'
+            Assert-R ($item.Error.Contains($child, [StringComparison]::OrdinalIgnoreCase)) 'Error omitted failing child path'
+            Assert-R ($item.Error -match '(?i)expected' -and $item.Error -match '(?i)(actual|observed)') 'Error omitted expected/actual evidence'
+            Assert-R ([IO.File]::Exists($child) -and [IO.Directory]::Exists($root)) 'Race target was deleted'
+            if ($mode -eq 'replacement') {
+                Assert-R ([IO.File]::ReadAllText($child) -ceq 'replacement identity must survive') 'Replacement content changed'
+                Assert-R ([IO.File]::ReadAllText($child + '.original') -ceq 'original child content') 'Original content changed'
+            } else {
+                Assert-R ($race.before.ChangeTime -ne $race.after.ChangeTime) 'Time mutation did not change native time'
+                Assert-R ($item.Error.Contains([string]$race.before.ChangeTime) -and $item.Error.Contains([string]$race.after.ChangeTime)) 'Error omitted measured ChangeTime values'
+            }
+            No-FileRecordsR $s
+        }
     }
     if ($Large) {
         Case-H 'large-sibling-baselines' {
@@ -217,7 +289,7 @@ public static class HardlinkEntryTimesProbe {
         }
     }
 } finally {
-    $report = @{ fixtureRun = $script:fixtureRun; executable = $ExecutablePath; executableSha256 = (Get-FileHash -LiteralPath $ExecutablePath).Hash; rustProbePath=$RustProbePath;sameSourceBuild=$buildBinding;sources = $sourceHashes;results = @($results);commands = @($script:commands);passed = @($results | Where-Object passed).Count;failed = @($results | Where-Object { !$_.passed }).Count;largeRequested=[bool]$Large;unverified=$(if(!$Large){@('Optional 32769-sibling stress case was not requested.')}else{@()});retainedFixtures = $OutputDirectory;note = 'Fresh fixtures only; failed/ambiguous deletes are never resent. Native boundaries use the same-source Rust libtest; shipping CLI/MCP paths remain separate actual-process cases.' }
+    $report = @{ fixtureRun = $script:fixtureRun; executable = $ExecutablePath; executableSha256 = (Get-FileHash -LiteralPath $ExecutablePath).Hash; assembly = $AssemblyPath; assemblySha256 = (Get-FileHash -LiteralPath $AssemblyPath).Hash; sources = $sourceHashes; results = @($results); commands = @($script:commands); passed = @($results | Where-Object passed).Count; failed = @($results | Where-Object { !$_.passed }).Count; retainedFixtures = $OutputDirectory; note = 'Fresh fixtures only; failed/ambiguous deletes are never resent. Race fixtures retained for inspection.' }
     Save-R $ReportPath $report
     $env:TEMP = $oldTemp; $env:TMP = $oldTmp
 }

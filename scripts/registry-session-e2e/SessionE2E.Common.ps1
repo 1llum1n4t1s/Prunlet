@@ -30,7 +30,6 @@ function SavePrivateJson([string]$Path,$Data){
 }
 function Assert([bool]$Condition,[string]$Message){if(!$Condition){throw $Message}}
 function AssertPreparedSettings($Settings){
- if($Settings.assemblyPath-and$Settings.rustProbePath){throw 'Prepared candidate runtime is ambiguous; no fixture mutation attempted.'}
  $security=Get-Acl -LiteralPath $PSScriptRoot
  $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
  Assert $security.AreAccessRulesProtected 'Run directory ACL inheritance was enabled'
@@ -43,7 +42,7 @@ function AssertPreparedSettings($Settings){
  Assert ([IO.Path]::IsPathFullyQualified($Settings.registryVerificationScriptPath)-and[IO.File]::Exists($Settings.registryVerificationScriptPath)) 'Registry verification script missing'
  Assert ($Settings.registryVerificationScriptSha256-ceq(Get-FileHash -LiteralPath $Settings.registryVerificationScriptPath -Algorithm SHA256).Hash) 'Registry verification script changed after Prepare'
  if($Settings.moveExecutablePath){Assert ([IO.Path]::IsPathFullyQualified($Settings.moveExecutablePath)-and[IO.File]::Exists($Settings.moveExecutablePath)) 'Move baseline executable missing';Assert ($Settings.moveExecutableSha256-ceq(Get-FileHash -LiteralPath $Settings.moveExecutablePath -Algorithm SHA256).Hash) 'Move baseline executable changed after Prepare'}
- foreach($dependency in @(@{path=$Settings.assemblyPath;hash=$Settings.assemblySha256},@{path=$Settings.rustProbePath;hash=$Settings.rustProbeSha256},@{path=$Settings.legacyRegistryExecutablePath;hash=$Settings.legacyRegistryExecutableSha256},@{path=$Settings.latestRegistryExecutablePath;hash=$Settings.latestRegistryExecutableSha256})){if($dependency.path){Assert ([IO.Path]::IsPathFullyQualified($dependency.path)-and[IO.File]::Exists($dependency.path)) 'Prepared registry checkpoint dependency missing';Assert ($dependency.hash-ceq(Get-FileHash -LiteralPath $dependency.path -Algorithm SHA256).Hash) 'Prepared registry checkpoint dependency changed'}}
+ foreach($dependency in @(@{path=$Settings.assemblyPath;hash=$Settings.assemblySha256},@{path=$Settings.legacyRegistryExecutablePath;hash=$Settings.legacyRegistryExecutableSha256})){if($dependency.path){Assert ([IO.Path]::IsPathFullyQualified($dependency.path)-and[IO.File]::Exists($dependency.path)) 'Prepared registry checkpoint dependency missing';Assert ($dependency.hash-ceq(Get-FileHash -LiteralPath $dependency.path -Algorithm SHA256).Hash) 'Prepared registry checkpoint dependency changed'}}
  Assert ($Settings.runRelative-match'^Software\\PrunletE2E\\[0-9a-f]{32}$') 'Unsafe prepared fixture scope'
  foreach($name in @('config','highConfig','currentConfig','recovery')){
   $path=[IO.Path]::GetFullPath($Settings[$name]);Assert ($path.StartsWith($PSScriptRoot.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)) 'Prepared path escaped run directory'

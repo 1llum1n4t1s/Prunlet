@@ -9,18 +9,12 @@ param(
     [ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBaselineSha256,
     [ValidateNotNullOrEmpty()][string[]]$CaseFilter = @('*'),
     [string]$SecondaryVolumeDirectory,
-    [string]$RustProbePath,
-    [string]$BuildManifestPath,
-    [string]$ExpectedBuildManifestSha256,
-    [string]$FixtureRoot,
-    [string]$ImmediateFixtureRoot,
     [switch]$LegacyCopyVerification
 )
 $ErrorActionPreference = 'Stop'
 # 新規削除はWindowsごみ箱方式で検証する。旧コピー生成の検証は過去exeの再現専用に隔離する。
 if (!$LegacyCopyVerification) {
     $fileArguments = @{ ExecutablePath = $ExecutablePath; OutputDirectory = $OutputDirectory; ReportPath = $ReportPath; CaseFilter = $CaseFilter }
-    foreach ($name in @('RustProbePath','BuildManifestPath','ExpectedBuildManifestSha256','FixtureRoot','ImmediateFixtureRoot')) { if ($PSBoundParameters.ContainsKey($name)) { $fileArguments[$name] = $PSBoundParameters[$name] } }
     & (Join-Path $PSScriptRoot 'Verify-RecordlessFiles.ps1') @fileArguments
     exit $LASTEXITCODE
 }

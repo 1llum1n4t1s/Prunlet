@@ -6,23 +6,20 @@ param(
     [string]$LegacyExecutablePath,
     [string]$MoveExecutablePath,
     [string]$BaselineExecutablePath,
-    [switch]$LegacyCopyVerification,
-    [string]$RustProbePath,
-    [string]$BuildManifestPath,
-    [string]$ExpectedBuildManifestSha256,
     [string]$FixtureRoot,
+    [switch]$LegacyCopyVerification,
     [ValidateRange(32769, 1000000)][int]$FileCount = 32769,
     [ValidateRange(60, 86400)][int]$ProcessTimeoutSeconds = 1800
 )
 $ErrorActionPreference = 'Stop'
 if (!$LegacyCopyVerification) {
-    if($FileCount -gt 65535){throw 'Current recordless LargeFileCount supports 32769..65535. Larger counts belong only to explicit LegacyCopyVerification.'}
-    $verificationArguments = @{ ExecutablePath = $ExecutablePath; OutputDirectory = $OutputDirectory; ReportPath = $ReportPath; Large = $true; LargeFileCount = $FileCount; ProcessTimeoutSeconds = $ProcessTimeoutSeconds; CaseFilter = @('*large-*') }
-    foreach($name in @('RustProbePath','BuildManifestPath','ExpectedBuildManifestSha256','FixtureRoot')){if($PSBoundParameters.ContainsKey($name)){$verificationArguments[$name]=$PSBoundParameters[$name]}}
-    $global:LASTEXITCODE=0
+    # 現行製品の大規模検証は操作記録を作らない経路へ渡す。旧方式の引数は混ぜない。
+    $verificationArguments = @{ ExecutablePath = $ExecutablePath; OutputDirectory = $OutputDirectory; ReportPath = $ReportPath; Large = $true; LargeFileCount = $FileCount; CaseFilter = @('cli-large-native-recordless-windows-roundtrip'); ProcessTimeoutSeconds = [Math]::Min($ProcessTimeoutSeconds, 3600) }
+    if ($FixtureRoot) { $verificationArguments.FixtureRoot = $FixtureRoot }
     & (Join-Path $PSScriptRoot 'Verify-RecordlessFiles.ps1') @verificationArguments
     exit $LASTEXITCODE
 }
+if ($FixtureRoot) { throw 'FixtureRoot is supported only by the current recordless verification.' }
 if (!$LegacyExecutablePath) { throw 'LegacyCopyVerification requires the pre-migration LegacyExecutablePath.' }
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }

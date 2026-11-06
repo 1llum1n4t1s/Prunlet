@@ -54,7 +54,7 @@ internal sealed class HookRouter
             if (!inspection.ContainsDirectDeletion(command.GetString()!, mode: mode)) return Pass();
             var reason = inspection.detection ?? "Prunlet rejected this command because an invocation could not be safely classified.";
             if (mode is null)
-                reason += " Shell metadata is missing or unsupported; this is a candidate interpretation, not a confirmed local deletion. Quoted search text or remote script data may be interpreted as command syntax. If the host forwards the tool as Bash without shell metadata, setting exec_command.shell alone cannot resolve this ambiguity. For an authorized SSH script sent from PowerShell, encode the entire local PowerShell script as UTF-16LE Base64 and submit the standalone form pwsh -NoProfile -EncodedCommand <base64>. The hook decodes and inspects that script; it does not exempt SSH names or remote deletion targets from inspection. See docs/integration.md for the supported form.";
+                reason += " Shell metadata is missing or unsupported; this is a candidate interpretation, not a confirmed local deletion. Quoted search text or remote script data may be interpreted as command syntax.";
             reason += " The hook did not execute the command. The following CLI guidance applies only to authorized Windows deletion targets. ";
 
             var executable = commandExecutable ?? Environment.ProcessPath ?? "prunlet.exe";

@@ -21,117 +21,91 @@ jobs:
         runtime: [win-x64, win-arm64]
     defaults:
       run:
-        shell: bash
-    env:
-      # gitの認証header・RustのWindows絶対パスをMSYSに書き換えさせない。
-      MSYS_NO_PATHCONV: '1'
-      MSYS2_ARG_CONV_EXCL: '*'
-      MSYS2_ENV_CONV_EXCL: GIT_CONFIG_VALUE_0
-      PRUNLET_RUNTIME: ${{ matrix.runtime }}
+        shell: pwsh
     steps:
-      - name: Checkout the released tag without Node
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PRUNLET_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          set -euo pipefail
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ && "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo 'Invalid checkout identity.' >&2; exit 1; }
-          [[ "$GITHUB_SERVER_URL" == https://github.com && -n "$GH_TOKEN" ]] || { echo 'Invalid checkout server or absent token.' >&2; exit 1; }
-          [[ "$PRUNLET_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ ]] || { echo 'Unsupported release tag.' >&2; exit 1; }
-          workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
-          [[ -z "$(find "$workspace" -mindepth 1 -maxdepth 1 -print -quit)" ]] || { echo 'Checkout requires an empty workspace.' >&2; exit 1; }
-          git init --quiet "$GITHUB_WORKSPACE"
-          git -C "$GITHUB_WORKSPACE" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          # 認証はfetchのsubshell環境だけに置き、git設定・URL・ログへ保存しない。
-          (
-            export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
-            export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\r\n')"
-            export GIT_TERMINAL_PROMPT=0 GIT_TRACE=0 GIT_TRACE_CURL=0 GIT_CURL_VERBOSE=0
-            git -C "$GITHUB_WORKSPACE" -c credential.helper= fetch --force --tags origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
-          )
-          unset GH_TOKEN
-          git -C "$GITHUB_WORKSPACE" checkout --detach "refs/tags/$PRUNLET_TAG"
-          [[ "$(git -C "$GITHUB_WORKSPACE" rev-parse --verify HEAD)" == "$GITHUB_SHA" ]] || { echo 'Checkout differs from the event commit.' >&2; exit 1; }
+      - name: Checkout the released tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Setup .NET
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: 10.0.x
       - name: Verify the released commit
+        id: source
         env:
           GH_TOKEN: ${{ github.token }}
           PRUNLET_TAG: ${{ github.event.release.tag_name }}
         run: |
-          set -euo pipefail
-          commit="$(git rev-parse --verify HEAD)"
-          [[ "$commit" =~ ^[0-9a-f]{40}$ && "$commit" == "$GITHUB_SHA" ]] || { echo 'Invalid release event commit.' >&2; exit 1; }
-          [[ "$(git rev-list -n 1 "refs/tags/$PRUNLET_TAG")" == "$commit" ]] || { echo 'Checkout differs from release tag.' >&2; exit 1; }
-          branch="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')"
-          [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo 'Default branch is invalid.' >&2; exit 1; }
-          git merge-base --is-ancestor "$commit" "refs/remotes/origin/$branch"
-          version="$(sed -nE 's/^version = "([^"]+)"\r?$/\1/p' Cargo.toml)"
-          [[ -n "$version" && "$version" == "${PRUNLET_TAG#v}" ]] || { echo 'Release tag differs from package version.' >&2; exit 1; }
-          printf 'PRUNLET_COMMIT=%s\nPRUNLET_BRANCH=%s\n' "$commit" "$branch" >> "$GITHUB_ENV"
-      - name: Bootstrap the pinned Rust release tool
-        run: |
-          set -euo pipefail
-          toolchain="$(sed -nE 's/^channel = "([^"]+)"\r?$/\1/p' rust-toolchain.toml)"
-          [[ "$toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Rust toolchain is not pinned.' >&2; exit 1; }
-          rustup toolchain install "$toolchain" --profile minimal
-          target=x86_64-pc-windows-msvc
-          if [[ "$PRUNLET_RUNTIME" == win-arm64 ]]; then target=aarch64-pc-windows-msvc; fi
-          rustup target add --toolchain "$toolchain" "$target"
-          temp="$(cygpath -u "$RUNNER_TEMP")/prunlet-release-temp-$PRUNLET_RUNTIME"
-          mkdir -p "$temp"
-          export TEMP="$(cygpath -w "$temp")" TMP="$(cygpath -w "$temp")"
-          export CARGO_TARGET_DIR="$(cygpath -w "$RUNNER_TEMP/prunlet-release-host")"
-          export RUSTUP_TOOLCHAIN="$toolchain" PRUNLET_SOURCE_COMMIT="$PRUNLET_COMMIT"
-          export CARGO_ENCODED_RUSTFLAGS=$'-C\x1ftarget-feature=+crt-static'
-          cargo build --release --locked --bin prunlet-release --target x86_64-pc-windows-msvc
-          helper="$(cygpath -u "$RUNNER_TEMP")/prunlet-release-host/x86_64-pc-windows-msvc/release/prunlet-release.exe"
-          printf 'PRUNLET_RELEASE_HELPER=%s\n' "$helper" >> "$GITHUB_ENV"
-      - name: Build and package the released commit
-        run: |
-          set -euo pipefail
-          output="$(cygpath -w "$RUNNER_TEMP/prunlet-build-$PRUNLET_RUNTIME")"
-          package="$(cygpath -w "$RUNNER_TEMP/prunlet-update-$PRUNLET_RUNTIME.zip")"
-          common=(--source "$GITHUB_WORKSPACE" --commit "$PRUNLET_COMMIT" --branch "$PRUNLET_BRANCH" --runtime "$PRUNLET_RUNTIME" --repository "$GITHUB_REPOSITORY")
-          "$PRUNLET_RELEASE_HELPER" build "${common[@]}" --output "$output" --release-source true
-          "$PRUNLET_RELEASE_HELPER" package "${common[@]}" --publish "$output/publish" --package "$package"
-      - name: Verify the release package
-        run: |
-          set -euo pipefail
-          sha256="$("$PRUNLET_RELEASE_HELPER" verify --source "$GITHUB_WORKSPACE" --publish "$(cygpath -w "$RUNNER_TEMP/prunlet-build-$PRUNLET_RUNTIME/publish")" --package "$(cygpath -w "$RUNNER_TEMP/prunlet-update-$PRUNLET_RUNTIME.zip")" --commit "$PRUNLET_COMMIT" --branch "$PRUNLET_BRANCH" --runtime "$PRUNLET_RUNTIME" --repository "$GITHUB_REPOSITORY" | tr -d '\r')"
-          [[ "$sha256" =~ ^[0-9A-F]{64}$ ]] || { echo 'Invalid verified package digest.' >&2; exit 1; }
-          printf 'PRUNLET_EXPECTED_SHA256=%s\n' "$sha256" >> "$GITHUB_ENV"
-      - name: Publish the verified package to R2
+          $ErrorActionPreference = 'Stop'
+          if ($env:PRUNLET_TAG -cnotmatch '^v?[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?$') { throw 'Unsupported release tag.' }
+          $commit = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $commit -cnotmatch '^[0-9a-f]{40}$') { throw 'Checkout commit is invalid.' }
+          if ($commit -cne $env:GITHUB_SHA) { throw 'Checkout differs from the release event commit.' }
+          $tagCommit = (git rev-list -n 1 ('refs/tags/' + $env:PRUNLET_TAG)).Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -cne $commit) { throw 'Checkout does not match the release tag.' }
+          $branch = (gh api "repos/$env:GITHUB_REPOSITORY" --jq '.default_branch').Trim()
+          if ($LASTEXITCODE -ne 0 -or $branch -cnotmatch '^[A-Za-z0-9._/-]+$') { throw 'Default branch is invalid.' }
+          git merge-base --is-ancestor $commit ('refs/remotes/origin/' + $branch)
+          if ($LASTEXITCODE -ne 0) { throw 'Release commit is not on the default branch.' }
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+          "branch=$branch" >> $env:GITHUB_OUTPUT
+      - name: Build the released commit
         env:
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          PRUNLET_RUNTIME: ${{ matrix.runtime }}
+          PRUNLET_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $env:PRUNLET_RUNTIME)
+          $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
+          & ./scripts/Publish-Prunlet.ps1 -OutputDirectory $output -Runtime $env:PRUNLET_RUNTIME | Out-Null
+          $expectedVersion = $env:PRUNLET_TAG -replace '^v', ''
+          foreach ($name in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
+            $product = Join-Path $output ('publish/' + $name)
+            if (![IO.File]::Exists($product)) { throw "Published product missing: $name" }
+            $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($product).ProductVersion
+            if (($version -split '\+')[0] -cne $expectedVersion) { throw "Published product version differs: $name $version" }
+          }
+          & ./scripts/Package-PrunletUpdate.ps1 -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory (Join-Path $output 'publish') -OutputPath $package -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME | Out-Null
+      - name: Verify the release package
+        id: verified_package
+        env:
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          PRUNLET_RUNTIME: ${{ matrix.runtime }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $env:PRUNLET_RUNTIME)
+          $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
+          $sha256 = & ./scripts/Verify-ReleasePackage.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory (Join-Path $output 'publish') -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME -Repository $env:GITHUB_REPOSITORY
+          "sha256=$sha256" >> $env:GITHUB_OUTPUT
+      - name: Publish the verified package to the existing R2 destination
+        env:
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          PRUNLET_RUNTIME: ${{ matrix.runtime }}
           PRUNLET_R2_ACCOUNT_ID: ${{ secrets.PRUNLET_R2_ACCOUNT_ID }}
           PRUNLET_R2_ACCESS_KEY_ID: ${{ secrets.PRUNLET_R2_ACCESS_KEY_ID }}
           PRUNLET_R2_SECRET_ACCESS_KEY: ${{ secrets.PRUNLET_R2_SECRET_ACCESS_KEY }}
-          PRUNLET_R2_BUCKET: ${{ vars.PRUNLET_R2_BUCKET }}
+          PRUNLET_R2_BUCKET: ${{ vars.PRUNLET_R2_BUCKET || 'prunlet-updates' }}
         run: |
-          set -euo pipefail
-          package="$(cygpath -w "$RUNNER_TEMP/prunlet-update-$PRUNLET_RUNTIME.zip")"
-          common=(--source "$GITHUB_WORKSPACE" --publish "$(cygpath -w "$RUNNER_TEMP/prunlet-build-$PRUNLET_RUNTIME/publish")" --package "$package" --commit "$PRUNLET_COMMIT" --branch "$PRUNLET_BRANCH" --runtime "$PRUNLET_RUNTIME" --repository "$GITHUB_REPOSITORY")
-          [[ "$("$PRUNLET_RELEASE_HELPER" verify "${common[@]}" | tr -d '\r')" == "$PRUNLET_EXPECTED_SHA256" ]] || { echo 'Package changed before R2 publication.' >&2; exit 1; }
-          publication="$("$PRUNLET_RELEASE_HELPER" publish-r2 "${common[@]}")"
-          # Rust publisherの固定schemaのscalarだけを確認する。秘密値・HTTP本文は出力しない。
-          compact="$(printf '%s' "$publication" | tr -d '[:space:]')"
-          bytes="$(stat -c %s "$(cygpath -u "$package")")"
-          for field in '"schema":1' '"verified":true' "\"sha256\":\"${PRUNLET_EXPECTED_SHA256,,}\"" "\"bytes\":$bytes" "\"commitSha\":\"$PRUNLET_COMMIT\"" "\"runtime\":\"$PRUNLET_RUNTIME\"" "\"repository\":\"$GITHUB_REPOSITORY\""; do
-            [[ "$compact" == *"$field,"* || "$compact" == *"$field}"* ]] || { echo 'R2 publication differs from the verified package.' >&2; exit 1; }
-          done
-      - name: Attach the same package to GitHub for older clients
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $env:PRUNLET_RUNTIME)
+          $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
+          & ./scripts/Publish-PrunletR2.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory (Join-Path $output 'publish') -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME -Repository $env:GITHUB_REPOSITORY
+      - name: Attach the same package to the release
         env:
           GH_TOKEN: ${{ github.token }}
           PRUNLET_TAG: ${{ github.event.release.tag_name }}
-          PRUNLET_RELEASE_ID: ${{ github.event.release.id }}
+          PRUNLET_RUNTIME: ${{ matrix.runtime }}
+          PRUNLET_EXPECTED_SHA256: ${{ steps.verified_package.outputs.sha256 }}
         run: |
-          set -euo pipefail
-          package="$(cygpath -w "$RUNNER_TEMP/prunlet-update-$PRUNLET_RUNTIME.zip")"
-          actual="$("$PRUNLET_RELEASE_HELPER" verify --source "$GITHUB_WORKSPACE" --publish "$(cygpath -w "$RUNNER_TEMP/prunlet-build-$PRUNLET_RUNTIME/publish")" --package "$package" --commit "$PRUNLET_COMMIT" --branch "$PRUNLET_BRANCH" --runtime "$PRUNLET_RUNTIME" --repository "$GITHUB_REPOSITORY" | tr -d '\r')"
-          [[ "$actual" == "$PRUNLET_EXPECTED_SHA256" ]] || { echo 'Source or package changed after verification.' >&2; exit 1; }
-          [[ "$PRUNLET_RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid release event identity.' >&2; exit 1; }
-          gh release upload "$PRUNLET_TAG" "$package" --repo "$GITHUB_REPOSITORY"
-          name="prunlet-update-$PRUNLET_RUNTIME.zip"
-          bytes="$(stat -c %s "$(cygpath -u "$package")")"
-          expected="sha256:${PRUNLET_EXPECTED_SHA256,,}"
-          # 既存assetを上書きせず、全pageの名前一致が一件でdigest・sizeも一致することを確認する。
-          result="$(gh api --hostname github.com --method GET --paginate "repos/$GITHUB_REPOSITORY/releases/$PRUNLET_RELEASE_ID/assets?per_page=100" --jq ".[] | select(.name == \"$name\") | if .state == \"uploaded\" and .size == $bytes and .digest == \"$expected\" then \"verified\" else \"mismatch\" end")"
-          [[ "$result" == verified ]] || { echo 'GitHub mirror digest or size differs; publication is incomplete. Do not resend automatically.' >&2; exit 1; }
+          $ErrorActionPreference = 'Stop'
+          $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
+          if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -cne $env:PRUNLET_EXPECTED_SHA256) { throw 'Package changed after verification.' }
+          gh release upload $env:PRUNLET_TAG $package --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed; an existing asset was not overwritten.' }

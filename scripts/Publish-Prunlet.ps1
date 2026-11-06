@@ -1,12 +1,40 @@
-#requires -Version 7.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$OutputDirectory,
-    [ValidateSet('win-x64', 'win-arm64')][string]$Runtime = 'win-x64',
-    [string]$TargetDirectory = $env:PRUNLET_CARGO_TARGET_DIRECTORY,
-    [ValidatePattern('^[0-9a-fA-F]{40}$')][string]$SourceCommit,
-    [switch]$IncludeVerificationProbe
+    [ValidateSet('win-x64', 'win-arm64')][string]$Runtime = 'win-x64'
 )
 $ErrorActionPreference = 'Stop'
-# 導入・CI・更新packageは従来の入口と出力DTOを使い、実ビルドだけをRustへ接続する。
-& (Join-Path $PSScriptRoot 'Publish-PrunletRust.ps1') @PSBoundParameters
+$repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
+if (-not [IO.Path]::IsPathFullyQualified($OutputDirectory)) { throw 'OutputDirectory must be absolute.' }
+$codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
+foreach ($forbiddenRoot in @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))) {
+    if ($outputRoot.Equals($forbiddenRoot, [StringComparison]::OrdinalIgnoreCase) -or $outputRoot.StartsWith($forbiddenRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Build output must be outside the repository and Codex home.'
+    }
+}
+$ancestor = $outputRoot
+while (-not (Test-Path -LiteralPath $ancestor)) { $ancestor = Split-Path -Parent $ancestor }
+while ($ancestor) {
+    if ((Get-Item -LiteralPath $ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Build output cannot traverse links.' }
+    $ancestor = Split-Path -Parent $ancestor
+}
+$intermediate = Join-Path $outputRoot 'obj'
+$publish = Join-Path $outputRoot 'publish'
+New-Item -ItemType Directory -Path $intermediate, $publish -Force | Out-Null
+& dotnet publish (Join-Path $repoRoot 'src\Prunlet\Prunlet.csproj') -c Release -r $Runtime --self-contained true -o $publish "-p:BaseIntermediateOutputPath=$intermediate\" "-p:BaseOutputPath=$outputRoot\bin\" '-p:PublishSingleFile=true' '-p:IncludeNativeLibrariesForSelfExtract=true' '-p:DebugType=None' '-p:DebugSymbols=false' '-p:UseSharedCompilation=false'
+if ($LASTEXITCODE -ne 0) { throw "Publish failed: $LASTEXITCODE" }
+$exe = Join-Path $publish 'prunlet.exe'
+# 同じCoreをGUI subsystemで発行し、対話ログオンでもコンソールを作らない。
+$maintenanceRoot = Join-Path $outputRoot 'maintenance'
+$maintenanceIntermediate = Join-Path $maintenanceRoot 'obj'
+$maintenancePublish = Join-Path $maintenanceRoot 'publish'
+New-Item -ItemType Directory -Path $maintenanceIntermediate, $maintenancePublish -Force | Out-Null
+& dotnet publish (Join-Path $repoRoot 'src\Prunlet\Prunlet.csproj') -c Release -r $Runtime --self-contained true -o $maintenancePublish "-p:BaseIntermediateOutputPath=$maintenanceIntermediate\" "-p:BaseOutputPath=$maintenanceRoot\bin\" '-p:PrunletMaintenanceHost=true' '-p:PublishSingleFile=true' '-p:IncludeNativeLibrariesForSelfExtract=true' '-p:DebugType=None' '-p:DebugSymbols=false' '-p:UseSharedCompilation=false'
+if ($LASTEXITCODE -ne 0) { throw "Maintenance publish failed: $LASTEXITCODE" }
+$maintenanceExe = Join-Path $publish 'prunlet-maintenance.exe'
+Copy-Item -LiteralPath (Join-Path $maintenancePublish 'prunlet-maintenance.exe') -Destination $maintenanceExe
+# hookは更新中のCLI排他から独立した入口を使う。同じバイナリを入口名で限定する。
+$hookExe = Join-Path $publish 'prunlet-hook.exe'
+Copy-Item -LiteralPath $exe -Destination $hookExe
+[ordered]@{ executable = $exe; maintenanceExecutable = $maintenanceExe; hookExecutable = $hookExe; runtime = $Runtime; sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; maintenanceSha256 = (Get-FileHash -LiteralPath $maintenanceExe -Algorithm SHA256).Hash; hookSha256 = (Get-FileHash -LiteralPath $hookExe -Algorithm SHA256).Hash; bytes = (Get-Item -LiteralPath $exe).Length } | ConvertTo-Json

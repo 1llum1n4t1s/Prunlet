@@ -13,7 +13,7 @@ try{
  if(!$CurrentOnly){$started=$true;foreach($readyFile in @('controller-ready.json','limited-ready.json')){
   $ready=ReadJson (Join-Path $PSScriptRoot $readyFile)
   Assert ($ready.success-and$ready.scope.kind-eq'nativeWindows') ('Explicit native session not ready: '+$readyFile)
-  Assert ((GetLaunchUtcTicks $ready.expiresUtc)-gt[DateTime]::UtcNow.AddMinutes(8).Ticks) 'Explicit session too near expiry; prepare new sessions'
+  Assert ([DateTimeOffset]::Parse($ready.expiresUtc)-gt[DateTimeOffset]::UtcNow.AddMinutes(8)) 'Explicit session too near expiry; prepare new sessions'
  }
  $clientToken=[SessionE2ENative]::TokenInfo();$normalReady=ReadJson (Join-Path $PSScriptRoot 'limited-ready.json');$adminReady=ReadJson (Join-Path $PSScriptRoot 'controller-ready.json')
  $normalDescriptor=ReadCapability $configData.registrySessionFile;$adminDescriptor=ReadCapability (ReadJson $settings.highConfig).registrySessionFile
@@ -113,10 +113,8 @@ try{
  }
  Check 'normal-client-key-privilege-denied-without-server-authority' {
   $f=NativeRequest 'create' @{leaf='denied-key';tree=$true};$b=NativeRequest 'observe' @{leaf='denied-key'}
-  $r=InvokePrunletCli @('registry-delete','--view','64','--recursive','--',$f.path)
-  $afterCli=NativeRequest 'observe' @{leaf='denied-key'};SaveJson (Join-Path $PSScriptRoot 'normal-key-cli-denial.json') @{cli=$r;before=$b;after=$afterCli}
-  Assert ($r.exitCode-ne 0) 'Normal CLI borrowed native-server key privileges';Assert ($r.stdout-match'SeSecurityPrivilege|Complete registry-key ACL preservation') ('Normal CLI did not reach effective-token privilege gate: '+$r.stdout+$r.stderr);Assert (Same $b $afterCli) 'CLI denied key changed'
-  $p=McpStart;try{$m=McpCall $p 'delete_registry' @{path=$f.path;view='64';recursive=$true};$afterMcp=NativeRequest 'observe' @{leaf='denied-key'};SaveJson (Join-Path $PSScriptRoot 'normal-key-mcp-denial.json') @{mcp=$m;before=$b;after=$afterMcp};Assert $m.result.isError 'Normal MCP borrowed native-server privileges';Assert (($m|ConvertTo-Json -Depth 30)-match'SeSecurityPrivilege|Complete registry-key ACL preservation') ('Normal MCP did not reach effective-token privilege gate: '+($m|ConvertTo-Json -Depth 30));Assert (Same $b $afterMcp) 'MCP denied key changed'}finally{McpStop $p}
+  $r=InvokePrunletCli @('registry-delete','--view','64','--recursive','--',$f.path);Assert ($r.exitCode-ne 0) 'Normal CLI borrowed native-server key privileges';Assert ($r.stdout-match'SeSecurityPrivilege|Complete registry-key ACL preservation') 'Normal CLI did not reach effective-token privilege gate';Assert (Same $b (NativeRequest 'observe' @{leaf='denied-key'})) 'CLI denied key changed'
+  $p=McpStart;try{$m=McpCall $p 'delete_registry' @{path=$f.path;view='64';recursive=$true};Assert $m.result.isError 'Normal MCP borrowed native-server privileges';Assert (($m|ConvertTo-Json -Depth 30)-match'SeSecurityPrivilege|Complete registry-key ACL preservation') 'Normal MCP did not reach effective-token privilege gate';Assert (Same $b (NativeRequest 'observe' @{leaf='denied-key'})) 'MCP denied key changed'}finally{McpStop $p}
   SaveJson (Join-Path $PSScriptRoot 'normal-key-denials.json') @{cli=$r;mcp=$m;before=$b;after=(NativeRequest 'observe' @{leaf='denied-key'})}
  }
  Check 'value-restore-conflict-preserves-existing-and-snapshot' {
@@ -188,8 +186,8 @@ try{
     'badpeer-descriptor'{'Registry session server process differs from the capability owner'}
     'offline'{'Native registry session communication failed'}
    }
+   Assert (($r.stdout+$r.stderr)-match[regex]::Escape($expectedReason)) ('Negative case reached a different guard: '+$negative+' expected '+$expectedReason)
    SaveJson (Join-Path $PSScriptRoot ($negative+'-rejection.json')) @{result=$r;expectedReason=$expectedReason;before=$before;after=(NativeRequest 'observe' @{leaf=$leaf});descriptorContentsLogged=$false;hmacValidationTested=$false}
-   Assert (($r.stdout+$r.stderr)-match[regex]::Escape($expectedReason)) ('Negative case reached a different guard: '+$negative+' expected '+$expectedReason+'; actual '+$r.stdout+$r.stderr)
   }
  }
  Check 'session-reject-different-executable-peer-unchanged' {
@@ -198,7 +196,6 @@ try{
   try{$pipe.Connect(5000);$head=[byte[]]::new(4);$task=$pipe.ReadExactlyAsync($head).AsTask();Assert ($task.Wait(10000)) 'Bad-peer reply timeout';$task.GetAwaiter().GetResult();$size=[BitConverter]::ToInt32($head,0);Assert ($size-gt 0-and$size-lt 65536) 'Bad-peer frame size';$body=[byte[]]::new($size);$pipe.ReadExactly($body);$reply=[Text.Encoding]::UTF8.GetString($body)|ConvertFrom-Json -AsHashtable;Assert ($reply.kind-eq'error'-and$reply.error-match'Registry session requires the same executable and Windows logon') 'Different executable peer did not reach the executable/logon guard';Assert (Same $before (NativeRequest 'observe')) 'Bad peer changed native fixture';SaveJson (Join-Path $PSScriptRoot 'badpeer-executable-rejection.json') @{kind=$reply.kind;error=$reply.error;unchanged=$true}}finally{$pipe.Dispose()}
  }
  Check 'cli-shared-lock-over-60s-resumes' {$r=TestCliLock;SaveJson (Join-Path $PSScriptRoot 'cli-shared-lock-result.json') $r}
- Check 'cli-closed-stderr-preserves-final-id-and-real-roundtrip' {$r=TestCliClosedStderr;SaveJson (Join-Path $PSScriptRoot 'cli-closed-stderr-result.json') $r}
  Check 'mcp-shared-lock-over-60s-token-and-no-postfinal-progress' {$r=TestMcpLock;SaveJson (Join-Path $PSScriptRoot 'mcp-shared-lock-result.json') $r}
  Check 'accepted-client-disconnect-completes-and-reconciles' {$r=TestDisconnectedClient;SaveJson (Join-Path $PSScriptRoot 'disconnect-reconcile-result.json') $r}
  Check 'explicit-desktop-administrator-clients' {

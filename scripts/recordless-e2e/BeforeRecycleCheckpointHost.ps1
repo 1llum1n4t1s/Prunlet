@@ -1,52 +1,49 @@
-[CmdletBinding()]
-param(
- [Parameter(Mandatory)][string]$ExecutablePath,
- [Parameter(Mandatory)][string]$RustProbePath,
- [Parameter(Mandatory)][string]$BuildManifestPath,
- [Parameter(Mandatory)][string]$ExpectedBuildManifestSha256,
- [Parameter(Mandatory)][string]$OutputDirectory,
- [Parameter(Mandatory)][string]$ReportPath,
- [Parameter(Mandatory)][string]$FixtureRoot,
- [Parameter(Mandatory)][ValidateSet('replace','alias','attributes','large')][string[]]$Modes,
- [Parameter(Mandatory)][string]$Suite,
- [Parameter(Mandatory)][string]$CallerPath
-)
+param([Parameter(Mandatory)][string]$AssemblyPath,[Parameter(Mandatory)][string]$ExpectedAssemblySha256,[Parameter(Mandatory)][string]$ConfigPath,[Parameter(Mandatory)][string]$TargetPath,[Parameter(Mandatory)][string]$MovedPath,[Parameter(Mandatory)][string]$EvidencePath)
 $ErrorActionPreference='Stop'
-$repo=[IO.Path]::GetFullPath((Split-Path (Split-Path $PSScriptRoot -Parent) -Parent))
-. (Join-Path (Split-Path $PSScriptRoot -Parent) 'Verification-Common.ps1')
-. (Join-Path $PSScriptRoot 'RustFileProbe.Common.ps1')
-# 実Shell直前の既存cfg(test) checkpointを使い、製品runtimeへ検証hookを追加しない。
-foreach($path in @($OutputDirectory,$ReportPath,$FixtureRoot)) {
- if(![IO.Path]::IsPathFullyQualified($path)){throw 'Absolute output, report and fixture paths required'}
- Assert-VerificationDestination $path @($repo,(Join-Path $env:USERPROFILE '.codex'))
- if(Test-Path -LiteralPath $path){throw 'Unused output, report and fixture paths required'}
- if(![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))){throw 'Existing parent required'}
-}
-foreach($path in @($OutputDirectory,$ReportPath)){if(![IO.Path]::GetPathRoot($path).Equals('D:\',[StringComparison]::OrdinalIgnoreCase)){throw 'External D output required'}}
-$null=Assert-RustFileProbeBinding
-$null=[IO.Directory]::CreateDirectory($OutputDirectory)
-$null=[IO.Directory]::CreateDirectory($FixtureRoot)
-$sources=@(Get-RustFileProbeSourceHashes)+@(@($PSCommandPath,$CallerPath)|ForEach-Object {@{path=$_;sha256=(Get-FileHash -LiteralPath $_).Hash}})
-$results=[Collections.Generic.List[object]]::new()
-$oldTemp=$env:TEMP;$oldTmp=$env:TMP
-try {
- $env:TEMP=Join-Path $OutputDirectory 'temp';$env:TMP=$env:TEMP;$null=[IO.Directory]::CreateDirectory($env:TEMP)
- foreach($mode in $Modes) {
-  $item=@{name=('before-recycle-'+$mode);passed=$false;skipped=$false};$results.Add($item)
+foreach($p in @($AssemblyPath,$ConfigPath,$TargetPath,$MovedPath,$EvidencePath)){if(![IO.Path]::IsPathFullyQualified($p)){throw 'Absolute paths required'}}
+if((Get-FileHash -LiteralPath $AssemblyPath).Hash -cne $ExpectedAssemblySha256){throw 'Prepared candidate assembly changed'}
+if(!('BeforeRecycleCheckpointHost' -as [type])) {
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Reflection;
+using System.Linq;
+using System.Text.Json;
+public static class BeforeRecycleCheckpointHost {
+ public static object Run(string assemblyPath,string configPath,string target,string moved,string evidencePath) {
+  var assembly=Assembly.LoadFrom(assemblyPath);
+  var configType=assembly.GetType("Prunlet.Core.PrunletConfig",true);
+  var serviceType=assembly.GetType("Prunlet.Core.DeletionService",true);
+  var native=assembly.GetType("Prunlet.Core.NativeRecycleBin",true);
+  var checkpoint=native.GetEvent("BeforeRecycleCheckpoint",BindingFlags.NonPublic|BindingFlags.Static) ?? throw new MissingMemberException("BeforeRecycleCheckpoint missing");
+  var createdCheckpoint=native.GetEvent("RecycleCreatedCheckpoint",BindingFlags.NonPublic|BindingFlags.Static) ?? throw new MissingMemberException("RecycleCreatedCheckpoint missing");
+  var fixture=AppDomain.CurrentDomain.GetAssemblies().Select(a=>a.GetType("Prunlet.RecordlessE2E.FixtureNative",false)).First(t=>t!=null);
+  var config=configType.GetMethod("Load").Invoke(null,new object[]{configPath});var service=Activator.CreateInstance(serviceType,new object[]{config});
+  int count=0,createdCount=0; object replacement=null; string createdSource=null,createdPath=null,createdId=null,createdError=null;
+  Action<string,string> handler=(phase,path)=>{
+   if(phase!="before-recycle" || !string.Equals(path,target,StringComparison.OrdinalIgnoreCase) || ++count!=1) throw new InvalidOperationException("Unexpected or repeated checkpoint");
+   File.Move(target,moved,false);
+   using(var f=new FileStream(target,FileMode.CreateNew,FileAccess.Write,FileShare.None)) {var bytes=System.Text.Encoding.UTF8.GetBytes("before-recycle replacement fixture");f.Write(bytes);f.Flush(true);}
+   replacement=fixture.GetMethod("SnapshotTree").Invoke(null,new object[]{target});
+   var evidence=JsonSerializer.SerializeToUtf8Bytes(new {phase,path,moved,replacement});
+   using(var f=new FileStream(evidencePath,FileMode.CreateNew,FileAccess.Write,FileShare.None)){f.Write(evidence);f.Flush(true);}
+  };
+  Action<string,string> createdHandler=(source,path)=>{
+   createdCount++;createdSource=source;createdPath=path;createdId=null;createdError=null;
+   try {createdId=(string)fixture.GetMethod("Identity").Invoke(null,new object[]{path});}
+   catch(Exception ex){createdError=ex.GetBaseException().ToString();}
+  };
+  checkpoint.GetAddMethod(true).Invoke(null,new object[]{handler});
   try {
-   $fixture=Join-Path $FixtureRoot $mode;$null=[IO.Directory]::CreateDirectory($fixture)
-   $probe=Invoke-RustFileContract ('file-before-recycle-'+$mode) $fixture
-   $value=$probe.result
-   if($value.checkpointCount -ne 1 -or !$value.originalPreserved -or !$value.replacementPreserved -or $value.result.items.Count -ne 1 -or $value.result.items[0].status -cne 'ambiguous'){throw 'Changed Shell source was not verified as ambiguous with both identities preserved'}
-   if($mode -ceq 'large' -and (!$value.largeSparse -or $value.logicalSizeBefore -ne 1TB -or $value.allocationSizeBefore -gt 1MB -or !$value.boundedOwnedSparseCleanup.resizedOwnedFixture -or $value.replacement.actualWindowsSizeRefusal -cne $true -or $value.replacement.retainedAtSource -cne $true -or $null -ne $value.replacement.destination -or $value.replacement.sourcePath -cne $value.result.items[0].path)){throw 'Actual Windows size refusal, same-ID replacement retained at source, and bounded owned finalization not verified'}
-   foreach($source in $sources){if((Get-FileHash -LiteralPath $source.path).Hash -cne $source.sha256){throw 'Verification source changed'}}
-   $item.probe=$probe;$item.passed=$true
-  }catch {$item.error=$_.Exception.ToString();$item.stack=$_.ScriptStackTrace}
+   createdCheckpoint.GetAddMethod(true).Invoke(null,new object[]{createdHandler});
+   try {
+   var result=serviceType.GetMethod("Delete",new[]{typeof(string[]),typeof(bool),typeof(bool)}).Invoke(service,new object[]{new[]{target},false,false});
+   var hasErrors=assembly.GetType("Prunlet.Program",true).GetMethod("HasErrors",BindingFlags.NonPublic|BindingFlags.Static) ?? throw new MissingMethodException("Program.HasErrors missing");
+   return new {checkpointCount=count,phase=count==1?"before-recycle":null,path=target,moved,replacement,result,reportedError=(bool)hasErrors.Invoke(null,new[]{result}),createdCheckpointCount=createdCount,createdSource,createdPath,createdId,createdError};
+   } finally {createdCheckpoint.GetRemoveMethod(true).Invoke(null,new object[]{createdHandler});}
+  } finally {checkpoint.GetRemoveMethod(true).Invoke(null,new object[]{handler});}
  }
-}finally {
- $env:TEMP=$oldTemp;$env:TMP=$oldTmp
- $report=@{suite=$Suite;runtime='rust';sameSourceBuild=$script:RustFileBuild;sources=$sources;results=@($results);passed=@($results|Where-Object passed).Count;failed=@($results|Where-Object {!$_.passed}).Count;skipped=0;retained=@($OutputDirectory,$FixtureRoot);scope='Actual Windows Shell plus candidate-source test-only Core; separate from shipping CLI/MCP E2E';cleanup='Originals, aliases and replacement Bin items retained without deletion retry. Only the exact owned sparse original is shortened after bounded identity/security/allocation/content proof. Windows-managed Bin ACL changes are recorded separately.'}
- $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($report|ConvertTo-Json -Depth 80));$file=[IO.FileStream]::new($ReportPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
- try{$file.Write($bytes);$file.Flush($true)}finally{$file.Dispose()}
 }
-if($results.Count -ne $Modes.Count -or @($results|Where-Object {!$_.passed}).Count){throw 'Before-recycle native verification failed; retain fixtures and inspect report'}
+'@
+}
+[BeforeRecycleCheckpointHost]::Run($AssemblyPath,$ConfigPath,$TargetPath,$MovedPath,$EvidencePath)

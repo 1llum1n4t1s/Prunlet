@@ -348,7 +348,6 @@ foreach ($case in $cases) {
             if ($case.name -eq 'file-remove-item') { $reasonValid = $reasonValid -and $reason.Contains('detected token "Remove-Item"') }
             if ($case.name -eq 'registry-delete') { $reasonValid = $reasonValid -and $reason.Contains('registry deletion command') -and $reason.Contains('"reg delete"') }
             if ($case.name -in @('quoted-search-ambiguous-shell','ssh-quoted-path-unknown-shell')) { $reasonValid = $reasonValid -and $reason.Contains('Shell metadata is missing or unsupported') -and $reason.Contains('interpretation=CMD') }
-            if ($case.name -eq 'ssh-quoted-path-unknown-shell') { $reasonValid = $reasonValid -and $reason.Contains('not a confirmed local deletion') -and $reason.Contains('setting exec_command.shell alone cannot resolve') -and $reason.Contains('pwsh -NoProfile -EncodedCommand <base64>') }
         }
         $results.Add([pscustomobject]@{ name=$case.name; tool=$tool; input=$event; inputJson=$json; expected=$expected; decision=$decision; exitCode=$process.ExitCode; stdout=$stdout; stderr=$stderr; fixtureUnchanged=$fixtureUnchanged; reasonValid=$reasonValid; passed=($process.ExitCode -eq 0 -and $decision -ceq $expected -and $fixtureUnchanged -and $reasonValid) })
         $process.Dispose()
