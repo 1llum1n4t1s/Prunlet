@@ -22,7 +22,7 @@ Codexセッションの削除失敗を調べる場合は、`bun scripts/scan-pru
 
 新しいファイル経路は、操作記録を作らずWindowsゴミ箱へ移す経路と、予約名の通常ファイル、Windowsのサイズ超過判定後、または対象ボリュームの即時削除設定とゴミ箱利用不可を確認した後に対象名を固定して削除する経路として検証する。旧schema 1〜4/6の復元・圧縮・終了履歴runnerを、新版通常経路の必須成功条件として使わない。旧版exeで作ったデータは下記の明示移行検証だけに使用する。
 
-- 予約名の通常ファイルについてCLI・stdio MCPの永久削除、dry-runの`would_permanently_delete`と不変更、通常名との混合・生存ハードリンク保全を確認する。予約名のディレクトリ・リンク・祖先とdevice構文は拒否し、preflight失敗や実体差し替えで無関係な対象を削除しないことを確認する。
+- 予約名の通常ファイルについてCLI・stdio MCPの永久削除、dry-runの`would_permanently_delete`と不変更、通常名との混合・生存ハードリンク保全を確認する。予約名のディレクトリ・リンク・祖先とdevice構文は拒否し、preflight失敗や実体差し替えで無関係な対象を削除しないことを確認する。予約名ディレクトリの拒否ケースでは、すべての不変更確認後に、検証自身が作った既知IDの空・非reparseディレクトリだけを同じ親の未使用通常名へ正規化する。親と元実体を保持した非上書きrenameを使い、ID不一致・移動先既存時の保全、旧名の消失と新名の同一性を確認する。検証用の後始末であり、製品Coreの予約名拒否や削除方式を変更しない。正規化失敗は元の検証エラーと併記して失敗として残す。
 - CLIの単一・複数・Unicode・長いパス・`--paths-file`・空フォルダー・明示再帰とdry-run、MCPの入力型・余剰property・1〜256件上限を実プロセスで確認する。
   長いパスのShell短縮名を再現する場合は`Verify-LongPathFiles.ps1 -Phase Prepare -OutputDirectory <未使用の外部D絶対パス> -FixtureRoot <未使用の許可済み絶対パス>`を使う。生成された`paths.json`をCLIの`delete --paths-file`へ渡し、dry-runと実削除のstdoutをそれぞれ同出力先の`dry-run.json`・`delete.json`へ保存して、対応する`-Phase VerifyDryRun`・`VerifyDelete`へ実終了コードを`-CliExitCode`で渡す。元の完全名と解決後の完全名、既存の親・実体検査を維持し、File IDだけの一致へ緩和しない。検証は同ID・内容の新規ゴミ箱項目と対象外ファイルの保全を照合する。Windowsの`0x80270038`（ゴミ箱のパス深さ制限）は成功にせず、永久削除へ切り替えずに元対象とゴミ箱を確認する。
 - ファイル結果が`dryRun`・`items`・`warnings`で、項目が`path`・`kind`・`status`・任意`error`だけを返すことを確認する。`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`と終了コード/MCP `isError`を照合し、operationId・backupPath・hash・sizeを返さないことを確認する。dry-runでは予約名の通常ファイルの永久削除予定と、それ以外のサイズ超過による永久削除を予測できない旨を確認する。
@@ -117,7 +117,7 @@ GitHub応答を検証用アーカイブへ差し替え、実際のインスト�
 
 使用中DLL・ファイルの拒否では、元対象の内容・ACL・属性を変えず、永久削除・コピーfallback・利用プロセス停止をしないことを確認する。通常ファイルの保持元はRestart Manager、CLI/MCPのロード済みDLL保持元はモジュール照会により、`error`に保持元PIDとファイルパスが返ることも確認する。`ambiguous`の同じ削除を再送せず、元対象とWindowsゴミ箱を照合する。
 
-ロード中DLLの検証は、削除前にloaderのモジュール一覧へfixtureの完全パスが現れることを確認する。削除後は元対象・ゴミ箱・操作記録の保全を先に検査し、その後に保持元PID・パスの正の観測を判定する。時間上限による未特定を成功へ読み替えない。
+ロード中DLLの検証は、削除前にloaderのモジュール一覧へfixtureの完全パスが現れることを確認する。削除後は元対象・ゴミ箱・操作記録の保全を先に検査し、その後に保持元PID・パスの正の観測を判定する。通常属性のDLLを使う`cli-loaded-dll-held-writable`・`mcp-loaded-dll-held-writable`は、確認済み即時削除設定のDボリュームで固定削除の拒否を再現し、native error 5と`Failure entry`の子ファイル絶対パス、rootのままの結果DTOを確認する。再帰中の失敗は要求rootの`Target`と失敗entryを区別し、保持元診断はそのentryを対象とする。時間上限による未特定を成功へ読み替えない。
 
 case-sensitive属性の準備で通常tokenの`fsutil`が拒否された場合は、新しいfixtureに対して`Verify-RecordlessFiles.ps1 -CaseFilter cli-case-sensitive-directory-preserves-both-names -CaseSensitiveSetupHelperPath <scripts/Enable-VerificationCaseSensitive.ps1の絶対パス>`を明示できる。通常のexe・外部出力・report・許可済みfixture rootの引数も渡す。helperは同じユーザーの管理者tokenで、作成済みの空fixture1個のflagだけを設定し、実体ID・ACL・属性の不変を確認する。UAC表示の有無はOSポリシーに従い、設定は変えない。削除・ゴミ箱照合・復元は元のrunnerの通常tokenで行い、大小文字2名の別IDと内容に加え、Bin内・復元後のcase-sensitive flagも検査する。WSL機能やACLの変更、製品の自動昇格は行わない。
 
