@@ -970,6 +970,149 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         }
     }
     $global:PrunletLatestFixture.zip = $zipPath
+    $managedRepository = Join-Path $OutputDirectory 'managed-git'
+    $managedRoot = Join-Path $managedRepository 'runtimé'
+    $managedRecovery = Join-Path $managedRoot 'recovery'
+    Test-Case 'Managed update accepts only an ignored existing installation and preserves its stage' {
+        New-Item -ItemType Directory -Path $managedRoot,$managedRecovery | Out-Null
+        Copy-Item -LiteralPath (Join-Path $instructionInstall 'bin') -Destination $managedRoot -Recurse
+        Copy-Item -LiteralPath (Join-Path $instructionInstall 'source-info.json') -Destination (Join-Path $managedRoot 'source-info.json')
+        & (Join-Path $managedRoot 'bin\prunlet.exe') --config (Join-Path $managedRoot 'config.json') init --backup-directory $managedRecovery | Out-Null
+        Assert-True ($LASTEXITCODE -eq 0) 'Managed fixture configuration failed.'
+        Set-FixtureVolumeMap (Join-Path $managedRoot 'config.json')
+        $stage = Join-Path $managedRoot '.prunlet-update-stage'
+        New-Item -ItemType Directory -Path $stage | Out-Null
+        $sentinel = Join-Path $stage 'retained-fixture.txt'
+        [IO.File]::WriteAllText($sentinel,'Preserve the previous update stage.')
+        $stageHash = (Get-FileHash -LiteralPath $sentinel).Hash
+        & git -C $managedRepository init --quiet
+        Assert-True ($LASTEXITCODE -eq 0) 'Fixture Git init failed.'
+        & git -C $managedRepository config core.ignorecase true
+        Assert-True ($LASTEXITCODE -eq 0) 'Fixture case-insensitive index setup failed.'
+        [IO.File]::WriteAllText((Join-Path $managedRepository '.gitignore'),"runtimé/`n")
+        & $installer -UpdateManagedInstallation -ExpectedCommitSha $global:PrunletLatestFixture.sha -InstallDirectory $managedRoot -WorkDirectory (Join-Path $OutputDirectory 'managed-update-work') -UpdateBackupRoot $fixtureUpdateBackupRoot | Out-Null
+        Assert-True ((Get-FileHash -LiteralPath $sentinel).Hash -ceq $stageHash) 'Existing update stage changed.'
+        Assert-True ((Get-Content -LiteralPath (Join-Path $managedRoot 'source-info.json') -Raw | ConvertFrom-Json).commitSha -ceq $global:PrunletLatestFixture.sha) 'Managed update installed another source.'
+    }
+    Test-Case 'Normal installation still refuses an ignored installation inside Git' {
+        $before = (Get-FileHash -LiteralPath (Join-Path $managedRoot 'source-info.json')).Hash
+        Expect-Failure { & $installer -InstallDirectory $managedRoot -WorkDirectory (Join-Path $OutputDirectory 'managed-default-refused') -UpdateBackupRoot $fixtureUpdateBackupRoot } 'repository'
+        Assert-True ((Get-FileHash -LiteralPath (Join-Path $managedRoot 'source-info.json')).Hash -ceq $before) 'Default refusal changed the installed product.'
+    }
+    Test-Case 'Registered managed update preserves the existing binding without changing Git excludes' {
+        $managedCodex = Join-Path $OutputDirectory 'managed-codex'
+        New-Item -ItemType Directory -Path $managedCodex | Out-Null
+        $instruction = 'Windowsのファイル・フォルダー・レジストリ削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。'
+        $binding = [ordered]@{executablePath=(Join-Path $managedRoot 'bin\prunlet.exe');configPath=(Join-Path $managedRoot 'config.json')} | ConvertTo-Json -Compress
+        $document = "<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->`n"+$instruction+"`nPrunlet CLI: "+$binding+"`n<!-- END PRUNLET AGENT-INSTRUCTIONS -->`n"
+        $agent = Join-Path $managedCodex 'AGENTS.md'
+        [IO.File]::WriteAllText($agent,$document)
+        $ignore = Join-Path $managedRepository '.gitignore'
+        $originalIgnore = [IO.File]::ReadAllBytes($ignore)
+        $priorCodexHome = $env:CODEX_HOME
+        try {
+            [IO.File]::WriteAllText($ignore,'')
+            $env:CODEX_HOME = $managedCodex
+            $initialGuide=[IO.File]::ReadAllText((Join-Path $managedRoot 'bin\PRUNLET.md')).Replace("`r`n","`n").Replace("`n","`r`n")
+            [IO.File]::WriteAllText((Join-Path $managedCodex 'PRUNLET.md'),$initialGuide,[Text.UTF8Encoding]::new($false))
+            & $installer -UpdateManagedInstallation -ExpectedCommitSha $global:PrunletLatestFixture.sha -CodexHome $managedCodex -InstallDirectory $managedRoot -WorkDirectory (Join-Path $OutputDirectory 'managed-registered-work') -UpdateBackupRoot $fixtureUpdateBackupRoot -RegisterCodex -RegisterAgentInstructions | Out-Null
+            Assert-True ((Get-FileHash -LiteralPath (Join-Path $managedCodex 'PRUNLET.md')).Hash -ceq (Get-FileHash -LiteralPath (Join-Path $managedRoot 'bin\PRUNLET.md')).Hash) 'Managed guide registration did not install the verified guide.'
+            Assert-True ([IO.File]::ReadAllText($ignore) -ceq '') 'Managed update changed Git exclusion rules.'
+            Assert-True ([IO.File]::ReadAllText($agent) -ceq $document) 'Managed update changed its registration without a registration request.'
+            $before = (Get-FileHash -LiteralPath (Join-Path $managedRoot 'source-info.json')).Hash
+            $Repository='1llum1n4t1s/Prunlet'; $Runtime='win-x64'; $CodexHome=$managedCodex
+            $script:ForbiddenRoots=@($repoRoot,$managedCodex,(Join-Path $env:USERPROFILE '.codex'))
+            foreach ($definition in $installerAst.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Test-InTree','Assert-PlainPath','Assert-ExternalPath','Test-RegisteredManagedInstallation','Assert-ManagedExistingPath','Read-ManagedInstallationJson','Get-ManagedInstallationSnapshot','Assert-ManagedInstallationSnapshot','Get-ManagedGuideRegistrationHash')},$true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
+            $snapshot=Get-ManagedInstallationSnapshot $managedRoot
+            $registeredGuide=Join-Path $managedCodex 'PRUNLET.md'
+            $guideText=[IO.File]::ReadAllText((Join-Path $managedRoot 'bin\PRUNLET.md')).Replace("`r`n","`n").Replace("`n","`r`n")
+            [IO.File]::WriteAllText($registeredGuide,$guideText,[Text.UTF8Encoding]::new($false))
+            $guideParameters=@{SourceGuidePath=(Join-Path $repoRoot 'integration\PRUNLET.md');CodexHome=$managedCodex;ExecutablePath=(Join-Path $managedRoot 'bin\prunlet.exe');ConfigPath=(Join-Path $managedRoot 'config.json');PreviousGuideSha256=(Get-ManagedGuideRegistrationHash $snapshot);ValidateOnly=$true}
+            & (Join-Path $repoRoot 'integration\install-agent-instructions.ps1') @guideParameters | Out-Null
+            [IO.File]::WriteAllText($registeredGuide,($guideText+'Edited body'),[Text.UTF8Encoding]::new($false))
+            Expect-Failure { & (Join-Path $repoRoot 'integration\install-agent-instructions.ps1') @guideParameters } 'edited or belongs'
+            $guideParameters.PreviousGuideSha256=Get-ManagedGuideRegistrationHash $snapshot
+            Expect-Failure { & (Join-Path $repoRoot 'integration\install-agent-instructions.ps1') @guideParameters } 'edited or belongs'
+            [IO.File]::WriteAllText($registeredGuide,$guideText.Insert(($guideText.IndexOf('Windows')+1),[string][char]0x200d),[Text.UTF8Encoding]::new($false))
+            $guideParameters.PreviousGuideSha256=Get-ManagedGuideRegistrationHash $snapshot
+            Expect-Failure { & (Join-Path $repoRoot 'integration\install-agent-instructions.ps1') @guideParameters } 'edited or belongs'
+            [IO.File]::WriteAllText($registeredGuide,$guideText,[Text.UTF8Encoding]::new($false))
+            foreach ($invalid in @($document.Replace('Prunlet CLI: ','CLI example: '),($document+$document),$document.Replace($instruction,'Unowned instruction'),$document.Replace($instruction,$instruction.Insert(1,[string][char]0x200d)),$document.Replace('prunlet.exe','other.exe'))) {
+                [IO.File]::WriteAllText($agent,$invalid)
+                Expect-Failure { Assert-ManagedInstallationSnapshot $snapshot } 'Git-ignored'
+                Expect-Failure { & $installer -UpdateManagedInstallation -CodexHome $managedCodex -InstallDirectory $managedRoot -WorkDirectory (Join-Path $OutputDirectory ('managed-binding-refused-'+[guid]::NewGuid().ToString('N'))) -UpdateBackupRoot $fixtureUpdateBackupRoot } 'Git-ignored'
+                Assert-True ((Get-FileHash -LiteralPath (Join-Path $managedRoot 'source-info.json')).Hash -ceq $before) 'Invalid registration changed installed products.'
+            }
+        } finally { $env:CODEX_HOME=$priorCodexHome; [IO.File]::WriteAllBytes($ignore,$originalIgnore); [IO.File]::WriteAllText($agent,$document) }
+    }
+    Test-Case 'Managed update refuses an unknown ignored directory' {
+        $unknown = Join-Path $managedRoot 'unknown'
+        New-Item -ItemType Directory -Path (Join-Path $unknown 'bin') | Out-Null
+        Expect-Failure { & $installer -UpdateManagedInstallation -InstallDirectory $unknown -WorkDirectory (Join-Path $OutputDirectory 'managed-unknown-refused') -UpdateBackupRoot $fixtureUpdateBackupRoot } 'existing installation'
+        Assert-True (!(Test-Path -LiteralPath (Join-Path $unknown 'config.json'))) 'Unknown directory was initialized.'
+        Expect-Failure { & $installer -UpdateManagedInstallation -InstallDirectory $instructionInstall -WorkDirectory (Join-Path $OutputDirectory 'managed-outside-git-refused') -UpdateBackupRoot $fixtureUpdateBackupRoot } 'inside Git'
+    }
+    Test-Case 'Managed update rejects tracked files and a nonignored directory before writes' {
+        $ignore = Join-Path $managedRepository '.gitignore'
+        $originalIgnore = [IO.File]::ReadAllBytes($ignore)
+        [IO.File]::WriteAllText($ignore,'')
+        Expect-Failure { & $installer -UpdateManagedInstallation -InstallDirectory $managedRoot -WorkDirectory (Join-Path $OutputDirectory 'managed-notignored-refused') -UpdateBackupRoot $fixtureUpdateBackupRoot } 'Git-ignored'
+        $tracked = Join-Path $managedRoot 'tracked-sentinel.txt'
+        [IO.File]::WriteAllText($tracked,'Tracked source must be preserved.')
+        & git -C $managedRepository add -- runtimé/tracked-sentinel.txt
+        Assert-True ($LASTEXITCODE -eq 0) 'Fixture index setup failed.'
+        try {
+            [IO.File]::WriteAllText($ignore,"*`n")
+            $before = (Get-FileHash -LiteralPath (Join-Path $managedRoot 'bin\prunlet.exe')).Hash
+            Expect-Failure { & $installer -UpdateManagedInstallation -InstallDirectory $managedRoot -WorkDirectory (Join-Path $OutputDirectory 'managed-tracked-refused') -UpdateBackupRoot $fixtureUpdateBackupRoot } 'tracked files'
+            Expect-Failure { & $installer -UpdateManagedInstallation -InstallDirectory $managedRoot.ToUpperInvariant() -WorkDirectory (Join-Path $OutputDirectory 'managed-tracked-case-refused') -UpdateBackupRoot $fixtureUpdateBackupRoot } 'tracked files'
+            Assert-True ((Get-FileHash -LiteralPath (Join-Path $managedRoot 'bin\prunlet.exe')).Hash -ceq $before) 'Tracked refusal changed the product.'
+        } finally {
+            & git -C $managedRepository update-index --force-remove -- runtimé/tracked-sentinel.txt
+            Assert-True ($LASTEXITCODE -eq 0) 'Fixture index restoration failed.'
+            [IO.File]::WriteAllBytes($ignore,$originalIgnore)
+        }
+    }
+    Test-Case 'Managed update pins configuration and refuses linked recovery and Git indirection' {
+        $Repository = '1llum1n4t1s/Prunlet'; $Runtime = 'win-x64'; $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+        $script:ForbiddenRoots = @($repoRoot,(Join-Path $env:USERPROFILE '.codex'))
+        $tokens = $null; $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($installer,[ref]$tokens,[ref]$parseErrors)
+        foreach ($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Test-InTree','Assert-PlainPath','Assert-ExternalPath','Test-RegisteredManagedInstallation','Assert-ManagedExistingPath','Read-ManagedInstallationJson','Get-ManagedInstallationSnapshot','Assert-ManagedInstallationSnapshot','Assert-ManagedRecoveryBinding')},$true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
+        $snapshot = Get-ManagedInstallationSnapshot $managedRoot
+        $configPath = Join-Path $managedRoot 'config.json'
+        $original = [IO.File]::ReadAllBytes($configPath)
+        $alternate = Join-Path $managedRoot 'alternate-recovery'
+        New-Item -ItemType Directory -Path $alternate | Out-Null
+        try {
+            $document = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json -AsHashtable
+            $document.volumeRecoveryDirectories = @{ 'D:\' = $alternate }
+            [IO.File]::WriteAllText($configPath,($document | ConvertTo-Json -Depth 20))
+            Expect-Failure { Assert-ManagedRecoveryBinding $snapshot } 'changed'
+            [IO.File]::WriteAllBytes($configPath,$original)
+            $document = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+            $document.backupDirectory = $alternate
+            [IO.File]::WriteAllText($configPath,($document | ConvertTo-Json -Depth 20))
+            Expect-Failure { Assert-ManagedInstallationSnapshot $snapshot } 'changed'
+            Expect-Failure { Assert-ManagedRecoveryBinding $snapshot } 'changed'
+            $link = Join-Path $managedRoot 'recovery-link'
+            New-Item -ItemType Junction -Path $link -Target $managedRecovery | Out-Null
+            $document.backupDirectory = $link
+            [IO.File]::WriteAllText($configPath,($document | ConvertTo-Json -Depth 20))
+            Expect-Failure { Get-ManagedInstallationSnapshot $managedRoot } 'links'
+        } finally { [IO.File]::WriteAllBytes($configPath,$original) }
+        $guide = Join-Path $managedRoot 'bin\PRUNLET.md'
+        $originalGuide = [IO.File]::ReadAllBytes($guide)
+        try { [IO.File]::WriteAllText($guide,'Changed auxiliary data'); Expect-Failure { Get-ManagedInstallationSnapshot $managedRoot } 'auxiliary hash' } finally { [IO.File]::WriteAllBytes($guide,$originalGuide) }
+        $priorGitDir = $env:GIT_DIR
+        try { $env:GIT_DIR=Join-Path $managedRepository '.git'; Expect-Failure { Get-ManagedInstallationSnapshot $managedRoot } 'physical Git' } finally { $env:GIT_DIR=$priorGitDir }
+        Expect-Failure { Assert-ManagedExistingPath $repoRoot } 'source or Codex'
+    }
+    Test-Case 'Expected source commit mismatch stops before replacing managed products' {
+        $before = (Get-FileHash -LiteralPath (Join-Path $managedRoot 'source-info.json')).Hash
+        Expect-Failure { & $installer -UpdateManagedInstallation -ExpectedCommitSha ('0'*40) -InstallDirectory $managedRoot -WorkDirectory (Join-Path $OutputDirectory 'managed-sha-refused') -UpdateBackupRoot $fixtureUpdateBackupRoot } 'ExpectedCommitSha'
+        Assert-True ((Get-FileHash -LiteralPath (Join-Path $managedRoot 'source-info.json')).Hash -ceq $before) 'Commit mismatch changed installed provenance.'
+    }
 } finally {
     Remove-Item Function:\Invoke-RestMethod, Function:\Invoke-WebRequest, Function:\Copy-Item
     Remove-Variable PrunletLatestFixture -Scope Global

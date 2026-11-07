@@ -400,9 +400,6 @@ try {
                     [Console]::Error.WriteLine('Prunlet update was deferred while an existing process is active.')
                 } else {
                     if (!$script:StartupUpdateReady) { throw 'Prunlet startup updates are disabled until safe stage reuse is implemented and verified.' }
-                    if ($state.ContainsKey('stageCleanup') -and $state.stageCleanup -ceq 'pending' -and
-                        (!$state.ContainsKey('migrationComplete') -or !$state.migrationComplete) -and
-                        $state.candidateCommit -ine $release.commit) { throw 'An incomplete update targets another commit; it was preserved.' }
                     $begin = & $ExecutablePath --config $ConfigPath __begin-published-update $release.commit $sourceInfo.commitSha
                     if ($LASTEXITCODE -ne 0 -or ($begin | ConvertFrom-Json -AsHashtable).status -notin @('ready', 'existing')) { throw 'Published update state could not be prepared.' }
                     $beginResult = $begin | ConvertFrom-Json -AsHashtable

@@ -133,6 +133,7 @@ internal static class StartupUpdateCoordinator
         public string PriorMaintenanceSha256 { get; set; } = "";
         public string PriorHookSha256 { get; set; } = "";
         public Dictionary<string, string>? PriorAuxiliarySha256 { get; set; }
+        public StageCacheBaseline? CacheBaseline { get; set; }
         public string StageWriteName { get; set; } = "";
         public string StageWriteOldSha256 { get; set; } = "";
         public string StageWriteNewSha256 { get; set; } = "";
@@ -158,6 +159,17 @@ internal static class StartupUpdateCoordinator
         public string Sha256 { get; set; } = "";
         public long Bytes { get; set; }
         public string Status { get; set; } = "writing";
+    }
+
+    internal sealed class StageCacheBaseline
+    {
+        public string Commit { get; set; } = "";
+        public string OwnerSha256 { get; set; } = "";
+        public string SourceInfoSha256 { get; set; } = "";
+        public string CliSha256 { get; set; } = "";
+        public string MaintenanceSha256 { get; set; } = "";
+        public string HookSha256 { get; set; } = "";
+        public Dictionary<string, string> AuxiliarySha256 { get; set; } = new(StringComparer.Ordinal);
     }
 
     private static readonly JsonSerializerOptions StateOptions = new(JsonSerializerDefaults.Web)
@@ -186,12 +198,17 @@ internal static class StartupUpdateCoordinator
             foreach (var property in document.RootElement.EnumerateObject())
             {
                 if (!names.Add(property.Name)) throw new InvalidDataException("Update state contains duplicate fields.");
-                if (property.Name is "priorAuxiliarySha256" or "auxiliaryBackupSha256" or "slotCli" or "slotMaintenance" or "slotHook"
+                if (property.Name is "priorAuxiliarySha256" or "auxiliaryBackupSha256" or "slotCli" or "slotMaintenance" or "slotHook" or "cacheBaseline"
                     && property.Value.ValueKind == JsonValueKind.Object)
                 {
                     var nested = new HashSet<string>(StringComparer.Ordinal);
                     foreach (var field in property.Value.EnumerateObject())
+                    {
                         if (!nested.Add(field.Name)) throw new InvalidDataException("Update state contains duplicate nested fields.");
+                        if (property.Name == "cacheBaseline" && field.Name == "auxiliarySha256" && field.Value.ValueKind == JsonValueKind.Object
+                            && field.Value.EnumerateObject().Select(item => item.Name).Distinct(StringComparer.Ordinal).Count() != field.Value.EnumerateObject().Count())
+                            throw new InvalidDataException("Update state contains duplicate cache auxiliary fields.");
+                    }
                 }
             }
             if (!names.Contains("product") || !names.Contains("schema") || !names.Contains("phase") || !names.Contains("epoch"))
@@ -205,6 +222,18 @@ internal static class StartupUpdateCoordinator
 
     private static void ValidateState(UpdateState state)
     {
+        if (state.CacheBaseline is not null
+            && (state.PriorStageCommit != "" || state.PriorStageInfoSha256 != "" || state.PriorPreviousInfoSha256 != ""
+                || state.PriorOwnerSha256 != "" || state.PriorCliSha256 != "" || state.PriorMaintenanceSha256 != ""
+                || state.PriorHookSha256 != "" || state.PriorAuxiliarySha256 is not null))
+            throw new InvalidDataException("Update state mixes unapplied cache and completed stage provenance.");
+        if (state.CacheBaseline is { } cache
+            && (!IsHex(cache.Commit, 40) || !IsHex(cache.OwnerSha256, 64) || !IsHex(cache.SourceInfoSha256, 64)
+                || !IsHex(cache.CliSha256, 64) || !IsHex(cache.MaintenanceSha256, 64) || !IsHex(cache.HookSha256, 64)
+                || cache.AuxiliarySha256 is null
+                || !cache.AuxiliarySha256.Keys.ToHashSet(StringComparer.Ordinal).SetEquals(AuxiliaryProducts.Select(item => @"bin\" + item.BinName))
+                || cache.AuxiliarySha256.Values.Any(hash => !IsHex(hash, 64))))
+            throw new InvalidDataException("Update state has incomplete staged cache provenance.");
         if (state.Product != "Prunlet" || state.Schema != 1 || state.Epoch != 1
             || state.Phase is not ("idle" or "switching" or "migrating" or "cleanup")
             || state.CleanupCli is not ("pending" or "attempting" or "done")
@@ -349,6 +378,24 @@ internal static class StartupUpdateCoordinator
             throw new IOException("A previous update is still active and was preserved.");
         if (state?.StageCleanup == "pending")
         {
+            if (!string.Equals(state.CandidateCommit, commit, StringComparison.OrdinalIgnoreCase)
+                && !state.MigrationComplete && string.IsNullOrEmpty(state.CandidateCliSha256))
+            {
+                if (!stageExists || state.CacheBaseline is not null || state.IntegrationReady
+                    || !string.IsNullOrEmpty(state.StageWriteName) || !string.IsNullOrEmpty(state.RotationStatus)
+                    || !string.IsNullOrEmpty(state.AuxiliaryRotationStatus) || !string.IsNullOrEmpty(state.PriorStageCommit))
+                    throw new IOException("A previous unapplied update requires attention and was preserved.");
+                var baseline = RecognizeUnappliedStage(root, state);
+                state = new UpdateState { CandidateCommit = commit.ToUpperInvariant(), StageCleanup = "pending",
+                    PreparedInstalledSourceInfoSha256 = installedInfoHash, CacheBaseline = baseline,
+                    SlotCli = state.SlotCli, SlotMaintenance = state.SlotMaintenance, SlotHook = state.SlotHook,
+                    PackageName = state.PackageName, PackageStatus = "ready",
+                    PackagePreviousSha256 = state.PackagePreviousSha256, PackagePreviousBytes = state.PackagePreviousBytes };
+                // cacheの証明を先に確定し、owner切替中断時も同じ旧hashから再開する。
+                WriteState(root, state);
+                UpdateStageOwner(root, state);
+                return new BeginPublishedResult("ready", commit.ToUpperInvariant());
+            }
             if (state.MigrationComplete && stageExists && !string.IsNullOrEmpty(state.CandidateCliSha256))
             {
                 if (string.Equals(state.CandidateCommit, commit, StringComparison.OrdinalIgnoreCase))
@@ -419,7 +466,7 @@ internal static class StartupUpdateCoordinator
                 throw new IOException("Installed provenance changed after update preparation; the stage was preserved.");
             if (stageExists)
             {
-                if (!string.IsNullOrEmpty(state.PriorStageCommit)) UpdateStageOwner(root, state);
+                if (!string.IsNullOrEmpty(state.PriorStageCommit) || state.CacheBaseline is not null) UpdateStageOwner(root, state);
                 VerifyStageOwner(stage, root, commit);
                 return new BeginPublishedResult("existing", commit.ToUpperInvariant());
             }
@@ -453,6 +500,153 @@ internal static class StartupUpdateCoordinator
         return new BeginPublishedResult("ready", commit.ToUpperInvariant());
     }
 
+    private static StageCacheBaseline RecognizeUnappliedStage(string root, UpdateState state)
+    {
+        if (state.PackageStatus != "ready" || !IsHex(state.PackagePreviousSha256, 64) || state.PackagePreviousBytes <= 0
+            || state.CleanupCli != "pending" || state.CleanupMaintenance != "pending" || state.CleanupHook != "pending"
+            || state.RotationName != "" || state.RotationStatus != "" || state.RotationPriorSha256 != ""
+            || state.RotationCandidateSha256 != "" || state.RotationBackupName != ""
+            || state.PriorStageCommit != "" || state.PriorStageInfoSha256 != "" || state.PriorPreviousInfoSha256 != ""
+            || state.PriorOwnerSha256 != "" || state.PriorCliSha256 != "" || state.PriorMaintenanceSha256 != ""
+            || state.PriorHookSha256 != "" || state.PriorAuxiliarySha256 is not null
+            || state.StageWriteName != "" || state.StageWriteOldSha256 != "" || state.StageWriteNewSha256 != "" || state.StageWriteBytes != 0
+            || state.AuxiliaryRotationName != "" || state.AuxiliaryRotationStatus != ""
+            || state.AuxiliaryRotationOldSha256 != "" || state.AuxiliaryRotationNewSha256 != ""
+            || !string.IsNullOrEmpty(state.CandidateMaintenanceSha256) || !string.IsNullOrEmpty(state.CandidateSourceInfoSha256)
+            || !string.IsNullOrEmpty(state.OldCommit) || state.AuxiliaryBackupSha256.Count != 0
+            || !string.IsNullOrEmpty(state.RotationCliBackup) || !string.IsNullOrEmpty(state.RotationMaintenanceBackup)
+            || !string.IsNullOrEmpty(state.RotationHookBackup))
+            throw new IOException("The previous unapplied stage has incomplete or active provenance.");
+        var stage = Path.Combine(root, ".prunlet-update-stage");
+        using var parents = PathPolicy.PinDirectories(stage);
+        // 来歴の検査からhash固定まで同じ実体を保持し、途中の差替えを認定しない。
+        using var ownerGuard = OpenStageMetadataGuard(Path.Combine(stage, ".prunlet-stage-owner.json"));
+        using var infoGuard = OpenStageMetadataGuard(Path.Combine(stage, "source-info.json"));
+        var ownerHash = Convert.ToHexString(SHA256.HashData(ownerGuard));
+        var infoHash = Convert.ToHexString(SHA256.HashData(infoGuard));
+        infoGuard.Position = 0;
+        VerifyStageOwner(stage, root, state.CandidateCommit);
+        var allowed = AuxiliaryProducts.Select(item => item.StagePath).ToHashSet(StringComparer.Ordinal);
+        allowed.UnionWith([".prunlet-stage-owner.json", "source-info.json", "prunlet.exe", "prunlet-maintenance.exe", "prunlet-hook.exe", state.PackageName]);
+        CheckDirectory(stage, "");
+        void CheckDirectory(string path, string relative)
+        {
+            using var pinned = PathPolicy.PinDirectories(path);
+            NativeFiles.RejectNamedStreams(path);
+            foreach (var entry in Directory.EnumerateFileSystemEntries(path))
+            {
+                var name = relative + Path.GetFileName(entry);
+                var attributes = File.GetAttributes(entry);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException("A linked stage entry was preserved.");
+                if ((attributes & FileAttributes.Directory) != 0)
+                {
+                    if (name is not ("scripts" or "integration")) throw new IOException("An unknown stage directory was preserved.");
+                    CheckDirectory(entry, name + @"\");
+                }
+                else
+                {
+                    if (!allowed.Remove(name)) throw new IOException("An unknown stage file was preserved.");
+                    NativeFiles.RejectNamedStreams(entry);
+                }
+            }
+        }
+        if (allowed.Count != 0) throw new IOException("The previous unapplied stage is incomplete.");
+        var infoPath = Path.Combine(stage, "source-info.json");
+        var prior = ReadProvenance(infoPath);
+        if (!prior.Commit.Equals(state.CandidateCommit, StringComparison.OrdinalIgnoreCase)
+            || !ReadArchiveHash(infoPath).Equals(state.PackagePreviousSha256, StringComparison.OrdinalIgnoreCase))
+            throw new IOException("The staged provenance differs from its package state.");
+        using var info = JsonDocument.Parse(infoGuard);
+        ValidateUnappliedSourceInfo(info.RootElement);
+        using var package = StartupUpdatePackage.OpenVerified(root,
+            info.RootElement.GetProperty("repository").GetString()!, info.RootElement.GetProperty("defaultBranch").GetString()!,
+            prior.Commit, info.RootElement.GetProperty("runtime").GetString()!, state.PackagePreviousSha256, state.PackagePreviousBytes);
+        foreach (var product in package.Products)
+        {
+            var leaf = product.Name["bin/".Length..];
+            var expected = leaf switch
+            {
+                "prunlet.exe" => prior.CliHash,
+                "prunlet-maintenance.exe" => prior.MaintenanceHash,
+                "prunlet-hook.exe" => prior.HookHash,
+                _ => prior.AuxiliaryHashes[@"bin\" + leaf]
+            };
+            if (!product.Sha256.Equals(expected, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("The staged product provenance differs from its package manifest.");
+            var relative = leaf.EndsWith(".exe", StringComparison.Ordinal) ? leaf
+                : AuxiliaryProducts.Single(item => item.BinName == leaf).StagePath;
+            VerifyCacheFile(Path.Combine(stage, relative), product.Sha256, product.Bytes);
+            var (kind, slot) = leaf switch
+            {
+                "prunlet.exe" => ("cli", state.SlotCli),
+                "prunlet-maintenance.exe" => ("maintenance", state.SlotMaintenance),
+                "prunlet-hook.exe" => ("hook", state.SlotHook),
+                _ => ("", null)
+            };
+            if (kind.Length == 0) continue;
+            if (slot is null || slot.Status != "ready" || slot.Bytes != product.Bytes
+                || !slot.Sha256.Equals(product.Sha256, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("The staged executable has no matching ready slot.");
+            VerifyCacheFile(Path.Combine(root, ".prunlet-update-slots", $"slot-{kind}-{slot.Generation}.bin"), slot.Sha256, slot.Bytes);
+        }
+        EnsureOwnedSlotDirectory(root);
+        StartupUpdateBudget.Ensure(root, 0);
+        return new StageCacheBaseline { Commit = prior.Commit,
+            OwnerSha256 = ownerHash, SourceInfoSha256 = infoHash,
+            CliSha256 = prior.CliHash, MaintenanceSha256 = prior.MaintenanceHash, HookSha256 = prior.HookHash,
+            AuxiliarySha256 = prior.AuxiliaryHashes.ToDictionary(item => item.Key, item => item.Value, StringComparer.Ordinal) };
+    }
+
+    private static void ValidateUnappliedSourceInfo(JsonElement info)
+    {
+        string[] names = ["repository", "defaultBranch", "commitSha", "downloadUrl", "archiveSha256",
+            "executableSha256", "maintenanceExecutableSha256", "hookExecutableSha256", "auxiliarySha256", "runtime"];
+        var fields = info.EnumerateObject().ToArray();
+        if (fields.Length != names.Length || !fields.Select(field => field.Name).ToHashSet(StringComparer.Ordinal).SetEquals(names)
+            || fields.Any(field => field.Value.ValueKind != (field.Name == "auxiliarySha256" ? JsonValueKind.Object : JsonValueKind.String)))
+            throw new InvalidDataException("Unapplied stage provenance has unknown, duplicate, or malformed fields.");
+        var repository = info.GetProperty("repository").GetString()!;
+        var branch = info.GetProperty("defaultBranch").GetString()!;
+        var downloadUrl = info.GetProperty("downloadUrl").GetString()!;
+        var prefix = $"https://api.github.com/repos/{repository}/releases/assets/";
+        if (!System.Text.RegularExpressions.Regex.IsMatch(repository, @"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z")
+            || string.IsNullOrEmpty(branch) || branch.Contains("..", StringComparison.Ordinal) || branch.StartsWith('/') || branch.EndsWith('/')
+            || branch.Any(c => !char.IsAsciiLetterOrDigit(c) && c is not ('.' or '_' or '/' or '-'))
+            || !downloadUrl.StartsWith(prefix, StringComparison.Ordinal)
+            || !long.TryParse(downloadUrl.AsSpan(prefix.Length), System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var assetId) || assetId <= 0
+            || info.GetProperty("runtime").GetString() is not ("win-x64" or "win-arm64"))
+            throw new InvalidDataException("Unapplied stage provenance has unsupported release metadata.");
+    }
+
+    private static FileStream OpenStageMetadataGuard(string path)
+    {
+        var handle = NativeFiles.OpenBackup(path);
+        try
+        {
+            NativeFiles.Verify(handle, path);
+            NativeFiles.VerifySingleLink(handle);
+            NativeFiles.RejectNamedStreams(path);
+            var stream = new FileStream(handle, FileAccess.Read);
+            if (stream.Length > 65536) { stream.Dispose(); throw new InvalidDataException("Stage metadata exceeds its supported size."); }
+            return stream;
+        }
+        catch { handle.Dispose(); throw; }
+    }
+
+    private static void VerifyCacheFile(string path, string hash, long bytes)
+    {
+        NativeFiles.RejectNamedStreams(path);
+        using var handle = NativeFiles.OpenBackup(path);
+        NativeFiles.Verify(handle, path);
+        NativeFiles.VerifySingleLink(handle);
+        using var stream = new FileStream(handle, FileAccess.Read);
+        if (stream.Length != bytes || !Convert.ToHexString(SHA256.HashData(stream)).Equals(hash, StringComparison.OrdinalIgnoreCase))
+            throw new IOException("A changed staged cache file was preserved: " + path);
+        NativeFiles.RejectNamedStreams(path);
+    }
+
     private static void UpdateStageOwner(string root, UpdateState state)
     {
         var owner = Path.Combine(root, ".prunlet-update-stage", ".prunlet-stage-owner.json");
@@ -461,7 +655,7 @@ internal static class StartupUpdateCoordinator
         StartupUpdateBudget.Ensure(root, bytes.Length);
         using var input = new MemoryStream(bytes, writable: false);
         WriteKnownStageProduct(root, state, "owner", owner, input, bytes.Length,
-            Convert.ToHexString(SHA256.HashData(bytes)), state.PriorOwnerSha256);
+            Convert.ToHexString(SHA256.HashData(bytes)), state.CacheBaseline?.OwnerSha256 ?? state.PriorOwnerSha256);
         VerifyStageOwner(Path.GetDirectoryName(owner)!, root, state.CandidateCommit);
     }
 
@@ -492,8 +686,10 @@ internal static class StartupUpdateCoordinator
         using var package = StartupUpdatePackage.OpenVerified(root, repository, branch, commit, runtime, assetSha256, assetBytes);
         StartupUpdateBudget.Ensure(root, 0);
         EnsureOwnedSlotDirectory(root);
-        var prior = string.IsNullOrEmpty(state.PriorStageCommit) ? null : ReadProvenance(Path.Combine(root, "source-info.json"));
-        if (prior is not null && !prior.Commit.Equals(state.PriorStageCommit, StringComparison.OrdinalIgnoreCase))
+        var prior = state.CacheBaseline is { } cache
+            ? new Provenance(cache.Commit, cache.CliSha256, cache.MaintenanceSha256, cache.HookSha256, cache.AuxiliarySha256)
+            : string.IsNullOrEmpty(state.PriorStageCommit) ? null : ReadProvenance(Path.Combine(root, "source-info.json"));
+        if (state.CacheBaseline is null && prior is not null && !prior.Commit.Equals(state.PriorStageCommit, StringComparison.OrdinalIgnoreCase))
             throw new IOException("Installed provenance no longer matches the prior stage.");
         var warnings = new List<string>();
         PrepareSlot(root, state, package, StartupUpdateSlot.Product.Cli, "bin/prunlet.exe", prior?.CliHash, warnings);
@@ -525,7 +721,7 @@ internal static class StartupUpdateCoordinator
         };
         var bytes = JsonSerializer.SerializeToUtf8Bytes(info, StateOptions);
         var infoHash = Convert.ToHexString(SHA256.HashData(bytes));
-        var priorInfoHash = prior is null ? null : state.PriorStageInfoSha256;
+        var priorInfoHash = state.CacheBaseline?.SourceInfoSha256 ?? (prior is null ? null : state.PriorStageInfoSha256);
         StartupUpdateBudget.Ensure(root, StageProductReserve(Path.Combine(stage, "source-info.json"), bytes.Length, infoHash, priorInfoHash));
         using (var input = new MemoryStream(bytes, writable: false))
             WriteStageProduct(root, state, "source-info.json", Path.Combine(stage, "source-info.json"), input, bytes.Length, infoHash, priorInfoHash);

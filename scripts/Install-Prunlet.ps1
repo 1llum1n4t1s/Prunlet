@@ -14,7 +14,9 @@ param(
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [string]$SettingsBackupDirectory,
     [switch]$PrepareStartupUpdate,
-    [switch]$UseGitHubCliAuthentication
+    [switch]$UseGitHubCliAuthentication,
+    [switch]$UpdateManagedInstallation,
+    [ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedCommitSha
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -106,6 +108,136 @@ function New-TrackedDirectory([string]$Path) {
         $createdDirectories.Add(@{ path = $directory; createdUtcTicks = (Get-Item -LiteralPath $directory).CreationTimeUtc.Ticks })
     }
 }
+function Test-RegisteredManagedInstallation([string]$Root) {
+    $effectiveHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    if (!(Assert-PlainPath $CodexHome 'CodexHome').Equals((Assert-PlainPath $effectiveHome 'Effective CodexHome'),[StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $document = Assert-PlainPath (Join-Path $CodexHome 'AGENTS.md') 'Existing CLI registration'
+    if (!(Test-Path -LiteralPath $document -PathType Leaf)) { return $false }
+    $text = [IO.File]::ReadAllText($document)
+    if ([regex]::Matches($text,'BEGIN PRUNLET AGENT-INSTRUCTIONS').Count -ne 1 -or [regex]::Matches($text,'END PRUNLET AGENT-INSTRUCTIONS').Count -ne 1) { return $false }
+    $block = [regex]::Matches($text,'(?ms)^<!-- BEGIN PRUNLET AGENT-INSTRUCTIONS -->\r?\n(.*?)^<!-- END PRUNLET AGENT-INSTRUCTIONS -->\r?$')
+    if ($block.Count -ne 1 -or $block[0].Index -ne 0) { return $false }
+    $line = [regex]::Matches($block[0].Groups[1].Value,'(?m)^Prunlet CLI: (\{[^\r\n]*\})\r?$')
+    if ($line.Count -ne 1) { return $false }
+    try {
+        $binding = $line[0].Groups[1].Value | ConvertFrom-Json -ErrorAction Stop
+        $instruction = 'Windowsのファイル・フォルダー・レジストリ削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。'
+        $canonical = $instruction + "`nPrunlet CLI: " + ([ordered]@{executablePath=$binding.executablePath;configPath=$binding.configPath} | ConvertTo-Json -Compress) + "`n"
+        if (![string]::Equals($block[0].Groups[1].Value.Replace("`r`n","`n"),$canonical,[StringComparison]::Ordinal)) { return $false }
+        $executable = Assert-PlainPath ([string]$binding.executablePath) 'Registered CLI'
+        $configuration = Assert-PlainPath ([string]$binding.configPath) 'Registered configuration'
+        return $executable.Equals((Join-Path $Root 'bin\prunlet.exe'),[StringComparison]::OrdinalIgnoreCase) -and $configuration.Equals((Join-Path $Root 'config.json'),[StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+function Assert-ManagedExistingPath([string]$Path,[switch]$RegisteredInstallation,[switch]$RequireGit) {
+    $full = Assert-PlainPath $Path 'Managed installation path'
+    foreach ($forbidden in $script:ForbiddenRoots) {
+        if (Test-InTree $full $forbidden) { throw 'Managed installation cannot use a source or Codex directory.' }
+    }
+    if (!(Test-Path -LiteralPath $full -PathType Container)) { throw 'Managed installation directories must already exist.' }
+    $repositories = [Collections.Generic.List[string]]::new()
+    $cursor = $full
+    while ($cursor) {
+        if (Test-Path -LiteralPath (Join-Path $cursor 'src\Prunlet\Prunlet.csproj')) { throw 'Managed installation cannot be inside a source tree.' }
+        if (Test-Path -LiteralPath (Join-Path $cursor '.git')) { $repositories.Add($cursor) }
+        $cursor = Split-Path -Parent $cursor
+    }
+    if ($RequireGit -and !$repositories.Count) { throw 'Managed update mode requires an existing installation inside Git.' }
+    if ($repositories.Count -gt 1) { throw 'Nested Git repositories are unsupported for managed installation.' }
+    if ($repositories.Count) {
+        foreach ($variable in @('GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE','GIT_COMMON_DIR','GIT_LITERAL_PATHSPECS')) {
+            if ([Environment]::GetEnvironmentVariable($variable)) { throw 'Managed installation requires the physical Git repository and index.' }
+        }
+        $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $gitRoot = $repositories[0]
+        $actual = & $git.Source --no-optional-locks --literal-pathspecs -c core.fsmonitor=false -C $gitRoot rev-parse --show-toplevel 2>$null
+        if ($LASTEXITCODE -ne 0 -or !$actual -or !(Assert-PlainPath ([string]$actual) 'Git root').Equals($gitRoot,[StringComparison]::OrdinalIgnoreCase)) { throw 'Managed installation Git repository could not be verified.' }
+        & $git.Source --no-optional-locks -c core.fsmonitor=false -C $gitRoot check-ignore --no-index -q -- $full 2>$null
+        if ($LASTEXITCODE -ne 0 -and !($LASTEXITCODE -eq 1 -and $RegisteredInstallation)) { throw 'Managed installation path must be Git-ignored or match its existing CLI registration.' }
+        $indexStart = [Diagnostics.ProcessStartInfo]::new($git.Source)
+        $indexStart.UseShellExecute = $false; $indexStart.CreateNoWindow = $true
+        $indexStart.RedirectStandardOutput = $true; $indexStart.RedirectStandardError = $true
+        $indexStart.StandardOutputEncoding = [Text.UTF8Encoding]::new($false,$true)
+        foreach ($argument in @('--no-optional-locks','-c','core.fsmonitor=false','-C',$gitRoot,'ls-files','-z')) { $indexStart.ArgumentList.Add($argument) }
+        $indexProcess = [Diagnostics.Process]::Start($indexStart)
+        try {
+            $indexError = $indexProcess.StandardError.ReadToEndAsync()
+            $indexText = $indexProcess.StandardOutput.ReadToEnd()
+            $indexProcess.WaitForExit(); [void]$indexError.GetAwaiter().GetResult()
+            if ($indexProcess.ExitCode -ne 0) { throw 'Managed installation path contains tracked files or an unverifiable index.' }
+            foreach ($entry in $indexText.Split([char]0,[StringSplitOptions]::RemoveEmptyEntries)) {
+                $trackedPath = [IO.Path]::GetFullPath((Join-Path $gitRoot $entry))
+                if (Test-InTree $trackedPath $full) { throw 'Managed installation path contains tracked files or an unverifiable index.' }
+            }
+        } finally { $indexProcess.Dispose() }
+    }
+    return $full
+}
+function Read-ManagedInstallationJson([string]$Path) {
+    [void](Assert-PlainPath $Path 'Managed installation file')
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'Managed update requires an existing installation and configuration.' }
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $reader = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes,$false),[Text.Encoding]::UTF8,$true)
+    try { $value = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop } finally { $reader.Dispose() }
+    return @{ value=$value; hash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)) }
+}
+function Get-ManagedInstallationSnapshot([string]$Root) {
+    $rootPath = Assert-PlainPath $Root 'Managed installation root'
+    $registered = Test-RegisteredManagedInstallation $rootPath
+    $full = Assert-ManagedExistingPath $rootPath -RegisteredInstallation:$registered -RequireGit
+    [void](Assert-ManagedExistingPath (Join-Path $full 'bin') -RegisteredInstallation:$registered)
+    $configuration = Read-ManagedInstallationJson (Join-Path $full 'config.json')
+    $provenance = Read-ManagedInstallationJson (Join-Path $full 'source-info.json')
+    $info = $provenance.value
+    if (![string]::Equals($info.repository,$Repository,[StringComparison]::OrdinalIgnoreCase) -or ![string]::Equals($info.runtime,$Runtime,[StringComparison]::Ordinal) -or $info.commitSha -notmatch '^[0-9a-fA-F]{40}$' -or $configuration.value.schema -ne 1) { throw 'Managed installation metadata does not match the requested product.' }
+    $recoveryPath = Assert-PlainPath ([string]$configuration.value.backupDirectory) 'Managed recovery'
+    $recovery = if (Test-InTree $recoveryPath $full) { Assert-ManagedExistingPath $recoveryPath -RegisteredInstallation:$registered } else { Assert-ExternalPath $recoveryPath 'Configured backupDirectory' }
+    if ((Test-InTree $full $recovery) -or (Test-InTree $recovery (Join-Path $full 'bin'))) { throw 'Managed recovery overlaps installed products.' }
+    $hashes = [ordered]@{}
+    foreach ($entry in @(@('prunlet.exe','executableSha256'),@('prunlet-maintenance.exe','maintenanceExecutableSha256'),@('prunlet-hook.exe','hookExecutableSha256'))) {
+        $path = Assert-PlainPath (Join-Path $full ('bin\'+$entry[0])) 'Managed product'
+        $expected = [string]$info.($entry[1])
+        if ($expected -notmatch '^[0-9a-fA-F]{64}$' -or !(Test-Path -LiteralPath $path -PathType Leaf) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $expected) { throw 'Managed installation product hash mismatch.' }
+        $hashes[$entry[0]] = $expected.ToUpperInvariant()
+    }
+    foreach ($name in @('Install-Prunlet.ps1','start-prunlet-mcp.ps1','configuration-common.ps1','maintenance-task.ps1','uninstall-maintenance.ps1','install-codex.ps1','uninstall-codex.ps1','install-agent-instructions.ps1','PRUNLET.md')) {
+        $relative = 'bin\'+$name
+        $path = Assert-PlainPath (Join-Path $full $relative) 'Managed auxiliary product'
+        $expected = [string]$info.auxiliarySha256.($relative)
+        if ($expected -notmatch '^[0-9a-fA-F]{64}$' -or !(Test-Path -LiteralPath $path -PathType Leaf) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $expected) { throw 'Managed installation auxiliary hash mismatch.' }
+        $hashes[$relative] = $expected.ToUpperInvariant()
+    }
+    if (Test-Path -LiteralPath (Join-Path $full 'bin\codex-pretooluse.ps1')) { throw 'Unowned retired backend was preserved; managed update cannot replace it.' }
+    return [ordered]@{ root=$full; recovery=$recovery; registered=$registered; configHash=$configuration.hash; sourceInfoHash=$provenance.hash; products=$hashes }
+}
+function Assert-ManagedInstallationSnapshot($Snapshot) {
+    $current = Get-ManagedInstallationSnapshot $Snapshot.root
+    if (![string]::Equals(($current | ConvertTo-Json -Depth 5 -Compress),($Snapshot | ConvertTo-Json -Depth 5 -Compress),[StringComparison]::Ordinal)) { throw 'Managed installation or recovery configuration changed; nothing was replaced.' }
+}
+function Get-ManagedGuideRegistrationHash($Snapshot) {
+    $previous = Assert-PlainPath (Join-Path $Snapshot.root 'bin\PRUNLET.md') 'Managed guide'
+    $expected = $Snapshot.products['bin\PRUNLET.md']
+    $previousBytes = [IO.File]::ReadAllBytes($previous)
+    if ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($previousBytes)) -ine $expected) { throw 'Managed installation auxiliary hash mismatch.' }
+    $current = Assert-PlainPath (Join-Path $CodexHome 'PRUNLET.md') 'Registered guide'
+    if (!(Test-Path -LiteralPath $current -PathType Leaf)) { return $expected }
+    $currentBytes = [IO.File]::ReadAllBytes($current)
+    $utf8 = [Text.UTF8Encoding]::new($false,$true)
+    # 本文が一致する改行形式の差だけを認識し、編集済み本文の拒否は登録helperに委ねる。
+    if ([string]::Equals($utf8.GetString($previousBytes).Replace("`r`n","`n"),$utf8.GetString($currentBytes).Replace("`r`n","`n"),[StringComparison]::Ordinal)) {
+        return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($currentBytes))
+    }
+    return $expected
+}
+function Assert-ManagedRecoveryBinding($Snapshot,[string]$ExpectedConfigHash = $Snapshot.configHash) {
+    $registered = Test-RegisteredManagedInstallation $Snapshot.root
+    [void](Assert-ManagedExistingPath $Snapshot.root -RegisteredInstallation:$registered -RequireGit)
+    $configuration = Read-ManagedInstallationJson (Join-Path $Snapshot.root 'config.json')
+    if ($configuration.hash -ine $ExpectedConfigHash) { throw 'Managed recovery configuration changed; migration was not started.' }
+    $recoveryPath = Assert-PlainPath ([string]$configuration.value.backupDirectory) 'Managed recovery'
+    $recovery = if (Test-InTree $recoveryPath $Snapshot.root) { Assert-ManagedExistingPath $recoveryPath -RegisteredInstallation:$registered } else { Assert-ExternalPath $recoveryPath 'Configured backupDirectory' }
+    if (!$recovery.Equals($Snapshot.recovery,[StringComparison]::OrdinalIgnoreCase)) { throw 'Managed recovery configuration changed; migration was not started.' }
+}
 function Expand-CheckedArchive([string]$Archive, [string]$Destination) {
     $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
     try {
@@ -155,7 +287,8 @@ $ForbiddenRoots = @((Assert-PlainPath $CodexHome 'CodexHome'), (Join-Path $env:U
 if ($env:CODEX_HOME) { $ForbiddenRoots += Assert-PlainPath $env:CODEX_HOME 'CODEX_HOME' }
 $scriptParent = Split-Path -Parent $PSScriptRoot
 if (Test-Path -LiteralPath (Join-Path $scriptParent 'src\Prunlet\Prunlet.csproj')) { $ForbiddenRoots += $scriptParent }
-$InstallDirectory = Assert-ExternalPath $InstallDirectory 'InstallDirectory'
+$managedInstallation = if ($UpdateManagedInstallation) { Get-ManagedInstallationSnapshot $InstallDirectory } else { $null }
+$InstallDirectory = if ($managedInstallation) { $managedInstallation.root } else { Assert-ExternalPath $InstallDirectory 'InstallDirectory' }
 
 if (!$WorkDirectory) {
     $WorkDirectory = Join-Path ([IO.Path]::GetTempPath()) "Codex\Prunlet\$runId"
@@ -169,12 +302,13 @@ if (Test-Path -LiteralPath $InstallDirectory -PathType Leaf) { throw 'InstallDir
 $configPath = Join-Path $InstallDirectory 'config.json'
 $existingConfig = Test-Path -LiteralPath $configPath -PathType Leaf
 
-if (!$BackupDirectory) { $BackupDirectory = Join-Path $InstallDirectory 'recovery' }
-$BackupDirectory = Assert-ExternalPath $BackupDirectory 'BackupDirectory'
+if (!$BackupDirectory) { $BackupDirectory = if ($managedInstallation) { $managedInstallation.recovery } else { Join-Path $InstallDirectory 'recovery' } }
+$BackupDirectory = Assert-PlainPath $BackupDirectory 'BackupDirectory'
+$BackupDirectory = if ($managedInstallation -and ([IO.Path]::GetFullPath($BackupDirectory).TrimEnd('\','/')).Equals($managedInstallation.recovery,[StringComparison]::OrdinalIgnoreCase)) { $managedInstallation.recovery } else { Assert-ExternalPath $BackupDirectory 'BackupDirectory' }
 if ($existingConfig) {
     [void](Assert-PlainPath $configPath 'ConfigPath')
     $existing = [IO.File]::ReadAllText($configPath) | ConvertFrom-Json
-    $effectiveBackup = Assert-ExternalPath $existing.backupDirectory 'Configured backupDirectory'
+    $effectiveBackup = if ($managedInstallation) { $managedInstallation.recovery } else { Assert-ExternalPath $existing.backupDirectory 'Configured backupDirectory' }
 } else { $effectiveBackup = $BackupDirectory }
 if ((Test-InTree $effectiveBackup $WorkDirectory) -or (Test-InTree $WorkDirectory $effectiveBackup)) { throw 'WorkDirectory and recovery backup must be separate trees.' }
 $UpdateBackupRoot = Assert-ExternalPath $UpdateBackupRoot 'UpdateBackupRoot'
@@ -188,7 +322,7 @@ if ($LASTEXITCODE -ne 0 -or !($sdks | Where-Object { $_ -match '^10\.' })) { thr
 $products = @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\prunlet-hook.exe', 'bin\Install-Prunlet.ps1', 'bin\start-prunlet-mcp.ps1', 'bin\configuration-common.ps1', 'bin\maintenance-task.ps1', 'bin\uninstall-maintenance.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
 $retiredProducts = @('bin\codex-pretooluse.ps1')
 $previousGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
-$previousGuideSha256 = if (Test-Path -LiteralPath $previousGuidePath -PathType Leaf) { (Get-FileHash -LiteralPath $previousGuidePath -Algorithm SHA256).Hash } else { $null }
+$previousGuideSha256 = if ($managedInstallation -and $RegisterAgentInstructions) { Get-ManagedGuideRegistrationHash $managedInstallation } elseif (Test-Path -LiteralPath $previousGuidePath -PathType Leaf) { (Get-FileHash -LiteralPath $previousGuidePath -Algorithm SHA256).Hash } else { $null }
 foreach ($relative in @($products + $retiredProducts)) {
     $target = Assert-PlainPath (Join-Path $InstallDirectory $relative) 'Installed product path'
     if (Test-Path -LiteralPath $target -PathType Container) { throw "Installed product path is a directory: $target" }
@@ -219,12 +353,14 @@ try {
     if (!$globalMutexAcquired) { throw 'Another Prunlet installation is already running for this directory.' }
     try { $mutexAcquired = $installationMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $mutexAcquired = $true }
     if (!$mutexAcquired) { throw 'Another Prunlet installation is already running for this directory.' }
+    if ($managedInstallation) { Assert-ManagedInstallationSnapshot $managedInstallation }
     $metadata = Get-PrunletGitHubApiResponse "repos/$Repository"
     $branch = [string]$metadata.default_branch
     if (!$branch) { throw 'GitHub did not return a default branch.' }
     $head = Get-PrunletGitHubApiResponse ("repos/$Repository/commits/" + [Uri]::EscapeDataString($branch))
     $sha = [string]$head.sha
     if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw 'GitHub did not return a valid commit SHA.' }
+    if ($ExpectedCommitSha -and $sha -ine $ExpectedCommitSha) { throw 'The latest source commit differs from ExpectedCommitSha; nothing was installed.' }
 
 
     New-Item -ItemType Directory -Path $WorkDirectory | Out-Null
@@ -270,6 +406,7 @@ try {
     $provenance = [ordered]@{ repository = $Repository; defaultBranch = $branch; commitSha = $sha; downloadUrl = $downloadUrl; archiveSha256 = $archiveHash; executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; maintenanceExecutableSha256 = (Get-FileHash -LiteralPath $maintenanceExe -Algorithm SHA256).Hash; hookExecutableSha256 = (Get-FileHash -LiteralPath $hookExe -Algorithm SHA256).Hash; auxiliarySha256 = $auxiliaryHashes; installedUtc = [DateTimeOffset]::UtcNow.ToString('o'); runtime = $Runtime }
     $provenance | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $WorkDirectory 'source-info.json') -Encoding utf8NoBOM
 
+    if ($managedInstallation) { Assert-ManagedInstallationSnapshot $managedInstallation }
     # 製品ファイルと設定原本を保全する。復元領域の移行は更新の最後にCoreへ委ねる。
     foreach ($relative in @($products + $retiredProducts)) {
         $target = Join-Path $InstallDirectory $relative
@@ -285,7 +422,7 @@ try {
     if ($saved.Count) {
         [ordered]@{ purpose = 'Restore product files after this update; config and recovery are excluded.'; installDirectory = $InstallDirectory; savedFiles = @($saved.Keys); cleanup = 'Delete after confirming this installation works.' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $updateBackup 'backup-info.json') -Encoding utf8NoBOM
     }
-    New-TrackedDirectory (Join-Path $InstallDirectory 'bin')
+    if ($managedInstallation) { Assert-ManagedInstallationSnapshot $managedInstallation } else { New-TrackedDirectory (Join-Path $InstallDirectory 'bin') }
     foreach ($relative in $products) {
         $inputPath = if ($relative -in @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\prunlet-hook.exe')) { Join-Path (Join-Path $buildRoot 'publish') ([IO.Path]::GetFileName($relative)) } elseif ($relative -eq 'source-info.json') { Join-Path $WorkDirectory $relative } elseif ($relative -eq 'bin\Install-Prunlet.ps1') { Join-Path $sourceRoot 'scripts\Install-Prunlet.ps1' } else { Join-Path $sourceRoot ('integration\' + [IO.Path]::GetFileName($relative)) }
         $target = Join-Path $InstallDirectory $relative
@@ -304,6 +441,8 @@ try {
         [void](Assert-PlainPath $configPath 'Capacity migration configuration')
         # 読込経路は変更せず、正式更新時だけ一度移行する。未知の設定もJSON木で保持する。
         $originalBytes = [IO.File]::ReadAllBytes($configPath)
+        $originalHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($originalBytes))
+        if ($managedInstallation -and $originalHash -ine $managedInstallation.configHash) { throw 'Managed recovery configuration changed; migration was not started.' }
         $nodeOptions = [Text.Json.Nodes.JsonNodeOptions]::new()
         $nodeOptions.PropertyNameCaseInsensitive = $true
         $settings = [Text.Json.Nodes.JsonNode]::Parse([Text.Encoding]::UTF8.GetString($originalBytes).TrimStart([char]0xfeff), $nodeOptions, [Text.Json.JsonDocumentOptions]::new())
@@ -386,6 +525,10 @@ try {
         $retirementJson | Set-Content -LiteralPath (Join-Path $updateBackup 'retired-products.json') -Encoding utf8NoBOM
     }
     # 移行開始後は旧exeへ戻さない。移行済み領域も同じ新版で再開できる状態を残す。
+    if ($managedInstallation) {
+        $expectedConfiguration = if ($migratedConfig) { $migratedConfig.sha256 } else { $managedInstallation.configHash }
+        Assert-ManagedRecoveryBinding $managedInstallation $expectedConfiguration
+    }
     $storageMigrationStarted = $true
     $migrationJson = & (Join-Path $InstallDirectory 'bin\prunlet.exe') --config $configPath migrate --apply --if-needed
     $migrationExitCode = $LASTEXITCODE
