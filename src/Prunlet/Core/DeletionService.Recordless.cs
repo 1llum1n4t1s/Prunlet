@@ -302,6 +302,9 @@ public sealed partial class DeletionService
         {
             while (stack.TryPeek(out var frame))
             {
+                var failurePath = frame.Path;
+                try
+                {
                 if (frame.Entries is null)
                 {
                     // 固定した親から列挙する。時刻は列挙キャッシュでなく、子の保持handleから採る。
@@ -314,10 +317,12 @@ public sealed partial class DeletionService
                     frame.Baselines = new PinnedEntryBaseline[frame.Entries.Count];
                     for (var index = 0; index < frame.Entries.Count; index++)
                     {
+                        failurePath = frame.Path;
                         var entry = frame.Entries[index];
                         var childPath = PathPolicy.FileSystemAbsolute(Path.Combine(frame.Path, entry.Name));
                         if (!PathPolicy.Within(childPath, frame.Path) || childPath.Equals(frame.Path, StringComparison.OrdinalIgnoreCase))
                             throw new IOException($"Oversized directory entry escaped its fixed parent: '{childPath}'.");
+                        failurePath = childPath;
                         try
                         {
                             var inspection = NativeFiles.OpenShellInspection(childPath);
@@ -329,6 +334,7 @@ public sealed partial class DeletionService
                             throw new IOException($"Cannot capture directory entry baseline '{childPath}'. Enumerated[id={entry.FileId}, attributes={entry.Attributes:X8}, reparseTag={entry.ReparseTag:X8}, creation={entry.CreationTime}, change={entry.ChangeTime}]. {ex.Message}", ex);
                         }
                     }
+                    failurePath = frame.Path;
                     if (frame.Identity.IsDirectory && frame.Identity.ReparseTag == 0)
                         OversizedDeleteCheckpoint?.Invoke("directory-baselines-captured", frame.Path);
                 }
@@ -339,6 +345,7 @@ public sealed partial class DeletionService
                     var childPath = PathPolicy.FileSystemAbsolute(Path.Combine(frame.Path, entry.Name));
                     if (!PathPolicy.Within(childPath, frame.Path) || childPath.Equals(frame.Path, StringComparison.OrdinalIgnoreCase))
                         throw new IOException($"Oversized directory entry escaped its fixed parent: '{childPath}'.");
+                    failurePath = childPath;
                     var isDirectory = (entry.Attributes & (uint)FileAttributes.Directory) != 0;
                     var inspection = frame.Inspections![entryIndex] ?? throw new IOException($"Directory entry baseline was not retained: '{childPath}'.");
                     var baseline = frame.Baselines![entryIndex];
@@ -463,6 +470,11 @@ public sealed partial class DeletionService
                     }
                 }
                 finally { frame.ReleaseInspections(); frame.Lease?.Dispose(); }
+                }
+                catch (Exception ex) when (IsRecycleFailure(ex) && ex is not FileDeletionEntryException)
+                {
+                    throw new FileDeletionEntryException(failurePath, ex);
+                }
             }
         }
         finally

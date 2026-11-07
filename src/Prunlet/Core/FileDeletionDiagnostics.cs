@@ -7,6 +7,18 @@ using System.Text.Json;
 
 namespace Prunlet.Core;
 
+// 再帰削除で実際に失敗したentryを保持し、要求のrootと区別する。
+internal sealed class FileDeletionEntryException : IOException
+{
+    internal string EntryPath { get; }
+
+    internal FileDeletionEntryException(string entryPath, Exception inner) : base(inner.Message, inner)
+    {
+        EntryPath = entryPath;
+        HResult = inner.HResult;
+    }
+}
+
 // 失敗時だけ現在の保持元を観測する。再削除・プロセス停止・リンク先や配下の走査はしない。
 internal static class FileDeletionDiagnostics
 {
@@ -15,6 +27,9 @@ internal static class FileDeletionDiagnostics
         var native = NativeError(error);
         var message = $"{error.Message} Target: {JsonSerializer.Serialize(path)}; HRESULT 0x{error.HResult:X8}"
             + (native is null ? "." : $"; native error {native}.");
+        var failurePath = error is FileDeletionEntryException entryError ? entryError.EntryPath : path;
+        if (error is FileDeletionEntryException)
+            message += $" Failure entry: {JsonSerializer.Serialize(failurePath)}.";
         if (native == 5 || unchecked((uint)error.HResult) == 0x80070005)
             message += " Windows access denial can result from security restrictions, pending deletion, or other access conditions; error 5 alone does not identify the cause.";
         message += unchecked((uint)error.HResult) switch
@@ -24,7 +39,7 @@ internal static class FileDeletionDiagnostics
             _ => string.Empty
         };
         if (!inspectLocks || !ShouldInspectUsers(error)) return message;
-        try { return message + ObserveUsers(path); }
+        try { return message + ObserveUsers(failurePath); }
         catch (Exception diagnosticError) when (DiagnosticFailure(diagnosticError))
         {
             return message + $" Lock diagnostics unavailable ({diagnosticError.GetType().Name}); the original deletion result is unchanged.";

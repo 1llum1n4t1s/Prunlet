@@ -39,6 +39,8 @@ public static class FixtureNative {
     [DllImport("kernel32.dll",SetLastError=true)]
     static extern bool GetFileInformationByHandleEx(SafeFileHandle handle,int field,byte[] bytes,uint length);
     [DllImport("kernel32.dll",SetLastError=true)]
+    static extern bool SetFileInformationByHandle(SafeFileHandle handle,int field,IntPtr bytes,uint length);
+    [DllImport("kernel32.dll",SetLastError=true)]
     static extern bool GetFileInformationByHandle(SafeFileHandle handle,out BasicInfo info);
     [StructLayout(LayoutKind.Sequential)] struct BasicInfo {public uint Attributes,CreationLow,CreationHigh,AccessLow,AccessHigh,WriteLow,WriteHigh,VolumeSerial,SizeHigh,SizeLow,Links,IndexHigh,IndexLow;}
     [DllImport("advapi32.dll",SetLastError=true)]
@@ -159,6 +161,57 @@ public static class FixtureNative {
         using var pin=HoldParent(Path.GetDirectoryName(destination)!);
         if(sourceProof[0].Directory)Directory.Move(source,destination);else File.Move(source,destination,false);
         if(Identity(destination)!=expectedId||File.Exists(source)||Directory.Exists(source))throw new IOException("Fixture move identity changed.");
+    }
+    // このcaseが作った空のNULディレクトリだけを通常名へ戻す。削除や置換は行わない。
+    public static void NormalizeOwnedReservedDirectory(string source,string destination,string expectedId,string scope) {
+        // 通常pathのNULをGetFullPathがdevice名へ解釈する前にfilesystem形式へ固定する。
+        string sourceDrivePath=source.StartsWith(@"\\?\",StringComparison.Ordinal)?source.Substring(4):source;
+        if(sourceDrivePath.Length<3||!char.IsAsciiLetter(sourceDrivePath[0])||sourceDrivePath[1]!=':'||sourceDrivePath[2]!='\\')
+            throw new IOException("Reserved fixture source requires an absolute drive filesystem path.");
+        source=Absolute(@"\\?\"+sourceDrivePath);destination=Extended(destination);scope=Extended(scope);
+        RequireOwned(source,scope);RequireOwned(destination,scope);
+        string parent=Path.GetDirectoryName(source)!;
+        if(Path.GetFileName(source)!="NUL"||Path.GetFileName(destination)!="reserved-directory-fixture"
+            ||!parent.Equals(Path.GetDirectoryName(destination),StringComparison.Ordinal))throw new IOException("Reserved fixture normalization requires its fixed sibling name.");
+        var ancestorPaths=new Stack<string>();
+        for(string? ancestor=parent;ancestor is not null;ancestor=Path.GetDirectoryName(ancestor))ancestorPaths.Push(ancestor);
+        var ancestorPins=new List<SafeFileHandle>();
+        try {
+        while(ancestorPaths.TryPop(out var ancestor))ancestorPins.Add(HoldParent(ancestor));
+        using var sourcePin=Open(source,0x30080,1);
+        var before=ReadNode(sourcePin);
+        if(before.Id!=expectedId||!before.Directory||before.ReparseTag!=0||(before.Attributes&(int)FileAttributes.ReparsePoint)!=0)
+            throw new IOException("Reserved fixture identity or directory type differs.");
+        RequireMissingFixture(destination);
+        if(Directory.EnumerateFileSystemEntries(source).Any())throw new IOException("Reserved fixture directory is not empty.");
+        var current=ReadNode(sourcePin);
+        if(current.Id!=before.Id||current.Attributes!=before.Attributes||current.SecurityBase64!=before.SecurityBase64)
+            throw new IOException("Reserved fixture changed before normalization.");
+        // Coreと同じNULL RootDirectory・絶対extended名を使い、全祖先を固定しておく。
+        var name=System.Text.Encoding.Unicode.GetBytes(destination);
+        int rootOffset=IntPtr.Size==8?8:4,lengthOffset=rootOffset+IntPtr.Size,nameOffset=lengthOffset+4,size=checked(nameOffset+name.Length+2);
+        var buffer=Marshal.AllocHGlobal(size);
+        try {
+            Marshal.Copy(new byte[size],0,buffer,size);
+            Marshal.WriteInt32(buffer,lengthOffset,name.Length);Marshal.Copy(name,0,IntPtr.Add(buffer,nameOffset),name.Length);
+            if(!SetFileInformationByHandle(sourcePin,3,buffer,(uint)size)) {
+                int code=Marshal.GetLastWin32Error();var error=new Win32Exception(code);
+                throw new IOException($"Cannot normalize reserved fixture without replacement (Win32 {code}): {error.Message}",error);
+            }
+        }finally{Marshal.FreeHGlobal(buffer);}
+        var after=ReadNode(sourcePin);
+        using var destinationPin=Open(destination,0x20080,7);var named=ReadNode(destinationPin);
+        if(after.Id!=before.Id||after.Attributes!=before.Attributes||after.SecurityBase64!=before.SecurityBase64
+            ||named.Id!=before.Id||named.Attributes!=before.Attributes||named.SecurityBase64!=before.SecurityBase64
+            ||Directory.EnumerateFileSystemEntries(destination).Any())throw new IOException("Normalized fixture identity, attributes, security or emptiness changed.");
+        RequireMissingFixture(source);
+        }finally{for(int index=ancestorPins.Count-1;index>=0;index--)ancestorPins[index].Dispose();}
+    }
+    static void RequireMissingFixture(string path) {
+        using var probe=CreateFileW(Extended(path),0x80,7,IntPtr.Zero,3,0x03200000,IntPtr.Zero);
+        int error=Marshal.GetLastWin32Error();
+        if(!probe.IsInvalid)throw new IOException("Fixture destination already exists.");
+        if(error!=2&&error!=3)throw new Win32Exception(error,"Cannot confirm fixture name is absent.");
     }
 }
 
