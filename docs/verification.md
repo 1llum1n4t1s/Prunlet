@@ -14,6 +14,8 @@ Windows・.NET 10 SDK・PowerShell 7で実行する。ビルドは`scripts/Publi
 
 ## 通常E2Eの検証範囲
 
+Codexセッションの削除失敗を調べる場合は、`bun scripts/scan-prunlet-failures.ts --days 3 --details`で既定の`~/.codex/sessions`を読み取る。`--root`でログ元、`--until <ISO日時>`で集計終端を固定できる。保存日ではなくイベント時刻を使い、Prunlet呼出し文脈のある非dry-run DTOの`failed`/`ambiguous`を出力イベント内で重複排除する。件数は失敗の観測数であり、証拠の再表示を含み、固有の操作数・不具合数ではない。非DTOの失敗候補と帰属不明DTOは別集計とし、元イベントの照合と隔離fixtureで原因を確かめる。ログ中のコマンドは実行しない。parserの境界は`bun scripts/verify-session-failure-scan.ts <未使用の外部D絶対ディレクトリ>`で確認する。
+
 フックのshell文字列解析は`scripts/Verify-HookParsing.ps1`に今回のexeと未使用の外部出力先・reportを渡して確認する。Mac向けSSH送信のヒアストリングを含む入力は実行せず、hookプロセスのstdinへJSONとして送り、許可・拒否、stdout/stderr、終了コードとfixture不変更を照合する。Codexの`Bash`とshell欠落、単独EncodedCommandの復号、認識した別名・不正値・外側wrapperの拒否、復号本文の直接削除と解析不能な展開、明示PowerShell、CMD、shell不明を区別する。SSH先での実削除を成功条件へ置き換えない。
 
 スパースfixtureのC#は`scripts/recordless-e2e/SparseFixture.cs`を共通入力とし、各runnerはこの実ファイルのpathとSHA-256を記録する。旧runnerのhere-stringやAST配置を検証入力として使わない。
@@ -22,6 +24,7 @@ Windows・.NET 10 SDK・PowerShell 7で実行する。ビルドは`scripts/Publi
 
 - 予約名の通常ファイルについてCLI・stdio MCPの永久削除、dry-runの`would_permanently_delete`と不変更、通常名との混合・生存ハードリンク保全を確認する。予約名のディレクトリ・リンク・祖先とdevice構文は拒否し、preflight失敗や実体差し替えで無関係な対象を削除しないことを確認する。
 - CLIの単一・複数・Unicode・長いパス・`--paths-file`・空フォルダー・明示再帰とdry-run、MCPの入力型・余剰property・1〜256件上限を実プロセスで確認する。
+  長いパスのShell短縮名を再現する場合は`Verify-LongPathFiles.ps1 -Phase Prepare -OutputDirectory <未使用の外部D絶対パス> -FixtureRoot <未使用の許可済み絶対パス>`を使う。生成された`paths.json`をCLIの`delete --paths-file`へ渡し、dry-runと実削除のstdoutをそれぞれ同出力先の`dry-run.json`・`delete.json`へ保存して、対応する`-Phase VerifyDryRun`・`VerifyDelete`へ実終了コードを`-CliExitCode`で渡す。元の完全名と解決後の完全名、既存の親・実体検査を維持し、File IDだけの一致へ緩和しない。検証は同ID・内容の新規ゴミ箱項目と対象外ファイルの保全を照合する。Windowsの`0x80270038`（ゴミ箱のパス深さ制限）は成功にせず、永久削除へ切り替えずに元対象とゴミ箱を確認する。
 - ファイル結果が`dryRun`・`items`・`warnings`で、項目が`path`・`kind`・`status`・任意`error`だけを返すことを確認する。`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`と終了コード/MCP `isError`を照合し、operationId・backupPath・hash・sizeを返さないことを確認する。dry-runでは予約名の通常ファイルの永久削除予定と、それ以外のサイズ超過による永久削除を予測できない旨を確認する。
 - 実際の容量超過を起こす専用sparse fixtureをCLI・MCPで検証し、ファイル・フォルダーの元名の消失と今回分のゴミ箱項目、混合batch・生存hardlink・部分失敗の扱いを確認する。確認済みの即時削除設定とサイズ超過以外の失敗では永久削除せず、旧既定と設定済みの退避先を保護する。即時削除設定のボリュームは設定を変更せずCLI・MCPで通常サイズのファイルと再帰削除を確認する。Shellの直前とサイズ超過・ゴミ箱利用不可の通知後での差し替え・ロックを別々に確認し、Shellが別実体を移した場合は`ambiguous`を返すこととWindows側の副作用を区別する。
 - `Verify-OversizeRaces.ps1`・`Verify-BeforeRecycleRace.ps1`・`Verify-BeforeRecycleSmallRace.ps1`は、同じ候補のexe・assembly・assembly SHA-256と未使用の外部D出力先を受け取る。実ShellとCore内部の境界を再現し、CLI・MCPの実プロセス検証とは区別する。証拠が一致したfixtureだけを清掃候補として残し、指定された経路で清掃する。
@@ -96,6 +99,8 @@ GitHub応答を検証用アーカイブへ差し替え、実際のインスト�
 
 起動時更新では、旧MCPが応答中の延期と終了後の切替、独立hookの応答、標準入出力とEOF、複数起動の排他、取得失敗時の旧版利用、切替・登録・移行途中からの再開を確認します。 配布と同じZIPから複数回更新し、補助製品の変更・据置・再変更、旧slotの実体再利用、schema 5記録の不変更を確認します。容量検査はファイルとディレクトリのADS、stateの一時出力を含め、上限拒否時に元データを変えないことを確認します。改変した登録・不正state・互換性を確認できない候補は保持して停止し、不明な清掃を自動再送しないことを確認します。隔離fixtureでの成功と、公開後の実ホストでの読み込み・hook信頼は区別します。
 
+未適用stageを残した手動導入後の更新準備は、`scripts/Verify-UnappliedStartupStage.ps1 -ExecutablePath <今回のCLI絶対パス> -PublishDirectory <同じビルドのpublish絶対パス> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <未使用の外部D JSON絶対パス>`で隔離検証します。配布用スクリプトで生成・照合した実ZIPを使い、実CLIのbegin・prepareと、今回のビルドにhash一致する新candidateのCore apply・補助製品適用・統合確認・移行完了を通し、旧製品の既定保持による`cleanup_pending`から次候補の準備へ戻れることを確認します。次候補eは直前候補dとexeが同一で、補助guideだけを変更したZIPです。HTTP取得だけを検証済みZIPと取得完了stateの配置で代替し、実ユーザーのCodex登録・Task Schedulerは変更しません。未署名の旧3製品だけPE overlayを加えた非実行fixtureで変更hashを作り、新旧stageの主stream更新とFile ID保持、slot再利用、準備の反復、state保存後owner更新前からの再開を確認します。未知hashの途中主stream、ADS・リンク・所有marker・未知内容・不整合stateは保持停止し、拒否理由と不変更を確認します。総容量上限は実CLIの追加予約要求で拒否を確認し、実容量超過やHTTPの部分取得再開の検証とは区別します。Coreの統合確認は実ホストの登録済み内容の検証を代替しません。実登録と旧製品の物理清掃を含む複数回の完全更新・実ホスト検証は、この専用検証の対象外です。
+
 定期整理はTask Scheduler境界を隔離して、毎日03:00と現在のユーザーのログオンの両トリガー、有効状態、`StartWhenAvailable`、電池使用時の実行許可、既存タスク設定の保持をXMLで検証します。PCの電源断・スリープ・ログオフを伴う取り逃し回復の実動作は、この検証の対象外です。
 
 非表示起動は`scripts/Verify-MaintenanceTask.ps1 -ExecutablePath <今回のCLI exe> -OutputDirectory <新しい外部D作業領域> -ReportPath <外部JSONレポート>`で、実Task Schedulerと保守専用exeを検証します。同じpublishフォルダーに`prunlet-maintenance.exe`が必要です。CLIのconsole subsystemと保守exeのGUI subsystem、旧タスクからの設定を保つ移行、保守以外のコマンドの拒否、期限切れ整理・保持対象の復元、失敗終了コード、所有者検証を確認します。`-PauseForWindowInspection`は旧・新タスクを専用lockで待機させ、別途ウィンドウを観測するための指定です。配置後も同じ登録タスクを手動起動して表示と終了コードを確認し、実際のWindows再起動と区別します。
@@ -111,6 +116,10 @@ GitHub応答を検証用アーカイブへ差し替え、実際のインスト�
 60秒超の共通ロック待機と解放後の続行、待機中の元対象・レジストリsnapshot保全を確認する。CLIのstderr通知とstdout JSON、MCPのtoken付き進捗と最終応答後の通知抑止を確認する。固定ロックを削除して競合を回避しない。
 
 使用中DLL・ファイルの拒否では、元対象の内容・ACL・属性を変えず、永久削除・コピーfallback・利用プロセス停止をしないことを確認する。通常ファイルの保持元はRestart Manager、CLI/MCPのロード済みDLL保持元はモジュール照会により、`error`に保持元PIDとファイルパスが返ることも確認する。`ambiguous`の同じ削除を再送せず、元対象とWindowsゴミ箱を照合する。
+
+ロード中DLLの検証は、削除前にloaderのモジュール一覧へfixtureの完全パスが現れることを確認する。削除後は元対象・ゴミ箱・操作記録の保全を先に検査し、その後に保持元PID・パスの正の観測を判定する。時間上限による未特定を成功へ読み替えない。
+
+case-sensitive属性の準備で通常tokenの`fsutil`が拒否された場合は、新しいfixtureに対して`Verify-RecordlessFiles.ps1 -CaseFilter cli-case-sensitive-directory-preserves-both-names -CaseSensitiveSetupHelperPath <scripts/Enable-VerificationCaseSensitive.ps1の絶対パス>`を明示できる。通常のexe・外部出力・report・許可済みfixture rootの引数も渡す。helperは同じユーザーの管理者tokenで、作成済みの空fixture1個のflagだけを設定し、実体ID・ACL・属性の不変を確認する。UAC表示の有無はOSポリシーに従い、設定は変えない。削除・ゴミ箱照合・復元は元のrunnerの通常tokenで行い、大小文字2名の別IDと内容に加え、Bin内・復元後のcase-sensitive flagも検査する。WSL機能やACLの変更、製品の自動昇格は行わない。
 
 明示キューはCLIの`delete-queue`・`delete-queue-status`・`delete-queue-cancel`と、stdio MCPの既存`delete_files`のenqueue・status・cancelを実プロセスで確認する。共有・ロック違反中の保全と解放後の一度だけの削除、`pending`の取消と開始後の取消拒否、完了結果の1時間保持と失効、worker上限8件（完了保持中を含む）・256パス・照合対象4096項目・IPC入力1 MiBの上限、親や対象の差し替え、再帰範囲の追加・削除での中止を確認する。待機期限は設けない。削除開始後の失敗・不明結果とworker消失・IPC切断を自動再送しないこと、受付後のstdio切断でも継続すること、操作記録を作らないこと、通常の同期削除とMCPの5ツールを維持することも確認する。取消要求の受理だけを削除の取消完了やrollbackと判定しない。
 

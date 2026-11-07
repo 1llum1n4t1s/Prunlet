@@ -28,6 +28,10 @@ RTKの共通指示と同様、エージェントのツール選択を案内す�
 
 ## 手動の設定準備
 
+既存の管理済み配置がGitの祖先配下にある場合だけ、導入スクリプトの`-UpdateManagedInstallation`を明示できる。既存設定・配置情報・実行ファイルと補助ファイルのhash一致、リンクのない既存ディレクトリ、Gitの追跡対象がないことを確認する。Gitの除外対象でない場合は、実効CodexHomeの正規管理blockにあるCLI登録と配置先が一致することも必要である。復元先は既存設定の値を保持し、配置外の復元先には通常の導入ガードを適用する。
+
+作業先・更新バックアップ・ソース・Codex内部へのガードは維持する。配置前と移行前にパス・設定・hashを再確認し、`-ExpectedCommitSha <40桁SHA>`を渡した場合は取得した既定branchのHEADとも照合する。共通guideの再登録では、検証済み配置のguideとUTF-8本文が一致するLF/CRLFの差だけを認識し、編集済み本文は拒否する。旧更新stageはこのモードで清掃しない。これらは非原子的な整合確認であり、ディレクトリ実体を固定する機構ではない。
+
 通常はインストーラーが設定を作成します。手動の初期化は[README](../README.md#初期設定)を参照してください。`backupDirectory`は保護された共通metadata基点で、レジストリ記録を`.registry-records-v1/<operationId>`へ保存します。新しいファイル・フォルダー削除は操作記録やsnapshotを作りません。
 
 ファイル・フォルダーは通常Windowsのゴミ箱へ移し、復元はWindowsの画面で行います。末尾名がWindows予約名の通常ファイルは、実体と親・名前・属性を固定して照合し、追加確認やShell試行なしで永久削除します。予約名の祖先・ディレクトリ・reparse pointは対象外です。通常名の対象は、Windowsが対象をゴミ箱に対して大きすぎると判定し、元の実体を再確認できた場合は、元の名前の永久削除を試みます。削除の完了を確認できたときだけ`permanently_deleted`を返します。サイズ超過以外の失敗からは永久削除へ切り替えません。CLIの`restore`（`registry-restore`の別名）とMCPの`restore_registry`はレジストリ専用です。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールです。`operations`と`list_operations`にもファイル削除を載せません。

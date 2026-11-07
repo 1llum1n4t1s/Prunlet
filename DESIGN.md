@@ -48,6 +48,8 @@ Shellがゴミ箱への移動を成功と返した場合は、返却項目だけ
 
 失敗時の診断はCoreの`FileDeletionDiagnostics`が担当し、`DeletionService`が各項目の`error`へ付加してCLI・MCPへ返す。共有・ロック違反と削除元へのアクセス拒否では保持元を観測し、dry-runではプロセス照会を行わない。アクセス拒否だけで保持元や原因を断定しない。診断は失敗後の現在値であり、診断不能でも元の削除結果を維持する。保持元の特定を削除の再試行やプロセス停止へ結び付けない。照会方法と観測範囲の制約は[連携手順](docs/integration.md#使用中のファイルと同時実行)を参照する。
 
+ロード済みモジュールの照会は、一時的なToolhelp process snapshotから自分を含め最大32プロセスの起動元チェーンを先に並べ、残りのプロセスを従来順で一度ずつ調べる。親関係は照会順にだけ使い、保持元の判定には実モジュールパスの一致を必要とする。snapshot取得に失敗した場合は従来順へ戻し、10秒・8件の上限と、全保持元を特定できない場合の注記を維持する。
+
 固定実体への永久削除要求が受理された後、削除handleを解放してから名前の確認に失敗した場合は、その到達段階と確認できなかったentryをエラーへ含める。Win32 5はACLの制限や削除待ちなど複数の理由で返り得るため、番号だけでは原因を決めない。確認不能は引き続き`ambiguous`として扱い、名前の消失や削除完了を推測しない。
 
 ### 明示的な削除待機キュー
@@ -147,6 +149,8 @@ CodexのMCP登録は`integration/start-prunlet-mcp.ps1`をPowerShell 7で起動�
 MCP起動時に公開済みlatestを確認し、既存版の子孫で更新protocolと保管形式が互換の候補だけを準備する。既存の製品・登録の所有とhashを確認し、旧CLI/MCPと保守exeを同時にwrite排他できなければ変更せず延期する。hookは独立exeとして継続し、旧プロセスを終了させない。固定の更新状態は製品切替・登録・移行の再開と更新cacheの所有確認・再利用に限り、ファイル操作履歴には使わない。途中状態では通常CLI/MCPと保守を止め、候補からレジストリ移行を再開する。移行開始後は旧exeへrollbackせず、registryが利用可能になってからsource-infoとidleを確定する。書込みや置換が不明なときは保全して自動再送せず、確定したregistryの利用とは分離する。
 
 stageは再帰削除せず、完了した世代の正規製品とmetadataをhashと実体で照合して主streamだけを再利用する。正常な次回更新を、stageが存在するだけで止めない。未知の項目は残して容量へ含め、未確定の切替・移行は先に同じ候補で再開する。
+
+切替前のidleで候補実行・移行・登録確定・未解決の書込みやrotationがない未適用stageも、旧owner・source-info・stateの公開ZIP hash/長さ・ZIP manifest・全12製品・3つのready slotが一致し、未知の項目・ADS・リンクがない場合に限りcacheとして再利用する。旧commit・owner/source-info hash・3製品と9補助製品のhashを任意stateの`cacheBaseline`へ先に固定してからownerを切り替え、中断時は同じbaselineで再開する。これはstage主streamの更新だけに用い、previousへの退避と製品rotationは現在のinstalled来歴を基準にする。認定できないstageは変更せず保持する。
 
 配布元の方針は公開済みGitHub Releaseであり、その発行者を信頼する。`.github/workflows/prunlet-release-package.yml`が公開タグからwin-x64・win-arm64をビルドし、`scripts/Package-PrunletUpdate.ps1`でZIPを作成する。公開前に`Verify-ReleasePackage.ps1`がentryの過不足・重複、metadataの取得元・commit・runtime等、および全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合する。検証済みZIP全体のSHA-256をアップロード直前にも再確認し、同じreleaseへ添付する。既存assetは上書きしない。取得側はタグが既定ブランチ上のcommitを指すこととasset digest・size、パッケージ内のcommit・runtime・製品hashを検証する。digestは転送内容の一致を示し、ソースからビルドされたことを独立に証明しない。Actionsの期限付きartifactを更新の必須条件としない。
 
