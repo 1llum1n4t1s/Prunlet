@@ -118,7 +118,11 @@ public sealed partial class DeletionService
                     var recycled = NativeRecycleBin.RecycleDeleteTarget(item.Path, identity.IsDirectory && identity.ReparseTag == 0, resolved =>
                     {
                         queued?[index].VerifyUnchanged();
-                        if (!resolved.Equals(item.Path, StringComparison.Ordinal)) throw new IOException("Shell resolved a different recycle source path.");
+                        // Shellが長い名前を8.3表記で返す場合も、通常実体の最終正規名が一致する場合だけ受理する。
+                        // File IDだけの一致では別hardlink名を区別できないため、名前の完全一致は維持する。
+                        if (!resolved.Equals(item.Path, StringComparison.Ordinal)
+                            && (identity.ReparseTag != 0 || !PathPolicy.Resolve(resolved, finalDirectory: identity.IsDirectory, allowMissing: false).Equals(item.Path, StringComparison.Ordinal)))
+                            throw new IOException("Shell resolved a different recycle source path.");
                         CheckRecycleTarget(item.Path, identity.IsDirectory);
                         using var parent = NativeFiles.OpenDirectory(Path.GetDirectoryName(item.Path)!);
                         if (!SameRecordlessObject(parentIdentities[index]!, NativeFiles.MoveIdentity(parent))) throw new IOException("Recycle parent identity changed.");

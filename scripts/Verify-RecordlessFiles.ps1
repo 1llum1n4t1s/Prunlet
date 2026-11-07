@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$ExecutablePath,[Parameter(Mandatory)][string]$OutputDirectory,[Parameter(Mandatory)][string]$ReportPath,[ValidateNotNullOrEmpty()][string[]]$CaseFilter=@('*'),[switch]$Large,[ValidateRange(32769,65535)][int]$LargeFileCount=32769,[string]$AssemblyPath,[string]$ExpectedAssemblySha256,[string]$FixtureRoot,[ValidateRange(1,3600)][int]$ProcessTimeoutSeconds=240)
+param([Parameter(Mandatory)][string]$ExecutablePath,[Parameter(Mandatory)][string]$OutputDirectory,[Parameter(Mandatory)][string]$ReportPath,[ValidateNotNullOrEmpty()][string[]]$CaseFilter=@('*'),[switch]$Large,[ValidateRange(32769,65535)][int]$LargeFileCount=32769,[string]$AssemblyPath,[string]$ExpectedAssemblySha256,[string]$FixtureRoot,[string]$CaseSensitiveSetupHelperPath,[ValidateRange(1,3600)][int]$ProcessTimeoutSeconds=240)
 $ErrorActionPreference='Stop'
 # 想定する失敗: private file journal/PIDL/stage生成、dry-runの変更、Shellと設定が照合できない永久削除、
 # nativeID/ACL/全stream/link関係の欠落、衝突上書き、preflight一部削除、並列入力順の破損、
@@ -12,6 +12,13 @@ $repo=[IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 foreach($path in @($ExecutablePath,$OutputDirectory,$ReportPath)){if(![IO.Path]::IsPathFullyQualified($path)){throw 'Absolute paths required'}}
 foreach($path in @($OutputDirectory,$ReportPath)){Assert-VerificationDestination $path @($repo,(Join-Path $env:USERPROFILE '.codex'));if(![IO.Path]::GetPathRoot($path).Equals('D:\',[StringComparison]::OrdinalIgnoreCase)){throw 'External D output required'};if(Test-Path -LiteralPath $path){throw 'Unused output/report required'};if(![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))){throw 'Output parent must exist'}}
 if(![IO.File]::Exists($ExecutablePath)){throw 'Executable missing'}
+if($CaseSensitiveSetupHelperPath){
+ if(![IO.Path]::IsPathFullyQualified($CaseSensitiveSetupHelperPath)){throw 'Absolute case-sensitive setup helper required'}
+ $CaseSensitiveSetupHelperPath=[IO.Path]::GetFullPath($CaseSensitiveSetupHelperPath)
+ if(![IO.File]::Exists($CaseSensitiveSetupHelperPath)){throw 'Case-sensitive setup helper missing'}
+ $helperAncestor=$CaseSensitiveSetupHelperPath
+ while($helperAncestor){if((Get-Item -LiteralPath $helperAncestor -Force).Attributes-band[IO.FileAttributes]::ReparsePoint){throw 'Case-sensitive setup helper must not traverse links'};$helperAncestor=[IO.Path]::GetDirectoryName($helperAncestor)}
+}
 if([bool]$AssemblyPath-ne[bool]$ExpectedAssemblySha256){throw 'AssemblyPath and ExpectedAssemblySha256 must be supplied together'}
 if($AssemblyPath){if(![IO.Path]::IsPathFullyQualified($AssemblyPath)-or![IO.File]::Exists($AssemblyPath)){throw 'Absolute candidate assembly required'};if((Get-FileHash -LiteralPath $AssemblyPath).Hash-cne$ExpectedAssemblySha256){throw 'Candidate assembly hash mismatch'}}
 $script:fixtureRun=$null;if($FixtureRoot){$script:fixtureRun=New-VerificationFixtureRun -FixtureRoot $FixtureRoot -ForbiddenRoots @($repo,(Join-Path $env:USERPROFILE '.codex')) -NamePrefix 'recordless'}
@@ -300,10 +307,30 @@ try{
  Case-R 'core-oversized-cross-directory-external-masked-change' {Test-OversizeCrossDirectoryAliasesR -CoreMode 'external-masked-change'} -RequiresAssembly
  Case-R 'cli-case-sensitive-directory-preserves-both-names' {
   $s=New-ScopeR 'case-sensitive';$p=Join-Path $s.files 'case-sensitive';$null=[IO.Directory]::CreateDirectory($p);$beforeRoot=Snapshot-R $p
-  $fsutil=Join-Path $env:SystemRoot 'System32/fsutil.exe';$output=@(& $fsutil file SetCaseSensitiveInfo $p enable 2>&1);$code=$LASTEXITCODE;$script:observed.enable=@{exitCode=$code;output=$output}
+  if($CaseSensitiveSetupHelperPath){
+   $identity=[Security.Principal.WindowsIdentity]::GetCurrent();try{$sid=$identity.User.Value;$principal=[Security.Principal.WindowsPrincipal]::new($identity);$script:observed.deletionToken=@{userSid=$sid;isAdministrator=$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)}}finally{$identity.Dispose()}
+   $beforeFlag=[Prunlet.RecordlessE2E.FixtureNative]::IsCaseSensitive($p)
+   $setupReport=Join-Path $s.root 'case-sensitive-setup.json'
+   $arguments=@('-NoProfile','-File',('"{0}"'-f$CaseSensitiveSetupHelperPath),'-FixturePath',('"{0}"'-f$p),'-ExpectedId',$beforeRoot[0].Id,'-ExpectedSecurityBase64',$beforeRoot[0].SecurityBase64,'-ExpectedUserSid',$sid,'-ReportPath',('"{0}"'-f$setupReport),'-TempDirectory',('"{0}"'-f$script:temp))
+   $hostProcess=[Diagnostics.Process]::GetCurrentProcess();try{$pwsh=$hostProcess.MainModule.FileName}finally{$hostProcess.Dispose()}
+   $helperPin=[IO.File]::Open($CaseSensitiveSetupHelperPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+   try{$helperHash=(Get-FileHash -LiteralPath $CaseSensitiveSetupHelperPath).Hash;$setup=Start-Process -FilePath $pwsh -ArgumentList $arguments -Verb RunAs -WindowStyle Hidden -Wait -PassThru}finally{$helperPin.Dispose()}
+   try{$setupExit=$setup.ExitCode}finally{$setup.Dispose()}
+   Assert-R ([IO.File]::Exists($setupReport)) 'Elevated setup report missing'
+   $proof=[IO.File]::ReadAllText($setupReport)|ConvertFrom-Json -AsHashtable -Depth 100
+   $script:observed.enable=@{helperPath=$CaseSensitiveSetupHelperPath;helperSha256=$helperHash;exitCode=$setupExit;proof=$proof}
+   Assert-R ($setupExit-eq0-and$proof.exitCode-eq0-and$proof.fsutilExitCode-eq0) 'Elevated case-sensitive setup failed'
+   Assert-R ($proof.fixturePath-ceq$p-and$proof.token.isElevated-eq$true-and$proof.token.isAdministrator-eq$true-and$proof.token.userSid-ceq$sid) 'Elevated setup token or fixture mismatch'
+   Assert-R ($proof.beforeNativeId-ceq$beforeRoot[0].Id-and$proof.afterNativeId-ceq$beforeRoot[0].Id-and$proof.beforeSecurityBase64-ceq$beforeRoot[0].SecurityBase64-and$proof.afterSecurityBase64-ceq$beforeRoot[0].SecurityBase64-and$proof.beforeCaseSensitive-eq$beforeFlag-and$proof.afterCaseSensitive-eq$true) 'Elevated setup identity, security or flag mismatch'
+   $currentRoot=Snapshot-R $p
+   Assert-R ($currentRoot.Count-eq1-and$currentRoot[0].Id-ceq$beforeRoot[0].Id-and$currentRoot[0].SecurityBase64-ceq$beforeRoot[0].SecurityBase64-and[Prunlet.RecordlessE2E.FixtureNative]::IsCaseSensitive($p)) 'Normal-token setup reread mismatch'
+   $code=$setupExit;$output=@($proof.fsutilOutput)
+  }else{
+   $fsutil=Join-Path $env:SystemRoot 'System32/fsutil.exe';$output=@(& $fsutil file SetCaseSensitiveInfo $p enable 2>&1);$code=$LASTEXITCODE;$script:observed.enable=@{exitCode=$code;output=$output}
+  }
   $nativeCaseSensitive=[Prunlet.RecordlessE2E.FixtureNative]::IsCaseSensitive($p);$script:observed.enable.nativeFlag=$nativeCaseSensitive;if($code-ne0-or!$nativeCaseSensitive){Assert-R (($output-join' ')-match'(?i)access|denied|support|privilege|拒否|サポート|権限') 'Unknown case-sensitive setup failure';$null=Assert-SnapshotR $p $beforeRoot;$script:skipReason='Case-sensitive boundary unverified: native fsutil refused this token/filesystem.';return}
   [Prunlet.RecordlessE2E.FixtureNative]::WriteCaseSensitiveFile((Join-Path $p 'Case.txt'),$utf8.GetBytes('upper'));[Prunlet.RecordlessE2E.FixtureNative]::WriteCaseSensitiveFile((Join-Path $p 'case.txt'),$utf8.GetBytes('lower'));$before=Snapshot-R $p;Assert-R ($before.Count-eq3-and$before[1].Id-cne$before[2].Id) 'Distinct case-sensitive names not established';$prior=Before-BinR $before;$r=Delete-R $s @($p) -Recursive;$script:observed.recycle=$r
-  if($r.exitCode-eq0){Assert-WireR $r @($p) @('recycled');$null=Restore-BinR $s $p $before $prior}else{Assert-R ($r.json.items[0].status-in@('failed','ambiguous')) 'Case-sensitive refusal had an unknown result';$null=Assert-SnapshotR $p $before;$script:observed.outcome='native Shell refusal preserved both names and native proofs'};No-FileRecordsR $s
+  if($r.exitCode-eq0){Assert-WireR $r @($p) @('recycled');$binItem=[Prunlet.RecordlessE2E.OwnedBinLocator]::FindNew($before[0].Id,$prior);Assert-R ([Prunlet.RecordlessE2E.FixtureNative]::IsCaseSensitive($binItem.PhysicalPath)) 'Case-sensitive flag lost in Windows Bin';$script:observed.binCaseSensitive=$true;$null=Restore-BinR $s $p $before $prior;Assert-R ([Prunlet.RecordlessE2E.FixtureNative]::IsCaseSensitive($p)) 'Case-sensitive flag lost after restore';$script:observed.restoredCaseSensitive=$true}else{Assert-R ($r.json.items[0].status-in@('failed','ambiguous')) 'Case-sensitive refusal had an unknown result';$null=Assert-SnapshotR $p $before;$script:observed.outcome='native Shell refusal preserved both names and native proofs'};No-FileRecordsR $s
  }
  Case-R 'cli-protected-deny-acl-native-windows-roundtrip' {$s=New-ScopeR 'protected-acl';$p=File-R $s 'protected';$acl=Get-Acl -LiteralPath $p;$acl.SetAccessRuleProtection($true,$true);$guests=[Security.Principal.SecurityIdentifier]::new('S-1-5-32-546');$deny=[Security.AccessControl.FileSystemAccessRule]::new($guests,[Security.AccessControl.FileSystemRights]::ReadData,[Security.AccessControl.AccessControlType]::Deny);$acl.AddAccessRule($deny);Set-Acl -LiteralPath $p -AclObject $acl;$before=Snapshot-R $p;$prior=Before-BinR $before;$r=Delete-R $s @($p);Assert-WireR $r @($p) @('recycled');Assert-R ($r.exitCode-eq0) 'Protected/Deny fixture recycle failed';$null=Restore-BinR $s $p $before $prior}
  Case-R 'cli-mcp-lock-over-sixty-seconds-progress-eof' {
@@ -345,9 +372,9 @@ try{
    if(!('RecordlessDllLoader' -as [type])){Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class RecordlessDllLoader { [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr LoadLibraryExW(string path, IntPtr file, uint flags); [DllImport("kernel32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool FreeLibrary(IntPtr module); }'}
    $s=New-ScopeR $caseName;$tree=Join-Path $s.files 'tree';$parent=Join-Path $tree 'nested';$null=[IO.Directory]::CreateDirectory($parent);$dll=Join-Path $parent 'fixture.dll';[IO.File]::Copy((Join-Path $env:WINDIR 'System32/version.dll'),$dll);[IO.File]::SetAttributes($dll,([IO.FileAttributes]::ReadOnly-bor[IO.FileAttributes]::Archive));$before=Snapshot-R $tree;$prior=Before-BinR $before
    $module=[RecordlessDllLoader]::LoadLibraryExW($dll,[IntPtr]::Zero,1);Assert-R ($module-ne[IntPtr]::Zero) ('LoadLibraryExW failed: '+[Runtime.InteropServices.Marshal]::GetLastWin32Error())
-   try{if(!$heldDll){Assert-R ([RecordlessDllLoader]::FreeLibrary($module)) 'FreeLibrary failed';$module=[IntPtr]::Zero};if($dllMode-eq'mcp-held'){$session=Open-McpR $s;try{Init-McpR $session;$reply=Call-McpR $session 10 'delete_files' @{paths=@($tree);recursive=$true};$r=@{exitCode=$(if($reply.failed){1}else{0});json=($reply.response.result.content[0].text|ConvertFrom-Json -AsHashtable -Depth 100)}}finally{Close-McpR $session}}else{$r=Delete-R $s @($tree) -Recursive};$script:observed.result=$r;$script:observed.loadedDuringRequest=$heldDll
-    if($r.exitCode-ne0){$diagnostic=$r.json.items[0].error;Assert-R ($diagnostic-match('PID '+$PID+'\b')-and$diagnostic.Contains('loaded module')-and$diagnostic.Contains('fixture.dll')) 'Deletion failure did not return the loaded DLL holder and path'}
+   try{$loader=[Diagnostics.Process]::GetCurrentProcess();try{$loadedModules=@($loader.Modules|Where-Object {$_.FileName.Equals($dll,[StringComparison]::OrdinalIgnoreCase)}|ForEach-Object FileName)}finally{$loader.Dispose()};$script:observed.loader=@{pid=$PID;fixturePath=$dll;matchingModules=$loadedModules};Assert-R ($loadedModules.Count-eq1) 'Loader Modules did not expose the exact fixture DLL path';if(!$heldDll){Assert-R ([RecordlessDllLoader]::FreeLibrary($module)) 'FreeLibrary failed';$module=[IntPtr]::Zero};if($dllMode-eq'mcp-held'){$session=Open-McpR $s;try{Init-McpR $session;$reply=Call-McpR $session 10 'delete_files' @{paths=@($tree);recursive=$true};$r=@{exitCode=$(if($reply.failed){1}else{0});json=($reply.response.result.content[0].text|ConvertFrom-Json -AsHashtable -Depth 100)}}finally{Close-McpR $session}}else{$r=Delete-R $s @($tree) -Recursive};$script:observed.result=$r;$script:observed.loadedDuringRequest=$heldDll
     if($r.exitCode-eq0){Assert-WireR $r @($tree) @('recycled');Assert-R (![IO.Directory]::Exists($tree)) 'Recycled tree remains at source';$null=Restore-BinR $s $tree $before $prior;$script:observed.outcome='recycled-and-restored'}else{Assert-R $heldDll 'Released DLL deletion failed';Assert-R ($r.json.items.Count-eq1-and$r.json.items[0].status-in@('failed','ambiguous')) 'Unknown failure status';Assert-WireR $r @($tree) @($r.json.items[0].status);$null=Assert-SnapshotR $tree $before;Assert-R (@([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($before[0].Id)|Where-Object {$_.Pidl-notin$prior}).Count-eq0) 'Failed deletion left a new owned Bin entry';No-FileRecordsR $s;$script:observed.outcome='rejected-with-source-preserved'}
+    if($r.exitCode-ne0){$diagnostic=$r.json.items[0].error;Assert-R ($diagnostic-match('PID '+$PID+'\b')-and$diagnostic.Contains('loaded module')-and$diagnostic.Contains('fixture.dll')) 'Deletion failure did not return the loaded DLL holder and path'}
    }finally{if($module-ne[IntPtr]::Zero){Assert-R ([RecordlessDllLoader]::FreeLibrary($module)) 'Final FreeLibrary failed'}}
   }
  }
