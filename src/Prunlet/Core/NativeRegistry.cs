@@ -419,9 +419,6 @@ internal static class NativeRegistry
         => OpenNativeCore(transaction, parent, name, access, failureMessage,
             followLink ? 0x40u : 0x40u | 0x100u | 0x1000u, (followLink ? 0u : 8u) | (backupRestore ? 4u : 0));
 
-    private static SafeRegistryHandle OpenNativeOrdinary(Transaction? transaction, SafeRegistryHandle? parent, string name, uint access)
-        => OpenNativeOrdinaryWithMode(transaction, parent, name, access, backupRestore: false);
-
     private static SafeRegistryHandle OpenNativeOrdinaryWithMode(Transaction? transaction, SafeRegistryHandle? parent, string name, uint access, bool backupRestore)
         => OpenNativeCore(transaction, parent, name, access, "Cannot open an ordinary registry key without reparsing", 0x40u | 0x1000u, backupRestore ? 4u : 0);
 

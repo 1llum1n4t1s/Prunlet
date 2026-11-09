@@ -443,8 +443,4 @@ internal static class Program
         public RecoveryOperationSummary[] Operations { get; init; } = [];
     }
 
-    private sealed class OperationSummary
-    {
-        public string OperationId { get; init; } = string.Empty;
-    }
 }

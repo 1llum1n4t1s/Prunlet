@@ -4,7 +4,6 @@ public sealed partial class DeletionService
 {
     private readonly PrunletConfig config;
     private readonly RegistrySessionContext? registrySession;
-    private const int CopyBufferSize = 128 * 1024;
     internal event Action<TimeSpan, bool>? RecoveryLockProgress;
 
     public DeletionService(PrunletConfig config) : this(config, null) { }
