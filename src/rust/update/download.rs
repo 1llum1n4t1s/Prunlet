@@ -26,6 +26,18 @@ pub fn receive_from(
     hash: &str,
     bytes: u64,
 ) -> Result<bool> {
+    receive_release(root, repository, commit, asset, hash, bytes, None)
+}
+
+pub(super) fn receive_release(
+    root: &Path,
+    repository: &str,
+    commit: &str,
+    asset: u64,
+    hash: &str,
+    bytes: u64,
+    tag: Option<&str>,
+) -> Result<bool> {
     ensure!(
         regex::Regex::new(r"\A[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}\z")?
             .is_match(repository)
@@ -34,6 +46,25 @@ pub fn receive_from(
             && is_hex(hash, 64),
         "Published asset identity is invalid."
     );
+    let url = if let Some(tag) = tag {
+        ensure!(
+            regex::Regex::new(r"\Av?[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?\z")?
+                .is_match(tag),
+            "Published release tag is invalid."
+        );
+        let runtime = match std::env::consts::ARCH {
+            "x86_64" => "win-x64",
+            "aarch64" => "win-arm64",
+            _ => anyhow::bail!("Published Windows runtime is unsupported."),
+        };
+        // APIで確認したdigestを使い、ZIP本体はREST枠を消費しない公開URLから取得する。
+        format!(
+            "https://github.com/{repository}/releases/download/{tag}/prunlet-update-{runtime}.zip"
+        )
+    } else {
+        // 出荷済みlauncherからの引数を維持する。
+        format!("https://api.github.com/repos/{repository}/releases/assets/{asset}")
+    };
     let stage = stage_path(root);
     let _parents = path::pin_directories(&stage)?;
     let _mutex = InstallationMutexes::acquire(root)?;
@@ -46,7 +77,6 @@ pub fn receive_from(
     );
     verify_stage_owner(&stage, root, commit)?;
     budget::ensure(root, 0)?;
-    let url = format!("https://api.github.com/repos/{repository}/releases/assets/{asset}");
     let used = budget::measure(root)?;
     let mut existing = None;
     let destination = stage.join(&state.package_name);

@@ -421,8 +421,10 @@ fn parse_command(command: &str, args: &[String]) -> Result<Value> {
         }
         "__download-published-package" => {
             ensure!(
-                args.len() == 5 && nonnegative_i64(&args[2]) && nonnegative_i64(&args[4]),
-                "Published download requires repository, commit, asset ID, SHA-256 and byte length."
+                matches!(args.len(), 5 | 6)
+                    && nonnegative_i64(&args[2])
+                    && nonnegative_i64(&args[4]),
+                "Published download requires repository, commit, asset ID, SHA-256, byte length and an optional release tag."
             );
             Ok(json!({"argv":args}))
         }

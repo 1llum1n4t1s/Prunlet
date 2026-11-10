@@ -7,6 +7,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $script:StartupUpdateReady = $true
+$script:UseAuthenticatedUpdateApi = $false
 
 . (Join-Path $PSScriptRoot 'configuration-common.ps1')
 # job handleをPowerShellプロセスの終了まで保持し、入口終了時に子も終了させる。
@@ -76,23 +77,70 @@ function Test-ProductsIdle([string]$Executable) {
     finally { foreach ($handle in $handles) { $handle.Dispose() } }
 }
 
+function Get-UpdateApi([string]$Endpoint) {
+    $headers = @{ 'User-Agent' = 'Prunlet-Latest-Installer'; 'Accept' = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+    if (!$script:UseAuthenticatedUpdateApi) {
+        try { return Invoke-RestMethod -Uri ('https://api.github.com/' + $Endpoint) -Headers $headers -TimeoutSec 8 }
+        catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+            $response = $_.Exception.Response
+            $remaining = $null
+            # 未認証primary枠切れだけを切り替え、Retry-After付きや通常の権限拒否は再送しない。
+            if ($response.StatusCode -ne 403 -or $response.Headers.Contains('Retry-After') -or
+                !$response.Headers.TryGetValues('X-RateLimit-Remaining', [ref]$remaining) -or
+                (@($remaining) -join ',') -cne '0') { throw }
+            $script:UseAuthenticatedUpdateApi = $true
+        }
+    }
+    $gh = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (!$gh) { throw 'GitHub anonymous API rate limit exceeded and GitHub CLI is unavailable.' }
+    $start = [Diagnostics.ProcessStartInfo]::new($gh.Source)
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.StandardOutputEncoding = [Text.UTF8Encoding]::new($false, $true)
+    foreach ($arg in @('api', '--hostname', 'github.com', '--method', 'GET', '--header', 'Accept: application/vnd.github+json', '--header', 'X-GitHub-Api-Version: 2022-11-28', $Endpoint)) { $start.ArgumentList.Add($arg) }
+    # 既存認証はghの内部だけで使い、対話とデバッグを無効にする。
+    [void]$start.Environment.Remove('GH_DEBUG')
+    [void]$start.Environment.Remove('GH_FORCE_TTY')
+    $start.Environment['GH_PAGER'] = 'cat'
+    $start.Environment['NO_COLOR'] = '1'
+    $start.Environment['GH_PROMPT_DISABLED'] = '1'
+    $start.Environment['GIT_TERMINAL_PROMPT'] = '0'
+    $process = [Diagnostics.Process]::Start($start)
+    try {
+        $process.StandardInput.Close()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (!$process.WaitForExit(8000)) {
+            try { $process.Kill($true) } catch { }
+            throw 'GitHub CLI update request timed out.'
+        }
+        [void]$stderr.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) { throw 'GitHub CLI update request failed; existing authentication may be unavailable.' }
+        try { return ConvertFrom-Json -InputObject $stdout.GetAwaiter().GetResult() -ErrorAction Stop }
+        catch { throw 'GitHub CLI returned invalid update metadata.' }
+    } finally { $process.Dispose() }
+}
+
 function Get-LatestReleaseInfo([string]$Repository, [string]$Runtime) {
     if ($Repository -cnotmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$') { throw 'Installed repository is invalid.' }
     if ($Runtime -cnotin @('win-x64', 'win-arm64')) { throw 'Installed runtime is unsupported.' }
-    $headers = @{ 'User-Agent' = 'Prunlet-Latest-Installer'; 'Accept' = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
-    $metadata = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository" -Headers $headers -TimeoutSec 8
+    $metadata = Get-UpdateApi "repos/$Repository"
     $branch = [string]$metadata.default_branch
     if (!$branch) { throw 'GitHub did not return a default branch.' }
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases/latest" -Headers $headers -TimeoutSec 8
+    $release = Get-UpdateApi "repos/$Repository/releases/latest"
     $tag = [string]$release.tag_name
     if (!$tag -or $release.draft -or $release.prerelease) { throw 'GitHub did not return a published stable release.' }
-    $reference = Invoke-RestMethod -Uri ("https://api.github.com/repos/$Repository/git/ref/tags/" + [Uri]::EscapeDataString($tag)) -Headers $headers -TimeoutSec 8
+    if ($tag -cnotmatch '\Av?[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?\z') { throw 'Published release tag is invalid.' }
+    $reference = Get-UpdateApi "repos/$Repository/git/ref/tags/$tag"
     $target = $reference.object
     for ($depth = 0; $depth -lt 8; $depth++) {
         $sha = [string]$target.sha
         if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw 'Release tag has an invalid object SHA.' }
         if ($target.type -ceq 'commit') {
-            $comparison = Invoke-RestMethod -Uri ("https://api.github.com/repos/$Repository/compare/$sha..." + [Uri]::EscapeDataString($branch) + '?per_page=1') -Headers $headers -TimeoutSec 8
+            $comparison = Get-UpdateApi ("repos/$Repository/compare/$sha..." + [Uri]::EscapeDataString($branch) + '?per_page=1')
             if ($comparison.status -cnotin @('ahead', 'identical')) { throw 'Release commit is not on the default branch.' }
             $name = 'prunlet-update-' + $Runtime + '.zip'
             $assets = @($release.assets | Where-Object { $_.name -ceq $name -and $_.state -ceq 'uploaded' })
@@ -101,10 +149,10 @@ function Get-LatestReleaseInfo([string]$Repository, [string]$Runtime) {
             if ([string]$asset.digest -cnotmatch '^sha256:[0-9a-f]{64}$' -or [long]$asset.size -le 0 -or [long]$asset.size -gt 536870912) { throw 'Published package digest or size is invalid.' }
             if ([long]$asset.id -le 0) { throw 'Published package identity is invalid.' }
             # GitHub Releaseの発行者を信頼する。digestは転送内容の照合であり、独立したbuild来歴証明ではない。
-            return @{ commit = $sha; branch = $branch; assetSha256 = ([string]$asset.digest).Substring(7); assetBytes = [long]$asset.size; assetId = [long]$asset.id }
+            return @{ commit = $sha; branch = $branch; tag = $tag; assetSha256 = ([string]$asset.digest).Substring(7); assetBytes = [long]$asset.size; assetId = [long]$asset.id }
         }
         if ($target.type -cne 'tag') { throw 'Release tag does not identify a commit.' }
-        $annotated = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/git/tags/$sha" -Headers $headers -TimeoutSec 8
+        $annotated = Get-UpdateApi "repos/$Repository/git/tags/$sha"
         $target = $annotated.object
     }
     throw 'Release tag nesting exceeds the supported depth.'
@@ -114,8 +162,7 @@ function Get-LatestCommit([string]$Repository, [string]$Runtime, [string]$Instal
     if ($InstalledCommit -cnotmatch '^[0-9a-fA-F]{40}$') { throw 'Installed commit is invalid.' }
     $release = if ($null -eq $ReleaseInfo) { Get-LatestReleaseInfo $Repository $Runtime } else { $ReleaseInfo }
     if ($release.commit -ine $InstalledCommit) {
-        $headers = @{ 'User-Agent' = 'Prunlet-Latest-Installer'; 'Accept' = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
-        $comparison = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/compare/$InstalledCommit...$($release.commit)?per_page=1" -Headers $headers -TimeoutSec 8
+        $comparison = Get-UpdateApi "repos/$Repository/compare/$InstalledCommit...$($release.commit)?per_page=1"
         if ($comparison.status -cne 'ahead') { throw 'Published release does not descend from the installed commit.' }
     }
     return $release.commit
@@ -409,7 +456,7 @@ try {
                     if ($LASTEXITCODE -ne 0 -or ($begin | ConvertFrom-Json -AsHashtable).status -notin @('ready', 'existing')) { throw 'Published update state could not be prepared.' }
                     $beginResult = $begin | ConvertFrom-Json -AsHashtable
                     if ($beginResult.ContainsKey('warnings')) { foreach ($warning in $beginResult.warnings) { [Console]::Error.WriteLine('Prunlet update: ' + $warning) } }
-                    $received = & $ExecutablePath --config $ConfigPath __download-published-package $sourceInfo.repository $release.commit $release.assetId $release.assetSha256 $release.assetBytes
+                    $received = & $ExecutablePath --config $ConfigPath __download-published-package $sourceInfo.repository $release.commit $release.assetId $release.assetSha256 $release.assetBytes $release.tag
                     if ($LASTEXITCODE -ne 0 -or ($received | ConvertFrom-Json -AsHashtable).status -cne 'downloaded') { throw 'Published package download was not confirmed.' }
                     $prepared = & $ExecutablePath --config $ConfigPath __prepare-published-package $sourceInfo.repository $release.branch $release.commit $sourceInfo.runtime $release.assetSha256 $release.assetBytes $release.assetId
                     if ($LASTEXITCODE -ne 0) { throw 'Published package preparation did not complete.' }

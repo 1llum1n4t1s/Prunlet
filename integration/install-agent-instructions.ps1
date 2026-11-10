@@ -98,9 +98,19 @@ if (!(Test-Path -LiteralPath $SourceGuidePath -PathType Leaf)) { throw 'SourceGu
 [byte[]]$sourceBytes = [IO.File]::ReadAllBytes($SourceGuidePath)
 if (![IO.File]::ReadAllText($SourceGuidePath).StartsWith($guideHeader, [StringComparison]::Ordinal)) { throw 'Source guide has no Prunlet ownership header.' }
 $sourceHash = Get-BytesHash $sourceBytes
+$sameGuide = $false
 if ($guideExists) {
-    $guideHash = Get-BytesHash ([IO.File]::ReadAllBytes($guidePath))
-    if ($guideHash -cne $sourceHash -and (!$PreviousGuideSha256 -or $guideHash -ine $PreviousGuideSha256)) { throw 'PRUNLET.md was edited or belongs to another registration; it was preserved.' }
+    $guideBytes = [IO.File]::ReadAllBytes($guidePath)
+    $guideHash = Get-BytesHash $guideBytes
+    $sameGuide = $guideHash -ceq $sourceHash
+    if ($ValidateOnly -and !$sameGuide) {
+        # 自動更新の検証ではCRLF/LF差だけなら登録済みの実物を保全する。
+        $utf8 = [Text.UTF8Encoding]::new($false, $true)
+        $existingText = $utf8.GetString($guideBytes).Replace("`r`n", "`n")
+        $sourceText = $utf8.GetString($sourceBytes).Replace("`r`n", "`n")
+        $sameGuide = $existingText.Equals($sourceText, [StringComparison]::Ordinal)
+    }
+    if (!$sameGuide -and (!$PreviousGuideSha256 -or $guideHash -ine $PreviousGuideSha256)) { throw 'PRUNLET.md was edited or belongs to another registration; it was preserved.' }
     if (![IO.File]::ReadAllText($guidePath).StartsWith($guideHeader, [StringComparison]::Ordinal)) { throw 'Existing PRUNLET.md has no Prunlet ownership header.' }
 }
 if ($Uninstall) { $updatedText = $document.text.Remove($blockMatch.Index, $blockMatch.Length) }
@@ -124,7 +134,7 @@ if ($ValidateOnly) {
         agentPath = $agentPath
         guidePath = $guidePath
         agentChanged = ((Get-BytesHash $updatedAgent) -cne (Get-BytesHash $document.bytes))
-        guideChanged = (!$guideExists -or $guideHash -cne $sourceHash)
+        guideChanged = !$sameGuide
     }
 }
 $changes = [Collections.Generic.List[object]]::new()

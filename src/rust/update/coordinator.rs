@@ -473,16 +473,17 @@ pub fn execute(config: &Config, command: &str, args: &Value) -> Result<Value> {
         }
         "__download-published-package" => {
             ensure!(
-                argv.len() == 5,
-                "Published download requires repository, commit, asset ID, SHA-256 and byte length."
+                matches!(argv.len(), 5 | 6),
+                "Published download requires repository, commit, asset ID, SHA-256, byte length and an optional release tag."
             );
-            super::download::receive_from(
+            super::download::receive_release(
                 &root,
                 argv[0],
                 argv[1],
                 number(argv[2])?,
                 argv[3],
                 number(argv[4])?,
+                argv.get(5).copied(),
             )?;
             Ok(json!({"status":"downloaded"}))
         }

@@ -161,13 +161,15 @@ latest導入時に`capacityDefaultMigrationVersion`が欠落または1未満の�
 
 Windowsの利用者向け導入はGitHubの既定ブランチ最新HEADを解決し、取得元・ブランチ・commitを`source-info.json`へ記録する。開発クローン・ローカルビルドをlatest導入の代用にしない。設定の検証には`validate-config`を使い、設定読込とservice構築だけで走査・変更しない。共通指示の生成元は`integration/PRUNLET.md`で、配置済み共通指示の更新とソース変更は別の結果として扱う。
 
-インストーラーの`-UseGitHubCliAuthentication`は、APIの未認証枠を使えない場合などに、既存のGitHub CLIへAPI取得を委ねる明示選択である。既定ブランチ・commit解決の契約は変えず、`gh api --hostname github.com --method GET`を直接起動する。トークンを抽出せず、対話とデバッグ出力を抑止し、認証関連のstderrを記録へ転載しない。ghの導入・ログイン・cloneへの切替は行わず、失敗時は停止する。起動時自動更新の認証経路は変更しない。
+インストーラーの`-UseGitHubCliAuthentication`は、APIの未認証枠を使えない場合などに、既存のGitHub CLIへAPI取得を委ねる明示選択である。既定ブランチ・commit解決の契約は変えず、`gh api --hostname github.com --method GET`を直接起動する。トークンを抽出せず、対話とデバッグ出力を抑止し、認証関連のstderrを記録へ転載しない。ghの導入・ログイン・cloneへの切替は行わず、失敗時は停止する。
 
 手動導入の`-UpdateManagedInstallation`は、Gitの祖先配下にある既存の管理済み配置を更新するための限定的なパス検査例外である。既存設定・取得元情報と全製品hashを照合し、Git追跡対象を含まず、Git除外または実効CodexHomeの正規CLI登録で所有を確認できる配置だけを扱う。作業先・更新バックアップ・ソース・Codex内部へのガードを維持し、既存の復元先を保持する。配置と移行の直前にも再確認するが、ディレクトリ実体の原子的固定は提供しない。登録guideは検証済み本文との改行差だけを許容し、旧更新stageは保全する。`-ExpectedCommitSha`は取得した既定ブランチの最新HEADとの一致を要求し、不一致なら導入を止める。詳細な条件は[連携手順](docs/integration.md#手動の設定準備)を参照する。
 
 ### 起動時自動更新
 
 WindowsのCodex MCP登録は`integration/start-prunlet-mcp.ps1`をPowerShell 7で起動する。launcherがGitHubへの照会と更新手順の調停を行い、`update::coordinator`が製品・登録・移行の状態遷移を、`update::package`・`update::download`がパッケージ検証と取得を、`update::budget`・`update::slot`・`update::rotation`が容量と再利用を担当する。`update::gate`は通常CLI・MCP・保守の開始前に更新状態を検査する。hook専用の`prunlet-hook.exe`はこのgateを通らず、削除を実行するCLIのパスを受け取って案内する。
+
+Windowsの起動時照会では、未認証の主レート上限を示す403（残数0、`Retry-After`なし）のときだけ、同じ起動内の読取りを既存の`gh`認証へ切り替える。認証も使えなければ現行版で起動する。ZIP本体は照会済みタグとCPUのGitHub公開URLから取得し、APIで照合したサイズとSHA-256を検証する。登録済み`PRUNLET.md`が候補とUTF-8のCRLF/LFだけ異なる場合は、登録済みの実物を変更せず更新を進める。
 
 MCP起動時に公開済みlatestを確認し、既存版の子孫で更新protocolと保管形式が互換の候補だけを準備する。既存の製品・登録の所有とhashを確認し、旧CLI/MCPと保守exeを同時にwrite排他できなければ変更せず延期する。hookは独立exeとして継続し、旧プロセスを終了させない。固定の更新状態は製品切替・登録・移行の再開と更新cacheの所有確認・再利用に限り、ファイル操作履歴には使わない。途中状態では通常CLI/MCPと保守を止め、候補からレジストリ移行を再開する。移行開始後は旧exeへrollbackせず、registryが利用可能になってからsource-infoとidleを確定する。書込みや置換が不明なときは保全して自動再送せず、確定したregistryの利用とは分離する。
 
