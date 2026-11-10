@@ -1,6 +1,10 @@
 //! Mac版は署名済み単一実行ファイルを同一ディレクトリ内で置換する。
 use super::{Pinned, path, security};
-use crate::{config::ConfigData, json::parse_unique, update::package::is_hex};
+use crate::{
+    config::ConfigData,
+    json::parse_unique,
+    update::{github, package::is_hex},
+};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -21,7 +25,6 @@ use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 const LOCK: &str = ".prunlet-macos-update.lock";
 const NEXT: &str = ".prunlet-next";
-const REPO: &str = "1llum1n4t1s/Prunlet";
 const ASSET: &str = "prunlet-update-osx-arm64.zip";
 const COMMIT: &str = env!("PRUNLET_SOURCE_COMMIT");
 const TEAM: Option<&str> = option_env!("PRUNLET_MACOS_TEAM_ID");
@@ -219,73 +222,7 @@ fn request(url: &str, limit: u64, seconds: u32) -> Result<Vec<u8>> {
         let name = hex::encode(Sha256::digest(url.as_bytes()));
         return super::read_plain_file(&PathBuf::from(root).join(name), limit as usize, true);
     }
-    // curlrcを読まず、GitHubの認証情報を受け渡さない。転送の時間と実バイト数を両方制限する。
-    let mut child = Command::new("/usr/bin/curl")
-        .args([
-            "--disable",
-            "--fail",
-            "--silent",
-            "--location",
-            "--max-redirs",
-            "3",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--max-time",
-            &seconds.to_string(),
-            "--max-filesize",
-            &limit.to_string(),
-            "--header",
-            "User-Agent: Prunlet-macOS",
-            "--",
-            url,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut bytes = Vec::new();
-    let read = child
-        .stdout
-        .take()
-        .context("Missing transfer stream")?
-        .take(limit + 1)
-        .read_to_end(&mut bytes);
-    if read.is_err() || bytes.len() as u64 > limit {
-        let _ = child.kill();
-    }
-    let status = child.wait()?;
-    read?;
-    ensure!(
-        status.success() && bytes.len() as u64 <= limit,
-        "GitHub response failed or exceeded its limit"
-    );
-    Ok(bytes)
-}
-
-fn api(endpoint: &str) -> Result<Value> {
-    parse_unique(&request(
-        &format!("https://api.github.com/repos/{REPO}/{endpoint}"),
-        8 * 1024 * 1024,
-        5,
-    )?)
-}
-
-fn version(text: &str) -> Option<[u64; 3]> {
-    let mut result = [0; 3];
-    let mut parts = text.split('.');
-    for value in &mut result {
-        let part = parts.next()?;
-        if part.is_empty()
-            || !part.bytes().all(|b| b.is_ascii_digit())
-            || (part.len() > 1 && part.starts_with('0'))
-        {
-            return None;
-        }
-        *value = part.parse().ok()?;
-    }
-    parts.next().is_none().then_some(result)
+    github::request(url, limit, seconds)
 }
 
 #[derive(Deserialize)]
@@ -403,65 +340,12 @@ pub(crate) fn package(output: &Path) -> Result<Value> {
 }
 
 fn update(exe: &Path, ancestors: &path::DirectoryLease, lock: &Pinned) -> Result<bool> {
-    ensure!(is_hex(COMMIT, 40), "Installed Mac commit is unknown");
-    let release = api("releases/latest")?;
-    let tag = release["tag_name"]
-        .as_str()
-        .context("Release tag is missing")?;
-    let candidate_version = tag.strip_prefix('v').context("Unsupported release tag")?;
-    let newer = version(candidate_version).context("Invalid release version")?;
-    let installed = version(crate::VERSION).context("Invalid installed version")?;
-    if newer <= installed {
-        return Ok(false);
-    }
-    ensure!(
-        release["draft"] == false && release["prerelease"] == false,
-        "Release is not stable"
-    );
-    let assets = release["assets"]
-        .as_array()
-        .context("Release assets missing")?;
-    let mut matching = assets.iter().filter(|a| a["name"] == ASSET);
-    let Some(asset) = matching.next() else {
+    let Some(candidate) = github::newer(request, COMMIT, ASSET, MAX_PACKAGE)? else {
         return Ok(false);
     };
-    ensure!(
-        matching.next().is_none() && asset["state"] == "uploaded",
-        "Ambiguous Mac release asset"
-    );
-    let size = asset["size"]
-        .as_u64()
-        .filter(|n| *n > 0 && *n <= MAX_PACKAGE)
-        .context("Invalid asset size")?;
-    let digest = asset["digest"]
-        .as_str()
-        .and_then(|s| s.strip_prefix("sha256:"))
-        .filter(|s| is_hex(s, 64))
-        .context("Release asset has no SHA-256")?;
-    let expected_url = format!("https://github.com/{REPO}/releases/download/{tag}/{ASSET}");
-    ensure!(
-        asset["browser_download_url"] == expected_url,
-        "Unexpected release asset URL"
-    );
-    let candidate = api(&format!("commits/{tag}"))?;
-    let commit = candidate["sha"]
-        .as_str()
-        .filter(|s| is_hex(s, 40))
-        .context("Invalid release commit")?;
-    let relation = api(&format!("compare/{COMMIT}...{commit}?per_page=1"))?;
-    let main = api(&format!("compare/{commit}...main?per_page=1"))?;
-    ensure!(
-        relation["status"] == "ahead"
-            && matches!(main["status"].as_str(), Some("ahead" | "identical")),
-        "Release is not a newer main descendant"
-    );
-    let package = request(&expected_url, size, 30)?;
-    ensure!(
-        package.len() as u64 == size
-            && hex::encode(Sha256::digest(&package)).eq_ignore_ascii_case(digest),
-        "Release ZIP differs from GitHub metadata"
-    );
-    let bytes = executable_bytes(&package, candidate_version, commit)?;
+    let candidate_version = &candidate.version;
+    let commit = &candidate.commit;
+    let bytes = executable_bytes(&candidate.bytes, candidate_version, commit)?;
     let staged = exe.with_file_name(NEXT);
     match fs::symlink_metadata(&staged) {
         Ok(_) => {

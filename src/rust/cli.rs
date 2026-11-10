@@ -112,6 +112,11 @@ fn write_error(error: &anyhow::Error, stderr: bool) {
 }
 
 fn run_inner(args: &[String]) -> Result<i32> {
+    #[cfg(target_os = "linux")]
+    if args == ["--linux-build-info"] {
+        write_json(&platform::linux::startup::build_info())?;
+        return Ok(0);
+    }
     #[cfg(target_os = "macos")]
     if args == ["--macos-build-info"] {
         write_json(&platform::macos::startup::build_info())?;
@@ -131,6 +136,7 @@ fn run_inner(args: &[String]) -> Result<i32> {
         write_json(&platform::macos::startup::package(Path::new(path))?)?;
         return Ok(0);
     }
+    #[cfg(not(target_os = "linux"))]
     if args == ["--startup-update-protocol"] {
         let protocol = json!({"protocol":1,"storageEpoch":1});
         write_json(&protocol)?;
@@ -150,6 +156,8 @@ fn run_inner(args: &[String]) -> Result<i32> {
     let tail = &args[3..];
     #[cfg(target_os = "macos")]
     let _installation_lease = platform::macos::startup::enter(&config_path, command, args)?;
+    #[cfg(target_os = "linux")]
+    let _installation_lease = platform::linux::startup::enter(&config_path, command, args)?;
     if command == "hook" {
         ensure!(
             tail.is_empty() || (tail.len() == 2 && tail[0] == "--hook-script"),
@@ -637,6 +645,15 @@ mod tests {
     }
 }
 
+#[cfg(target_os = "linux")]
+const HELP: &str = r#"Prunlet — Linux freedesktop Trash.
+prunlet --config <absolute-json-path> init --backup-directory <directory>
+prunlet --config <absolute-json-path> validate-config
+prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]
+prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>
+prunlet --config <absolute-json-path> mcp
+prunlet --config <absolute-json-path> hook
+"#;
 #[cfg(target_os = "macos")]
 const HELP: &str = r#"Prunlet — Apple Silicon macOS Trash.
 prunlet --install-macos <new absolute installation path>

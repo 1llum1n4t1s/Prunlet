@@ -5,6 +5,8 @@ pub mod coordinator;
 #[cfg(windows)]
 pub mod download;
 pub mod gate;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) mod github;
 #[cfg(windows)]
 mod http;
 #[cfg(windows)]

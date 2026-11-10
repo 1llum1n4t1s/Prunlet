@@ -779,6 +779,7 @@ dependencies = [
  "bytes",
  "chrono",
  "embed-resource",
+ "flate2",
  "fs2",
  "hex",
  "http-body-util",

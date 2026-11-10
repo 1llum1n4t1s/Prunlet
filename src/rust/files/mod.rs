@@ -29,7 +29,11 @@ pub fn execute(
     {
         crate::platform::macos::execute(config, command, args, progress)
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::linux::execute(config, command, args, progress)
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         anyhow::bail!("This operating system is not supported")
     }
@@ -43,7 +47,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
     {
         crate::platform::macos::validate_config(config)
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::linux::validate_config(config)
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         anyhow::bail!("This operating system is not supported")
     }

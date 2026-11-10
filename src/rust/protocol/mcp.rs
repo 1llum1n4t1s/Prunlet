@@ -59,9 +59,9 @@ fn access(v: &Value) -> std::result::Result<(), (i32, String)> {
 }
 fn command(params: &Value) -> std::result::Result<(&'static str, Value), (i32, String)> {
     let name = string(params, "name")?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if name != "delete_files" {
-        return Err(invalid("Unknown macOS tool."));
+        return Err(invalid("Only delete_files is supported on this platform."));
     }
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     if !args.is_object() {
@@ -69,6 +69,8 @@ fn command(params: &Value) -> std::result::Result<(&'static str, Value), (i32, S
     }
     let cmd = match name {
         "delete_files" => {
+            #[cfg(target_os = "linux")]
+            extra(&args, &["paths", "dryRun", "recursive"])?;
             let action = args
                 .get("action")
                 .map(|v| {
@@ -341,18 +343,30 @@ pub fn run(backend: Arc<dyn Backend>) -> Result<()> {
 const INSTRUCTIONS: &str = r#"Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true for directory contents. Files and directories normally go to the Windows Recycle Bin without Prunlet operation records. An ordinary file with a Windows reserved final name is permanently deleted after identity checks without using the bin; dry-run reports would_permanently_delete. Reserved-name directories and links are rejected. If Windows reports that an item is too large for the bin and its original identity is confirmed, Prunlet attempts to permanently delete its original name. Only confirmed removal returns permanently_deleted; an uncertain attempt returns ambiguous. A permanently deleted name cannot be restored from the bin. Other recycling failures do not trigger permanent deletion. Dry-run cannot predict an ordinary item's bin-size outcome. File results have no operationId. For ambiguous results, do not resend deletion; inspect the source and Windows Recycle Bin. Windows controls bin retention and users may empty it. Metadata and legacy volume recovery directories and their ancestors remain protected. Links are handled without following their targets. Hard links share content with surviving aliases. Prunlet retention and capacity settings default to 7 days and 1 GiB for registry snapshots only, never for the Windows bin. list_operations lists registry recovery only. Use delete_registry for explicitly authorized local keys/values with required view 32 or 64, and restore_registry for their operationId. Empty valueName selects the default value; omitted valueName selects the key. Full key ACL snapshots require SeSecurityPrivilege; no automatic elevation or nontransactional fallback. Existing host approvals and policies still apply."#;
 #[cfg(target_os = "macos")]
 const INSTRUCTIONS: &str = "Use delete_files for authorized absolute macOS paths. Set recursive=true for directory contents. Files move to the macOS Trash without operation records. Links are handled without following their targets. Inspect the source and Trash after ambiguous results. The queue waits for cooperative flock locks.";
+#[cfg(target_os = "linux")]
+const INSTRUCTIONS: &str = "Use delete_files for authorized absolute Linux paths. Set recursive=true for directory contents. Items move to the freedesktop home Trash on the same mount. Links are handled without following their targets. Inspect the source and Trash after ambiguous results.";
 fn tools() -> Value {
     let tools: Vec<Value> =
         serde_json::from_str(include_str!("tools.json")).expect("embedded MCP schemas");
     #[cfg(windows)]
     return Value::Array(tools);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let mut file_tool = tools
             .into_iter()
             .find(|tool| tool["name"] == "delete_files")
             .expect("embedded file tool");
         file_tool["description"] = json!(INSTRUCTIONS);
+        #[cfg(target_os = "linux")]
+        {
+            let schema = &mut file_tool["inputSchema"];
+            let properties = schema["properties"].as_object_mut().expect("file tool properties");
+            properties.remove("action");
+            properties.remove("jobId");
+            let schema = schema.as_object_mut().expect("file tool schema");
+            schema.remove("oneOf");
+            schema.insert("required".into(), json!(["paths"]));
+        }
         json!([file_tool])
     }
 }
@@ -403,4 +417,31 @@ fn duplicate_access_mode(text: &str) -> bool {
         i += 1;
     }
     false
+}
+
+#[cfg(test)]
+mod access_mode_tests {
+    use super::duplicate_access_mode;
+
+    #[test]
+    fn refuses_duplicate_access_mode_in_the_same_object() {
+        for text in [
+            r#"{"accessMode":"normal","accessMode":"backupRestore"}"#,
+            r#"{"arguments":{"accessMode":"normal","\u0061ccessMode":"backupRestore"}}"#,
+            r#"{"accessMode":"normal","child":{},"accessMode":"backupRestore"}"#,
+        ] {
+            assert!(duplicate_access_mode(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn preserves_separate_access_modes_and_unrelated_duplicate_keys() {
+        for text in [
+            r#"{"accessMode":"normal","child":{"accessMode":"backupRestore"}}"#,
+            r#"{"children":[{"accessMode":"normal"},{"accessMode":"backupRestore"}]}"#,
+            r#"{"accessMode":"normal","text":"\"accessMode\": \"backupRestore\"","text":"note"}"#,
+        ] {
+            assert!(!duplicate_access_mode(text), "{text}");
+        }
+    }
 }

@@ -1,13 +1,17 @@
 # Prunletの設計
 
-Prunletは、AIエージェントに許可されたファイル・フォルダー削除をCLIとMCPへ集約し、共通の検証経路で処理する。Windows x64・ARM64とApple Silicon Macでは、通常のファイル削除をOSのゴミ箱へ委ね、Prunletの復元用記録を残さない。Windowsは条件を限定したファイルの永久削除と、snapshot・トランザクションを使うレジストリ削除・復元も扱う。利用手順は[README](README.md)、連携は[Windowsの連携手順](docs/integration.md)と[macOSの導入手順](docs/macos.md)、検証は[検証手順](docs/verification.md)を参照する。
+Prunletは、AIエージェントに許可されたファイル・フォルダー削除をCLIとMCPへ集約し、共通の検証経路で処理する。Windows x64・ARM64、Apple Silicon Mac、Linux x64・ARM64では、通常のファイル削除をOSのゴミ箱へ委ね、Prunletの復元用記録を残さない。Windowsは条件を限定したファイルの永久削除と、snapshot・トランザクションを使うレジストリ削除・復元も扱う。利用手順は[README](README.md)、連携は[Windows](docs/integration.md)・[macOS](docs/macos.md)・[Linux](docs/linux.md)の導入手順、検証は[検証手順](docs/verification.md)を参照する。
+
+Linux版は `src/rust/platform/linux` の同期Trash処理をCLI・stdio MCPで共有する。対象の親と実体をfdで保持し、マウントIDを比較する。freedesktop Trashの `.trashinfo` を先に保存し、`renameat2(RENAME_NOREPLACE)` で移動する。元と移動先を照合できない場合は `ambiguous` を返し、その要求の残りを止める。別マウントへのコピーや永久削除へ切り替えない。
+
+Linux版の起動時更新はMac版とGitHub Releaseの照合を共有する。管理済み配置の固定ロックを通常CLIとMCPで共有し、起動時の更新だけが排他で実行される。tar.gzは展開先のパスを作らずに検証し、同一 `bin` に新しいinodeを準備する。検証後に実行ファイルの名前を原子的に置き換え、起動済みの世代が変わった入口は新しいinodeを実行する。設定や復元領域は置換しない。
 
 ## 構成と責務
 
 製品コードは`src/rust`のRust実装で、ワークスペースの正本は[`Cargo.toml`](Cargo.toml)である。[MSVCターゲットの設定](.cargo/config.toml)でCランタイムを静的リンクし、Windowsの製品exeの実行に.NETランタイムやVCランタイムの追加導入を求めない。
 
 - `service::Runtime`がCLIとMCPの共通実行境界となり、ファイルを`files`、レジストリと明示移行を`registry`、起動時更新の内部要求を`update`へ渡す。旧ファイルの明示移行は`registry::migration`から`migration`へ委譲する。
-- `cli`はCLIの入力検証とJSON出力、`protocol::mcp`はstdio JSON-RPCを担当する。MCPは両OSで`delete_files`を公開し、Windowsでは`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`も公開する。`--config <path> mcp`として起動した場合は、起動前・引数検証の例外もstderrへ出してプロトコルstdoutを保つ。他のCLIでは例外をstdoutのJSONで返し、値名などの引数に`mcp`が含まれるだけでは出力先を変えない。
+- `cli`はCLIの入力検証とJSON出力、`protocol::mcp`はstdio JSON-RPCを担当する。MCPは各OSで`delete_files`を公開し、Windowsでは`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`も公開する。`--config <path> mcp`として起動した場合は、起動前・引数検証の例外もstderrへ出してプロトコルstdoutを保つ。他のCLIでは例外をstdoutのJSONで返し、値名などの引数に`mcp`が含まれるだけでは出力先を変えない。
 - `protocol::hook`は認識した直接削除を検査・拒否し、配置済みCLIを案内する。Windowsの専用入口`prunlet-hook.exe`はCLIと同じバイナリを別名で配置する。macOSは`prunlet --config <path> hook`で同じ実行ファイルを使う。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
 - `prunlet-maintenance.exe`は同じCoreをGUI subsystemで発行した定期保守入口で、`--config <path> maintain --apply`だけを受け付ける。コンソールを作らずにレジストリ復元データを整理する。
 - `platform::windows`がパス・実体・ACLの照合やWindows Shellとの接続を担当する。ゴミ箱からの復元と保持期間の管理はWindowsに委ねる。Prunletはファイル復元APIや通常の履歴圧縮入口を提供しない。

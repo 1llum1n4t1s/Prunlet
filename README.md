@@ -1,6 +1,6 @@
 # Prunlet — Anti “blocked by policy”
 
-Prunletは、`blocked by policy`による清掃の停止を減らすために、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約するWindows・Apple Silicon Mac用ツールです。許可された削除を最初からPrunletへ任せる使い方に揃えます。
+Prunletは、`blocked by policy`による清掃の停止を減らすために、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約するWindows・Apple Silicon Mac・Linux用ツールです。許可された削除を最初からPrunletへ任せる使い方に揃えます。
 
 通常はファイル・フォルダーをOSのゴミ箱へ移します。Prunletはファイルの操作記録・操作ID・復元用snapshotを保存せず、ゴミ箱からの復元と保持はOSに任せます。Codexフックは直接削除を検査・拒否し、CLI手順を案内します。提供元はKagayoiです。
 
@@ -31,6 +31,10 @@ CodexからMacなどへ送るPowerShellスクリプトは、[フックの連携�
 ### Apple Silicon Mac
 
 [GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases/latest)から`prunlet-update-osx-arm64.zip`を取得します。署名・公証の確認、専用フォルダーへの新規導入、CodexのMCP登録は[macOSの導入手順](docs/macos.md)に従ってください。登録済みMCPは起動時に更新を確認し、使用中なら次回以降に延期します。
+
+### Linux
+
+Linux x64・ARM64の導入、Codex登録、ゴミ箱の使い方は[Linuxの導入手順](docs/linux.md)を参照してください。
 
 ### Windows
 
@@ -200,7 +204,7 @@ MSIX由来の仮想viewで6801になる場合は、[通常Windowsの明示セッ
 
 ## MCP
 
-`prunlet --config <絶対パス> mcp`でローカルstdioサーバーを起動します。標準出力はJSON-RPC専用です。MCPプロトコルの2025-11-25・2025-06-18・2024-11-05に対応します。`delete_files`は両OSで使えます。表のほかのツールはWindows専用です。
+`prunlet --config <絶対パス> mcp`でローカルstdioサーバーを起動します。標準出力はJSON-RPC専用です。MCPプロトコルの2025-11-25・2025-06-18・2024-11-05に対応します。`delete_files`の同期削除はWindows・macOS・Linux、待機登録・照会・取消はWindows・macOSで使えます。表のほかのツールはWindows専用です。
 
 | ツール | 引数 | 用途 |
 | --- | --- | --- |
@@ -214,7 +218,7 @@ MSIX由来の仮想viewで6801になる場合は、[通常Windowsの明示セッ
 
 ## Codexとの連携
 
-Windowsの共通MCP登録、削除入力の検査、解除手順は[連携手順](docs/integration.md)を参照してください。macOSのMCP登録例とフックの起動引数は[macOSの導入手順](docs/macos.md)を参照してください。ネイティブexeのフックは認識した直接削除を拒否し、検知した命令とshellの解釈を理由として返します。shellが不明な場合は候補としての判定であり、ローカル削除と確定したものではありません。検索文字列やリモートスクリプトが拒否された場合は、[フックの検査範囲](docs/integration.md#hookの検査範囲)を確認してください。フックが案内するCLIは、許可されたホストOS上の対象の削除に使います。削除や入力の自動置換は行いません。Codex側の承認や管理ポリシーを維持します。
+Windowsの共通MCP登録、削除入力の検査、解除手順は[連携手順](docs/integration.md)を参照してください。MCP登録例とフックの起動引数は、各OSの手順を参照してください。[macOSの導入手順](docs/macos.md)・[Linuxの導入手順](docs/linux.md)。ネイティブexeのフックは認識した直接削除を拒否し、検知した命令とshellの解釈を理由として返します。shellが不明な場合は候補としての判定であり、ローカル削除と確定したものではありません。検索文字列やリモートスクリプトが拒否された場合は、[フックの検査範囲](docs/integration.md#hookの検査範囲)を確認してください。フックが案内するCLIは、許可されたホストOS上の対象の削除に使います。削除や入力の自動置換は行いません。Codex側の承認や管理ポリシーを維持します。
 
 ## 保存先の実体検証で停止する場合
 
