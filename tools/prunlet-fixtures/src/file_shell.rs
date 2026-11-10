@@ -1,4 +1,5 @@
 //! 検証fixture専用のShell識別・非置換移動。製品Coreには依存しない。
+use crate::path_scope::is_strict_child;
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -66,16 +67,6 @@ unsafe extern "system" {
 #[link(name = "ole32")]
 unsafe extern "system" {
     fn CreateStreamOnHGlobal(global: *mut c_void, delete: i32, stream: *mut *mut c_void) -> i32;
-}
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn CompareStringOrdinal(
-        a: *const u16,
-        alen: i32,
-        b: *const u16,
-        blen: i32,
-        ignore_case: i32,
-    ) -> i32;
 }
 struct Com(*mut c_void);
 impl Drop for Com {
@@ -176,30 +167,7 @@ fn validate_id(s: &str) -> Result<()> {
     Ok(())
 }
 fn owned(path: &Path, scope: &Path) -> Result<()> {
-    // Windowsのordinal比較は文字数が増える大文字変換を行わない。
-    let p: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .map(|c| if c == b'/' as u16 { b'\\' as u16 } else { c })
-        .collect();
-    let mut s: Vec<u16> = scope
-        .as_os_str()
-        .encode_wide()
-        .map(|c| if c == b'/' as u16 { b'\\' as u16 } else { c })
-        .collect();
-    while s.last() == Some(&(b'\\' as u16)) {
-        s.pop();
-    }
-    ensure!(
-        !s.is_empty()
-            && s.len() <= i32::MAX as usize
-            && p.len() > s.len()
-            && p[s.len()] == b'\\' as u16
-            && unsafe {
-                CompareStringOrdinal(p.as_ptr(), s.len() as i32, s.as_ptr(), s.len() as i32, 1)
-            } == 2,
-        "Fixture path escaped its owned scope"
-    );
+    ensure!(is_strict_child(path, scope), "Fixture path escaped its owned scope");
     Ok(())
 }
 fn pin_parents(p: &Path) -> Result<Vec<Handle>> {
@@ -945,44 +913,5 @@ pub fn dispatch(op: &str, args: &Value) -> Result<Value> {
         "file.shell.move_owned" => move_owned(args),
         "file.shell.normalize_reserved_directory" => normalize_reserved(args),
         _ => bail!("Unknown Shell fixture operation: {op}"),
-    }
-}
-
-#[cfg(test)]
-mod scope_tests {
-    use super::*;
-
-    #[test]
-    fn windows_ordinal_scope_boundaries() {
-        assert!(
-            owned(
-                Path::new(r"D:\Fixture\Straße\item"),
-                Path::new(r"d:\fixture\Straße")
-            )
-            .is_ok()
-        );
-        assert!(
-            owned(
-                Path::new(r"D:\Fixture\Straße\item"),
-                Path::new(r"D:\Fixture\STRASSE")
-            )
-            .is_err()
-        );
-        assert!(
-            owned(
-                Path::new(r"D:\Fixture\STRASSE\item"),
-                Path::new(r"D:\Fixture\Straße")
-            )
-            .is_err()
-        );
-        assert!(
-            owned(
-                Path::new(r"D:\FixtureSuffix\item"),
-                Path::new(r"D:\Fixture")
-            )
-            .is_err()
-        );
-        assert!(owned(Path::new(r"D:\Fixture"), Path::new(r"D:\Fixture")).is_err());
-        assert!(owned(Path::new(r"D:\item"), Path::new("d:\\")).is_ok());
     }
 }

@@ -1,4 +1,5 @@
 //! 検証fixture専用のsparse証拠と、所有済み内容だけの縮小。
+use crate::path_scope::is_strict_child;
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -69,30 +70,7 @@ fn absolute(s: &str) -> Result<PathBuf> {
     Ok(p)
 }
 fn owned(path: &Path, scope: &Path) -> Result<()> {
-    // Windowsのordinal比較は文字数が増える大文字変換を行わない。
-    let p: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .map(|c| if c == b'/' as u16 { b'\\' as u16 } else { c })
-        .collect();
-    let mut s: Vec<u16> = scope
-        .as_os_str()
-        .encode_wide()
-        .map(|c| if c == b'/' as u16 { b'\\' as u16 } else { c })
-        .collect();
-    while s.last() == Some(&(b'\\' as u16)) {
-        s.pop();
-    }
-    ensure!(
-        !s.is_empty()
-            && s.len() <= i32::MAX as usize
-            && p.len() > s.len()
-            && p[s.len()] == b'\\' as u16
-            && unsafe {
-                CompareStringOrdinal(p.as_ptr(), s.len() as i32, s.as_ptr(), s.len() as i32, 1)
-            } == 2,
-        "Sparse fixture escaped owned scope"
-    );
+    ensure!(is_strict_child(path, scope), "Sparse fixture escaped owned scope");
     Ok(())
 }
 fn open(path: &Path, access: u32, share: u32, flags: u32) -> Result<Handle> {
@@ -553,44 +531,5 @@ pub fn dispatch(op: &str, args: &Value) -> Result<Value> {
         "file.sparse.allocation" => allocation(&absolute(field(args, "path")?)?),
         "file.sparse.bin_totals" => bin_totals(&absolute(field(args, "rootPath")?)?),
         _ => bail!("Unknown sparse fixture operation: {op}"),
-    }
-}
-
-#[cfg(test)]
-mod scope_tests {
-    use super::*;
-
-    #[test]
-    fn windows_ordinal_scope_boundaries() {
-        assert!(
-            owned(
-                Path::new(r"D:\Fixture\Straße\item"),
-                Path::new(r"d:\fixture\Straße")
-            )
-            .is_ok()
-        );
-        assert!(
-            owned(
-                Path::new(r"D:\Fixture\Straße\item"),
-                Path::new(r"D:\Fixture\STRASSE")
-            )
-            .is_err()
-        );
-        assert!(
-            owned(
-                Path::new(r"D:\Fixture\STRASSE\item"),
-                Path::new(r"D:\Fixture\Straße")
-            )
-            .is_err()
-        );
-        assert!(
-            owned(
-                Path::new(r"D:\FixtureSuffix\item"),
-                Path::new(r"D:\Fixture")
-            )
-            .is_err()
-        );
-        assert!(owned(Path::new(r"D:\Fixture"), Path::new(r"D:\Fixture")).is_err());
-        assert!(owned(Path::new(r"D:\item"), Path::new("d:\\")).is_ok());
     }
 }

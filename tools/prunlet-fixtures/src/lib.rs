@@ -6,6 +6,8 @@
 #[cfg(windows)]
 mod files;
 #[cfg(windows)]
+mod path_scope;
+#[cfg(windows)]
 mod protected;
 #[cfg(windows)]
 mod registry;
