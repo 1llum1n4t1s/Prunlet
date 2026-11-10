@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.40 - 2026-11-10
+
+- Linux x64・ARM64向けに、freedesktop Trashを使うCLI・stdio MCP・Codexフックを追加。
+- Linux版はMCP起動時にGitHubの公開版を確認し、設定と復元領域を保ったまま同じCPU向けの実行ファイルへ更新する。
+- MCPのOS別対応を文書に明記し、権限指定の重複拒否とWindows検証用フィクスチャのパス境界を確認するテストを整理。
+
 ## 1.0.39 - 2026-11-10
 
 - Apple Silicon Mac向けにTrashを使うCLI・MCP・フックと削除待機キューを復活。

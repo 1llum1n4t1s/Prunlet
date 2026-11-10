@@ -1,6 +1,6 @@
 [package]
 name = "prunlet-fixtures"
-version = "1.0.39"
+version = "1.0.40"
 edition = "2024"
 rust-version = "1.99.1"
 publish = false
