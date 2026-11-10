@@ -169,15 +169,19 @@ Windowsの利用者向け導入はGitHubの既定ブランチ最新HEADを解決
 
 WindowsのCodex MCP登録は`integration/start-prunlet-mcp.ps1`をPowerShell 7で起動する。launcherがGitHubへの照会と更新手順の調停を行い、`update::coordinator`が製品・登録・移行の状態遷移を、`update::package`・`update::download`がパッケージ検証と取得を、`update::budget`・`update::slot`・`update::rotation`が容量と再利用を担当する。`update::gate`は通常CLI・MCP・保守の開始前に更新状態を検査する。hook専用の`prunlet-hook.exe`はこのgateを通らず、削除を実行するCLIのパスを受け取って案内する。
 
-Windowsの起動時照会では、未認証の主レート上限を示す403（残数0、`Retry-After`なし）のときだけ、同じ起動内の読取りを既存の`gh`認証へ切り替える。認証も使えなければ現行版で起動する。ZIP本体は照会済みタグとCPUのGitHub公開URLから取得し、APIで照合したサイズとSHA-256を検証する。登録済み`PRUNLET.md`が候補とUTF-8のCRLF/LFだけ異なる場合は、登録済みの実物を変更せず更新を進める。
+Windowsの起動時照会は未認証で始める。HTTP 403で`X-RateLimit-Remaining`が`0`、かつ`Retry-After`がない場合だけ主レート上限と判断し、その起動中の読取りを既存の`gh`認証によるGETへ切り替える。認証は`gh`の内部で使い、対話を抑止する。照会に失敗した場合は更新を延期し、更新状態が`idle`なら現行版で起動する。
 
 MCP起動時に公開済みlatestを確認し、既存版の子孫で更新protocolと保管形式が互換の候補だけを準備する。既存の製品・登録の所有とhashを確認し、旧CLI/MCPと保守exeを同時にwrite排他できなければ変更せず延期する。hookは独立exeとして継続し、旧プロセスを終了させない。固定の更新状態は製品切替・登録・移行の再開と更新cacheの所有確認・再利用に限り、ファイル操作履歴には使わない。途中状態では通常CLI/MCPと保守を止め、候補からレジストリ移行を再開する。移行開始後は旧exeへrollbackせず、registryが利用可能になってからsource-infoとidleを確定する。書込みや置換が不明なときは保全して自動再送せず、確定したregistryの利用とは分離する。
+
+登録の検証では、登録済み`PRUNLET.md`のバイト列が候補と異なる場合に、両方を厳密なUTF-8として読み、CRLFをLFにそろえて本文を照合する。一致すれば既存ファイルのバイト列を保持したまま進める。登録への書込みが必要な候補は保留する。この同一性判定は登録済みガイドの読取り検証に限り、配布物のSHA-256照合は元のバイト列で行う。
 
 stageは再帰削除せず、完了した世代の正規製品とmetadataをhashと実体で照合して主streamだけを再利用する。正常な次回更新を、stageが存在するだけで止めない。未知の項目は残して容量へ含め、未確定の切替・移行は先に同じ候補で再開する。
 
 切替前のidleで候補実行・移行・登録確定・未解決の書込みやrotationがない未適用stageも、旧owner・source-info・stateの公開ZIP hash/長さ・ZIP manifest・全12製品・3つのready slotが一致し、未知の項目・ADS・リンクがない場合に限りcacheとして再利用する。旧commit・owner/source-info hash・3製品と9補助製品のhashを任意stateの`cacheBaseline`へ先に固定してからownerを切り替え、中断時は同じbaselineで再開する。これはstage主streamの更新だけに用い、previousへの退避と製品rotationは現在のinstalled来歴を基準にする。認定できないstageは変更せず保持する。
 
-配布元の方針は公開済みGitHub Releaseであり、その発行者を信頼する。`.github/workflows/prunlet-release-package.yml`が公開タグからwin-x64・win-arm64をビルドし、`scripts/Package-PrunletUpdate.ps1`でZIPを作成する。公開前に`Verify-ReleasePackage.ps1`がentryの過不足・重複、metadataの取得元・commit・runtime等、および全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合する。検証済みZIP全体のSHA-256をアップロード直前にも再確認し、同じreleaseへ添付する。既存assetは上書きしない。取得側はタグが既定ブランチ上のcommitを指すこととasset digest・size、パッケージ内のcommit・runtime・製品hashを検証する。digestは転送内容の一致を示し、ソースからビルドされたことを独立に証明しない。Actionsの期限付きartifactを更新の必須条件としない。
+配布元は公開済みGitHub Releaseとする。`.github/workflows/prunlet-release-package.yml`が公開タグからwin-x64・win-arm64をビルドし、`scripts/Package-PrunletUpdate.ps1`でZIPを作成する。公開前に`Verify-ReleasePackage.ps1`がentryの過不足・重複、metadataの取得元・commit・runtime等、および全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合する。検証済みZIP全体のSHA-256をアップロード直前にも再確認し、同じreleaseへ添付する。既存assetは上書きしない。
+
+取得側はタグが既定ブランチ上のcommitを指すことと、パッケージ内のcommit・runtime・製品hashを検証する。通常の起動時更新では、照会済みタグと実行体のruntimeからGitHubの公開ZIP URLを組み立て、REST API枠を使わずにZIPを取得する。タグを渡さない旧launcherからの要求ではasset IDによるAPI取得を維持する。どちらの取得経路でも、APIが返したサイズとSHA-256で転送内容を照合する。ソースとビルドの対応は発行者への信頼に依存する。Actionsの期限付きartifactを更新の必須条件としない。
 
 更新用cacheはレジストリ復元領域とは別に合計2 GiBを上限とする。公開ZIP・stage・製品slot・固定candidate/previous・保全した異常世代・各ディレクトリのADS・更新管理ファイルを容量に含め、確保前と完了後に検査する。slotはcache専用で、実行・移動・削除しない。正規hash・長さ・単一linkを同じ排他handleで確認し、通常streamだけをin-place更新する。候補へはそのhandleの通常streamだけをCreateNewコピーする。ADSや不明な部分書込みは保持し、予算不足を自動削除で回避しない。
 

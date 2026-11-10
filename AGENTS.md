@@ -63,7 +63,7 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 - 保護アクセス・診断: 保護レジストリのopen・privilege・viewを変更した場合は`Verify-ProtectedRegistryAccess.ps1`と`Verify-ProtectedRegistryViews.ps1`、ファイルのアクセス拒否・削除後確認の診断を変更した場合は`Verify-AccessDeniedFiles.ps1`も実行する。引数とfixture条件は[検証手順](docs/verification.md)に従い、API適合性probeとCLI/MCP E2Eの結果を区別する。
 - snapshot公開: 容量予約・本文のシリアライズ・公開処理を変更した場合は`scripts/Verify-RegistrySnapshotPublication.ps1`も実行する。必須引数と保存境界の検証範囲は[レジストリ検証](docs/verification.md#レジストリの削除と復元)に従い、実レジストリの往復検証とは区別する。
 - 導入: installer・共通指示・登録解除変更では`scripts/Verify-LatestInstall.ps1`を実行する。fixtureと実GitHub、保存内容と実ホストhook読込・承認・guide遵守を区別する。移行開始後の失敗で旧binaryへrollbackせず新exe/設定/登録を保全し、同じCLIで再開できることを確認する。
-- 起動時更新: `integration/start-prunlet-mcp.ps1`・`src/rust/update/`・公開ZIPの生成や登録を変更した場合は、[導入検証](docs/verification.md#latestインストーラー)の起動時更新の範囲も確認する。公開と同じZIPによる複数回更新、使用中の延期、独立hook、途中再開、登録改変の保全、ADSを含む容量上限を検証し、通常の導入検証だけで代替しない。未適用stageの認定・再利用を変更した場合は、同節の`Verify-UnappliedStartupStage.ps1`も実行し、実ホスト登録を含む完全更新との検証範囲の違いを明示する。
+- 起動時更新: `integration/start-prunlet-mcp.ps1`・`src/rust/update/`・公開ZIPの生成や登録を変更した場合は、[導入検証](docs/verification.md#latestインストーラー)の起動時更新の範囲も確認する。公開と同じZIPによる複数回更新、使用中の延期、独立hook、途中再開、登録改変の保全、ADSを含む容量上限を検証し、通常の導入検証だけで代替しない。GitHub照会・取得を変更した場合は、未認証の主レート上限だけで既存の`gh`認証へ切り替わること、照会失敗時の安全な現行版起動、公開ZIPのサイズ・SHA-256不一致の拒否を確認する。共通指示の照合を変更した場合は、CRLF/LF差だけなら登録済み`PRUNLET.md`のバイト列を保持して更新でき、候補と本文が異なれば保留することを確認する。未適用stageの認定・再利用を変更した場合は、同節の`Verify-UnappliedStartupStage.ps1`も実行し、実ホスト登録を含む完全更新との検証範囲の違いを明示する。
 
 ゴミ箱全体の空化・既存項目の清掃を行わず、今回fixtureだけを扱う。検証後の保持・清掃は[検証手順](docs/verification.md#検証後の保持と清掃)に従い、未清掃パス・理由・再開条件を返す。
 
