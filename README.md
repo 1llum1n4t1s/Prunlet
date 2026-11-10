@@ -8,7 +8,7 @@ Prunletは、`blocked by policy`による清掃の停止を減らすために、
 
 ## `blocked by policy`対策としての使い方
 
-AIが生成した`Remove-Item`や`rm`などの削除コマンドで清掃が止まりやすい環境では、許可された削除を最初からPrunlet CLIへ任せます。Apple Silicon MacのCodexでは[macOSの導入手順](docs/macos.md)に沿って、配置済みのCLIと設定を使います。
+AIが生成した`Remove-Item`や`rm`などの削除コマンドで清掃が止まりやすい環境では、許可された削除を最初からPrunlet CLIへ任せます。Apple Silicon MacとLinuxのCodexでは、導入時に配置したCLIと設定を使います。[macOSの導入手順](docs/macos.md)・[Linuxの導入手順](docs/linux.md)
 
 WindowsのCodexでは、次の順序で利用します。
 
@@ -34,7 +34,9 @@ CodexからMacなどへ送るPowerShellスクリプトは、[フックの連携�
 
 ### Linux
 
-Linux x64・ARM64の導入、Codex登録、ゴミ箱の使い方は[Linuxの導入手順](docs/linux.md)を参照してください。
+CPUに合う`prunlet-linux-x64.tar.gz`または`prunlet-linux-arm64.tar.gz`と、同名の`.sha256`ファイルを取得します。[GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases)
+
+チェックサムの照合、専用ディレクトリへの配置、Codex登録は[Linuxの導入手順](docs/linux.md#初回インストール)を参照してください。公式配布版は、手順どおりに配置するとMCP起動時に更新を確認し、使用中なら次回以降に延期します。
 
 ### Windows
 
@@ -87,7 +89,7 @@ MSIX環境でAppDataが別の実体へ転送される場合は、`-UpdateBackupR
 
 ## 初期設定
 
-macOSの導入時には設定が作成されます。以下はWindowsの初期設定手順です。Windowsのインストーラーを利用した場合は初期化済みです。手動ではレジストリ復元データの保存先を指定します。`init`は既存設定を上書きしません。
+macOSとLinuxでは各OSの導入手順で設定を作成します。以下はWindowsの初期設定手順です。Windowsのインストーラーを利用した場合は初期化済みです。手動ではレジストリ復元データの保存先を指定します。`init`は既存設定を上書きしません。
 
 ```powershell
 $config = Join-Path $env:USERPROFILE '.local\Prunlet\config.json'
@@ -120,6 +122,10 @@ $exe = Join-Path $env:USERPROFILE '.local\Prunlet\bin\prunlet.exe'
 
 協調的な`flock`の解放を待つには`delete-queue -- <絶対パス>`で登録し、`delete-queue-status <job-id>`で最終結果を確認します。取消は`pending`の間に`delete-queue-cancel <job-id>`で行います。
 
+### Linuxでの削除・復元
+
+[LinuxのCLI例](docs/linux.md#初回インストール)の実行ファイルと設定の絶対パスを使います。`delete --dry-run -- <絶対パス>`で対象を確認し、実行時は`--dry-run`を外します。ホームTrashと同じマウントの項目を移せます。`recycled`の項目はfreedesktop Trash対応のファイルマネージャーで復元できます。`ambiguous`の場合は元のパスとゴミ箱を確認し、同じ削除を自動再送しないでください。
+
 ### Windowsでの削除・復元
 
 正式なsandbox権限申請に対応し、実効設定で申請が必要かつ許可されるCodexホストでは、実削除を初回から申請付きで実行します。dry-runはゴミ箱へのアクセス許可を保証しません。Windowsの管理者権限が必要な場合は、許可範囲内でエージェントが管理者CMDを起動し、同じ配置済みCLIと設定で実行・結果確認を行います。本人のUAC同意が必要な場合は操作を案内します。Prunlet自身は自動昇格せず、拒否・結果不明を別経路で再試行しません。詳細は[連携手順](docs/integration.md#sandboxとゴミ箱へのアクセス)を参照してください。
@@ -147,7 +153,7 @@ Windowsのゴミ箱にある間のアクセス権と、復元先の親からの�
 
 ### 使用中のファイルを待機して削除する
 
-使用中の対象を待つ場合は、削除の開始前に明示的な`delete-queue`へ登録します。通常の`delete`は従来どおり同期で結果を返します。
+Windowsで使用中の対象を待つ場合は、削除の開始前に明示的な`delete-queue`へ登録します。通常の`delete`は従来どおり同期で結果を返します。
 
 ```cmd
 C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete-queue --paths-file C:\work\delete-paths.json
@@ -218,7 +224,9 @@ MSIX由来の仮想viewで6801になる場合は、[通常Windowsの明示セッ
 
 ## Codexとの連携
 
-Windowsの共通MCP登録、削除入力の検査、解除手順は[連携手順](docs/integration.md)を参照してください。MCP登録例とフックの起動引数は、各OSの手順を参照してください。[macOSの導入手順](docs/macos.md)・[Linuxの導入手順](docs/linux.md)。ネイティブexeのフックは認識した直接削除を拒否し、検知した命令とshellの解釈を理由として返します。shellが不明な場合は候補としての判定であり、ローカル削除と確定したものではありません。検索文字列やリモートスクリプトが拒否された場合は、[フックの検査範囲](docs/integration.md#hookの検査範囲)を確認してください。フックが案内するCLIは、許可されたホストOS上の対象の削除に使います。削除や入力の自動置換は行いません。Codex側の承認や管理ポリシーを維持します。
+Windowsの共通MCP登録、削除入力の検査、解除手順は[連携手順](docs/integration.md)を参照してください。macOSとLinuxのMCP登録例とフックの起動引数は、それぞれの導入手順を参照してください。[macOSの導入手順](docs/macos.md)・[Linuxの導入手順](docs/linux.md)
+
+フックは認識した直接削除を拒否し、検知した命令とshellの解釈を理由として返します。shellが不明な場合は候補としての判定であり、ローカル削除と確定したものではありません。検索文字列やリモートスクリプトが拒否された場合は、[フックの検査範囲](docs/integration.md#hookの検査範囲)を確認してください。フックが案内するCLIは、許可されたホストOS上の対象の削除に使います。削除や入力の自動置換は行いません。Codex側の承認や管理ポリシーを維持します。
 
 ## 保存先の実体検証で停止する場合
 

@@ -2,20 +2,17 @@
 
 Prunletは、AIエージェントに許可されたファイル・フォルダー削除をCLIとMCPへ集約し、共通の検証経路で処理する。Windows x64・ARM64、Apple Silicon Mac、Linux x64・ARM64では、通常のファイル削除をOSのゴミ箱へ委ね、Prunletの復元用記録を残さない。Windowsは条件を限定したファイルの永久削除と、snapshot・トランザクションを使うレジストリ削除・復元も扱う。利用手順は[README](README.md)、連携は[Windows](docs/integration.md)・[macOS](docs/macos.md)・[Linux](docs/linux.md)の導入手順、検証は[検証手順](docs/verification.md)を参照する。
 
-Linux版は `src/rust/platform/linux` の同期Trash処理をCLI・stdio MCPで共有する。対象の親と実体をfdで保持し、マウントIDを比較する。freedesktop Trashの `.trashinfo` を先に保存し、`renameat2(RENAME_NOREPLACE)` で移動する。元と移動先を照合できない場合は `ambiguous` を返し、その要求の残りを止める。別マウントへのコピーや永久削除へ切り替えない。
-
-Linux版の起動時更新はMac版とGitHub Releaseの照合を共有する。管理済み配置の固定ロックを通常CLIとMCPで共有し、起動時の更新だけが排他で実行される。tar.gzは展開先のパスを作らずに検証し、同一 `bin` に新しいinodeを準備する。検証後に実行ファイルの名前を原子的に置き換え、起動済みの世代が変わった入口は新しいinodeを実行する。設定や復元領域は置換しない。
-
 ## 構成と責務
 
 製品コードは`src/rust`のRust実装で、ワークスペースの正本は[`Cargo.toml`](Cargo.toml)である。[MSVCターゲットの設定](.cargo/config.toml)でCランタイムを静的リンクし、Windowsの製品exeの実行に.NETランタイムやVCランタイムの追加導入を求めない。
 
 - `service::Runtime`がCLIとMCPの共通実行境界となり、ファイルを`files`、レジストリと明示移行を`registry`、起動時更新の内部要求を`update`へ渡す。旧ファイルの明示移行は`registry::migration`から`migration`へ委譲する。
 - `cli`はCLIの入力検証とJSON出力、`protocol::mcp`はstdio JSON-RPCを担当する。MCPは各OSで`delete_files`を公開し、Windowsでは`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`も公開する。`--config <path> mcp`として起動した場合は、起動前・引数検証の例外もstderrへ出してプロトコルstdoutを保つ。他のCLIでは例外をstdoutのJSONで返し、値名などの引数に`mcp`が含まれるだけでは出力先を変えない。
-- `protocol::hook`は認識した直接削除を検査・拒否し、配置済みCLIを案内する。Windowsの専用入口`prunlet-hook.exe`はCLIと同じバイナリを別名で配置する。macOSは`prunlet --config <path> hook`で同じ実行ファイルを使う。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
+- `protocol::hook`は認識した直接削除を検査・拒否し、配置済みCLIを案内する。Windowsの専用入口`prunlet-hook.exe`はCLIと同じバイナリを別名で配置する。macOSとLinuxは`prunlet --config <path> hook`で同じ実行ファイルを使う。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
 - `prunlet-maintenance.exe`は同じCoreをGUI subsystemで発行した定期保守入口で、`--config <path> maintain --apply`だけを受け付ける。コンソールを作らずにレジストリ復元データを整理する。
 - `platform::windows`がパス・実体・ACLの照合やWindows Shellとの接続を担当する。ゴミ箱からの復元と保持期間の管理はWindowsに委ねる。Prunletはファイル復元APIや通常の履歴圧縮入口を提供しない。
 - `platform::macos`がファイルパスと実体の照合、FoundationのTrash呼び出し、Mach IPCによる待機キュー、署名済み実行ファイルの導入と起動時更新を担当する。
+- `platform::linux`がfdを使ったパスと実体の検証、freedesktopのホームTrashへの同期移動、単一実行ファイルの起動時更新を担当する。macOSとLinuxはGitHub Releaseの候補選定と取得を`update::github`で共有する。
 - Windows向けの`integration/`のPowerShellスクリプトはCodex登録、MCP起動時更新の調停、定期保守タスクの登録を担当する。製品Coreの削除処理は持たない。
 
 権限の境界はホストのsandbox承認、Windowsの実トークン、Prunlet Coreの対象検証に分かれる。Prunlet自身は自動昇格しないが、許可された削除についてエージェントが明示的に管理者CMDを起動し、同じ配置済みCLIと設定を使う連携は別の責務である。起動成功だけを削除成功とは扱わず、拒否・結果不明を昇格で迂回しない。起動と結果確認の手順は[連携手順](docs/integration.md#sandboxとゴミ箱へのアクセス)に集約する。
@@ -79,6 +76,12 @@ CLIとstdio MCPの`delete_files`は同じTrash処理を使う。絶対UTF-8パ�
 同期処理は親と対象のFDを保持し、`recursive`を指定したフォルダーも最上位の項目を移す。子を個別に固定しないため、大きなツリーでも子の数に応じたFDを消費しない。`NSFileManager`にパスを渡す直前に実体を再照合し、返却されたTrashのパスが同じ実体を指し、元名の消失を確認できた場合に`recycled`を返す。OSへのパス指定と事前確認は一体の原子操作ではない。移動後の照合ができなければ`ambiguous`として後続対象を保全し、再送や永久削除への切替を行わない。OSが復元と保持を管理し、Prunletのファイル操作記録は作らない。
 
 待機キューは同じCLIコマンドと`delete_files`の`action`を使い、再帰対象では子もFDで固定する。最大256パス、親を含む最大4096項目と利用可能なFD数の範囲で事前検査する。協調的な`flock`の競合だけを待ち、全ロックの取得後に同じTrash経路で実体を再照合する。取消は`pending`の間だけ受理する。固定のMachサービス枠は実効ユーザーごとに最大8件で、カーネルの監査トークンで相手を確認し、照会先はPIDとその世代も照合する。workerは開始許可を受け取ってから実行できる。許可送信後に応答を失った場合はジョブIDで照会し、自動再送しない。受付後はstdio切断と独立して実行し、結果はworkerのメモリーに1時間保持する。
+
+### Linuxのファイル削除
+
+CLIとstdio MCPの`delete_files`は同じ同期処理を使う。絶対パスの親をシンボリックリンクを辿らずに開き、末尾のリンクはリンク自体を扱う。設定・復元領域・実行ファイル・管理済み配置・Trashとのパスの重なりと、保護対象と同じ実体を拒否する。対象と親のマウントIDをホームTrashと照合し、再帰対象では子も検査して別マウントや保護実体を含むツリーを拒否する。マウントIDを使うため、デバイス番号が同じbind mountも区別する。全対象を事前検査し、失敗があれば移動しない。dry-runではTrashのディレクトリも作成しない。
+
+ホームTrashのディレクトリfdの`flock`で、同じTrashに対するPrunletの移動を設定間でも直列化する。`.trashinfo`を先に作成・同期し、保持した親と対象の実体を再照合して`renameat2(RENAME_NOREPLACE)`で`files`へ移す。フォルダーは最上位の項目を移す。名前の検査とrenameは別操作のため、移動先の実体、元名の消失、`.trashinfo`の実体を移動後に照合し、ディレクトリを同期してから`recycled`を返す。renameの失敗後は元実体の保持と移動先を確認し、安全に回収できる今回の`.trashinfo`だけを片付ける。結果を確認できなければ`ambiguous`を返し、要求の残りを保全する。別マウントへのコピーや永久削除には切り替えない。`.trashinfo`はファイルマネージャーが復元に使うTrashの情報であり、Prunletの復元用記録は作らない。
 
 ## 保存領域と保護
 
@@ -182,7 +185,13 @@ stageは再帰削除せず、完了した世代の正規製品とmetadataをhash
 
 導入はDeveloper ID署名と公証を確認した単一実行ファイルから行う。新規のprivateな配置を別名で用意し、同じ親の下へ上書きなしで公開する。管理対象のCLI・MCP・hook・キューworkerは配置ルートの`.prunlet-macos-update.lock`を共有する。配置済みの設定で起動したMCPだけが更新を試み、排他を取得できなければ更新を延期する。共用ロック取得後に世代を再照合し、入れ替わっていれば現行の実行ファイルへ引き継ぐ。
 
-GitHubの新しい安定版は、導入済みコミットの子孫で`main`に含まれることを要求する。配布ZIPは64 MiB以下で、Releaseの長さとSHA-256、`manifest.json`と`prunlet`の2項目、単一arm64 Mach-Oと実行ファイルのhashを照合する。候補を同じ`bin`ディレクトリに新規作成し、Developer ID・公証・実行ファイルが報告する版とコミットなどを確認してから、実体を再照合して名前を原子的に置換する。実行ファイルだけを交換できるため、設定・復元領域・Codex登録の切替を伴わない。取得・候補検証に失敗した場合は標準エラーへ理由を出し、現行のMCPを起動する。
+macOSとLinuxは`update::github`で同じGitHub Releaseを照合する。導入版より新しい安定版で、導入済みコミットの子孫かつ`main`に含まれるものを対象とし、配布assetの長さとSHA-256を確認する。macOSの配布ZIPは64 MiB以下で、`manifest.json`と`prunlet`の2項目、単一arm64 Mach-Oと実行ファイルのhashを照合する。候補を同じ`bin`ディレクトリに新規作成し、Developer ID・公証・実行ファイルが報告する版とコミットなどを確認してから、実体を再照合して名前を原子的に置換する。実行ファイルだけを交換できるため、設定・復元領域・Codex登録の切替を伴わない。取得・候補検証に失敗した場合は標準エラーへ理由を出し、現行のMCPを起動する。
+
+### Linuxの起動時自動更新
+
+管理済み配置のCLI・MCP・hookは配置ルートの`.prunlet-linux-update.lock`を共有する。公式実行ファイルを配置ルートの`config.json`でMCP起動したときにだけ、排他取得を試みる。別プロセスが配置を使用中なら更新を延期する。排他取得後も配置と実行ファイルの実体を照合する。
+
+同じCPU向けのtar.gzは展開先のパスを作らずに解析し、`prunlet`・`manifest.json`の2項目、各上限、実行体の長さ・SHA-256・ELFのCPUを照合する。同じ`bin`に新しいinodeを作成し、同期した候補から版・コミット・CPUを読み返す。配置と新旧の実体を再照合して実行ファイルの名前を原子的に置き換える。共用ロックの取得後に世代が変わっていた入口は現行の実行体を起動する。取得・候補検証に失敗した場合は標準エラーへ理由を出し、現行のMCPを起動する。置換対象を実行ファイルだけに絞り、設定・復元領域・Codex登録を保持する。
 
 ## 製品と検証の境界
 

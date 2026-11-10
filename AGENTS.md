@@ -32,11 +32,11 @@ Windowsの管理者起動はsandbox権限申請と区別する。許可済みの
 
 ファイル削除は`src/rust/platform/macos`の共通Trash経路に集約し、MCPは`delete_files`のみとする。対象と祖先の実体確認、リンク先の保全、Trashの返却実体と元名の照合を維持する。待機キューは協調的な`flock`だけを待ち、開始許可とMach監査トークンの照合を維持する。`ambiguous`は元のパスとゴミ箱を確認し、自動再送しない。配置済みCLI・MCP・workerは固定の更新ロックを共有する。詳しい境界は[macOSの削除設計](DESIGN.md#macosのファイル削除)と[更新の設計](DESIGN.md#macosの起動時自動更新)を参照する。
 
+## Linux版の実装
+
+同期削除は`src/rust/platform/linux`の共通経路に集約し、MCPは`delete_files`の同期削除だけを公開する。ホームTrashと同じマウントでの移動、事前検査、リンク先と保護領域の保全を維持する。`ambiguous`では元のパスとTrashを確認し、自動再送しない。管理済み配置の固定ロックと更新時の実行体照合は[Linuxの起動時自動更新](DESIGN.md#linuxの起動時自動更新)に従う。削除の境界は[Linuxのファイル削除](DESIGN.md#linuxのファイル削除)を参照する。
+
 ## ビルドと検証
-
-Linux x64・ARM64は、`ssh mac` 先のLima `linux-validation` でビルドする。Linuxの通常配布実行体で `bun scripts/Verify-LinuxFiles.ts <実行体> <新規の外部出力先>` を実行する。x64をARM64ゲストで動かす場合は、末尾へQEMUとx64動的ローダーの引数を渡す。専用の `XDG_DATA_HOME` でTrash往復、CLI・MCP・hook、別マウントの拒否を確認する。詳細は[Linuxの検証](docs/verification.md#linuxの検証)を参照する。
-
-Linux起動時更新の変更は、各CPUの通常MCP起動を `Verify-UnixStartupUpdate.ts` で確認する。通信応答の置換は `prunlet_linux_update_tests` のデバッグビルドに限定し、公開用のtar.gzと同じ形式で連続更新・延期・中断・拒否を確認する。
 
 ### Windows
 
@@ -73,11 +73,17 @@ Apple Silicon実機で`aarch64-apple-darwin`をビルドし、`CARGO_TARGET_DIR`
 
 公開用ビルドはクリーンな対象コミットから`bash scripts/Publish-PrunletMac.sh <外部の新規出力先> <40桁SHA>`を実行する。
 
+### Linux
+
+x64・ARM64ともに`ssh mac`先のLima `linux-validation`でビルドする。各CPUの通常配布実行体で`bun scripts/Verify-LinuxFiles.ts <実行体> <新規の外部出力先>`を実行する。ARM64ゲストでx64を検証する場合のQEMU・動的ローダーの引数と、隔離した`XDG_DATA_HOME`での検証範囲は[Linuxの検証](docs/verification.md#linuxの検証)に従う。
+
+起動時更新の変更では、各CPUに対応するLinuxゲストで`bun scripts/Verify-UnixStartupUpdate.ts`を実行し、通常MCP起動で連続更新・延期・中断・拒否を確認する。GitHub応答の置換は`prunlet_linux_update_tests`を指定したデバッグビルドに限定し、候補は公開用と同じtar.gz形式を使う。
+
 ## 導入と文書
 
 Prunletの `vava` で新しいリリースを公開するときは、Apple Silicon版のビルド・署名・公証・ZIP生成を `ssh mac` の実機で行う。[Apple Silicon版の公開手順](docs/distribution.md#apple-silicon版の公開手順)に従い、検証済みZIPを同じGitHub Releaseに添付してから公開する。Mac向けにGitHub Actionsを起動したり、GitHubホストのrunnerへ切り替えたりしない。Windows版は既存の配布workflowを使う。再開時は完了済みの工程と実物を照合して再利用する。
 
-Linux x64・ARM64のリリースビルドは、`ssh mac` 先のLima `linux-validation` で行う。[Linux版の公開手順](docs/distribution.md#linux版の公開手順)に従い、検証済みtar.gzとチェックサムを同じGitHub Releaseへ添付する。Linux向けのGitHub Actionsは起動しない。
+Linuxのリリースビルドは、上記のLimaゲストで`bash scripts/Publish-PrunletLinux.sh <新規の絶対出力先> <40桁SHA> <linux-x64|linux-arm64>`を各CPU向けに実行する。[Linux版の公開手順](docs/distribution.md#linux版の公開手順)に従い、検証済みtar.gzとチェックサムを同じGitHub Releaseへ添付する。Linux向けのGitHub Actionsは起動しない。
 
 Dependabotと依存検証のworkflowを変更する場合は、[依存更新の境界](DESIGN.md#依存更新の境界)にある検証条件と読取り権限の境界を維持する。依存検証CIの成功は、変更内容に応じた上記の追加E2Eを代替しない。
 
