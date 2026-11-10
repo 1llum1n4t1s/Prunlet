@@ -8,30 +8,35 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $script:StartupUpdateReady = $true
 
-# CodexがMCP入口を終了した場合、子プロセスを残さない。
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class PrunletMcpJob
-{
-    [StructLayout(LayoutKind.Sequential)] private struct Basic { public long A, B; public uint Flags; public UIntPtr C, D; public uint E; public UIntPtr F; public uint G, H; }
-    [StructLayout(LayoutKind.Sequential)] private struct Counters { public ulong A, B, C, D, E, F; }
-    [StructLayout(LayoutKind.Sequential)] private struct Limits { public Basic Basic; public Counters Io; public UIntPtr A, B, C, D; }
-    [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
-    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool SetInformationJobObject(IntPtr job, int type, ref Limits limits, uint length);
-    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
-    [DllImport("kernel32.dll")] private static extern IntPtr GetCurrentProcess();
-    private static IntPtr job;
-    public static void Start()
-    {
-        job = CreateJobObject(IntPtr.Zero, null);
-        if (job == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
-        Limits limits = new(); limits.Basic.Flags = 0x2000;
-        if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf<Limits>())) throw new System.ComponentModel.Win32Exception();
-        if (!AssignProcessToJobObject(job, GetCurrentProcess())) throw new System.ComponentModel.Win32Exception();
+. (Join-Path $PSScriptRoot 'configuration-common.ps1')
+# job handleをPowerShellプロセスの終了まで保持し、入口終了時に子も終了させる。
+function Start-PrunletMcpJob {
+    if ([IntPtr]::Size -ne 8) { throw 'Prunlet MCP requires a 64-bit process.' }
+    $create = New-PrunletNativeDelegate kernel32.dll CreateJobObjectW ([IntPtr]) @([IntPtr], [string])
+    $set = New-PrunletNativeDelegate kernel32.dll SetInformationJobObject ([int]) @([IntPtr], [int], [IntPtr], [uint32])
+    $assign = New-PrunletNativeDelegate kernel32.dll AssignProcessToJobObject ([int]) @([IntPtr], [IntPtr])
+    $current = New-PrunletNativeDelegate kernel32.dll GetCurrentProcess ([IntPtr]) @()
+    $close = New-PrunletNativeDelegate kernel32.dll CloseHandle ([int]) @([IntPtr])
+    $name = 'Local\Prunlet.McpLauncher.' + [guid]::NewGuid().ToString('N')
+    $job = $create.Invoke([IntPtr]::Zero, $name)
+    $createError = [Runtime.InteropServices.Marshal]::GetLastPInvokeError()
+    if ($job -eq [IntPtr]::Zero) { throw [ComponentModel.Win32Exception]::new($createError) }
+    $limits = [Runtime.InteropServices.Marshal]::AllocHGlobal(144)
+    try {
+        if ($createError -eq 183) { throw 'Prunlet MCP launcher job name already exists.' }
+        [Runtime.InteropServices.Marshal]::Copy([byte[]]::new(144), 0, $limits, 144)
+        # 通常の子は終了時に停止する。明示キューworkerだけが作成時に離脱を指定する。
+        [Runtime.InteropServices.Marshal]::WriteInt32($limits, 16, (0x2000 -bor 0x0800)) # KILL_ON_JOB_CLOSE | BREAKAWAY_OK
+        if (!$set.Invoke($job, 9, $limits, 144)) { throw [ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastPInvokeError()) }
+        if (!$assign.Invoke($job, $current.Invoke())) { throw [ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastPInvokeError()) }
+        $script:PrunletMcpJobHandle = $job
+        $script:PrunletMcpJobName = $name
+        $job = [IntPtr]::Zero
+    } finally {
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($limits)
+        if ($job -ne [IntPtr]::Zero) { [void]$close.Invoke($job) }
     }
 }
-'@
 
 function Read-StartupState([string]$Path) {
     if (!(Test-Path -LiteralPath $Path)) { return @{ product = 'Prunlet'; schema = 1; phase = 'idle' } }
@@ -357,7 +362,7 @@ function Invoke-UpdateCoordinator([string]$Stage, [string]$Config, [string]$Code
 }
 
 try {
-    [PrunletMcpJob]::Start()
+    Start-PrunletMcpJob
     foreach ($path in @($ExecutablePath, $ConfigPath, $CodexHome)) {
         if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Prunlet MCP paths must be absolute.' }
     }
@@ -427,6 +432,7 @@ try {
             $mutex.Dispose()
         }
     }
+    $env:PRUNLET_MCP_LAUNCHER_JOB = $script:PrunletMcpJobName
     & $ExecutablePath --config $ConfigPath mcp
     exit $LASTEXITCODE
 } catch {

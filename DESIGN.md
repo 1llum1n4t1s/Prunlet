@@ -4,11 +4,11 @@
 
 ## 構成と責務
 
-製品コードは`src/Prunlet`のC#実装で、`Prunlet.csproj`は`net10.0-windows`を対象とする。`scripts/Publish-Prunlet.ps1`はWindows x64・ARM64向けにランタイム同梱の単一ファイルexeを生成する。
+製品コードは`src/rust`のRust実装で、`Cargo.toml`を正本とする。`scripts/Publish-Prunlet.ps1`はWindows x64・ARM64向けに実行ファイルを生成し、hook入口にはCLIと同一のバイナリを使う。製品の実行に.NETランタイムは不要である。
 
-- `Core/DeletionService`がファイル削除・レジストリ削除と復元・保守・明示移行を担当する。CLI・MCP・hookに別の削除方式を実装しない。
-- `Program`はCLIの入力検証とJSON出力、`Protocol/McpServer`はstdio JSON-RPCを担当する。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールである。`--config <path> mcp`として起動した場合は、起動前・引数検証の例外もstderrへ出してプロトコルstdoutを保つ。他のCLIでは例外をstdoutのJSONで返し、値名などの引数に`mcp`が含まれるだけでは出力先を変えない。
-- `Protocol/HookRouter`は認識した直接削除を検査・拒否し、配置済みCLIを案内する。専用入口`prunlet-hook.exe`はCLIと同じバイナリを別名で配置する。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
+- `service::Runtime`が共通の実行境界を担当し、`files`・`registry`・`migration`のCoreへ委譲する。CLI・MCP・hookに別の削除方式を実装しない。
+- `cli`はCLIの入力検証とJSON出力、`protocol::mcp`はstdio JSON-RPCを担当する。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールである。`--config <path> mcp`として起動した場合は、起動前・引数検証の例外もstderrへ出してプロトコルstdoutを保つ。他のCLIでは例外をstdoutのJSONで返し、値名などの引数に`mcp`が含まれるだけでは出力先を変えない。
+- `protocol::hook`は認識した直接削除を検査・拒否し、配置済みCLIを案内する。専用入口`prunlet-hook.exe`はCLIと同じバイナリを別名で配置する。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
 - `prunlet-maintenance.exe`は同じCoreをGUI subsystemで発行した定期保守入口で、`--config <path> maintain --apply`だけを受け付ける。コンソールを作らずにレジストリ復元データを整理する。
 - Windows Shellがゴミ箱への移動とファイル復元を担当する。Prunletのファイル復元API・通常の履歴圧縮入口は提供しない。
 
@@ -16,9 +16,9 @@
 
 ### フックのshell解析境界
 
-`Protocol/HookRouter`は`Bash`・`exec_command`・`functions.exec_command`のコマンド文字列を検査する。`exec_command`系の明示的な`tool_input.shell`がPowerShellまたはCMDなら、その文字列規則を選択する。shell未指定・未知・Posix系の指定、および`Bash`ではCMD・PowerShell・Posixの複数規則で検査する。未知shellをCMDで実行するWindowsホストがあるため、tool名やshell名だけからPosix実行とは推測しない。静的なshell wrapperのコマンド本文も再帰検査し、認識したPowerShell・CMDのwrapperには対応する規則を使う。
+`protocol::hook`は`Bash`・`exec_command`・`functions.exec_command`のコマンド文字列を検査する。`exec_command`系の明示的な`tool_input.shell`がPowerShellまたはCMDなら、その文字列規則を選択する。shell未指定・未知・Posix系の指定、および`Bash`ではCMD・PowerShell・Posixの複数規則で検査する。未知shellをCMDで実行するWindowsホストがあるため、tool名やshell名だけからPosix実行とは推測しない。静的なshell wrapperのコマンド本文も再帰検査し、認識したPowerShell・CMDのwrapperには対応する規則を使う。
 
-拒否理由の検知情報と解析中のshell規則は要求専用の`HookRouter`インスタンスに保持し、別要求へ持ち越さない。検知した命令・オプションと、その検知に使ったshell解釈を応答へ含め、検査不能な入力には原因を返す。shell未指定・未知の場合は候補の解釈であることを明示し、ローカル削除と断定しない。検索文字列やリモートスクリプトの引用も別shellでは命令になり得るため、CLI案内は許可されたWindows対象に限定する。応答形式と利用時の扱いは[連携手順](docs/integration.md#hookの検査範囲)を参照する。
+拒否理由の検知情報と解析中のshell規則は要求専用の`protocol::hook`インスタンスに保持し、別要求へ持ち越さない。検知した命令・オプションと、その検知に使ったshell解釈を応答へ含め、検査不能な入力には原因を返す。shell未指定・未知の場合は候補の解釈であることを明示し、ローカル削除と断定しない。検索文字列やリモートスクリプトの引用も別shellでは命令になり得るため、CLI案内は許可されたWindows対象に限定する。応答形式と利用時の扱いは[連携手順](docs/integration.md#hookの検査範囲)を参照する。
 
 CMD規則では`#`をコメントとして扱わず、後続のコマンド区切り以降も検査する。静的な`IF`は`/i`・`not`、`exist`・`defined`・`errorlevel`・`cmdextversion`、`==`と`EQU/NEQ/LSS/LEQ/GTR/GEQ`の条件直後のコマンドを検査する。条件の真偽は評価せず、比較値や`echo`の引数を削除コマンドとは扱わない。wrapper本文の再構成では、引用内の`==`と引用外の比較演算子、空の引用文字列を区別して保つ。
 
@@ -28,7 +28,7 @@ PowerShellのヒアストリングは行頭の終端までを文字列として�
 
 ファイル・フォルダーは入力パスを正規化し、対象・祖先・保護領域・リンクを検証する。全対象のpreflightを終えてからWindowsゴミ箱へ移す。末尾名がWindows予約名の実在する通常ファイル（非ディレクトリ・非reparse）だけは、追加確認やShell試行をせず固定ハンドルで永久削除する。予約名の祖先・ディレクトリ・リンクはこの例外に含めない。通常名の対象は、Windowsが対象を大きすぎると明示した場合、またはゴミ箱利用不可を返し対象ボリュームの即時削除設定を確認できた場合で、生成先や別原因の失敗がなく、保持した元実体と再固定した名前・親・属性が一致した場合だけ、同じ要求内で対象名を永久削除する。即時削除設定は、Shell応答が0x80270036で生成先や別原因の失敗がなく、実効ユーザーSIDと対象ボリュームGUIDに対応するNukeOnDeleteがDWORDの1で、user/machineのNoRecycleFilesポリシー値が存在しない場合だけ受理する。設定はShell前後と各固定削除直前に再照合し、不明・不一致は保全する。NukeOnDeleteは公開API契約ではなく、設定を原子的に固定できないため、確認直後の変更やABA競合は排除できない。フォルダーの進捗通知は失敗と扱わない。その他の失敗・不明状態からは永久削除へ切り替えない。再帰指定のない非空フォルダーは拒否し、リンク先を走査しない。独自退避・別ボリュームへのコピー・自動昇格は行わない。
 
-Shellが削除元を8.3短縮名で返した場合、非reparseの対象だけを`PathPolicy.Resolve`で解決し、入力の正規名と大小文字を含めて完全一致する場合に受理する。親・元実体・属性の再照合も続ける。同じFile IDの別ハードリンク名を誤って受理しないため、IDの一致だけには緩和しない。
+Shellが削除元を8.3短縮名で返した場合、非reparseの対象だけを`platform::windows::path::resolve`で解決し、入力の正規名と大小文字を含めて完全一致する場合に受理する。親・元実体・属性の再照合も続ける。同じFile IDの別ハードリンク名を誤って受理しないため、IDの一致だけには緩和しない。
 
 新規ファイル削除では、操作ID・PIDL・File ID・内容hash・size・ACL snapshotを復元用に永続化しない。manifest・monitor・index・retirement・復元stageも作成しない。処理中の安全確認に使う情報と永続的な操作記録を区別する。共通の`maintenance.lock`は排他制御用の固定ファイルであり、操作記録ではない。
 
@@ -46,7 +46,7 @@ Shellがゴミ箱への移動を成功と返した場合は、返却項目だけ
 
 対象のclaim取得順・process共通worker上限・重複/親子の排他・全preflight完了後の実行を維持する。ハードリンクの共有を検出した場合は排他的な実行へ切り替える。MCP要求枠とfile worker枠を分け、registry privilege変更をfile workerと並行させない。
 
-ロック待機の`RecoveryLockProgress`はCoreが発行し、`Program`がstderrへ診断を出す。MCPの並行ファイル要求用serviceもこの購読を引き継ぐ。`McpServer`は要求ごとの`progressToken`がある場合だけ追加購読して`notifications/progress`を返し、処理終了時に解除して最終応答後の通知と別要求への混入を防ぐ。
+ロック待機の`RecoveryLockProgress`はCoreが発行し、`cli`がstderrへ診断を出す。MCPの並行ファイル要求用serviceもこの購読を引き継ぐ。`McpServer`は要求ごとの`progressToken`がある場合だけ追加購読して`notifications/progress`を返し、処理終了時に解除して最終応答後の通知と別要求への混入を防ぐ。
 
 失敗時の診断はCoreの`FileDeletionDiagnostics`が担当し、`DeletionService`が各項目の`error`へ付加してCLI・MCPへ返す。再帰固定削除の走査中の例外は`FileDeletionEntryException`で失敗entryと元例外のHRESULT・内部例外を保持する。結果DTOの`path`と診断の`Target`は要求rootのまま、`Failure entry`に失敗entryの絶対パスを表示し、保持元の照会もそのentryを対象とする。これにより、要求単位の結果を保ちながら失敗箇所を診断できる。共有・ロック違反と削除元へのアクセス拒否では保持元を観測し、dry-runではプロセス照会を行わない。アクセス拒否だけで保持元や原因を断定しない。診断は失敗後の現在値であり、診断不能でも元の削除結果を維持する。保持元の特定を削除の再試行やプロセス停止へ結び付けない。照会方法と観測範囲の制約は[連携手順](docs/integration.md#使用中のファイルと同時実行)を参照する。
 
@@ -60,7 +60,7 @@ Shellがゴミ箱への移動を成功と返した場合は、返却項目だけ
 
 同じexeのジョブ専用一時workerとユーザー限定IPCを使い、ジョブ・実体照合情報・結果をメモリーだけに保持する。SID・Windows sessionごとのnamed Mutexで完了保持中を含め最大8 workerに制限する。1要求1〜256パス・親を含む照合情報4096項目・IPC入力1 MiBを上限とする。対象・親・再帰対象の子を削除前に固定して事前probeのWin32 32/33だけを1秒間隔で期限なく待ち、実体や再帰範囲の変更を検出したら中止する。全対象が削除可能になってから既存Coreの削除経路を一度だけ呼び、削除開始後は再送しない。取消は開始判定と同じlockで`pending`の間だけ受理する。
 
-状態は`pending`・`running`・`completed`・`failed`・`ambiguous`・`cancelled`・`unavailable`。最終結果は1時間保持し、`expiresUtc`で期限を返す。照会不能・worker終了・期限切れは`unavailable`として結果不明を示す。受付済みなら呼出元のstdio切断後も継続し、workerが初期ACKを返せなければ削除を開始しない。
+状態は`pending`・`running`・`completed`・`failed`・`ambiguous`・`cancelled`・`unavailable`。最終結果は1時間保持し、`expiresUtc`で期限を返す。照会不能・worker終了・期限切れは`unavailable`として結果不明を示す。受付済みなら呼出元のstdio切断後も継続し、workerが初期ACKを返せなければ削除を開始しない。登録MCPでは通常の子をlauncher終了時に停止し、明示キューworkerは受付前にlauncherのWindows jobからの離脱を照合する。 起動時更新の直後に旧launcherの終了時強制終了jobから新しいexeを起動した場合、キューを受け付ける前に再接続を案内する。
 
 待機ジョブIDは復元用操作IDではなく、manifest・snapshot・恒久キュー・操作履歴を作らない。OSやworkerの消失時は結果不明として扱い、再起動後に同じ削除を再開しない。既存の同期削除・保護領域・ゴミ箱移動と永久削除の条件は維持する。
 
@@ -148,7 +148,7 @@ latest導入時に`capacityDefaultMigrationVersion`が欠落または1未満の�
 
 ### 起動時自動更新
 
-CodexのMCP登録は`integration/start-prunlet-mcp.ps1`をPowerShell 7で起動する。launcherがGitHubへの照会と更新手順の調停を行い、`Core/StartupUpdateCoordinator`が製品・登録・移行の状態遷移を、`StartupUpdatePackage`・`StartupPublishedDownload`がパッケージ検証と取得を、`StartupUpdateBudget`・`StartupUpdateSlot`・`StartupUpdateRotation`が容量と再利用を担当する。`StartupUpdateGate`は通常CLI・MCP・保守の開始前に更新状態を検査する。hook専用の`prunlet-hook.exe`はこのgateを通らず、削除を実行するCLIのパスを受け取って案内する。
+CodexのMCP登録は`integration/start-prunlet-mcp.ps1`をPowerShell 7で起動する。launcherがGitHubへの照会と更新手順の調停を行い、`update::coordinator`が製品・登録・移行の状態遷移を、`update::package`・`update::download`がパッケージ検証と取得を、`update::budget`・`update::slot`・`update::rotation`が容量と再利用を担当する。`update::gate`は通常CLI・MCP・保守の開始前に更新状態を検査する。hook専用の`prunlet-hook.exe`はこのgateを通らず、削除を実行するCLIのパスを受け取って案内する。
 
 MCP起動時に公開済みlatestを確認し、既存版の子孫で更新protocolと保管形式が互換の候補だけを準備する。既存の製品・登録の所有とhashを確認し、旧CLI/MCPと保守exeを同時にwrite排他できなければ変更せず延期する。hookは独立exeとして継続し、旧プロセスを終了させない。固定の更新状態は製品切替・登録・移行の再開と更新cacheの所有確認・再利用に限り、ファイル操作履歴には使わない。途中状態では通常CLI/MCPと保守を止め、候補からレジストリ移行を再開する。移行開始後は旧exeへrollbackせず、registryが利用可能になってからsource-infoとidleを確定する。書込みや置換が不明なときは保全して自動再送せず、確定したregistryの利用とは分離する。
 
@@ -162,10 +162,10 @@ stageは再帰削除せず、完了した世代の正規製品とmetadataをhash
 
 ビルドと検証の実行規約・必須コマンドは[AGENTS.md](AGENTS.md#ビルドと検証)、各経路の検証範囲とfixtureの保持・清掃は[検証手順](docs/verification.md)を正本とする。
 
-既存Rust版のWindowsクライアント向けにも、同一ZIPをR2へ配置してからGitHub Releaseへ添付する。固定配信先・資格情報・順序は[配布手順](docs/distribution.md)を参照する。
+既存のWindowsクライアント向けにも、同一ZIPをR2へ配置してからGitHub Releaseへ添付する。固定配信先・資格情報・順序は[配布手順](docs/distribution.md)を参照する。
 
 ## 依存更新の境界
 
-`.github/dependabot.yml`はGitHub ActionsとNuGetの更新を毎週月曜09:00（日本時間）に確認し、minor・patchをまとめ、majorは個別PRにする。`.github/workflows/dependency-validation.yml`はDependabotのPRまたは手動起動を対象に、Windows・.NET 10でrestore・buildとCLI・MCP・hookの通常E2Eを行う。出力はrunnerの一時領域へ分離し、checkoutの認証情報を保持せず、権限はcontentsの読取りに限定する。
+`.github/dependabot.yml`はGitHub ActionsとCargoの更新を毎週月曜09:00（日本時間）に確認し、minor・patchをまとめ、majorは個別PRにする。`.github/workflows/dependency-validation.yml`はDependabotのPRまたは手動起動を対象に、WindowsでCargo buildとCLI・MCP・hookの通常E2Eを行う。出力はrunnerの一時領域へ分離し、checkoutの認証情報を保持せず、権限はcontentsの読取りに限定する。
 
 依存PRの取り込みは、対象差分と検証結果を確認して個別に行う。依存検証workflowはcontentsの読取り権限で完結する。

@@ -1,6 +1,6 @@
 # Windowsの更新ZIP配布
 
-GitHub Releaseを発行者・タグ・コミット・digest・sizeの信頼の基点とし、同じ更新ZIPを既存のCloudflare R2にも配置する。C#版はGitHubから取得し、公開済みRust版のWindowsクライアントは従来のR2アドレスから取得する。schema 1と同梱12ファイルを共通に保つ。
+GitHub Releaseを発行者・タグ・コミット・digest・sizeの信頼の基点とし、同じ更新ZIPを既存のCloudflare R2にも配置する。現行クライアントはGitHubから取得し、公開済みの旧Windowsクライアントは従来のR2アドレスから取得する。schema 1と同梱12ファイルを共通に保つ。
 
 ## 既存の配信先
 

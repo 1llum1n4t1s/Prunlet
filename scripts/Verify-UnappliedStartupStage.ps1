@@ -4,7 +4,9 @@ param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$PublishDirectory,
     [Parameter(Mandatory)][string]$OutputDirectory,
-    [Parameter(Mandatory)][string]$ReportPath
+    [Parameter(Mandatory)][string]$ReportPath,
+    [string]$BuildManifestPath,
+    [string]$ExpectedBuildManifestSha256
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -28,26 +30,8 @@ $utf8 = [Text.UTF8Encoding]::new($false)
 $commits = @(('a' * 40), ('b' * 40), ('c' * 40), ('d' * 40), ('e' * 40))
 $auxiliary = @('Install-Prunlet.ps1', 'start-prunlet-mcp.ps1', 'configuration-common.ps1', 'maintenance-task.ps1', 'uninstall-maintenance.ps1', 'install-codex.ps1', 'uninstall-codex.ps1', 'install-agent-instructions.ps1', 'PRUNLET.md')
 $packages = @{}
-if (!('PrunletUnappliedStageIdentity' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-public static class PrunletUnappliedStageIdentity {
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int kind, byte[] data, uint size);
-    public static string Read(string path) {
-        using var handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
-        if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-        byte[] data = new byte[24];
-        if (!GetFileInformationByHandleEx(handle, 18, data, 24)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-        return Convert.ToHexString(data);
-    }
-}
-'@
-}
+. (Join-Path $PSScriptRoot 'FileFixtures.Common.ps1')
+$null = Initialize-PrunletFixtureBinding -ExecutablePath $ExecutablePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256
 
 function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { throw $Message } }
 function Write-Json([string]$Path, $Value) { [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 50 -Compress), $utf8) }
@@ -157,7 +141,7 @@ function Get-Snapshot([string]$Root) {
     $snapshot = [ordered]@{}
     foreach ($item in @(Get-Item -LiteralPath $Root) + @(Get-ChildItem -LiteralPath $Root -Force -Recurse | Sort-Object FullName)) {
         $key = $item.FullName.Substring($Root.Length)
-        $snapshot[$key] = @{ attributes = [string]$item.Attributes; identity = if ($item.PSIsContainer) { '' } else { [PrunletUnappliedStageIdentity]::Read($item.FullName) }; length = if ($item.PSIsContainer) { 0 } else { $item.Length }; hash = if ($item.PSIsContainer) { '' } else { (Get-FileHash -LiteralPath $item.FullName).Hash } }
+        $snapshot[$key] = @{ attributes = [string]$item.Attributes; identity = if ($item.PSIsContainer) { '' } else { Get-FileFixtureIdentity -Path $item.FullName }; length = if ($item.PSIsContainer) { 0 } else { $item.Length }; hash = if ($item.PSIsContainer) { '' } else { (Get-FileHash -LiteralPath $item.FullName).Hash } }
         foreach ($stream in @(Get-Item -LiteralPath $item.FullName -Stream * | Where-Object Stream -ne ':$DATA')) {
             $streamPath = $item.FullName + ':' + $stream.Stream
             $snapshot[$key + ':' + $stream.Stream] = @{ length = $stream.Length; hash = (Get-FileHash -LiteralPath $streamPath).Hash }
@@ -183,7 +167,7 @@ try {
         $oldState = Read-Json (State-Path $root)
         $stageIdentities = @{}
         foreach ($relative in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe', 'integration\PRUNLET.md')) {
-            $stageIdentities[$relative] = [PrunletUnappliedStageIdentity]::Read((Join-Path (Stage-Path $root) $relative))
+            $stageIdentities[$relative] = Get-FileFixtureIdentity -Path (Join-Path (Stage-Path $root) $relative)
         }
         Invoke-Cli $root @('__begin-published-update', $commits[3], $commits[2]) | Out-Null
         $state = Read-Json (State-Path $root)
@@ -191,7 +175,7 @@ try {
         Set-Package $root $commits[3]; Prepare-Package $root $commits[3]; Prepare-Package $root $commits[3]
         $state = Read-Json (State-Path $root)
         foreach ($slot in @('slotCli', 'slotMaintenance', 'slotHook')) { Assert-True ($state[$slot].generation -eq $oldState[$slot].generation) 'Verified nonexecuting slot was not reused.' }
-        foreach ($relative in $stageIdentities.Keys) { Assert-True ([PrunletUnappliedStageIdentity]::Read((Join-Path (Stage-Path $root) $relative)) -ceq $stageIdentities[$relative]) 'Known staged file was replaced instead of updating its main stream.' }
+        foreach ($relative in $stageIdentities.Keys) { Assert-True ((Get-FileFixtureIdentity -Path (Join-Path (Stage-Path $root) $relative)) -ceq $stageIdentities[$relative]) 'Known staged file was replaced instead of updating its main stream.' }
         Assert-True ((Get-Snapshot (Join-Path $root 'bin')) -ceq $live) 'Preparation changed installed products.'
         Assert-True ((Get-FileHash -LiteralPath (Join-Path $root 'source-info.json')).Hash -ceq $installed) 'Preparation changed installed provenance.'
         $guide = Join-Path (Stage-Path $root) 'integration\PRUNLET.md'
@@ -295,7 +279,7 @@ try {
     $report = [ordered]@{
         executablePath = $ExecutablePath; executableSha256 = (Get-FileHash -LiteralPath $ExecutablePath).Hash
         verificationScriptSha256 = (Get-FileHash -LiteralPath $PSCommandPath).Hash
-        sourceInputs = @('src\Prunlet\Core\StartupUpdateCoordinator.cs', 'scripts\Package-PrunletUpdate.ps1', 'scripts\Verify-ReleasePackage.ps1') | ForEach-Object { @{ path = $_; sha256 = (Get-FileHash -LiteralPath (Join-Path $sourceRoot $_)).Hash } }
+        sourceInputs = @('Cargo.toml', 'Cargo.lock', 'src\rust\update\coordinator.rs', 'src\rust\update\state.rs', 'src\rust\update\slot.rs', 'src\rust\update\package.rs', 'scripts\Package-PrunletUpdate.ps1', 'scripts\Verify-ReleasePackage.ps1') | ForEach-Object { @{ path = $_; sha256 = (Get-FileHash -LiteralPath (Join-Path $sourceRoot $_)).Hash } }
         packages = @($packages.Keys | Sort-Object | ForEach-Object { @{ commit = $_; path = $packages[$_].path; sha256 = $packages[$_].hash; bytes = $packages[$_].bytes; verification = $packages[$_].verified } })
         scope = 'Real CLI begin/prepare; fixed new candidate Core apply/integration/confirm/migration and existing cleanup_pending retention; next release preparation. Local real ZIP delivery replaces HTTP only; no old candidate execution or actual host registration.'
         passed = $results.Count - $failed; failed = $failed; cases = @($results); invocations = @($invocations)

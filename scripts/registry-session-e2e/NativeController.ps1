@@ -1,4 +1,4 @@
-﻿param([Parameter(Mandatory)][string]$SettingsPath,[ValidatePattern('^[0-9a-f]{32}$')][string]$LaunchNonce)
+param([Parameter(Mandatory)][string]$SettingsPath,[ValidatePattern('^[0-9a-f]{32}$')][string]$LaunchNonce)
 $script:AutomaticLaunchNonce=$LaunchNonce
 . (Join-Path $PSScriptRoot 'SessionE2E.Common.ps1')
 $settings=ReadJson $SettingsPath;$script:ExecutablePath=$settings.executablePath;$script:Config=$settings.highConfig;$script:RunRelative=$settings.runRelative
@@ -20,13 +20,13 @@ function StartOwnedClient([switch]$Cleanup){
 $currentOperations=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 try{
  LoadFixture
- $tokenInfo=[SessionE2ENative]::TokenInfo();AssertLaunchRole $settings $true
+ $tokenInfo=(Get-SessionFixtureTokenInfo);AssertLaunchRole $settings $true
  $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
  Assert ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'Start this fixture controller explicitly from an administrator desktop shell'
- Assert (![SessionE2ENative]::Packaged()) 'Controller remains packaged; no fixture created'
- $existingRoot=[PrunletRegistryE2E]::Open($script:RunRelative,64)
+ Assert (!(Test-SessionFixturePackaged)) 'Controller remains packaged; no fixture created'
+ $existingRoot=Open-RegistryFixtureKey $script:RunRelative 64
  if($existingRoot){$existingRoot.Dispose();throw 'Prepared native run root already exists; no fixture mutation allowed'}
- $privilege=[PrunletRegistryE2E]::EnableSecurity();Assert $privilege 'Native fixture controller lacks SeSecurityPrivilege'
+ $privilege=Enable-RegistryFixtureSecurity;Assert $privilege 'Native fixture controller lacks SeSecurityPrivilege'
  AssertLaunchLease $settings
  $session=Child @('registry-session','--minutes','30','--assert-native-windows')
  $stderr=$session.StandardError.ReadToEndAsync();$readyLine=$session.StandardOutput.ReadLineAsync()
@@ -60,7 +60,7 @@ try{
      }
      'cleanup'{
       Assert ($null-eq$adminClient-or$adminClient.HasExited) 'Administrator clients still running; preserve fixture'
-      $root=[PrunletRegistryE2E]::Open($script:RunRelative,64)
+      $root=Open-RegistryFixtureKey $script:RunRelative 64
       if(!$root){$result=@{exitCode=0;alreadyAbsent=$true};break};$root.Dispose()
       Assert $ownsRoot 'Existing native root is not owned by this controller; preserve it'
       $cleanup=StartOwnedClient -Cleanup
@@ -68,23 +68,23 @@ try{
      }
      'create'{
       Assert ($d.leaf-match'^[a-z][a-z0-9-]{0,60}$') 'Unsafe fixture leaf'
-      if(!$ownsRoot){[SessionE2ENative]::CreateRunRoot($script:RunRelative);$ownsRoot=$true}
+      if(!$ownsRoot){(New-SessionFixtureRunRoot $script:RunRelative);$ownsRoot=$true}
       $relative=$script:RunRelative+'\'+$d.leaf
-      [SessionE2ENative]::CreateClass($relative,'Prunlet session 日本語 class')
-      $k=[PrunletRegistryE2E]::Create($relative,64)
-      try{[PrunletRegistryE2E]::Set($k,'',1,[Text.Encoding]::Unicode.GetBytes("default-value`0"));[PrunletRegistryE2E]::Set($k,'raw-日本語😀',0x1234,[byte[]]@(0,255,128,1,0));[PrunletRegistryE2E]::Set($k,'binary',3,[byte[]]@(0,255,17,128))}finally{$k.Dispose()}
-      if($d.tree){$child=[PrunletRegistryE2E]::Create($relative+'\child\empty',64);$child.Dispose();[PrunletRegistryE2E]::SetLowIntegrityFixture($relative,64)}
+      (New-SessionFixtureClass $relative 'Prunlet session 日本語 class')
+      $k=New-RegistryFixtureKey $relative 64
+      try{Set-RegistryFixtureValue $k '' 1 ([Text.Encoding]::Unicode.GetBytes("default-value`0"));Set-RegistryFixtureValue $k 'raw-日本語😀' 0x1234 ([byte[]]@(0,255,128,1,0));Set-RegistryFixtureValue $k 'binary' 3 ([byte[]]@(0,255,17,128))}finally{$k.Dispose()}
+      if($d.tree){$child=New-RegistryFixtureKey ($relative+'\child\empty') 64;$child.Dispose();Set-RegistryFixtureLowIntegrity $relative 64}
       $result=@{path='HKEY_CURRENT_USER\'+$relative;leaf=$d.leaf}
      }
      'observe'{
       $relative=if($d.leaf){$script:RunRelative+'\'+$d.leaf}else{$script:RunRelative}
-      $k=[PrunletRegistryE2E]::Open($relative,64,$true)
-      if(!$k){$result=@{exists=$false}}else{try{$result=@{exists=$true;name=[SessionE2ENative]::Name($k);keyClass=[SessionE2ENative]::Class($k);snapshot=@([PrunletRegistryE2E]::Snapshot($relative,64));values=@{} };foreach($n in $k.GetValueNames()){$result.values[$n]=[PrunletRegistryE2E]::Value($k,$n)}}finally{$k.Dispose()}}
+      $k=Open-RegistryFixtureKey $relative 64 $true
+      if(!$k){$result=@{exists=$false}}else{try{$result=@{exists=$true;name=(Get-SessionFixtureName $k);keyClass=(Get-SessionFixtureClass $k);snapshot=@(Get-RegistryFixtureSnapshot $relative 64);values=@{} };foreach($n in $k.GetValueNames()){$result.values[$n]=Get-RegistryFixtureValue $k $n}}finally{$k.Dispose()}}
      }
      'set-collision'{
       Assert $ownsRoot 'No owned native fixture root'
-      $relative=$script:RunRelative+'\'+$d.leaf;$k=[PrunletRegistryE2E]::Create($relative,64)
-      try{[PrunletRegistryE2E]::Set($k,$d.valueName,3,[byte[]]@(99,98,97))}finally{$k.Dispose()};$result=@{created=$true}
+      $relative=$script:RunRelative+'\'+$d.leaf;$k=New-RegistryFixtureKey $relative 64
+      try{Set-RegistryFixtureValue $k $d.valueName 3 ([byte[]]@(99,98,97))}finally{$k.Dispose()};$result=@{created=$true}
      }
      'current-delete'{
       Assert $ownsRoot 'No owned native fixture root'

@@ -1,11 +1,9 @@
 # 失敗仮説: 未公開controlの昇格、部分本文の上書き、fresh inventory不足時の削除、
 # publication owner/body停止時のsnapshot消失。真正producerと実候補の公開APIだけを使う。
 function Load-ControlFixture {
-    Assert-True ($AssemblyPath -and [IO.File]::Exists($AssemblyPath) -and $LegacyRegistryExecutablePath -and [IO.File]::Exists($LegacyRegistryExecutablePath)) 'Checkpoint cases require the actual candidate DLL and genuine registry baseline.'
+    Assert-True (($RustProbePath -and [IO.File]::Exists($RustProbePath)) -and $LegacyRegistryExecutablePath -and [IO.File]::Exists($LegacyRegistryExecutablePath)) 'Checkpoint cases require the actual candidate Rust probe and genuine registry baseline.'
     Assert-True ([Diagnostics.FileVersionInfo]::GetVersionInfo($LegacyRegistryExecutablePath).ProductVersion -match '^1\.0\.15(?:[.+-]|$)') 'Registry producer must be genuine 1.0.15.'
     . (Join-Path $PSScriptRoot '..\recordless-e2e\Common.ps1')
-    if (!('Prunlet.RecordlessE2E.FixtureNative' -as [type])) { Add-Type -Path @('NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs' | ForEach-Object { Join-Path (Join-Path $PSScriptRoot '..\recordless-e2e') $_ }) -CompilerOptions '/unsafe' }
-    if (!('Prunlet.RecordlessE2E.PermissionFixture' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot '..\recordless-e2e\PermissionFixture.cs') }
 }
 function Invoke-ControlBinary([string]$Binary,[string]$ConfigPath,[string[]]$Arguments) {
     $process=Start-Child $Arguments $Binary $ConfigPath
@@ -24,11 +22,7 @@ function New-OldRegistryControlFixture([bool]$Expire) {
     $script:Config=$legacyConfig;$script:Recovery=$legacyRoot;return @{Id=$id;OldRoot=$record;Namespace=(Join-Path $legacyRoot '.registry-records-v1');SourceBefore=$sourceBefore}
 }
 function Stop-RegistryCheckpoint([string]$Id,[string]$Phase,[string]$Action,[string]$Event='RegistryControlCheckpoint') {
-    $signal=Join-Path $script:CaseRoot 'owned-checkpoint.txt';$hostPath=Join-Path $PSScriptRoot '..\recordless-e2e\RegistryCheckpointHost.ps1';$info=[Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
-    foreach($argument in @('-NoProfile','-File',$hostPath,'-AssemblyPath',$AssemblyPath,'-ExpectedAssemblySha256',(Get-FileHash $AssemblyPath).Hash,'-ConfigPath',$script:Config,'-EventName',$Event,'-Checkpoint',$Phase,'-OperationId',$Id,'-Action',$Action,'-SignalPath',$signal)){$info.ArgumentList.Add($argument)}
-    $info.Environment['TEMP']=Join-Path $script:CaseRoot 'temp';$info.Environment['TMP']=$info.Environment['TEMP'];$child=[Diagnostics.Process]::Start($info);$stdout=$child.StandardOutput.ReadToEndAsync();$stderr=$child.StandardError.ReadToEndAsync();$clock=[Diagnostics.Stopwatch]::StartNew()
-    try {while(!(Test-Path -LiteralPath $signal)-and!$child.HasExited-and$clock.ElapsedMilliseconds-lt60000){[Threading.Thread]::Sleep(20)};Assert-True (Test-Path -LiteralPath $signal) ('Real registry checkpoint not reached: '+$(if($child.HasExited){$stderr.GetAwaiter().GetResult()}else{'timeout'}));$lines=[IO.File]::ReadAllLines($signal);Assert-True ($lines.Count-eq3-and$lines[0]-ceq$Phase-and$lines[1]-ceq$Id-and[int]$lines[2]-eq$child.Id) 'Signal did not bind exact owned process';$child.Kill($true);Assert-True ($child.WaitForExit(10000)) 'Owned checkpoint process did not exit';Save-Json (Join-Path $script:CaseRoot 'checkpoint-evidence.json') @{event=$Event;checkpoint=$Phase;operationId=$Id;pid=$child.Id;actualAssemblySha256=(Get-FileHash $AssemblyPath).Hash;scope='Real candidate DLL public API; actual durable event; owned child crash, followed by actual CLI'} }
-    finally {if(!$child.HasExited){$child.Kill($true);$child.WaitForExit()};[IO.File]::WriteAllText((Join-Path $script:CaseRoot 'checkpoint.stdout.txt'),$stdout.GetAwaiter().GetResult(),$utf8);[IO.File]::WriteAllText((Join-Path $script:CaseRoot 'checkpoint.stderr.txt'),$stderr.GetAwaiter().GetResult(),$utf8);$child.Dispose()}
+    Stop-RustRegistryCheckpoint $Id $Phase $Action $Event
 }
 function Invoke-ControlResume($Fixture,[bool]$Expired) {
     Save-Json (Join-Path $script:CaseRoot 'control-pre-resume.json') @{registrySource=$Fixture.SourceBefore;namespace=(Snapshot-R $Fixture.Namespace);legacySource=$(if(Test-Path -LiteralPath $Fixture.OldRoot){Snapshot-R $Fixture.OldRoot}else{$null})}
@@ -38,6 +32,33 @@ function Invoke-ControlResume($Fixture,[bool]$Expired) {
     $again=Invoke-RegistryCli @('maintain','--apply');Assert-True ($again.ExitCode-eq0-and$again.Json.capacityKnown-and(Snapshot)-ceq$Fixture.SourceBefore) 'Control resume was not idempotent'
     Save-Json (Join-Path $script:CaseRoot 'control-post-resume.json') @{registrySource=(Snapshot);namespace=(Snapshot-R $Fixture.Namespace);expired=$Expired;legacySourceAbsent=!(Test-Path -LiteralPath $Fixture.OldRoot)}
 }
+if($RustProbePath -and $LatestRegistryExecutablePath){
+    Case 'latest-csharp-producer-rust-current-cross-restore' {
+        Assert-True ([IO.File]::Exists($LatestRegistryExecutablePath)) 'Genuine C# 1.0.29 producer missing'
+        Assert-True ([Diagnostics.FileVersionInfo]::GetVersionInfo($LatestRegistryExecutablePath).ProductVersion -match '^1\.0\.29(?:[.+-]|$)') 'Latest registry producer must be genuine C# 1.0.29'
+        Assert-True (!(Get-FileHash $LatestRegistryExecutablePath).Hash.Equals((Get-FileHash $ExecutablePath).Hash,[StringComparison]::OrdinalIgnoreCase)) 'Rust candidate must not substitute for the genuine C# producer'
+        Fixture;$before=Snapshot
+        $originalKey=(Open-RegistryFixtureKey ($script:Relative) (64));try{$beforeClass=(Get-RegistryFixtureClass ($originalKey))}finally{$originalKey.Dispose()}
+        $producerRoot=Join-Path $script:CaseRoot 'latest-csharp-metadata';$null=[IO.Directory]::CreateDirectory($producerRoot)
+        $producerConfig=Join-Path $script:CaseRoot 'latest-csharp-config.json'
+        $init=Invoke-ControlBinary $LatestRegistryExecutablePath $producerConfig @('init','--backup-directory',$producerRoot)
+        Assert-True ($init.ExitCode-eq0) 'Genuine C# latest init failed'
+        $prepared=Invoke-ControlBinary $LatestRegistryExecutablePath $producerConfig @('migrate','--apply')
+        Assert-True ($prepared.ExitCode-eq0-and$prepared.Json.registryReady) 'Genuine C# latest namespace preparation failed'
+        $producerSettings=Read-Json $producerConfig
+        Assert-True (!$producerSettings.ContainsKey('registryScope')-or$producerSettings.registryScope-ceq'current') 'Cross-restore must retain current/unknown scope, never infer nativeWindows'
+        $deleted=Invoke-ControlBinary $LatestRegistryExecutablePath $producerConfig @('registry-delete','--view','64','--recursive','--',$script:Path)
+        Assert-True ($deleted.ExitCode-eq0-and$deleted.Json.operationId-and!(Exists)) 'Genuine C# latest did not delete the owned fixture'
+        $id=$deleted.Json.operationId
+        $restored=Invoke-ControlBinary $ExecutablePath $producerConfig @('registry-restore',$id)
+        Assert-True ($restored.ExitCode-eq0-and(Exists)-and(Snapshot)-ceq$before) 'Rust cross-restore did not preserve genuine latest full raw/security snapshot'
+        $restoredKey=(Open-RegistryFixtureKey ($script:Relative) (64));try{$afterClass=(Get-RegistryFixtureClass ($restoredKey))}finally{$restoredKey.Dispose()}
+        Assert-True ($afterClass-ceq$beforeClass) 'Rust cross-restore changed the genuine key class'
+        $reconciled=Invoke-ControlBinary $ExecutablePath $producerConfig @('registry-reconcile',$id)
+        Assert-True ($reconciled.ExitCode-eq0-and$reconciled.Json.items[0].status-ceq'restored') 'Rust did not reconcile the genuine latest restored receipt'
+        Save-Json (Join-Path $script:CaseRoot 'latest-cross-restore-evidence.json') @{producerPath=$LatestRegistryExecutablePath;producerSha256=(Get-FileHash $LatestRegistryExecutablePath).Hash;consumerPath=$ExecutablePath;consumerSha256=(Get-FileHash $ExecutablePath).Hash;scope='Both producer and consumer are standalone current Core in the actual native desktop process; missing scope remains current/unknown';operationId=$id;rawOwnerGroupDaclSaclClassPreserved=$true;before=$before;after=(Snapshot);keyClass=$afterClass;producerDelete=$deleted;consumerRestore=$restored;reconcile=$reconciled}
+    }
+}
 foreach($kind in @('migration','terminal','terminal-cleanup')) {foreach($phase in @('prefix','published')) {
     Case ('registry-control-'+$kind+'-'+$phase+'-crash-resume') {
         . (Join-Path $PSScriptRoot '..\recordless-e2e\Common.ps1');$script:observed=@{};Load-ControlFixture;$fixture=New-OldRegistryControlFixture ($kind-ceq'terminal-cleanup');$action=if($kind-ceq'migration'){'Migrate'}else{'MigrateMaintain'};Stop-RegistryCheckpoint $fixture.Id ($kind+'.'+$phase) $action;Invoke-ControlResume $fixture ($kind-ceq'terminal-cleanup')
@@ -46,7 +67,7 @@ foreach($kind in @('migration','terminal','terminal-cleanup')) {foreach($phase i
 foreach($damage in @('bad-prefix','both-controls','missing-inventory')) {
     Case ('registry-control-'+$damage+'-preserved-and-recovered') {
         . (Join-Path $PSScriptRoot '..\recordless-e2e\Common.ps1');$script:observed=@{};Load-ControlFixture;$fixture=New-OldRegistryControlFixture $false;$phase=if($damage-ceq'both-controls'){'terminal.published'}else{'terminal.prefix'};Stop-RegistryCheckpoint $fixture.Id $phase 'MigrateMaintain';$final=Join-Path $fixture.Namespace ($fixture.Id+'.terminal.json');$pending=$final+'.pending';$original=$null;$held=$null
-        if($damage-ceq'bad-prefix'){$original=[IO.File]::ReadAllBytes($pending);$modified=[byte[]]$original.Clone();$modified[0]=$modified[0]-bxor1;[IO.File]::WriteAllBytes($pending,$modified)}elseif($damage-ceq'both-controls'){[IO.File]::WriteAllBytes($pending,[IO.File]::ReadAllBytes($final));[Prunlet.RecordlessE2E.PermissionFixture]::SetDacl($pending,[Convert]::FromBase64String((Snapshot-R $final)[0].SecurityBase64))}else{$missing=Join-Path (Join-Path $fixture.Namespace $fixture.Id) 'registry-manifest.json';$held=Join-Path $script:CaseRoot 'owned-manifest-held.json';[IO.File]::Move($missing,$held)}
+        if($damage-ceq'bad-prefix'){$original=[IO.File]::ReadAllBytes($pending);$modified=[byte[]]$original.Clone();$modified[0]=$modified[0]-bxor1;[IO.File]::WriteAllBytes($pending,$modified)}elseif($damage-ceq'both-controls'){[IO.File]::WriteAllBytes($pending,[IO.File]::ReadAllBytes($final));$pendingIdentity=(Get-FileFixtureSnapshot -Path $pending)[0];$finalIdentity=(Get-FileFixtureSnapshot -Path $final)[0];Set-FileFixtureDaclOwned -Path $pending -Scope $script:CaseRoot -ExpectedId $pendingIdentity.Id -ExpectedCurrentSecurityBase64 $pendingIdentity.SecurityBase64 -SecurityBase64 $finalIdentity.SecurityBase64}else{$missing=Join-Path (Join-Path $fixture.Namespace $fixture.Id) 'registry-manifest.json';$held=Join-Path $script:CaseRoot 'owned-manifest-held.json';[IO.File]::Move($missing,$held)}
         $before=Snapshot-R $fixture.Namespace;$heldBefore=if($held){Snapshot-R $held}else{$null}
         try {$refused=Invoke-RegistryCli @('maintain','--apply');Assert-True ($refused.ExitCode-ne0-and!$refused.Json.capacityKnown) 'Invalid control was accepted';$after=Assert-SnapshotR $fixture.Namespace $before;if($held){$null=Assert-SnapshotR $held $heldBefore};Assert-True ((Snapshot)-ceq$fixture.SourceBefore) 'Invalid control changed native registry data/security';if($damage-ceq'both-controls'){Assert-True (($refused.Stdout+$refused.Stderr)-match'(?i)both') 'Dual controls were refused for an unrelated reason'};Save-Json (Join-Path $script:CaseRoot 'invalid-control-preservation.json') @{damage=$damage;before=$before;after=$after;held=$heldBefore;sourceBefore=$fixture.SourceBefore;sourceAfter=(Snapshot);response=$refused.Json}}finally{if($original){[IO.File]::WriteAllBytes($pending,$original)}elseif($held){[IO.File]::Move($held,$missing)}else{[IO.File]::Move($pending,(Join-Path $script:CaseRoot 'owned-extra-pending-held.json'))}}
         Invoke-ControlResume $fixture $false

@@ -1,4 +1,4 @@
-﻿$script:LaunchScopeRoot=$PSScriptRoot
+$script:LaunchScopeRoot=$PSScriptRoot
 # Prepareが固定した入力を、書込み・renameを許さないread handleで実行終了まで保持する。
 function OpenPreparedPins([string]$PreparedSettingsPath) {
  $held=[Collections.Generic.List[IDisposable]]::new()
@@ -72,22 +72,22 @@ function WaitLaunchChange([int]$Milliseconds=1000){
  try{$null=$watcher.WaitForChanged([IO.WatcherChangeTypes]::All,$Milliseconds)}finally{$watcher.Dispose()}
 }
 function AssertLaunchReady($Prepared){
- $caller=[SessionE2ENative]::TokenInfo()
+ $caller=(Get-SessionFixtureTokenInfo)
  AssertLaunchRole $Prepared $false
  foreach($role in @(@{file='limited-ready.json';admin=$false;config=$Prepared.config},@{file='controller-ready.json';admin=$true;config=$Prepared.highConfig})){
   $ready=ReadLaunchRecord $role.file
   $configName=if($role.admin){'highConfig'}else{'config'}
-  if([SessionE2ENative]::Fingerprint([IO.File]::ReadAllText($role.config))-cne$Prepared.configFingerprints[$configName]){throw 'Prepared native config changed.'}
+  if((Get-SessionFixtureFingerprint ([IO.File]::ReadAllText($role.config)))-cne$Prepared.configFingerprints[$configName]){throw 'Prepared native config changed.'}
   $descriptor=ReadCapability (ReadJson $role.config).registrySessionFile
   if(!$ready.success-or$ready.nonce-cne$Prepared.nonce-or!$ready.tokenInfo-or$ready.tokenInfo.packaged-or$ready.tokenInfo.isAppContainer-or$ready.tokenInfo.isAdministrator-ne$role.admin){throw 'Desktop helper tier/nonce differs.'}
-  $server=[SessionLaunchNative]::ProcessInfo([int]$descriptor.serverProcessId)
+  $server=(Get-SessionFixtureProcessInfo ([int]$descriptor.serverProcessId))
   if($server.creationFileTime-ne$descriptor.serverCreationTime-or!$server.path.Equals($Prepared.executablePath,[StringComparison]::OrdinalIgnoreCase)){throw 'Actual session process differs.'}
   foreach($field in @('ownerSid','authenticationId','windowsSessionId','isAdministrator','packaged','isAppContainer')){if($server[$field]-cne$ready.tokenInfo[$field]){throw 'Actual server token differs.'}}
   $helperPid=if($role.admin){$ready.controllerPid}else{$ready.pid}
-  $actual=[SessionLaunchNative]::ProcessInfo([int]$helperPid)
+  $actual=(Get-SessionFixtureProcessInfo ([int]$helperPid))
   foreach($tokenField in @('ownerSid','authenticationId','windowsSessionId','isAdministrator','packaged','isAppContainer')){if($actual[$tokenField]-cne$ready.tokenInfo[$tokenField]){throw 'Desktop helper actual token differs.'}}
   if($actual.creationTicks-ne$ready.creationTicks-or!$actual.path.Equals($Prepared.powerShellHostPath,[StringComparison]::OrdinalIgnoreCase)){throw 'Desktop helper actual process differs.'}
-  if($descriptor.authenticationId-cne$actual.authenticationId-or$descriptor.scope.ownerSid-cne$caller.ownerSid-or$descriptor.windowsSessionId-ne$caller.windowsSessionId-or$descriptor.scope.kind-cne'nativeWindows'-or$descriptor.configurationSha256-cne[SessionE2ENative]::Fingerprint([IO.File]::ReadAllText($role.config))-or!$descriptor.executableSha256.Equals($Prepared.executableSha256,[StringComparison]::OrdinalIgnoreCase)-or$ready.sessionPid-ne$descriptor.serverProcessId-or(GetLaunchUtcTicks $descriptor.expiresUtc)-le[DateTime]::UtcNow.AddMinutes(8).Ticks){throw 'Prepared native descriptor differs.'}
+  if($descriptor.authenticationId-cne$actual.authenticationId-or$descriptor.scope.ownerSid-cne$caller.ownerSid-or$descriptor.windowsSessionId-ne$caller.windowsSessionId-or$descriptor.scope.kind-cne'nativeWindows'-or$descriptor.configurationSha256-cne(Get-SessionFixtureFingerprint ([IO.File]::ReadAllText($role.config)))-or!$descriptor.executableSha256.Equals($Prepared.executableSha256,[StringComparison]::OrdinalIgnoreCase)-or$ready.sessionPid-ne$descriptor.serverProcessId-or(GetLaunchUtcTicks $descriptor.expiresUtc)-le[DateTime]::UtcNow.AddMinutes(8).Ticks){throw 'Prepared native descriptor differs.'}
   if(!$role.admin-and$actual.authenticationId-cne$caller.authenticationId){throw 'Normal session authentication differs.'}
   if($role.admin-and$actual.authenticationId-ceq$caller.authenticationId){throw 'Administrator session authentication is not distinct.'}
  }
@@ -97,7 +97,7 @@ function StartPreparedDesktopSessions($Prepared,[string]$ScopeRoot,[string]$Prep
  $claim=LaunchProcessRecord;$claim.nonce=$Prepared.nonce;$claim.expiresTicks=[DateTime]::UtcNow.AddMinutes(3).Ticks
  foreach($existing in @('controller-ready.json','limited-ready.json','controller-error.json','limited-error.json','run-started.json','run-permit.json','start-committed.json','start-cancelled.json')){if([IO.File]::Exists((Join-Path $ScopeRoot $existing))){throw 'Scope has prior launch output; prepare a new scope.'}}
  if(@([IO.Directory]::EnumerateFiles($ScopeRoot,'request-*.json')).Count){throw 'Scope has prior fixture requests.'}
- $caller=[SessionE2ENative]::TokenInfo();AssertLaunchRole $Prepared $false;$desktop=[SessionLaunchNative]::DesktopInfo()
+ $caller=(Get-SessionFixtureTokenInfo);AssertLaunchRole $Prepared $false;$desktop=(Get-SessionFixtureDesktopInfo)
  if($caller.isAdministrator-or$caller.isAppContainer){throw 'Start requires a normal caller token.'}
  $explorer=Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)) 'explorer.exe'
  if(!$desktop.path.Equals($explorer,[StringComparison]::OrdinalIgnoreCase)-or$desktop.packaged-or$desktop.isAppContainer-or$desktop.isAdministrator){throw 'Desktop shell is not the normal Windows explorer.'}
@@ -140,7 +140,7 @@ function GetLaunchUtcTicks($Value){
 }
 
 function AssertLaunchRole($Prepared,[bool]$Administrator){
- $actual=[SessionE2ENative]::TokenInfo()
+ $actual=(Get-SessionFixtureTokenInfo)
  if($actual.isAdministrator-ne$Administrator-or$actual.isAppContainer-or($actual.packaged-and$Administrator)){throw 'Helper actual token tier/package differs.'}
  foreach($field in @('ownerSid','windowsSessionId')){if($actual[$field]-cne$Prepared.preparedToken[$field]){throw 'Prepared caller SID/session differs.'}}
  if(!$Administrator-and$actual.authenticationId-cne$Prepared.preparedToken.authenticationId){throw 'Prepared normal caller AuthID differs.'}

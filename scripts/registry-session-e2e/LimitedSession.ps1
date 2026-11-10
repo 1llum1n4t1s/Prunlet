@@ -1,4 +1,4 @@
-﻿param([Parameter(Mandatory)][string]$SettingsPath,[ValidatePattern('^[0-9a-f]{32}$')][string]$LaunchNonce)
+param([Parameter(Mandatory)][string]$SettingsPath,[ValidatePattern('^[0-9a-f]{32}$')][string]$LaunchNonce)
 $script:AutomaticLaunchNonce=$LaunchNonce
 . (Join-Path $PSScriptRoot 'SessionE2E.Common.ps1')
 $s=ReadJson $SettingsPath;$script:ExecutablePath=$s.executablePath;$script:Config=$s.config;$p=$null
@@ -8,7 +8,7 @@ Assert ([IO.File]::Exists($powerShellHostPath)) 'Current PowerShell host executa
 Assert ($powerShellHostPath.Equals($s.powerShellHostPath,[StringComparison]::OrdinalIgnoreCase)) 'Normal PowerShell host differs from Prepare; use the prepared absolute desktop command'
 $script:RunRelative=$s.runRelative
 try{
- LoadFixture;$tokenInfo=[SessionE2ENative]::TokenInfo();AssertLaunchRole $s $false
+ LoadFixture;$tokenInfo=(Get-SessionFixtureTokenInfo);AssertLaunchRole $s $false
  Assert (!$tokenInfo.packaged) 'Normal desktop helper remains packaged; no fixture created'
  Assert (!$tokenInfo.isAppContainer) 'Normal desktop helper is AppContainer; no fixture created'
  Assert (!$tokenInfo.isAdministrator) 'Normal helper must not be administrator'

@@ -30,7 +30,7 @@ CodexからMacなどへ送るPowerShellスクリプトは、[フックの連携�
 
 ## インストールと更新
 
-Windows x64・ARM64、PowerShell 7に対応します。下記のインストーラーはソースをビルドするため、.NET 10 SDKが必要です。生成・配布するexeはランタイム同梱で、実行時に.NETランタイムを別途導入する必要はありません。インストール元は[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の既定ブランチの最新HEADです。開発用クローンは使用しません。
+Windows x64・ARM64、PowerShell 7に対応します。下記のインストーラーはソースをビルドするため、Rustup・Cargoと対象WindowsのMSVCビルドツール、対象アーキテクチャのRust MSVCターゲットが必要です。Rustのバージョンはソースの`rust-toolchain.toml`で固定します。生成・配布するexeの実行に.NETランタイムは不要です。インストール元は[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の既定ブランチの最新HEADです。開発用クローンは使用しません。
 
 Windows ARM64では、下の実行コマンドに`-Runtime win-arm64`を追加してください。既定は`win-x64`で、ARM64での未指定は停止します。x64エミュレーションを選ぶ場合も`-Runtime win-x64`の明示指定が必要です。
 

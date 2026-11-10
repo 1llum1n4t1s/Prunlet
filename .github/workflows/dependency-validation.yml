@@ -25,23 +25,21 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Setup .NET
-        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
-        with:
-          dotnet-version: 10.0.x
-      - name: Restore
+      - name: Prepare Rust target
         run: |
-          dotnet restore src/Prunlet/Prunlet.csproj -p:BaseIntermediateOutputPath="$env:RUNNER_TEMP/prunlet-obj/" -p:BaseOutputPath="$env:RUNNER_TEMP/prunlet-bin/"
+          rustup target add x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         run: |
-          dotnet build src/Prunlet/Prunlet.csproj -c Release --no-restore -p:BaseIntermediateOutputPath="$env:RUNNER_TEMP/prunlet-obj/" -p:BaseOutputPath="$env:RUNNER_TEMP/prunlet-bin/"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./scripts/Publish-Prunlet.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'prunlet-build') -IncludeVerificationProbe | Out-Null
       - name: Run CLI MCP and hook E2E
         run: |
           $report = Join-Path $env:RUNNER_TEMP "prunlet-dependency-verification.json"
           $runRoot = Join-Path $env:RUNNER_TEMP ("prunlet-e2e-" + [guid]::NewGuid().ToString("N"))
-          & ./scripts/Verify-Prunlet.ps1 -ExecutablePath (Join-Path $env:RUNNER_TEMP "prunlet-bin/Release/net10.0-windows/prunlet.exe") -OutputDirectory $runRoot -ReportPath $report
+          $build = Join-Path $env:RUNNER_TEMP 'prunlet-build'
+          $manifest = Join-Path $build 'build-manifest.json'
+          $manifestHash = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash
+          & ./scripts/Verify-RecordlessFiles.ps1 -ExecutablePath (Join-Path $build 'publish/prunlet.exe') -RustProbePath (Join-Path $build 'publish/prunlet-verification.exe') -BuildManifestPath $manifest -ExpectedBuildManifestSha256 $manifestHash -OutputDirectory $runRoot -ReportPath $report
           $verificationExitCode = $LASTEXITCODE
           if (Test-Path -LiteralPath $report) {
             $verification = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json

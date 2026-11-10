@@ -5,6 +5,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
+    [Parameter(Mandatory)][string]$BuildManifestPath,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBuildManifestSha256,
     [Parameter(Mandatory)][string]$BaselineExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
@@ -13,6 +15,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
+. (Join-Path $PSScriptRoot 'FileFixtures.Common.ps1')
+$null=Initialize-PrunletFixtureBinding -ExecutablePath $ExecutablePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
 foreach ($path in @($ExecutablePath, $BaselineExecutablePath, $OutputDirectory, $ReportPath)) {
@@ -59,42 +63,7 @@ $previousTemp = $env:TEMP; $previousTmp = $env:TMP
 try {
     $env:TEMP = $tempRoot; $env:TMP = $tempRoot
     . (Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1')
-    $helperFiles = @('NativeShellFixture.cs', 'FixtureNative.cs', 'OwnedBinLocator.cs', 'PermissionFixture.cs') | ForEach-Object { Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $_ }
-    Add-Type -Path $helperFiles -CompilerOptions '/unsafe'
-    Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-public static class PrunletMaintenanceEvidence {
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern SafeFileHandle CreateFileW(string p,uint a,uint s,IntPtr sa,uint d,uint f,IntPtr t);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetFileInformationByHandleEx(SafeFileHandle h,int k,byte[] b,uint n);
-    [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetKernelObjectSecurity(SafeFileHandle h,uint i,byte[] b,uint n,out uint need);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern SafeFileHandle CreateJobObjectW(IntPtr a,string n);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(SafeFileHandle j,IntPtr p);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(SafeFileHandle j,int c,out Accounting a,uint n,IntPtr r);
-    [StructLayout(LayoutKind.Sequential)] struct Accounting { public long User,Kernel,PeriodUser,PeriodKernel; public uint Faults,Total,Active,Terminated; }
-    public static string[] Snapshot(string p) {
-        using(var h=CreateFileW(p,0x20080,7,IntPtr.Zero,3,0x02200000,IntPtr.Zero)) {
-            if(h.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
-            byte[] id=new byte[24]; if(!GetFileInformationByHandleEx(h,18,id,24)) throw new Win32Exception(Marshal.GetLastWin32Error());
-            uint n; bool measured=GetKernelObjectSecurity(h,7,null,0,out n); int e=Marshal.GetLastWin32Error();
-            if((!measured&&e!=122)||n<20||n>1048576) throw new Win32Exception(e);
-            byte[] security=new byte[n]; if(!GetKernelObjectSecurity(h,7,security,n,out n)) throw new Win32Exception(Marshal.GetLastWin32Error());
-            Array.Resize(ref security,(int)n); return new[]{Convert.ToHexString(id),Convert.ToBase64String(security)};
-        }
-    }
-    public static SafeFileHandle Bind(IntPtr process) {
-        var job=CreateJobObjectW(IntPtr.Zero,null);
-        if(job.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
-        if(!AssignProcessToJobObject(job,process)) { int e=Marshal.GetLastWin32Error(); job.Dispose(); throw new Win32Exception(e); } return job;
-    }
-    public static double CpuMilliseconds(SafeFileHandle job) {
-        Accounting a; if(!QueryInformationJobObject(job,1,out a,(uint)Marshal.SizeOf<Accounting>(),IntPtr.Zero)) throw new Win32Exception(Marshal.GetLastWin32Error());
-        return (a.User+a.Kernel)/10000.0;
-    }
-}
-'@
+
 } finally { $env:TEMP = $previousTemp; $env:TMP = $previousTmp }
 function Invoke-Cli([string[]]$CliArguments, [string]$Exe = $ExecutablePath) {
     foreach ($argument in $CliArguments) { if ($argument -cnotmatch '^[A-Za-z0-9_ .:\\-]+$') { throw 'Unsafe CMD argument.' } }
@@ -111,36 +80,39 @@ function Invoke-Cli([string[]]$CliArguments, [string]$Exe = $ExecutablePath) {
         $null = $process.Start()
         $shellOut = $process.StandardOutput.ReadToEndAsync(); $shellErr = $process.StandardError.ReadToEndAsync()
         # stdin投入前にJobへ割当て、CLI子プロセスの終了後もCPU集計を失わない。
-        $job = [PrunletMaintenanceEvidence]::Bind($process.Handle)
+        $job = (New-FileFixtureJob -Process $process)
         $quoted = @(@('--config', $configPath) + $CliArguments | ForEach-Object { '"' + $_ + '"' })
         $command = '@"' + $Exe + '" ' + ($quoted -join ' ') + ' 1>"' + $stdoutPath + '" 2>"' + $stderrPath + '"'
         $timer = [Diagnostics.Stopwatch]::StartNew()
         $process.StandardInput.WriteLine($command)
         $process.StandardInput.WriteLine('exit %errorlevel%'); $process.StandardInput.Close()
         while (!$child -and !$process.HasExited -and $timer.ElapsedMilliseconds -lt 5000) {
-            $child = [Prunlet.RecordlessE2E.PermissionFixture]::FindChild($process.Id, $Exe)
+            $child = (Find-FileFixtureChildProcess -ParentId $process.Id -ExecutablePath $Exe)
             if (!$child) { [Threading.Thread]::Sleep(2) }
         }
         if (!$process.WaitForExit(600000)) { $process.Kill($true); $process.WaitForExit(); throw "CLI timeout: $CliArguments" }
         $timer.Stop()
         $out = [IO.File]::ReadAllText($stdoutPath, $utf8); $err = [IO.File]::ReadAllText($stderrPath, $utf8)
         $call = @{ executable = $Exe; arguments = $CliArguments; exitCode = $process.ExitCode; elapsedMilliseconds = $timer.Elapsed.TotalMilliseconds
-            cpuMilliseconds = $(if ($child) { $child.TotalProcessorTime.TotalMilliseconds } else { $null }); cpuVerified = ($null -ne $child); actualCliPid = $(if ($child) { $child.Id } else { $null }); cpuScope = 'Actual CLI TotalProcessorTime'; jobCpuMilliseconds = [PrunletMaintenanceEvidence]::CpuMilliseconds($job); stdoutPath = $stdoutPath; stderrPath = $stderrPath
+            cpuMilliseconds = $(if ($child) { $child.TotalProcessorTime.TotalMilliseconds } else { $null }); cpuVerified = ($null -ne $child); actualCliPid = $(if ($child) { $child.Id } else { $null }); cpuScope = 'Actual CLI TotalProcessorTime'; jobCpuMilliseconds = $job.CpuMilliseconds(); stdoutPath = $stdoutPath; stderrPath = $stderrPath
             shellStdout = $shellOut.GetAwaiter().GetResult(); shellStderr = $shellErr.GetAwaiter().GetResult() }
         $calls.Add($call)
         $json = $null; try { $json = $out | ConvertFrom-Json -AsHashtable -Depth 80 } catch { }
         return @{ ExitCode = $process.ExitCode; Json = $json; Stdout = $out; Stderr = $err; Measurement = $call }
     } finally {
         if (!$process.HasExited) { $process.Kill($true); $process.WaitForExit() }
-        if ($child) { $child.Dispose() }; if ($job) { $job.Dispose() }; $process.Dispose()
+        try {
+            if ($child) { $child.Dispose() }
+            if ($job) { try { $job.Dispose() } catch { $results.Add(@{name='job-release';passed=$false;state=$job.ReleaseState;leaseId=$job.LastLeaseId;resubmitted=$false});throw } }
+        } finally { $process.Dispose() }
     }
 }
 function Snapshot-Tree([string]$Root) {
     $entries = @((Get-Item -LiteralPath $Root -Force)) + @(Get-ChildItem -LiteralPath $Root -Recurse -Force)
     $snapshot = foreach ($entry in $entries) {
         Assert-True (!($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) 'Fixture unexpectedly contains a reparse point.'
-        $native = [PrunletMaintenanceEvidence]::Snapshot($entry.FullName)
-        @{ relative = $entry.FullName.Substring($Root.Length); identity = $native[0]; securityBase64 = $native[1]
+        $native = Get-FileFixtureNode -Path $entry.FullName
+        @{ relative = $entry.FullName.Substring($Root.Length); identity = $native.Id; securityBase64 = $native.SecurityBase64
             attributes = [int]$entry.Attributes; hash = $(if (!$entry.PSIsContainer) { Digest $entry.FullName } else { $null }) }
     }
     return ,@($snapshot | Sort-Object relative)
@@ -228,18 +200,18 @@ try {
     $null = Assert-SnapshotR $operationRoot $rawBefore
     $results.Add(@{ name = 'alternating-same-legacy-operation-maintain-dry-run'; passed = $true; operationId = $operationId })
     # LIST拒否を実証した旧ディレクトリで、通常一覧/保守が走査しないことを確認する。
-    $security = [Prunlet.RecordlessE2E.PermissionFixture]::Security($operationRoot)
+    $aclLease=New-FileFixtureAccessLease -Path $operationRoot -Scope $metadata -WritableAcl -ExpectedId $rawBefore[0].Id -ExpectedSecurityBase64 $rawBefore[0].SecurityBase64
     try {
-        [Prunlet.RecordlessE2E.PermissionFixture]::DenyDataRead($operationRoot, $security)
-        $denied = [Convert]::ToBase64String([Prunlet.RecordlessE2E.PermissionFixture]::Security($operationRoot))
+        $aclLease.DenyRead()
+        $denied = [Convert]::ToBase64String((Get-FileFixtureSecurity -Path $operationRoot))
         $enumerationFailed = $false
         try { $null = @([IO.Directory]::EnumerateFileSystemEntries($operationRoot)) } catch { $enumerationFailed = $true }
         Assert-True $enumerationFailed 'Old directory LIST denial was not established.'
         foreach ($arguments in @(@('operations'), @('maintain', '--dry-run'), @('maintain', '--apply'))) {
             $call = Invoke-Cli $arguments; Assert-Call $call 'Normal registry-only operation with denied legacy directory'
-            Assert-True ([Convert]::ToBase64String([Prunlet.RecordlessE2E.PermissionFixture]::Security($operationRoot)) -ceq $denied) 'Normal operation changed denied directory ACL.'
+            Assert-True ([Convert]::ToBase64String((Get-FileFixtureSecurity -Path $operationRoot)) -ceq $denied) 'Normal operation changed denied directory ACL.'
         }
-    } finally { [Prunlet.RecordlessE2E.PermissionFixture]::SetDacl($operationRoot, $security) }
+    } finally { if((Get-FileFixtureIdentity -Path $operationRoot)-cne$rawBefore[0].Id){throw 'Legacy fixture identity changed; ACL lease retained'};try{$aclLease.Dispose()}catch{$results.Add(@{name='legacy-acl-release';passed=$false;state=$aclLease.ReleaseState;leaseId=$aclLease.LastLeaseId;resubmitted=$false});throw} }
     $null = Assert-SnapshotR $operationRoot $rawBefore
     $null = Assert-SnapshotR $payload $binBefore
     Assert-True ((Digest $configPath) -ceq $configHash) 'Normal operations changed config.'
@@ -248,7 +220,7 @@ try {
     $discarded = @($migration.Json.operations | Where-Object path -CEQ $operationRoot)
     Assert-True ($migration.Json.registryReady -and $migration.Json.complete -and $discarded.Count -eq 1 -and $discarded[0].status -ceq 'recycled' -and $null -eq $discarded[0].schema -and !$discarded[0].operationId -and !(Test-Path -LiteralPath $operationRoot)) 'Explicit legacy metadata discard failed.'
     $null = Assert-SnapshotR $payload $binBefore
-    $metadataItem = @([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($rawBefore[0].Id))
+    $metadataItem = @((Find-FileFixtureBinIdentity -ExpectedId ($rawBefore[0].Id)))
     Assert-True ($metadataItem.Count -eq 1) 'Discarded metadata root must have one owned Windows Bin identity.'
     $metadataBinBefore = Assert-SnapshotR $metadataItem[0].PhysicalPath $rawBefore -WindowsManagedBin
     $binPaths.Add($metadataItem[0].PhysicalPath)

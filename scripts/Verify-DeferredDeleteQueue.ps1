@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$ConfigPath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
+    [string]$LegacyMcpWrapperPath,
     [ValidateRange(10, 300)][int]$CompletionTimeoutSeconds = 60,
     [ValidateRange(2, 30)][int]$AcceptanceTimeoutSeconds = 10
 )
@@ -24,6 +25,14 @@ $ReportPath = [IO.Path]::GetFullPath($ReportPath)
 foreach ($path in @($ExecutablePath, $ConfigPath)) {
     Assert-VerificationDestination $path @()
     if (![IO.File]::Exists($path)) { throw "Required input missing: $path" }
+}
+if ($PSBoundParameters.ContainsKey('LegacyMcpWrapperPath')) {
+    if (!$LegacyMcpWrapperPath -or ![IO.Path]::IsPathFullyQualified($LegacyMcpWrapperPath)) { throw 'Legacy MCP wrapper path must be absolute.' }
+    $LegacyMcpWrapperPath = [IO.Path]::GetFullPath($LegacyMcpWrapperPath)
+    Assert-VerificationDestination $LegacyMcpWrapperPath @()
+    if (![IO.File]::Exists($LegacyMcpWrapperPath)) { throw 'Legacy MCP wrapper must be a plain file.' }
+    $legacyItem = Get-Item -LiteralPath $LegacyMcpWrapperPath -Force
+    if ($legacyItem.PSIsContainer -or ($legacyItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Legacy MCP wrapper must be a plain file.' }
 }
 foreach ($path in @($OutputDirectory, $ReportPath)) {
     Assert-VerificationDestination $path @($repo, (Join-Path $env:USERPROFILE '.codex'))
@@ -51,6 +60,7 @@ $config.registrySessionFile = $null
 $cases = [Collections.Generic.List[object]]::new()
 $invocations = [Collections.Generic.List[object]]::new()
 $ownedJobs = [Collections.Generic.List[object]]::new()
+$workerExecutables = @{}
 $workerCleanup = [Collections.Generic.List[object]]::new()
 $started = [DateTimeOffset]::UtcNow
 $exeHash = (Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash
@@ -179,7 +189,8 @@ function Stop-OwnedWorkerQ($Job) {
         catch [ArgumentException] { $cleanup.status = 'already-exited'; return }
         $null = $worker.Handle
         Assert-Q ($worker.StartTime.ToUniversalTime() -ge $started.UtcDateTime.AddSeconds(-1)) 'Worker PID was reused by an older process.'
-        Assert-Q ($worker.MainModule.FileName.Equals($ExecutablePath, [StringComparison]::OrdinalIgnoreCase)) 'Worker executable changed; retained.'
+        $expectedExecutable = if ($workerExecutables.ContainsKey($Job.jobId)) { $workerExecutables[$Job.jobId] } else { $ExecutablePath }
+        Assert-Q ($worker.MainModule.FileName.Equals($expectedExecutable, [StringComparison]::OrdinalIgnoreCase)) 'Worker executable changed; retained.'
         $state = Get-StateQ $Job.jobId
         Assert-Q ($state.json.workerProcessId -eq $Job.workerProcessId -and $state.json.status -cne 'unavailable') 'Original job no longer owns this worker PID; retained.'
         $worker.Kill()
@@ -398,6 +409,137 @@ try {
         Assert-Q (!!$first.json.error -and !!$second.json.error) 'Unknown outcome omitted its explanation.'
         Assert-Q ([IO.File]::ReadAllText($fixture.child) -ceq $fixture.content) 'Status query resent deletion after worker exit.'
     }
+    function Invoke-RegisteredWrapperQ($case, [bool]$Legacy) {
+        # 実際の管理配置を隔離領域に再現し、source-infoを置かず通信前に更新を延期する。
+        $prefix = if ($Legacy) { 'legacy-registered' } else { 'registered' }
+        $installRoot = Join-Path $OutputDirectory ($prefix + '-install')
+        $bin = Join-Path $installRoot 'bin'
+        $codexHome = Join-Path $OutputDirectory ($prefix + '-codex-home')
+        $backup = Join-Path $OutputDirectory ($prefix + '-backup')
+        $null = [IO.Directory]::CreateDirectory($bin)
+        $null = [IO.Directory]::CreateDirectory($codexHome)
+        $copiedExe = Join-Path $bin 'prunlet.exe'
+        $copiedConfig = Join-Path $installRoot 'config.json'
+        $sourceHook = Join-Path ([IO.Path]::GetDirectoryName($ExecutablePath)) 'prunlet-hook.exe'
+        Assert-Q ([IO.File]::Exists($sourceHook)) 'The candidate build does not contain prunlet-hook.exe.'
+        [IO.File]::Copy($ExecutablePath, $copiedExe, $false)
+        [IO.File]::Copy($sourceHook, (Join-Path $bin 'prunlet-hook.exe'), $false)
+        [IO.File]::Copy($fixtureConfig, $copiedConfig, $false)
+        $wrapperSource = if ($Legacy) { $LegacyMcpWrapperPath } else { Join-Path $repo 'integration\start-prunlet-mcp.ps1' }
+        [IO.File]::Copy($wrapperSource, (Join-Path $bin 'start-prunlet-mcp.ps1'), $false)
+        [IO.File]::Copy((Join-Path $repo 'integration\configuration-common.ps1'), (Join-Path $bin 'configuration-common.ps1'), $false)
+        $case.observed.wrapperSource = $wrapperSource
+        $case.observed.wrapperSha256 = (Get-FileHash -LiteralPath $wrapperSource -Algorithm SHA256).Hash
+        Assert-Q ((Get-FileHash -LiteralPath $copiedExe -Algorithm SHA256).Hash -ceq $exeHash) 'Copied executable differs from the candidate.'
+        $registration = & (Join-Path $repo 'integration\install-codex.ps1') -ExecutablePath $copiedExe -ConfigPath $copiedConfig -CodexHome $codexHome -BackupDirectory $backup
+        $case.observed.registration = $registration | ConvertFrom-Json -AsHashtable
+        Assert-Q ($case.observed.registration.status -ceq 'installed') 'Isolated registration failed.'
+        $toml = [IO.File]::ReadAllText((Join-Path $codexHome 'config.toml'))
+        $block = [regex]::Matches($toml, '(?ms)^# BEGIN PRUNLET MCP\r?\n\[mcp_servers\.prunlet\]\r?\ncommand = (?<command>"(?:\\.|[^"\\])*")\r?\nargs = (?<args>\[(?:\s*"(?:\\.|[^"\\])*"\s*(?:,\s*"(?:\\.|[^"\\])*"\s*)*)?\])\r?\nstartup_timeout_sec = 600\r?\n# END PRUNLET MCP\r?$')
+        Assert-Q ($block.Count -eq 1) 'Generated MCP registration is not the expected JSON-compatible TOML block.'
+        # 登録値だけをJSONとして復号し、PowerShell式として評価しない。
+        $command = $block[0].Groups['command'].Value | ConvertFrom-Json
+        $arguments = @($block[0].Groups['args'].Value | ConvertFrom-Json)
+        $expectedArgs = @('-NoProfile', '-NonInteractive', '-File', (Join-Path $bin 'start-prunlet-mcp.ps1'), '-ExecutablePath', $copiedExe, '-ConfigPath', $copiedConfig, '-CodexHome', $codexHome)
+        Assert-Q ($command -ceq 'pwsh' -and $arguments.Count -eq $expectedArgs.Count) 'Generated MCP command or argument count differs.'
+        for ($index = 0; $index -lt $expectedArgs.Count; $index++) {
+            Assert-Q ($arguments[$index] -is [string] -and $arguments[$index] -ceq $expectedArgs[$index]) 'Generated MCP arguments differ from the isolated registration.'
+        }
+        $case.observed.command = $command
+        $case.observed.arguments = $arguments
+        $fixture = New-FixtureQ ($prefix + '-wrapper-locked')
+        $held = [IO.FileStream]::new($fixture.child, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $process = [Diagnostics.Process]::new()
+        $start = [Diagnostics.ProcessStartInfo]::new()
+        $start.FileName = $command
+        foreach ($argument in $arguments) { $start.ArgumentList.Add($argument) }
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardInput = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $start.StandardInputEncoding = $utf8
+        $start.StandardOutputEncoding = $utf8
+        $start.StandardErrorEncoding = $utf8
+        $start.Environment['TEMP'] = $temp
+        $start.Environment['TMP'] = $temp
+        $process.StartInfo = $start
+        $session = @{ process = $process }
+        $launched = $false
+        $job = $null
+        $finished = $false
+        $output = $null
+        $errors = $null
+        try {
+            $launched = $process.Start()
+            Assert-Q $launched 'Registered MCP wrapper did not start.'
+            $errors = $process.StandardError.ReadToEndAsync()
+            $null = Invoke-McpQ $session 101 'initialize' @{ protocolVersion = '2024-11-05'; capabilities = @{}; clientInfo = @{ name = 'registered-queue-e2e'; version = '1' } }
+            $process.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
+            $process.StandardInput.Flush()
+            $accepted = Invoke-McpQ $session 102 'tools/call' @{ name = 'delete_files'; arguments = @{ action = 'enqueue'; paths = @($fixture.root); recursive = $true } }
+            $job = $accepted.structuredContent
+            $case.observed.response = $accepted
+            $case.observed.accepted = $job
+            if ($job.jobId -cmatch '^[a-f0-9]{32}$' -and $job.workerProcessId -gt 0) {
+                $workerExecutables[$job.jobId] = $copiedExe
+                $ownedJobs.Add($job)
+            }
+            if ($Legacy) {
+                $content = @($accepted.content)
+                Assert-Q ($accepted.isError -eq $true -and $null -eq $job -and $content.Count -eq 1 -and $content[0].type -ceq 'text' -and $content[0].text -ceq 'Reconnect to the installed Prunlet MCP launcher before enqueuing; deletion was not started') 'Legacy wrapper enqueue was not rejected with the expected reconnect instruction and no job or worker ID.'
+                Assert-Q ([IO.File]::ReadAllText($fixture.child) -ceq $fixture.content) 'Legacy wrapper rejection changed the locked target.'
+            } else {
+                Assert-Q (!$accepted.isError -and $job.jobId -cmatch '^[a-f0-9]{32}$' -and $job.workerProcessId -gt 0 -and $job.status -ceq 'pending') 'Registered MCP did not acknowledge a pending job with its worker.'
+            }
+            $process.StandardInput.Close()
+            $output = $process.StandardOutput.ReadToEndAsync()
+            Assert-Q ($process.WaitForExit(15000)) 'Registered wrapper did not exit after stdin EOF; do not resend.'
+            $case.observed.wrapperExitCode = $process.ExitCode
+            Assert-Q ($output.Wait(5000) -and $errors.Wait(5000)) 'Registered wrapper exited without pipe EOF; do not resend.'
+            $case.observed.stdoutEof = $true
+            $case.observed.stderrEof = $true
+            $case.observed.wrapperStdoutAfterAck = $output.GetAwaiter().GetResult()
+            $case.observed.wrapperStderr = $errors.GetAwaiter().GetResult()
+            Assert-Q ($process.ExitCode -eq 0) 'Registered wrapper exited unsuccessfully after stdin EOF.'
+            Assert-Q ($case.observed.wrapperStderr -match 'Prunlet startup update was deferred:' -and $case.observed.wrapperStderr -match 'source-info\.json') 'Expected offline startup update deferral was not recorded.'
+            if ($Legacy) {
+                Assert-Q ([IO.File]::ReadAllText($fixture.child) -ceq $fixture.content) 'Legacy wrapper rejection changed the target after EOF.'
+                $finished = $true
+                return
+            }
+            $waiting = Get-StateQ $job.jobId
+            $case.observed.waitingAfterWrapperExit = $waiting.json
+            Assert-Q ($waiting.exitCode -eq 0 -and $waiting.json.status -ceq 'pending' -and $waiting.json.workerProcessId -eq $job.workerProcessId) 'Original worker did not remain pending after wrapper exit.'
+            Assert-Q ([IO.File]::ReadAllText($fixture.child) -ceq $fixture.content) 'Locked target changed before release.'
+            $held.Dispose(); $held = $null
+            $terminal = Wait-TerminalQ $job.jobId
+            $case.observed.terminal = $terminal.json
+            Assert-Q ($terminal.exitCode -eq 0 -and $terminal.json.status -ceq 'completed' -and $terminal.json.jobId -ceq $job.jobId -and $terminal.json.workerProcessId -eq $job.workerProcessId) 'Original queued worker did not complete after release.'
+            $items = @($terminal.json.result.items)
+            Assert-Q ($items.Count -eq 1 -and $items[0].path -ceq $fixture.root -and $items[0].status -cin @('recycled', 'permanently_deleted')) 'Completed registered job omitted its successful file result.'
+            Assert-Q (![IO.Directory]::Exists($fixture.root)) 'Completed registered target remains at its original path.'
+            $finished = $true
+        } finally {
+            # 失敗時は解除前に所有を照合してworkerを止め、fixtureと観測結果を保持する。
+            if (!$finished -and $job -and $workerExecutables.ContainsKey($job.jobId)) { Stop-OwnedWorkerQ $job }
+            if ($held) { $held.Dispose() }
+            if ($launched) {
+                if (!$process.HasExited) {
+                    try { $process.StandardInput.Close() } catch { }
+                    if (!$process.WaitForExit(5000)) { $process.Kill(); $process.WaitForExit(); $case.observed.wrapperForcedStop = $true }
+                }
+                if (!$case.observed.Contains('wrapperExitCode')) { $case.observed.wrapperExitCode = $process.ExitCode }
+                if ($errors -and $errors.Wait(5000) -and !$case.observed.Contains('wrapperStderr')) { $case.observed.wrapperStderr = $errors.GetAwaiter().GetResult() }
+                if ($output -and $output.Wait(5000) -and !$case.observed.Contains('wrapperStdoutAfterAck')) { $case.observed.wrapperStdoutAfterAck = $output.GetAwaiter().GetResult() }
+            }
+            $process.Dispose()
+        }
+    }
+    Run-CaseQ 'registered-wrapper-eof-keeps-queued-worker' { param($case) Invoke-RegisteredWrapperQ $case $false }
+    if ($LegacyMcpWrapperPath) {
+        Run-CaseQ 'legacy-registered-wrapper-rejects-enqueue' { param($case) Invoke-RegisteredWrapperQ $case $true }
+    }
     Run-CaseQ 'stdio-mcp-enqueue-status-and-cancel' {
         param($case)
         $fixture = New-FixtureQ 'mcp-cancelled'
@@ -457,7 +599,7 @@ try {
         if (@($workerCleanup | Where-Object { $_.jobId -ceq $job.jobId -and $_.status -in @('stopped-owned-worker', 'already-exited') }).Count -eq 0) { Stop-OwnedWorkerQ $job }
     }
     $report = [ordered]@{
-        executablePath = $ExecutablePath; executableSha256 = $exeHash; sourceConfigPath = $ConfigPath
+        executablePath = $ExecutablePath; executableSha256 = $exeHash; sourceConfigPath = $ConfigPath; legacyMcpWrapperPath = $LegacyMcpWrapperPath
         fixtureConfigPath = $fixtureConfig; outputDirectory = $OutputDirectory
         startedAtUtc = $started; finishedAtUtc = [DateTimeOffset]::UtcNow
         passed = @($cases | Where-Object passed).Count; failed = @($cases | Where-Object { !$_.passed }).Count
@@ -465,6 +607,7 @@ try {
         unverified = @('ambiguous outcome after deletion has started (no deterministic fault injection)', 'Windows Recycle Bin content and restoration', 'queue retention expiry and process restart')
         retained = @(@{ path = $OutputDirectory; reason = 'Failed-closed fixtures, CLI JSON, and isolated metadata retained for review. No unrelated Recycle Bin items were touched.' })
     }
+    if (!$LegacyMcpWrapperPath) { $report.unverified += 'legacy MCP wrapper with the candidate executable (LegacyMcpWrapperPath not supplied)' }
     [IO.File]::WriteAllText($ReportPath, ($report | ConvertTo-Json -Depth 60), $utf8)
 }
 [pscustomobject]$report | Select-Object passed, failed, outputDirectory | ConvertTo-Json

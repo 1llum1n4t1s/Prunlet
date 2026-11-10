@@ -1,4 +1,28 @@
 $ErrorActionPreference = 'Stop'
+# ネイティブDLLとdelegate型はプロセス寿命中保持し、生成した関数ポインターを無効化しない。
+if (!(Get-Variable -Name PrunletNativeLibraries -Scope Global -ErrorAction SilentlyContinue)) { $global:PrunletNativeLibraries = @{} }
+if (!(Get-Variable -Name PrunletNativeDelegateTypes -Scope Global -ErrorAction SilentlyContinue)) { $global:PrunletNativeDelegateTypes = @{} }
+function New-PrunletNativeDelegate {
+    param([Parameter(Mandatory)][string]$Library, [Parameter(Mandatory)][string]$Export,
+          [Parameter(Mandatory)][type]$ReturnType, [Parameter(Mandatory)][AllowEmptyCollection()][type[]]$ParameterTypes)
+    $signature = $ReturnType.AssemblyQualifiedName + '|' + (($ParameterTypes | ForEach-Object AssemblyQualifiedName) -join '|')
+    if (!$global:PrunletNativeDelegateTypes.ContainsKey($signature)) {
+        $assembly = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly([Reflection.AssemblyName]::new('Prunlet.Native.' + [guid]::NewGuid().ToString('N')), [Reflection.Emit.AssemblyBuilderAccess]::Run)
+        $module = $assembly.DefineDynamicModule('Native')
+        $type = $module.DefineType('NativeDelegate', [Reflection.TypeAttributes]'Class, Public, Sealed', [MulticastDelegate])
+        $constructor = $type.DefineConstructor([Reflection.MethodAttributes]'RTSpecialName, HideBySig, Public', [Reflection.CallingConventions]::Standard, [type[]]@([object], [IntPtr]))
+        $constructor.SetImplementationFlags([Reflection.MethodImplAttributes]'Runtime, Managed')
+        $invoke = $type.DefineMethod('Invoke', [Reflection.MethodAttributes]'Public, HideBySig, NewSlot, Virtual', $ReturnType, $ParameterTypes)
+        $invoke.SetImplementationFlags([Reflection.MethodImplAttributes]'Runtime, Managed')
+        $attr = [Runtime.InteropServices.UnmanagedFunctionPointerAttribute]
+        $builder = [Reflection.Emit.CustomAttributeBuilder]::new($attr.GetConstructor([type[]]@([Runtime.InteropServices.CallingConvention])), [object[]]@([Runtime.InteropServices.CallingConvention]::Winapi), [Reflection.FieldInfo[]]@($attr.GetField('SetLastError'), $attr.GetField('CharSet')), [object[]]@($true, [Runtime.InteropServices.CharSet]::Unicode))
+        $type.SetCustomAttribute($builder)
+        $global:PrunletNativeDelegateTypes[$signature] = $type.CreateType()
+    }
+    if (!$global:PrunletNativeLibraries.ContainsKey($Library)) { $global:PrunletNativeLibraries[$Library] = [Runtime.InteropServices.NativeLibrary]::Load($Library) }
+    $address = [Runtime.InteropServices.NativeLibrary]::GetExport($global:PrunletNativeLibraries[$Library], $Export)
+    return [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($address, $global:PrunletNativeDelegateTypes[$signature])
+}
 $script:PrunletHookMarker = 'Prunlet: protected literal deletion'
 function Resolve-Absolute([string]$Path, [string]$Label) {
     if ($Path -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+(?:\\|$))') { throw "$Label must be an absolute Windows path." }

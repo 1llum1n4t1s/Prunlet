@@ -1,6 +1,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ExpectedSid,
+    [Parameter(Mandatory)][string]$ExecutablePath,
+    [string]$BuildManifestPath,
+    [string]$ExpectedBuildManifestSha256,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
     [Parameter(Mandatory)][switch]$AssertNativeWindows
@@ -9,6 +12,9 @@ $ErrorActionPreference = 'Stop'
 if (!$AssertNativeWindows) { throw 'Explicit native Windows scope assertion is required.' }
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
+. (Join-Path $PSScriptRoot 'FixtureBridge.Common.ps1')
+. (Join-Path $PSScriptRoot 'RegistryFixtures.Common.ps1')
+. (Join-Path $PSScriptRoot 'ProtectedRegistryFixtures.Common.ps1')
 $excludedRoots = @($repoRoot, (Join-Path $env:USERPROFILE '.codex'))
 foreach ($path in @($OutputDirectory, $ReportPath)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'External D: absolute paths are required.' }
@@ -35,13 +41,13 @@ $report = [ordered]@{
     expectedSid = $ExpectedSid; actualSid = $identity.User.Value
     elevatedAdministrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     scriptSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    helperSha256 = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ProtectedRegistryAccess.Native.cs') -Algorithm SHA256).Hash.ToLowerInvariant()
+    helperSha256 = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ProtectedRegistryFixtures.Common.ps1') -Algorithm SHA256).Hash.ToLowerInvariant()
     startedUtc = [DateTime]::UtcNow.ToString('o'); status = 'running'; cases = @(); fixture = $null
 }
 $cases = [Collections.Generic.List[object]]::new()
-$held = [Collections.Generic.List[IDisposable]]::new()
+$held = [Collections.Generic.List[object]]::new()
 $privileges = $null; $protected = $null; $originalDacl = $null; $relative = $null
-$inputLeases = [Collections.Generic.List[IDisposable]]::new()
+$inputLeases = [Collections.Generic.List[object]]::new()
 function Require([bool]$Condition, [string]$Message) { if (!$Condition) { throw $Message } }
 function Same([byte[]]$Left, [byte[]]$Right) { [Convert]::ToBase64String($Left) -ceq [Convert]::ToBase64String($Right) }
 function Record-Open([string]$Name, $Open, [bool]$ExpectedSuccess) {
@@ -51,46 +57,37 @@ function Record-Open([string]$Name, $Open, [bool]$ExpectedSuccess) {
 try {
     Require ($identity.User.Value -ceq $ExpectedSid) 'Effective SID differs from the fixed input.'
     Require $report.elevatedAdministrator 'An elevated administrator token is required; no fixture was created.'
-    foreach ($inputPath in @($PSCommandPath, (Join-Path $PSScriptRoot 'ProtectedRegistryAccess.Native.cs'), (Join-Path $PSScriptRoot 'Verify-RegistryRecovery.ps1'))) {
+    $null=Initialize-PrunletFixtureBinding -ExecutablePath $ExecutablePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256
+    foreach ($inputPath in @($PSCommandPath, (Join-Path $PSScriptRoot 'ProtectedRegistryFixtures.Common.ps1'), (Join-Path $PSScriptRoot 'RegistryFixtures.Common.ps1'), (Join-Path $PSScriptRoot 'FixtureBridge.Common.ps1'))) {
         $inputLeases.Add([IO.File]::Open($inputPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read))
     }
-    $helperSource = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ProtectedRegistryAccess.Native.cs'))
-    [IO.File]::WriteAllText((Join-Path $OutputDirectory 'ProtectedRegistryAccess.Native.cs'), $helperSource, [Text.UTF8Encoding]::new($false))
-    $report.helperSha256 = [Convert]::ToHexStringLower([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($helperSource)))
-    Add-Type -TypeDefinition $helperSource
-    $privileges = [ProtectedRegistryAccessProbe+PrivilegeLease]::new()
+    $report.fixtureHelperSourceSha256 = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'RegistryFixtures.Common.ps1') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $privileges = Start-ProtectedFixturePrivileges
     $report.privileges = @('SeBackupPrivilege', 'SeRestorePrivilege', 'SeSecurityPrivilege')
     $report.privilegesBefore = $privileges.Before; $report.privilegesEnabled = $privileges.Enabled
-    # 既存のGUID境界付きfixture helperを読み込み、実行部分は呼ばない。
-    $fixtureSource = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'Verify-RegistryRecovery.ps1'))
-    [IO.File]::WriteAllText((Join-Path $OutputDirectory 'Verify-RegistryRecovery.input.ps1'), $fixtureSource, [Text.UTF8Encoding]::new($false))
-    $report.fixtureHelperSourceSha256 = [Convert]::ToHexStringLower([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($fixtureSource)))
-    $nativeSource = [regex]::Match($fixtureSource, "(?s)\`$nativeSource = @'\r?\n(.*?)\r?\n'@").Groups[1].Value
-    Require ($nativeSource.Length -gt 0) 'Existing bounded fixture helper was not found.'
-    Add-Type -TypeDefinition $nativeSource
     $access = [uint32]0x010F013F
     $softwarePath = '\Registry\User\' + $ExpectedSid + '\Software'
-    $software = [ProtectedRegistryAccessProbe]::Open($null, $null, $softwarePath, 0, $false, [uint32]0x20119); $held.Add($software)
+    $software = (Open-ProtectedFixtureKey $null $null $softwarePath 0 $false ([uint32]0x20119)); $held.Add($software)
     Record-Open 'native-software-anchor' $software $true
-    Require ([ProtectedRegistryAccessProbe]::Name($software.Handle).Equals($softwarePath, [StringComparison]::OrdinalIgnoreCase)) 'Software resolves outside the asserted native scope.'
+    Require ((Get-ProtectedFixtureName $software.Handle).Equals($softwarePath, [StringComparison]::OrdinalIgnoreCase)) 'Software resolves outside the asserted native scope.'
     $run = 'Software\PrunletE2E\' + [guid]::NewGuid().ToString('N')
-    [PrunletRegistryE2E]::Configure($false, $run)
+    Initialize-RegistryFixture $false $run
     $relative = $run + '-link-probes'; $report.fixture = 'HKEY_CURRENT_USER\' + $relative
-    $root = [PrunletRegistryE2E]::CreateVolatile($relative); $held.Add($root)
-    $protected = [PrunletRegistryE2E]::CreateVolatile($relative + '\restricted'); $held.Add($protected)
+    $root = (New-RegistryFixtureNativeKey $relative $true); $held.Add($root)
+    $protected = (New-RegistryFixtureNativeKey ($relative + '\restricted') $true); $held.Add($protected)
     $original = [byte[]]@(17, 0, 255, 42)
-    [PrunletRegistryE2E]::Set($protected, 'sentinel', 3, $original)
-    $originalDacl = [PrunletRegistryE2E]::FixtureDacl($relative + '\restricted', $protected)
-    [ProtectedRegistryAccessProbe]::Restrict($protected.Handle)
-    $ordinaryDenied = [ProtectedRegistryAccessProbe]::Open($null, $root.Handle, 'restricted', 0, $false, $access); $held.Add($ordinaryDenied)
+    Set-RegistryFixtureValue $protected 'sentinel' 3 $original
+    $originalDacl = (Get-RegistryFixtureDacl ($relative + '\restricted') $protected)
+    (Set-ProtectedFixtureRestriction $protected.Handle)
+    $ordinaryDenied = (Open-ProtectedFixtureKey $null $root.Handle 'restricted' 0 $false $access); $held.Add($ordinaryDenied)
     Record-Open 'normal-access-denied' $ordinaryDenied $false
     Require ($ordinaryDenied.Error -eq 5) 'ACL restriction did not produce the expected access denial.'
-    $backup = [ProtectedRegistryAccessProbe]::Open($null, $root.Handle, 'restricted', 4, $false, $access); $held.Add($backup)
+    $backup = (Open-ProtectedFixtureKey $null $root.Handle 'restricted' 4 $false $access); $held.Add($backup)
     Record-Open 'backup-restore-ordinary-open' $backup $true
-    $raw = [ProtectedRegistryAccessProbe]::Open($null, $root.Handle, 'restricted', 12, $true, $access); $held.Add($raw)
+    $raw = (Open-ProtectedFixtureKey $null $root.Handle 'restricted' 12 $true $access); $held.Add($raw)
     Record-Open 'backup-restore-raw-open' $raw $true
-    Require (Same ([ProtectedRegistryAccessProbe]::Read($backup.Handle)) $original) 'Raw data/type mismatch.'
-    $security = [ProtectedRegistryAccessProbe]::Security($backup.Handle)
+    Require (Same ((Get-ProtectedFixtureRead $backup.Handle)) $original) 'Raw data/type mismatch.'
+    $security = (Get-ProtectedFixtureSecurity $backup.Handle)
     Require ($security.Length -gt 0) 'Complete security bytes were not read.'
     $report.grantedRights = @{
         querySetReadControl = (($backup.GrantedAccess -band 0x20003) -eq 0x20003)
@@ -98,57 +95,57 @@ try {
         completeSecurity = (($backup.GrantedAccess -band 0x1020000) -eq 0x1020000)
         writeDaclOwner = (($backup.GrantedAccess -band 0xC0000) -eq 0xC0000)
     }
-    $transaction = [ProtectedRegistryAccessProbe]::Begin()
+    $transaction = (Start-ProtectedFixtureTransaction)
     try {
-        $bound = [ProtectedRegistryAccessProbe]::Open($transaction, $backup.Handle, '', 12, $true, $access)
+        $bound = (Open-ProtectedFixtureKey $transaction $backup.Handle '' 12 $true $access)
         try {
             Record-Open 'backup-restore-empty-relative-transaction-bind' $bound $true
-            Require (Same ([ProtectedRegistryAccessProbe]::Security($bound.Handle)) $security) 'Transaction security bytes differ.'
-            Require ([ProtectedRegistryAccessProbe]::Set($bound.Handle, [byte[]]@(1, 2, 3)) -eq 0) 'Transaction write could not be staged.'
-            Require (Same ([ProtectedRegistryAccessProbe]::Read($bound.Handle)) ([byte[]]@(1, 2, 3))) 'Transaction read did not see its write.'
-            Require (Same ([ProtectedRegistryAccessProbe]::Read($backup.Handle)) $original) 'Staged write leaked outside the transaction.'
-            Require ([ProtectedRegistryAccessProbe]::Rollback($transaction) -eq 0) 'Rollback failed.'
+            Require (Same ((Get-ProtectedFixtureSecurity $bound.Handle)) $security) 'Transaction security bytes differ.'
+            Require ((Set-ProtectedFixtureValue $bound.Handle ([byte[]]@(1, 2, 3))) -eq 0) 'Transaction write could not be staged.'
+            Require (Same ((Get-ProtectedFixtureRead $bound.Handle)) ([byte[]]@(1, 2, 3))) 'Transaction read did not see its write.'
+            Require (Same ((Get-ProtectedFixtureRead $backup.Handle)) $original) 'Staged write leaked outside the transaction.'
+            Require ((Complete-ProtectedFixtureTransaction $transaction $false) -eq 0) 'Rollback failed.'
         } finally { $bound.Dispose() }
     } finally { $transaction.Dispose() }
-    Require (Same ([ProtectedRegistryAccessProbe]::Read($backup.Handle)) $original) 'Rollback did not preserve original data.'
-    Require (Same ([ProtectedRegistryAccessProbe]::Security($backup.Handle)) $security) 'Rollback changed security bytes.'
+    Require (Same ((Get-ProtectedFixtureRead $backup.Handle)) $original) 'Rollback did not preserve original data.'
+    Require (Same ((Get-ProtectedFixtureSecurity $backup.Handle)) $security) 'Rollback changed security bytes.'
     $cases.Add(@{ name = 'raw-and-complete-security-stage-rollback'; passed = $true })
-    $transaction = [ProtectedRegistryAccessProbe]::Begin()
+    $transaction = (Start-ProtectedFixtureTransaction)
     try {
-        $bound = [ProtectedRegistryAccessProbe]::Open($transaction, $root.Handle, 'restricted', 4, $false, $access)
+        $bound = (Open-ProtectedFixtureKey $transaction $root.Handle 'restricted' 4 $false $access)
         try {
             Record-Open 'backup-restore-ordinary-transaction-open' $bound $true
-            Require ([ProtectedRegistryAccessProbe]::Set($bound.Handle, [byte[]]@(4, 5, 6)) -eq 0) 'Conflict write could not be staged.'
-            $externalError = [ProtectedRegistryAccessProbe]::Set($protected.Handle, [byte[]]@(7, 8, 9))
-            $commitError = [ProtectedRegistryAccessProbe]::Commit($transaction)
+            Require ((Set-ProtectedFixtureValue $bound.Handle ([byte[]]@(4, 5, 6))) -eq 0) 'Conflict write could not be staged.'
+            $externalError = (Set-ProtectedFixtureValue $protected.Handle ([byte[]]@(7, 8, 9)))
+            $commitError = (Complete-ProtectedFixtureTransaction $transaction $true)
             $cases.Add(@{ name = 'external-write-conflict'; externalError = $externalError; commitError = $commitError; passed = ($externalError -ne 0 -or $commitError -ne 0) })
             Require ($externalError -ne 0 -or $commitError -ne 0) 'External update and conflicting transaction both succeeded.'
             if ($externalError -eq 0) {
-                Require (Same ([ProtectedRegistryAccessProbe]::Read($backup.Handle)) ([byte[]]@(7, 8, 9))) 'The successful external update was not preserved after transaction conflict.'
+                Require (Same ((Get-ProtectedFixtureRead $backup.Handle)) ([byte[]]@(7, 8, 9))) 'The successful external update was not preserved after transaction conflict.'
                 $cases.Add(@{ name = 'external-update-preserved-before-fixture-reset'; passed = $true })
             }
         } finally { $bound.Dispose() }
     } finally { $transaction.Dispose() }
-    Require ([ProtectedRegistryAccessProbe]::Set($protected.Handle, $original) -eq 0) 'Could not reset isolated sentinel.'
-    $missing = [ProtectedRegistryAccessProbe]::Open($null, $root.Handle, 'missing', 4, $false, $access); $held.Add($missing)
+    Require ((Set-ProtectedFixtureValue $protected.Handle $original) -eq 0) 'Could not reset isolated sentinel.'
+    $missing = (Open-ProtectedFixtureKey $null $root.Handle 'missing' 4 $false $access); $held.Add($missing)
     Record-Open 'missing-path-backup-restore-open' $missing $false
     Require ($missing.Error -eq 2) 'Unexpected missing-path status.'
-    $missingAfter = [ProtectedRegistryAccessProbe]::Open($null, $root.Handle, 'missing', 0, $false, [uint32]0x20119); $held.Add($missingAfter)
+    $missingAfter = (Open-ProtectedFixtureKey $null $root.Handle 'missing' 0 $false ([uint32]0x20119)); $held.Add($missingAfter)
     Require ($missingAfter.Error -eq 2) 'Missing key was created.'
-    $link = [PrunletRegistryE2E]::CreateVolatile($relative + '\link', $true); $held.Add($link)
-    [PrunletRegistryE2E]::Set($link, 'SymbolicLinkValue', 6, [Text.Encoding]::Unicode.GetBytes([ProtectedRegistryAccessProbe]::Name($protected.Handle)))
-    $incomplete = [PrunletRegistryE2E]::CreateVolatile($relative + '\incomplete', $true); $held.Add($incomplete)
+    $link = (New-RegistryFixtureNativeKey ($relative + '\link') $true $true); $held.Add($link)
+    Set-RegistryFixtureValue $link 'SymbolicLinkValue' 6 ([Text.Encoding]::Unicode.GetBytes((Get-ProtectedFixtureName $protected.Handle)))
+    $incomplete = (New-RegistryFixtureNativeKey ($relative + '\incomplete') $true $true); $held.Add($incomplete)
     foreach ($name in @('link', 'incomplete')) {
-        $leaf = [ProtectedRegistryAccessProbe]::Open($null, $root.Handle, $name, 4, $false, $access); $held.Add($leaf)
+        $leaf = (Open-ProtectedFixtureKey $null $root.Handle $name 4 $false $access); $held.Add($leaf)
         Record-Open "backup-restore-ordinary-rejects-$name" $leaf $false
     }
-    $rawLink = [ProtectedRegistryAccessProbe]::Open($null, $root.Handle, 'link', 12, $true, $access); $held.Add($rawLink)
+    $rawLink = (Open-ProtectedFixtureKey $null $root.Handle 'link' 12 $true $access); $held.Add($rawLink)
     Record-Open 'backup-restore-raw-link-inspection' $rawLink $true
-    $rawChild = [ProtectedRegistryAccessProbe]::Open($null, $rawLink.Handle, 'missing', 12, $true, $access); $held.Add($rawChild)
+    $rawChild = (Open-ProtectedFixtureKey $null $rawLink.Handle 'missing' 12 $true $access); $held.Add($rawChild)
     Record-Open 'backup-restore-held-link-reparse-rejected' $rawChild $false
     Require ($rawChild.Error -eq 4395) 'Held link did not fail with reparse-point-encountered.'
-    Require (Same ([ProtectedRegistryAccessProbe]::Read($backup.Handle)) $original) 'Fixture target raw bytes changed.'
-    Require (Same ([ProtectedRegistryAccessProbe]::Security($backup.Handle)) $security) 'Fixture target ACL changed.'
+    Require (Same ((Get-ProtectedFixtureRead $backup.Handle)) $original) 'Fixture target raw bytes changed.'
+    Require (Same ((Get-ProtectedFixtureSecurity $backup.Handle)) $security) 'Fixture target ACL changed.'
     $report.status = 'passed'
 } catch {
     $report.status = 'failed'
@@ -157,10 +154,16 @@ try {
     $report.unexecuted = 'Execution stopped at the first unmet prerequisite or failed case; later cases were not run.'
 } finally {
     if ($originalDacl -and $protected) {
-        try { [PrunletRegistryE2E]::RestoreFixtureDacl($relative + '\restricted', $protected, $originalDacl); $report.fixtureAclRestored = $true }
+        try { Restore-RegistryFixtureDacl ($relative + '\restricted') $protected $originalDacl; $report.fixtureAclRestored = $true }
         catch { $report.fixtureAclRestored = $false; $report.cleanupError = $_.Exception.Message; $report.status = 'failed' }
     }
-    for ($index = $held.Count - 1; $index -ge 0; $index--) { $held[$index].Dispose() }
+    # ひとつの解放が失敗しても残りのleaseとtoken復元を試み、報告を必ず残す。
+    $closeErrors = [Collections.Generic.List[string]]::new()
+    for ($index = $held.Count - 1; $index -ge 0; $index--) {
+        try { $held[$index].Dispose() }
+        catch { $closeErrors.Add($_.Exception.Message); $report.status = 'failed' }
+    }
+    if ($closeErrors.Count) { $report.leaseCloseErrors = @($closeErrors.ToArray()) }
     if ($privileges) {
         try {
             $privileges.Dispose(); $report.privilegesRestored = $privileges.Restored

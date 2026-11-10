@@ -1,10 +1,13 @@
-﻿param(
+param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
     [string]$MoveExecutablePath,
-    [string]$AssemblyPath,
+    [string]$RustProbePath,
+    [string]$BuildManifestPath,
+    [string]$ExpectedBuildManifestSha256,
     [string]$LegacyRegistryExecutablePath,
+    [string]$LatestRegistryExecutablePath,
     [string]$FixtureRoot,
     [switch]$AssertNativeWindows,
     [ValidateSet('Prepare', 'Start', 'Current', 'Run')][string]$Mode = 'Prepare',
@@ -41,6 +44,12 @@ if (Test-Path -LiteralPath $ReportPath) { throw 'Report must be new.' }
 $settingsPath = Join-Path $OutputDirectory 'settings.json'
 $utf8 = [Text.UTF8Encoding]::new($false)
 if ($Mode -eq 'Prepare') {
+    if ($RustProbePath) {
+        if (!$BuildManifestPath -or !$ExpectedBuildManifestSha256) { throw 'Rust probe requires a fixed same-source build manifest and SHA-256.' }
+        $repo = $repoRoot
+        . (Join-Path $PSScriptRoot 'recordless-e2e/RustFileProbe.Common.ps1')
+        $preparedBuildBinding = Assert-RustFileProbeBinding
+    } elseif ($BuildManifestPath -or $ExpectedBuildManifestSha256) { throw 'Build manifest is only accepted with RustProbePath.' }
     if (Test-Path -LiteralPath $OutputDirectory) { throw 'Prepare requires a new output directory.' }
     # capabilityを含む子ファイルは、最初の作成から本人とSYSTEMだけへ公開する。
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -50,15 +59,19 @@ if ($Mode -eq 'Prepare') {
         $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($principal, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit', [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
     }
     $null = [IO.FileSystemAclExtensions]::CreateDirectory($security, $OutputDirectory)
-    foreach ($name in @('SessionLaunch.ps1','SessionLaunchNative.cs','SessionE2E.Common.ps1','SessionLockCases.ps1','Invoke-SessionE2E.ps1','NativeController.ps1','LimitedSession.ps1','ElevatedClient.ps1','FixtureNative.cs','SessionFixture.cs')) {
+    foreach ($name in @('RustProbe.Common.ps1','SessionLaunch.ps1','SessionE2E.Common.ps1','SessionLockCases.ps1','Invoke-SessionE2E.ps1','NativeController.ps1','LimitedSession.ps1','ElevatedClient.ps1')) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('registry-session-e2e\' + $name)) -Destination (Join-Path $OutputDirectory $name)
     }
+    foreach ($name in @('FixtureBridge.Common.ps1','SessionFixtures.Common.ps1','RegistryFixtures.Common.ps1')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $OutputDirectory $name) }
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'integration/configuration-common.ps1') -Destination (Join-Path $OutputDirectory 'configuration-common.ps1')
     $null = [IO.Directory]::CreateDirectory((Join-Path $OutputDirectory 'temp'))
     $null = [IO.Directory]::CreateDirectory((Join-Path $OutputDirectory 'metadata'))
     $oldTemp = $env:TEMP; $oldTmp = $env:TMP
     try {
         $env:TEMP = Join-Path $OutputDirectory 'temp'; $env:TMP = $env:TEMP
         . (Join-Path $OutputDirectory 'SessionE2E.Common.ps1')
+        $null = Initialize-PrunletFixtureBinding -ExecutablePath $ExecutablePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256 -SourceRoot $repoRoot
+        $fixtureBinding = Get-PrunletFixtureProcessBinding
         $script:ExecutablePath = $ExecutablePath
         $currentConfigPath = Join-Path $OutputDirectory 'current-config.json'
         $script:Config = $currentConfigPath
@@ -78,37 +91,61 @@ if ($Mode -eq 'Prepare') {
         $high = $normal.Clone(); $high.registrySessionFile = Join-Path $OutputDirectory 'native-high-session.json'
         $highConfigPath = Join-Path $OutputDirectory 'high-config.json'; SaveJson $highConfigPath $high
         $registryVerificationScriptPath = Join-Path $PSScriptRoot 'Verify-RegistryRecovery.ps1'
-        if (!('SessionE2ENative' -as [type])) { Add-Type -Path (Join-Path $OutputDirectory 'SessionFixture.cs') }
-        SaveJson $settingsPath @{preparedToken=[SessionE2ENative]::TokenInfo();configFingerprints=@{config=[SessionE2ENative]::Fingerprint([IO.File]::ReadAllText($nativeConfigPath));highConfig=[SessionE2ENative]::Fingerprint([IO.File]::ReadAllText($highConfigPath))};executablePath=$ExecutablePath; executableSha256=(Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash; powerShellHostPath=$powerShellHostPath; moveExecutablePath=$MoveExecutablePath; moveExecutableSha256=$(if ($MoveExecutablePath) {(Get-FileHash -LiteralPath $MoveExecutablePath -Algorithm SHA256).Hash} else {$null}); registryVerificationScriptPath=$registryVerificationScriptPath; registryVerificationScriptSha256=(Get-FileHash -LiteralPath $registryVerificationScriptPath -Algorithm SHA256).Hash; config=$nativeConfigPath; highConfig=$highConfigPath; currentConfig=$currentConfigPath; runRelative=('Software\PrunletE2E\' + [guid]::NewGuid().ToString('N')); recovery=$recovery; reportPath=$ReportPath; expectedCurrentSoftwareTransactionError=$ExpectedCurrentSoftwareTransactionError}
+        SaveJson $settingsPath @{preparedToken=(Get-SessionFixtureTokenInfo);configFingerprints=@{config=(Get-SessionFixtureFingerprint ([IO.File]::ReadAllText($nativeConfigPath)));highConfig=(Get-SessionFixtureFingerprint ([IO.File]::ReadAllText($highConfigPath)))};executablePath=$ExecutablePath; executableSha256=(Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash; powerShellHostPath=$powerShellHostPath; moveExecutablePath=$MoveExecutablePath; moveExecutableSha256=$(if ($MoveExecutablePath) {(Get-FileHash -LiteralPath $MoveExecutablePath -Algorithm SHA256).Hash} else {$null}); registryVerificationScriptPath=$registryVerificationScriptPath; registryVerificationScriptSha256=(Get-FileHash -LiteralPath $registryVerificationScriptPath -Algorithm SHA256).Hash; config=$nativeConfigPath; highConfig=$highConfigPath; currentConfig=$currentConfigPath; runRelative=('Software\PrunletE2E\' + [guid]::NewGuid().ToString('N')); recovery=$recovery; reportPath=$ReportPath; expectedCurrentSoftwareTransactionError=$ExpectedCurrentSoftwareTransactionError}
     } finally { $env:TEMP = $oldTemp; $env:TMP = $oldTmp }
     $preparedSettings = [IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json -AsHashtable
     $preparedSettings.schema = 2; $preparedSettings.nonce = [guid]::NewGuid().ToString('N')
-    $preparedSettings.assemblyPath = $AssemblyPath
+    $preparedSettings.fixtureLibraryPath = $fixtureBinding.path
+    $preparedSettings.fixtureLibrarySha256 = $fixtureBinding.sha256
+    $preparedSettings.fixtureManifestPath = $fixtureBinding.manifestPath
+    $preparedSettings.fixtureManifestSha256 = $fixtureBinding.manifestHash
+    $preparedSettings.fixtureSourceRoot = $repoRoot
+    $preparedSettings.candidateRuntime = if ($RustProbePath) { 'rust-libtest' } else { 'unconfigured' }
+    $preparedSettings.rustSourceRoot = if ($RustProbePath) { $repoRoot } else { $null }
+    $preparedSettings.rustProbePath = $RustProbePath
+    $preparedSettings.rustProbeSha256 = if ($RustProbePath) { (Get-FileHash -LiteralPath $RustProbePath -Algorithm SHA256).Hash } else { $null }
+    $preparedSettings.buildManifestPath = if ($RustProbePath) { [IO.Path]::GetFullPath($BuildManifestPath) } else { $null }
+    $preparedSettings.buildManifestSha256 = if ($RustProbePath) { $preparedBuildBinding.manifestSha256 } else { $null }
+    $preparedSettings.sourceFingerprint = if ($RustProbePath) { $preparedBuildBinding.sourceFingerprint } else { $null }
     if ($FixtureRoot) {
         if (![IO.Path]::IsPathFullyQualified($FixtureRoot) -or ![IO.Directory]::Exists($FixtureRoot)) { throw 'FixtureRoot must be an existing absolute directory.' }
         Assert-VerificationDestination $FixtureRoot @($repoRoot,$codexRoot)
     }
     $preparedSettings.fixtureRoot = $FixtureRoot
-    $preparedSettings.assemblySha256 = if ($AssemblyPath) { (Get-FileHash -LiteralPath $AssemblyPath).Hash } else { $null }
+    $preparedSettings.latestRegistryExecutablePath = $LatestRegistryExecutablePath
+    $preparedSettings.latestRegistryExecutableSha256 = if ($LatestRegistryExecutablePath) { (Get-FileHash -LiteralPath $LatestRegistryExecutablePath).Hash } else { $null }
     $preparedSettings.legacyRegistryExecutablePath = $LegacyRegistryExecutablePath
     $preparedSettings.legacyRegistryExecutableSha256 = if ($LegacyRegistryExecutablePath) { (Get-FileHash -LiteralPath $LegacyRegistryExecutablePath).Hash } else { $null }
     $preparedSettings.inputs = @()
     $preparedSettings.inputs += @{path=(Join-Path $PSScriptRoot 'Verification-Fixture.ps1');sha256=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')).Hash}
-    $preparedSettings.inputs += @{path=(Join-Path $PSScriptRoot 'ProtectedRegistryAccess.Native.cs');sha256=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ProtectedRegistryAccess.Native.cs')).Hash}
-    $preparedInputs = @([IO.Directory]::EnumerateFiles($OutputDirectory) | Where-Object { [IO.Path]::GetExtension($_) -in @('.ps1','.cs') }) + @($PSCommandPath, (Join-Path $PSScriptRoot 'registry-session-e2e\SessionLaunch.ps1'), $registryVerificationScriptPath, (Join-Path $PSScriptRoot 'Verification-Common.ps1'), $ExecutablePath, $powerShellHostPath)
+    foreach ($name in @('FixtureBridge.Common.ps1','RegistryFixtures.Common.ps1','ProtectedRegistryFixtures.Common.ps1','FileFixtures.Common.ps1')) { $path=Join-Path $PSScriptRoot $name; $preparedSettings.inputs += @{path=$path;sha256=(Get-FileHash -LiteralPath $path).Hash} }
+    $preparedInputs = @([IO.Directory]::EnumerateFiles($OutputDirectory) | Where-Object { [IO.Path]::GetExtension($_) -eq '.ps1' }) + @($PSCommandPath, (Join-Path $PSScriptRoot 'registry-session-e2e\SessionLaunch.ps1'), $registryVerificationScriptPath, (Join-Path $PSScriptRoot 'Verification-Common.ps1'), $ExecutablePath, $powerShellHostPath)
+    $preparedInputs += @($fixtureBinding.path,$fixtureBinding.manifestPath)
+    # Current-onlyでもfixture DLLと同じsourceをPrepare時の入力として固定する。
+    . (Join-Path $PSScriptRoot 'RustBuildInputs.Common.ps1')
+    $preparedInputs += Join-Path $PSScriptRoot 'RustBuildInputs.Common.ps1'
+    $preparedInputs += @(Get-PrunletRustInputNames $repoRoot | ForEach-Object { Join-Path $repoRoot $_ })
     # registry runnerが実際に読むWindowsごみ箱検証の依存も同じPrepare入力へ固定する。
-    foreach ($name in @('Common.ps1','NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs','PermissionFixture.cs','RegistryCheckpointHost.ps1')) {
+    foreach ($name in @('Common.ps1')) {
         $preparedInputs += Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $name
     }
     $preparedInputs += Join-Path $PSScriptRoot 'registry-session-e2e/RegistryControlCases.ps1'
-    foreach ($dependency in @($AssemblyPath,$LegacyRegistryExecutablePath) | Where-Object { $_ }) {
+    foreach ($dependency in @($RustProbePath,$BuildManifestPath,$LegacyRegistryExecutablePath,$LatestRegistryExecutablePath) | Where-Object { $_ }) {
         if (![IO.Path]::IsPathFullyQualified($dependency) -or ![IO.File]::Exists($dependency)) { throw 'Checkpoint dependency must be an existing absolute candidate/baseline path.' }
         $preparedInputs += $dependency
+    }
+    if ($RustProbePath) {
+        $preparedInputs += @(Get-PrunletRustInputNames $repoRoot | ForEach-Object { Join-Path $repoRoot $_ })
+        foreach ($name in @('registry-session-e2e/RustProbe.Common.ps1','recordless-e2e/RustFileProbe.Common.ps1','RustBuildInputs.Common.ps1')) { $preparedInputs += Join-Path $PSScriptRoot $name }
+        if ((Get-RustFileSourceFingerprint $repoRoot) -cne $preparedBuildBinding.sourceFingerprint) { throw 'Rust inputs changed during Prepare.' }
     }
     if ($MoveExecutablePath) { $preparedInputs += $MoveExecutablePath }
     foreach ($preparedInput in ($preparedInputs | Select-Object -Unique)) {
         $preparedSettings.inputs += @{path=[IO.Path]::GetFullPath($preparedInput);sha256=(Get-FileHash -LiteralPath $preparedInput -Algorithm SHA256).Hash}
     }
+    $fixtureManifest = [IO.File]::ReadAllText($fixtureBinding.manifestPath) | ConvertFrom-Json -AsHashtable -Depth 100
+    if ((Get-PrunletRustInputSnapshot $repoRoot).fingerprint -cne $fixtureManifest.sourceFingerprint) { throw 'Fixture Rust inputs changed while hashing Prepare dependencies.' }
+    if ($RustProbePath -and (Get-RustFileSourceFingerprint $repoRoot) -cne $preparedBuildBinding.sourceFingerprint) { throw 'Rust inputs changed while hashing Prepare dependencies.' }
     SaveJson $settingsPath $preparedSettings
     # manualコマンドは診断互換として保持する。通常の検証起動はStartで同一scopeへ限定する。
     $quote = { param($value) "'" + $value.Replace("'", "''") + "'" }
@@ -134,12 +171,14 @@ $settings = OpenPreparedPins $settingsPath
 $script:LaunchPrepared=$settings
 . (Join-Path $OutputDirectory 'SessionE2E.Common.ps1')
 AssertPreparedSettings $settings
-if ($Mode -in @('Start', 'Run') -and ([string]::IsNullOrWhiteSpace($settings.moveExecutablePath) -or
-    [string]::IsNullOrWhiteSpace($settings.assemblyPath) -or [string]::IsNullOrWhiteSpace($settings.legacyRegistryExecutablePath))) {
-    throw 'Full native validation requires Prepare -MoveExecutablePath (genuine schema4 baseline), -AssemblyPath (candidate DLL), and -LegacyRegistryExecutablePath (genuine schema5 baseline). No desktop session was launched by this invocation.'
+# 再指定はPrepare時と同一の場合だけ受け付け、省略時は固定済み値を使う。
+foreach ($entry in @(@{name='RustProbePath';actual=$RustProbePath;expected=$settings.rustProbePath},@{name='BuildManifestPath';actual=$BuildManifestPath;expected=$settings.buildManifestPath},@{name='ExpectedBuildManifestSha256';actual=$ExpectedBuildManifestSha256;expected=$settings.buildManifestSha256})) {
+    if ($entry.actual -and !$entry.actual.Equals([string]$entry.expected,[StringComparison]::OrdinalIgnoreCase)) { throw ('Prepared candidate selection changed: '+$entry.name) }
 }
-if (!('SessionE2ENative' -as [type])) { Add-Type -Path (Join-Path $OutputDirectory 'SessionFixture.cs') }
-if (!('SessionLaunchNative' -as [type])) { Add-Type -Path (Join-Path $OutputDirectory 'SessionLaunchNative.cs') }
+if ($Mode -in @('Start', 'Run') -and ([string]::IsNullOrWhiteSpace($settings.moveExecutablePath) -or
+    [string]::IsNullOrWhiteSpace($settings.rustProbePath) -or [string]::IsNullOrWhiteSpace($settings.legacyRegistryExecutablePath) -or [string]::IsNullOrWhiteSpace($settings.latestRegistryExecutablePath))) {
+    throw 'Full native validation requires Prepare -MoveExecutablePath (genuine schema4 baseline), -RustProbePath (same-source test probe), -LegacyRegistryExecutablePath (genuine schema5 baseline), and -LatestRegistryExecutablePath (genuine 1.0.29 producer). No desktop session was launched by this invocation.'
+}
 $script:LaunchScopeRoot = $OutputDirectory
 if ($settings.executablePath -cne $ExecutablePath -or $settings.reportPath -cne $ReportPath -or $settings.executableSha256 -cne (Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash) { throw 'Prepared executable/report changed.' }
 if ($Mode -eq 'Start') {
@@ -151,7 +190,8 @@ if ($Mode -eq 'Current') {
     $currentReport = Join-Path $OutputDirectory 'current-probes-report.json'
     if (Test-Path -LiteralPath $currentReport) { throw 'Current probes already ran; use a new prepared directory.' }
     & (Join-Path $OutputDirectory 'Invoke-SessionE2E.ps1') -ExecutablePath $ExecutablePath -ReportPath $currentReport -CurrentOnly -ExpectedCurrentSoftwareTransactionError $settings.expectedCurrentSoftwareTransactionError
-    if (!$?) { exit 1 }; exit 0
+    if (!$?) { exit 1 }
+    exit 0
 }
 foreach ($name in @('controller-ready.json','limited-ready.json')) {
     if (![IO.File]::Exists((Join-Path $OutputDirectory $name))) { throw "Missing explicit desktop session: $name. Run both prepared desktop commands first." }

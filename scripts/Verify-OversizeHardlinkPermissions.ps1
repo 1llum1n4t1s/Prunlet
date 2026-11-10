@@ -1,8 +1,11 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
+    [Parameter(Mandatory)][string]$BuildManifestPath,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBuildManifestSha256,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
+    [string]$FixtureRoot,
     [switch]$Execute
 )
 $ErrorActionPreference='Stop'
@@ -15,6 +18,9 @@ $ErrorActionPreference='Stop'
 if (!$Execute) { throw 'Pass -Execute only when this E2E run is explicitly requested.' }
 $repo=[IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
+. (Join-Path $PSScriptRoot 'FileFixtures.Common.ps1')
+$null=Initialize-PrunletFixtureBinding -ExecutablePath $ExecutablePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256
+. (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')
 foreach ($path in @($ExecutablePath,$OutputDirectory,$ReportPath)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Absolute paths required.' }
     $full=[IO.Path]::GetFullPath($path)
@@ -28,38 +34,37 @@ foreach ($path in @($OutputDirectory,$ReportPath)) {
     if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) { throw 'Output and report parents must exist.' }
 }
 if ($ReportPath.StartsWith($OutputDirectory.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Report must be outside the unused output directory.' }
+$script:fixtureRun=$null
+if($FixtureRoot){$script:fixtureRun=New-VerificationFixtureRun -FixtureRoot $FixtureRoot -ForbiddenRoots @($repo,(Join-Path $env:USERPROFILE '.codex'),$OutputDirectory) -NamePrefix 'oversize'}
 $probe=[IO.File]::Open($ReportPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None); $probe.Dispose()
 $null=[IO.Directory]::CreateDirectory($OutputDirectory)
 $script:temp=Join-Path $OutputDirectory 'temp'; $null=[IO.Directory]::CreateDirectory($script:temp)
 $oldTemp=$env:TEMP; $oldTmp=$env:TMP; $env:TEMP=$script:temp; $env:TMP=$script:temp
 . (Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1')
 $script:commands=[Collections.Generic.List[object]]::new(); $results=[Collections.Generic.List[object]]::new(); $backups=[Collections.Generic.List[object]]::new()
-$helperFiles=@('NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs') | ForEach-Object { Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $_ }
 function Save-Progress {
-    Save-R $ReportPath @{suite='oversize-hardlink-permissions';sparseHelper=@{path=(Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs');sha256=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs')).Hash}; executable=$ExecutablePath; executableSha256=(Get-FileHash -LiteralPath $ExecutablePath).Hash; output=$OutputDirectory; temp=$script:temp; executed=$results.Count; passed=@($results | Where-Object passed).Count; failed=@($results | Where-Object {!$_.passed}).Count; aclBackups=@($backups); results=@($results); commands=@($script:commands); retained='All fixture paths and identified Bin entries are retained; inspect ambiguous results without retrying.'}
+    Save-R $ReportPath @{suite='oversize-hardlink-permissions';fixtureRun=$script:fixtureRun;sparseHelper=@{path=(Join-Path $PSScriptRoot 'SparseFixtures.Common.ps1');sha256=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'SparseFixtures.Common.ps1')).Hash}; executable=$ExecutablePath; executableSha256=(Get-FileHash -LiteralPath $ExecutablePath).Hash; output=$OutputDirectory; temp=$script:temp; executed=$results.Count; passed=@($results | Where-Object passed).Count; failed=@($results | Where-Object {!$_.passed}).Count; aclBackups=@($backups); results=@($results); commands=@($script:commands); retained='All fixture paths and identified Bin entries are retained; inspect ambiguous results without retrying.'}
 }
 function Shared-Node($Handle) {
-    $method=[Prunlet.RecordlessE2E.FixtureNative].GetMethod('ReadNode',[Reflection.BindingFlags]'NonPublic,Static')
-    Assert-R ($null -ne $method) 'Native node proof unavailable.'
-    return $method.Invoke($null,[object[]]@($Handle))
+    return Get-FileFixtureHandleNode -Handle $Handle
 }
 function Shared-Hash($Stream) {
     $Stream.Position=0
     return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Stream))
 }
-function New-BinItems([string]$Id,[string[]]$Prior) { return @([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($Id) | Where-Object { $_.Pidl -cnotin $Prior }) }
+function New-BinItems([string]$Id,[string[]]$Prior) { return @((Find-FileFixtureBinIdentity -ExpectedId ($Id)) | Where-Object { $_.Pidl -cnotin $Prior }) }
 function Sparse-Fixture([string]$Path,[string]$Root,[string]$RootId,[string[]]$RootPrior) {
     $prefix=$utf8.GetBytes('owned sparse prefix; allocated tails must stay zero')
     $stream=[IO.FileStream]::new($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
-    try { [PrunletSparseE2E]::MakeSparse($stream.SafeFileHandle); $stream.Write($prefix,0,$prefix.Length); $stream.Flush($true) } finally { $stream.Dispose() }
-    $proof=[PrunletSparseE2E]::CaptureProof($Path)
-    $s=@{path=$Path; root=$Root; rootId=$RootId; rootPrior=$RootPrior; proof=$proof; prefix=$prefix; logical=[long]1099511627776; prior=[string[]]@([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($proof.Id) | ForEach-Object Pidl)}
+    try { Set-FileFixtureSparse -Handle $stream.SafeFileHandle; $stream.Write($prefix,0,$prefix.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    $proof=Get-FileFixtureSparseProof -Path $Path -Scope $Root
+    $s=@{path=$Path; root=$Root; rootId=$RootId; rootPrior=$RootPrior; proof=$proof; prefix=$prefix; logical=[long]1099511627776; prior=[string[]]@((Find-FileFixtureBinIdentity -ExpectedId ($proof.Id)) | ForEach-Object Pidl)}
     return $s
 }
 function Grow-Sparse($Sparse) {
     $stream=[IO.FileStream]::new($Sparse.path,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
     try { $stream.SetLength($Sparse.logical); $stream.Flush($true) } finally { $stream.Dispose() }
-    $grown=[PrunletSparseE2E]::CaptureProof($Sparse.path)
+    $grown=Get-FileFixtureSparseProof -Path $Sparse.path -Scope $Sparse.root
     foreach ($field in @('Id','SecurityBase64','Attributes','NumberOfLinks')) { Assert-R ($Sparse.proof.$field -ceq $grown.$field) ('Sparse ' + $field + ' changed during creation.') }
     Assert-R ($grown.Length -eq $Sparse.logical -and $grown.NumberOfLinks -eq 1 -and $grown.AllocationSize -le 1MB -and $grown.CompressedSize -le 1MB) 'Sparse shape invalid.'
     $Sparse.proof=$grown
@@ -67,13 +72,13 @@ function Grow-Sparse($Sparse) {
 function Finalize-Sparse($Sparse) {
     $candidates=[Collections.Generic.List[string]]::new()
     if ([IO.File]::Exists($Sparse.path)) {
-        Assert-R ([Prunlet.RecordlessE2E.FixtureNative]::Identity($Sparse.root) -ceq $Sparse.rootId) 'Original folder identity changed.'
+        Assert-R ((Get-FileFixtureIdentity -Path ($Sparse.root)) -ceq $Sparse.rootId) 'Original folder identity changed.'
         $candidates.Add($Sparse.path)
     }
     $roots=@(New-BinItems $Sparse.rootId $Sparse.rootPrior)
     Assert-R ($roots.Count -le 1) 'Multiple folder Bin identities; retained.'
     if ($roots.Count -eq 1) {
-        Assert-R ([Prunlet.RecordlessE2E.FixtureNative]::Identity($roots[0].PhysicalPath) -ceq $Sparse.rootId) 'Folder Bin identity changed.'
+        Assert-R ((Get-FileFixtureIdentity -Path ($roots[0].PhysicalPath)) -ceq $Sparse.rootId) 'Folder Bin identity changed.'
         $child=Join-Path $roots[0].PhysicalPath 'huge-sparse'
         if ([IO.File]::Exists($child)) { $candidates.Add($child) }
     }
@@ -82,12 +87,14 @@ function Finalize-Sparse($Sparse) {
     if ($items.Count -eq 1) { $candidates.Add($items[0].PhysicalPath) }
     Assert-R ($candidates.Count -le 1) 'Sparse location ambiguous; retained.'
     if ($candidates.Count -eq 0) { return @{path=$Sparse.path; absentFromKnownLocations=$true; folderBin=$roots; sparseBin=$items} }
-    $tiny=[PrunletSparseE2E]::RestoreTiny($candidates[0],$Sparse.proof.Id,$Sparse.proof.SecurityBase64,[int]$Sparse.proof.Attributes,$Sparse.logical,$Sparse.prefix,[ulong]1048576)
+    # 別のBin項目は直前のPIDLとID照合で候補を絞り、元fixtureと別の親scopeを使う。
+    $sparseScope=if($candidates[0]-ceq$Sparse.path){$Sparse.root}else{[IO.Path]::GetDirectoryName($candidates[0])}
+    $tiny=Restore-FileFixtureSparseTiny -Path $candidates[0] -Scope $sparseScope -ExpectedId $Sparse.proof.Id -ExpectedSecurityBase64 $Sparse.proof.SecurityBase64 -ExpectedAttributes $Sparse.proof.Attributes -ExpectedLogicalLength $Sparse.logical -Prefix $Sparse.prefix -MaximumAllocation 1048576
     if (!$tiny.Success) { throw ('Sparse retained without shrinking: '+$tiny.Error) }
     return $tiny
 }
 function Probe-Access([string]$Path) {
-    return @{readData=[PermissionProbe]::TryAccess($Path,1); execute=[PermissionProbe]::TryAccess($Path,32); delete=[PermissionProbe]::TryAccess($Path,65536); readAttributes=[PermissionProbe]::TryAccess($Path,128)}
+    return @{readData=(Get-FileFixtureOpenError -Path $Path -Access 1); execute=(Get-FileFixtureOpenError -Path $Path -Access 32); delete=(Get-FileFixtureOpenError -Path $Path -Access 65536); readAttributes=(Get-FileFixtureOpenError -Path $Path -Access 128)}
 }
 function Assert-Deny($Probe) {
     Assert-R ($Probe.readData -eq 5 -and $Probe.execute -eq 5 -and $Probe.delete -eq 0 -and $Probe.readAttributes -eq 0) 'Expected read/execute denial and delete/attribute access were not observed.'
@@ -101,13 +108,13 @@ function Test-Scenario([string]$Mode,[ValidateSet('one','two-roots','same-root')
         $count=if($Multiple){2}else{1}
         foreach ($i in 1..$count) {
             $root=Join-Path $scope.files ('root-'+$i); $null=[IO.Directory]::CreateDirectory($root); $roots.Add($root)
-            $id=[Prunlet.RecordlessE2E.FixtureNative]::Identity($root)
-            $prior=[string[]]@([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($id) | ForEach-Object Pidl)
+            $id=(Get-FileFixtureIdentity -Path ($root))
+            $prior=[string[]]@((Find-FileFixtureBinIdentity -ExpectedId ($id)) | ForEach-Object Pidl)
             $rootProofs.Add(@{path=$root; id=$id; prior=$prior})
         }
         $survivor=File-R $scope 'survivor'
-        foreach ($root in $roots) { [Prunlet.RecordlessE2E.FixtureNative]::CreateHardlink((Join-Path $root 'shared'),$survivor) }
-        if ($sameRoot) { [Prunlet.RecordlessE2E.FixtureNative]::CreateHardlink((Join-Path $roots[0] 'shared-second'),$survivor) }
+        foreach ($root in $roots) { (New-FileFixtureHardlink -Link ((Join-Path $root 'shared')) -Source ($survivor) -Scope $scope.files) }
+        if ($sameRoot) { (New-FileFixtureHardlink -Link ((Join-Path $roots[0] 'shared-second')) -Source ($survivor) -Scope $scope.files) }
         $originalLinks=$count+1+[int]$sameRoot
         $original=Snapshot-R $survivor
         Assert-R ($original[0].NumberOfLinks -eq $originalLinks) 'Fixture hardlink count differs.'
@@ -138,13 +145,13 @@ function Test-Scenario([string]$Mode,[ValidateSet('one','two-roots','same-root')
         $dryNode=Shared-Node $held.SafeFileHandle
         Assert-R ($dryNode.Id -ceq $deniedNode.Id -and $dryNode.SecurityBase64 -ceq $deniedNode.SecurityBase64 -and $dryNode.NumberOfLinks -eq $deniedNode.NumberOfLinks -and (Shared-Hash $held) -ceq $beforeHash) 'Dry-run changed shared file.'
         foreach ($rp in $rootProofs) {
-            Assert-R ([Prunlet.RecordlessE2E.FixtureNative]::Identity($rp.path) -ceq $rp.id) 'Dry-run changed root identity.'
-            Assert-R ([Prunlet.RecordlessE2E.FixtureNative]::Identity((Join-Path $rp.path 'shared')) -ceq $original[0].Id) 'Dry-run changed the shared alias identity.'
+            Assert-R ((Get-FileFixtureIdentity -Path ($rp.path)) -ceq $rp.id) 'Dry-run changed root identity.'
+            Assert-R ((Get-FileFixtureIdentity -Path ((Join-Path $rp.path 'shared'))) -ceq $original[0].Id) 'Dry-run changed the shared alias identity.'
             Assert-R (@(New-BinItems $rp.id $rp.prior).Count -eq 0) 'Dry-run created a folder Bin item.'
         }
-        if ($sameRoot) { Assert-R ([Prunlet.RecordlessE2E.FixtureNative]::Identity((Join-Path $roots[0] 'shared-second')) -ceq $original[0].Id) 'Dry-run changed the second same-root alias identity.' }
+        if ($sameRoot) { Assert-R ((Get-FileFixtureIdentity -Path ((Join-Path $roots[0] 'shared-second'))) -ceq $original[0].Id) 'Dry-run changed the second same-root alias identity.' }
         foreach ($s in $sparseFiles) {
-            $now=[PrunletSparseE2E]::CaptureProof($s.path)
+            $now=Get-FileFixtureSparseProof -Path $s.path -Scope $s.root
             foreach ($field in @('Id','SecurityBase64','Attributes','NumberOfLinks','Length','AllocationSize','CompressedSize')) { Assert-R ($now.$field -ceq $s.proof.$field) ('Dry-run changed sparse '+$field) }
             Assert-R (@(New-BinItems $s.proof.Id $s.prior).Count -eq 0) 'Dry-run created a sparse Bin item.'
         }
@@ -158,7 +165,7 @@ function Test-Scenario([string]$Mode,[ValidateSet('one','two-roots','same-root')
             $response=Delete-R $scope $paths -Recursive; $script:observed.delete=$response
         }
         $after=Shared-Node $held.SafeFileHandle; $afterHash=Shared-Hash $held; $afterProbe=Probe-Access $survivor
-        $script:observed.survivor=@{node=$after; sha256=$afterHash; accessProbe=$afterProbe; pathIdentity=[Prunlet.RecordlessE2E.FixtureNative]::Identity($survivor)}
+        $script:observed.survivor=@{node=$after; sha256=$afterHash; accessProbe=$afterProbe; pathIdentity=(Get-FileFixtureIdentity -Path ($survivor))}
         Assert-R ($after.Id -ceq $original[0].Id -and $script:observed.survivor.pathIdentity -ceq $original[0].Id -and $after.SecurityBase64 -ceq $deniedNode.SecurityBase64 -and $afterHash -ceq $beforeHash) 'Survivor ID, complete ACL or content changed.'
         Assert-Deny $afterProbe
         if ($Mode -eq 'mcp') { Assert-R ([bool]$rpc.result.isError -eq $Multiple) 'MCP error flag differs from expected outcome.' }
@@ -176,9 +183,9 @@ function Test-Scenario([string]$Mode,[ValidateSet('one','two-roots','same-root')
             $successRoot=$rootProofs[$successIndex]; $ambiguousRoot=$rootProofs[$ambiguousIndex]
             Assert-R ($response.json.items[$ambiguousIndex].error -match '(?i)(prior hardlink deletion|hardlink.*(?:guard|uncertain|confirmed))') 'Ambiguous result did not identify the missing shared-link guard.'
             Assert-R (!(Test-Path -LiteralPath $successRoot.path)) 'Successfully deleted oversized root remained.'
-            Assert-R ([IO.Directory]::Exists($ambiguousRoot.path) -and [Prunlet.RecordlessE2E.FixtureNative]::Identity($ambiguousRoot.path) -ceq $ambiguousRoot.id) 'Ambiguous root is missing or its identity changed.'
+            Assert-R ([IO.Directory]::Exists($ambiguousRoot.path) -and (Get-FileFixtureIdentity -Path ($ambiguousRoot.path)) -ceq $ambiguousRoot.id) 'Ambiguous root is missing or its identity changed.'
             $ambiguousAlias=Join-Path $ambiguousRoot.path 'shared'
-            Assert-R ([IO.File]::Exists($ambiguousAlias) -and [Prunlet.RecordlessE2E.FixtureNative]::Identity($ambiguousAlias) -ceq $original[0].Id) 'Ambiguous root shared alias is missing or its identity changed.'
+            Assert-R ([IO.File]::Exists($ambiguousAlias) -and (Get-FileFixtureIdentity -Path ($ambiguousAlias)) -ceq $original[0].Id) 'Ambiguous root shared alias is missing or its identity changed.'
             $script:observed.rootOutcomes=@{successIndex=$successIndex; successRoot=$successRoot; ambiguousIndex=$ambiguousIndex; ambiguousRoot=$ambiguousRoot; ambiguousAlias=$ambiguousAlias; sharedIdentity=$original[0].Id}
         } else { Assert-R (!(Test-Path -LiteralPath $roots[0])) 'Oversized root remained.' }
         Assert-R ($after.NumberOfLinks -eq $(if($Multiple){2}else{1})) 'Survivor link count differs.'
@@ -199,21 +206,6 @@ function Test-Scenario([string]$Mode,[ValidateSet('one','two-roots','same-root')
     }
 }
 try {
-    Add-Type -Path $helperFiles -CompilerOptions '/unsafe'
-    Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-public static class PermissionProbe {
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
-    public static int TryAccess(string path,uint access) {
-        using var handle=CreateFileW(path,access,7,IntPtr.Zero,3,0x00200000,IntPtr.Zero);
-        return handle.IsInvalid ? Marshal.GetLastWin32Error() : 0;
-    }
-}
-'@
- if (!('PrunletSparseE2E' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'recordless-e2e/SparseFixture.cs') }
     foreach ($mode in @('cli','mcp')) { Test-Scenario $mode 'one'; Test-Scenario $mode 'two-roots'; Test-Scenario $mode 'same-root' }
 } catch { $results.Add(@{name='setup'; passed=$false; error=$_.Exception.ToString()}) }
 finally { try { Save-Progress } finally { $env:TEMP=$oldTemp; $env:TMP=$oldTmp } }

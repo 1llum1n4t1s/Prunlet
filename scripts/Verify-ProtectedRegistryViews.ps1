@@ -2,6 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$ExpectedExecutableSha256,
+    [string]$BuildManifestPath,
+    [string]$ExpectedBuildManifestSha256,
     [Parameter(Mandatory)][string]$ExpectedSid,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
@@ -10,6 +12,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
+. (Join-Path $PSScriptRoot 'FixtureBridge.Common.ps1')
+. (Join-Path $PSScriptRoot 'ProtectedRegistryFixtures.Common.ps1')
 foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Absolute paths required.' }
 }
@@ -30,7 +34,7 @@ $script:temp = Join-Path $OutputDirectory 'temp'
 $null = [IO.Directory]::CreateDirectory($script:temp)
 $env:TEMP = $script:temp; $env:TMP = $script:temp
 . (Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1')
-Add-Type -Path (Join-Path $PSScriptRoot 'ProtectedRegistryAccess.Native.cs')
+$null = Initialize-PrunletFixtureBinding -ExecutablePath $ExecutablePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256
 $script:commands = [Collections.Generic.List[object]]::new()
 $script:observed = @{}
 $results = [Collections.Generic.List[object]]::new()
@@ -42,7 +46,7 @@ $report = [ordered]@{
     scope = 'Explicit native Windows; isolated HKLM SOFTWARE GUID in both WOW64 views'
     executablePath = $ExecutablePath; executableSha256 = $ExpectedExecutableSha256
     callerSid = $identity.User.Value; fixture = $logical
-    sourceHashes = @(@($PSCommandPath, (Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1'), (Join-Path $PSScriptRoot 'Verification-Common.ps1'), (Join-Path $PSScriptRoot 'ProtectedRegistryAccess.Native.cs')) | ForEach-Object { @{path=$_;sha256=(Get-FileHash -LiteralPath $_).Hash} })
+    sourceHashes = @(@($PSCommandPath, (Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1'), (Join-Path $PSScriptRoot 'Verification-Common.ps1'), (Join-Path $PSScriptRoot 'ProtectedRegistryFixtures.Common.ps1'), (Join-Path $PSScriptRoot 'FixtureBridge.Common.ps1')) | ForEach-Object { @{path=$_;sha256=(Get-FileHash -LiteralPath $_).Hash} })
     status = 'running'; results = @(); cleanup = @(); error = $null
 }
 function Read-Sentinel([string]$View, [string]$Name = 'selected') {
@@ -89,7 +93,7 @@ try {
     $mcp = Start-R $ExecutablePath $scope.config @('mcp') -Streaming
     $mcp.transcript = [Collections.Generic.List[object]]::new()
     Init-McpR $mcp
-    $processBefore = [ProtectedRegistryAccessProbe]::ProcessPrivileges([uint32]$mcp.process.Id)
+    $processBefore = (Get-ProtectedFixtureProcessPrivileges ([uint32]$mcp.process.Id))
     foreach ($name in @('SeBackupPrivilege','SeRestorePrivilege')) {
         Assert-R ($processBefore[$name] -ne 'absent' -and ([Convert]::ToUInt32($processBefore[$name].Substring(2),16) -band 2) -eq 0) 'MCP process must begin with backup/restore privileges present but disabled.'
     }
@@ -106,7 +110,7 @@ try {
     $results.Add(@{name='mcp-backup-restore-64-view-separated';passed=$true;operationId=$deleted.json.operationId})
     $normal = Call-McpR $mcp 5 'delete_registry' @{path=$logical;view='64';valueName='selected';dryRun=$true}
     Assert-R (!$normal.failed -and $normal.json.items[0].status -ceq 'would_delete') 'Normal follow-up request failed.'
-    $processAfter = [ProtectedRegistryAccessProbe]::ProcessPrivileges([uint32]$mcp.process.Id)
+    $processAfter = (Get-ProtectedFixtureProcessPrivileges ([uint32]$mcp.process.Id))
     foreach ($name in $processBefore.Keys) { Assert-R ($processBefore[$name] -ceq $processAfter[$name]) "MCP process privilege leaked: $name" }
     $report.processPrivileges = @{before=$processBefore;after=$processAfter;normalFollowup=$normal}
     Assert-Sentinel '32' $true; Assert-Sentinel '64' $true

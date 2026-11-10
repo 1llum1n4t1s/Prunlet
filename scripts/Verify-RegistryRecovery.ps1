@@ -2,8 +2,11 @@
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Alias('BaselineMoveExecutablePath')][string]$MoveExecutablePath,
-    [string]$AssemblyPath,
+    [string]$RustProbePath,
+    [string]$BuildManifestPath,
+    [string]$ExpectedBuildManifestSha256,
     [string]$LegacyRegistryExecutablePath,
+    [string]$LatestRegistryExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
     [string]$FixtureRoot,
@@ -19,7 +22,27 @@ $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $codexRoot = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { Join-Path $env:USERPROFILE '.codex' }
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
 . (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')
-foreach ($path in @($ExecutablePath, $MoveExecutablePath, $AssemblyPath, $LegacyRegistryExecutablePath, $OutputDirectory, $ReportPath) | Where-Object { $_ }) {
+. (Join-Path $PSScriptRoot 'FixtureBridge.Common.ps1')
+. (Join-Path $PSScriptRoot 'RegistryFixtures.Common.ps1')
+. (Join-Path $PSScriptRoot 'ProtectedRegistryFixtures.Common.ps1')
+. (Join-Path $PSScriptRoot 'FileFixtures.Common.ps1')
+$null = Initialize-PrunletFixtureBinding -ExecutablePath $ExecutablePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256 -SourceRoot $repoRoot
+if ($RustProbePath) {
+    if (!$BuildManifestPath -or !$ExpectedBuildManifestSha256) { throw 'Rust probe requires a fixed same-source build manifest and SHA-256.' }
+    $repo = $repoRoot
+    . (Join-Path $PSScriptRoot 'recordless-e2e/RustFileProbe.Common.ps1')
+    $script:RegistryBuildBinding = Assert-RustFileProbeBinding
+    # 同じ候補・manifest・入力を要求終了までread handleで固定する。
+    $script:RegistryBuildPins = [Collections.Generic.List[object]]::new()
+    try {
+        foreach ($inputPath in @($ExecutablePath,$RustProbePath,$BuildManifestPath) + @(Get-PrunletRustInputNames $repo | ForEach-Object { Join-Path $repo $_ })) {
+            $handle = [IO.File]::Open($inputPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+            $script:RegistryBuildPins.Add($handle)
+        }
+        if ((Get-RustFileSourceFingerprint $repo) -cne $script:RegistryBuildBinding.sourceFingerprint) { throw 'Rust source changed while fixing registry verification inputs.' }
+    } catch { foreach ($handle in $script:RegistryBuildPins) { $handle.Dispose() }; throw }
+} elseif ($BuildManifestPath -or $ExpectedBuildManifestSha256) { throw 'Build manifest is only accepted with RustProbePath.' }
+foreach ($path in @($ExecutablePath, $MoveExecutablePath, $RustProbePath, $BuildManifestPath, $LegacyRegistryExecutablePath, $LatestRegistryExecutablePath, $OutputDirectory, $ReportPath) | Where-Object { $_ }) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Executable/output/report paths must be absolute.' }
 }
 $ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath)
@@ -112,232 +135,11 @@ function Case([string]$Name, [scriptblock]$Body, [switch]$RequiresMove) {
     catch { $results.Add(@{ name = $Name; passed = $false; error = $_.Exception.Message; milliseconds = $timer.ElapsedMilliseconds }); Write-Warning "$Name : $($_.Exception.Message)" }
 }
 # 補助APIはfixture作成と観測に限る。拒否された削除を別APIで再試行しない。
-$nativeSource = @'
-using System;
-using System.ComponentModel;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-using Microsoft.Win32;
-using Microsoft.Win32.SafeHandles;
-public static class PrunletRegistryE2E {
- static RegistryHive Hive;
- static IntPtr Root;
- static string FixturePrefix;
- static string LinkPrefix;
- static string ClassesPrefix;
- public static void Configure(bool machine,string fixturePrefix) {
-  string allowed=machine?"SYSTEM\\PrunletE2E\\":"Software\\PrunletE2E\\";
-  string suffix=fixturePrefix.StartsWith(allowed,StringComparison.OrdinalIgnoreCase)?fixturePrefix.Substring(allowed.Length):"";
-  if(suffix.Length!=32||!Guid.TryParseExact(suffix,"N",out _))throw new ArgumentException("Unsafe fixture namespace.");
-  Hive=machine?RegistryHive.LocalMachine:RegistryHive.CurrentUser;
-  Root=new IntPtr(machine?unchecked((int)0x80000002):unchecked((int)0x80000001)); FixturePrefix=fixturePrefix;
-  LinkPrefix=fixturePrefix+"-link-probes";
-  ClassesPrefix="Software\\Classes\\PrunletE2E_"+suffix;
- }
- static void CheckFixture(string relative) {
-  bool main=FixturePrefix!=null&&(relative.Equals(FixturePrefix,StringComparison.OrdinalIgnoreCase)||relative.StartsWith(FixturePrefix+"\\",StringComparison.OrdinalIgnoreCase));
-  bool links=LinkPrefix!=null&&(relative.Equals(LinkPrefix,StringComparison.OrdinalIgnoreCase)||relative.StartsWith(LinkPrefix+"\\",StringComparison.OrdinalIgnoreCase));
-  if(!main&&!links&&!IsClasses(relative))throw new ArgumentException("Registry fixture escaped its unique run root.");
- }
- static bool IsClasses(string relative) => ClassesPrefix!=null&&(relative.Equals(ClassesPrefix,StringComparison.OrdinalIgnoreCase)||relative.StartsWith(ClassesPrefix+"\\",StringComparison.OrdinalIgnoreCase));
- static void CheckPermissionFixture(string relative) {
-  CheckFixture(relative);
-  bool link=relative.StartsWith(LinkPrefix+"\\",StringComparison.OrdinalIgnoreCase);
-  bool protectedCase=relative.StartsWith(FixturePrefix+"\\backup-restore-protected-cli-mcp-key-value-roundtrip\\",StringComparison.OrdinalIgnoreCase);
-  if(!link&&!protectedCase)throw new ArgumentException("Permission probe escaped its dedicated GUID subtree.");
- }
- [DllImport("advapi32.dll",CharSet=CharSet.Unicode)] static extern int RegSetValueExW(SafeRegistryHandle k,string n,int r,uint t,byte[] b,int l);
- [DllImport("advapi32.dll",CharSet=CharSet.Unicode)] static extern int RegQueryValueExW(SafeRegistryHandle k,string n,IntPtr r,out uint t,byte[] b,ref uint l);
- [DllImport("advapi32.dll")] static extern int RegGetKeySecurity(SafeRegistryHandle k,uint i,byte[] b,ref uint l);
- [DllImport("advapi32.dll")] static extern int RegSetKeySecurity(SafeRegistryHandle k,uint information,byte[] descriptor);
- [DllImport("advapi32.dll",CharSet=CharSet.Unicode)] static extern int RegOpenKeyExW(IntPtr root,string path,uint options,uint access,out SafeRegistryHandle key);
- [DllImport("advapi32.dll",CharSet=CharSet.Unicode)] static extern int RegCreateKeyExW(IntPtr root,string path,int reserved,string keyClass,uint options,uint access,IntPtr security,out SafeRegistryHandle key,out uint disposition);
- [StructLayout(LayoutKind.Sequential)] struct UnicodeString { public ushort Length,MaximumLength; public IntPtr Buffer; }
- [StructLayout(LayoutKind.Sequential)] struct ObjectAttributes { public int Length; public IntPtr RootDirectory,ObjectName; public uint Attributes; public IntPtr SecurityDescriptor,SecurityQualityOfService; }
- [DllImport("ntdll.dll")] static extern int NtOpenKeyEx(out SafeRegistryHandle key,uint access,ref ObjectAttributes attributes,uint options);
- [DllImport("ntdll.dll")] static extern uint RtlNtStatusToDosError(int status);
- [DllImport("ntdll.dll")] static extern int NtQueryKey(SafeRegistryHandle key,int information,byte[] buffer,uint length,out uint resultLength);
- [DllImport("ntdll.dll")] static extern int NtRenameKey(SafeRegistryHandle key,ref UnicodeString name);
- public static int RenameVolatileLink(string relative,RegistryKey key,string newName) {
-  CheckFixture(relative);if(!relative.StartsWith(LinkPrefix+"\\",StringComparison.OrdinalIgnoreCase)||newName.Length==0||newName.Length>255||newName.IndexOfAny(new[]{'\\','/','\0'})>=0)throw new ArgumentException("Rename probe escaped volatile run root.");
-  IntPtr text=Marshal.StringToHGlobalUni(newName);
-  try {var name=new UnicodeString{Length=checked((ushort)(newName.Length*2)),MaximumLength=checked((ushort)((newName.Length+1)*2)),Buffer=text};int status=NtRenameKey(key.Handle,ref name);return status<0?(int)RtlNtStatusToDosError(status):0;}
-  finally {Marshal.FreeHGlobal(text);}
- }
- public static string ClassesAliasState() {
-  string source="\\Registry\\User\\"+System.Security.Principal.WindowsIdentity.GetCurrent().User.Value+"\\Software\\Classes";
-  IntPtr text=Marshal.StringToHGlobalUni(source),unicode=Marshal.AllocHGlobal(Marshal.SizeOf<UnicodeString>());
-  try {
-   Marshal.StructureToPtr(new UnicodeString{Length=checked((ushort)(source.Length*2)),MaximumLength=checked((ushort)((source.Length+1)*2)),Buffer=text},unicode,false);
-   var attributes=new ObjectAttributes{Length=Marshal.SizeOf<ObjectAttributes>(),ObjectName=unicode,Attributes=0x140};
-   SafeRegistryHandle handle;int status=NtOpenKeyEx(out handle,0x01020119,ref attributes,8);
-   if(status<0){handle.Dispose();throw new Win32Exception((int)RtlNtStatusToDosError(status));}
-   using(var alias=RegistryKey.FromHandle(handle,RegistryView.Registry64)) {
-    uint size=0;int error=RegGetKeySecurity(alias.Handle,0x10000,null,ref size);if(error!=122&&error!=0)throw new Win32Exception(error);
-    byte[] acl=new byte[size];error=RegGetKeySecurity(alias.Handle,0x10000,acl,ref size);if(error!=0)throw new Win32Exception(error);
-    byte[] basic=new byte[4096];uint length;status=NtQueryKey(alias.Handle,0,basic,(uint)basic.Length,out length);if(status<0)throw new Win32Exception((int)RtlNtStatusToDosError(status));
-    return Value(alias,"SymbolicLinkValue")+"|security:"+Convert.ToBase64String(acl)+"|lastwrite:"+BitConverter.ToInt64(basic,0);
-   }
-  } finally { Marshal.FreeHGlobal(unicode);Marshal.FreeHGlobal(text); }
- }
- [DllImport("KtmW32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateTransaction(IntPtr security,IntPtr unitOfWork,uint options,uint isolationLevel,uint isolationFlags,uint timeout,string description);
- [DllImport("KtmW32.dll",SetLastError=true)] static extern bool RollbackTransaction(SafeFileHandle transaction);
- [DllImport("advapi32.dll",CharSet=CharSet.Unicode)] static extern int RegOpenKeyTransactedW(IntPtr root,string path,uint options,uint access,out SafeRegistryHandle key,SafeFileHandle transaction,IntPtr extendedParameter);
- public sealed class KtmPreflightResult {
-  public int View;
-  public string Parent;
-  public string Stage;
-  public int NativeError;
-  public int RollbackError;
-  public bool Available { get { return NativeError==0&&RollbackError==0&&Stage=="complete"; } }
- }
- public static KtmPreflightResult PreflightKtm(int view) {
-  if(FixturePrefix==null)throw new InvalidOperationException("Configure the fixture hive before preflight.");
-  var result=new KtmPreflightResult { View=view,Parent=Hive==RegistryHive.LocalMachine?"SYSTEM":"Software",Stage="CreateTransaction" };
-  using(var transaction=CreateTransaction(IntPtr.Zero,IntPtr.Zero,0,0,0,30000,"Prunlet E2E read-only KTM preflight")) {
-   if(transaction.IsInvalid) { result.NativeError=Marshal.GetLastWin32Error();return result; }
-   try {
-    result.Stage="RegOpenKeyTransactedW(KEY_READ)";
-    SafeRegistryHandle key;
-    result.NativeError=RegOpenKeyTransactedW(Root,result.Parent,0,(uint)(0x20019|(view==32?0x200:0x100)),out key,transaction,IntPtr.Zero);
-    if(key!=null)key.Dispose();
-   } finally {
-    if(!RollbackTransaction(transaction))result.RollbackError=Marshal.GetLastWin32Error();
-   }
-  }
-  if(result.NativeError==0)result.Stage=result.RollbackError==0?"complete":"RollbackTransaction";
-  return result;
- }
- [DllImport("advapi32.dll",EntryPoint="RegOpenKeyExW",CharSet=CharSet.Unicode)] static extern int ReopenSecurity(SafeRegistryHandle root,string path,uint options,uint access,out SafeRegistryHandle key);
- [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
- [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr p,uint a,out IntPtr t);
- [StructLayout(LayoutKind.Sequential)] struct Luid { public uint LowPart; public int HighPart; }
- [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool LookupPrivilegeValue(string s,string n,out Luid l);
- [StructLayout(LayoutKind.Sequential)] struct Privileges { public uint Count; public Luid Luid; public uint Attributes; }
- [StructLayout(LayoutKind.Sequential)] struct PrivilegeSet { public uint Count; public uint Control; public Luid Luid; public uint Attributes; }
- [DllImport("advapi32.dll",SetLastError=true)] static extern bool AdjustTokenPrivileges(IntPtr t,bool d,ref Privileges p,uint l,IntPtr b,IntPtr r);
- [DllImport("advapi32.dll",SetLastError=true)] static extern bool PrivilegeCheck(IntPtr token,ref PrivilegeSet privileges,out bool enabled);
- [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
- public static bool EnableSecurity() {
-  IntPtr token; if(!OpenProcessToken(GetCurrentProcess(),0x28,out token)) return false;
-  try { Luid id; if(!LookupPrivilegeValue(null,"SeSecurityPrivilege",out id))return false;
-   var p=new Privileges{Count=1,Luid=id,Attributes=2};
-   if(!AdjustTokenPrivileges(token,false,ref p,0,IntPtr.Zero,IntPtr.Zero)||Marshal.GetLastWin32Error()!=0)return false;
-   var required=new PrivilegeSet{Count=1,Control=1,Luid=id,Attributes=2};
-   bool enabled;return PrivilegeCheck(token,ref required,out enabled)&&enabled;
-  } finally { CloseHandle(token); }
- }
- public static RegistryKey Open(string relative,int view,bool security=false) {
-  CheckFixture(relative);
-  SafeRegistryHandle h; int e=RegOpenKeyExW(IsClasses(relative)?new IntPtr(unchecked((int)0x80000001)):Root,relative,0,(uint)(0x20019|(view==32?0x200:0x100)|(security?0x1000000:0)),out h);
-  if(e==2)return null; if(e!=0)throw new Win32Exception(e); return RegistryKey.FromHandle(h,view==32?RegistryView.Registry32:RegistryView.Registry64);
- }
- public static RegistryKey Create(string relative,int view) {
-  CheckFixture(relative);
-  using(var root=RegistryKey.OpenBaseKey(IsClasses(relative)?RegistryHive.CurrentUser:Hive,view==32?RegistryView.Registry32:RegistryView.Registry64)) return root.CreateSubKey(relative,true);
- }
- public static RegistryKey CreateVolatile(string relative,bool link=false,string keyClass=null) {
-  CheckFixture(relative);
-  if(!(relative.Equals(LinkPrefix,StringComparison.OrdinalIgnoreCase)||relative.StartsWith(LinkPrefix+"\\",StringComparison.OrdinalIgnoreCase)))throw new ArgumentException("Volatile probes require their dedicated run root.");
-  SafeRegistryHandle handle;uint disposition;
-  int e=RegCreateKeyExW(Root,relative,0,keyClass,link?3u:1u,0xF013F,IntPtr.Zero,out handle,out disposition);
-  if(e!=0)throw new Win32Exception(e);
-  if(disposition!=1){handle.Dispose();throw new Exception("Volatile probe already existed.");}
-  return RegistryKey.FromHandle(handle,RegistryView.Registry64);
- }
- public static RegistryKey CreateWithClass(string relative,string keyClass) {
-  CheckPermissionFixture(relative);
-  if(!relative.StartsWith(FixturePrefix+"\\backup-restore-protected-cli-mcp-key-value-roundtrip\\",StringComparison.OrdinalIgnoreCase))throw new ArgumentException("Class fixture escaped the protected nonvolatile GUID subtree.");
-  SafeRegistryHandle handle;uint disposition;
-  int error=RegCreateKeyExW(Root,relative,0,keyClass,0,0xF013F,IntPtr.Zero,out handle,out disposition);
-  if(error!=0){handle.Dispose();throw new Win32Exception(error);}
-  if(disposition!=1){handle.Dispose();throw new InvalidOperationException("Class fixture already exists.");}
-  return RegistryKey.FromHandle(handle,RegistryView.Registry64);
- }
- public static void CreateLink(string relative,string target) {
-  CheckFixture(target);
-  if(!target.StartsWith(LinkPrefix+"\\",StringComparison.OrdinalIgnoreCase))throw new ArgumentException("Link target escaped volatile probe root.");
-  string native=Hive==RegistryHive.LocalMachine?"\\Registry\\Machine\\":"\\Registry\\User\\"+System.Security.Principal.WindowsIdentity.GetCurrent().User.Value+"\\";
-  using(var key=CreateVolatile(relative,true))Set(key,"SymbolicLinkValue",6,System.Text.Encoding.Unicode.GetBytes(native+target));
- }
- public static void Set(RegistryKey k,string name,uint type,byte[] data) { int e=RegSetValueExW(k.Handle,name,0,type,data,data.Length);if(e!=0)throw new Win32Exception(e); }
- public static int TrySet(RegistryKey k,string name,uint type,byte[] data) => RegSetValueExW(k.Handle,name,0,type,data,data.Length);
- public static long KeyLastWrite(RegistryKey key) {
-  byte[] basic=new byte[4096];uint length;int status=NtQueryKey(key.Handle,0,basic,(uint)basic.Length,out length);
-  if(status<0)throw new Win32Exception((int)RtlNtStatusToDosError(status));return BitConverter.ToInt64(basic,0);
- }
- public static void DenyFixtureSetValue(string relative,RegistryKey key) {
-  CheckPermissionFixture(relative);
-  string sid=System.Security.Principal.WindowsIdentity.GetCurrent().User.Value;
-  var descriptor=new System.Security.AccessControl.RawSecurityDescriptor("D:P(D;;0x2;;;"+sid+")(A;;KA;;;"+sid+")(A;;KA;;;SY)");
-  byte[] bytes=new byte[descriptor.BinaryLength];descriptor.GetBinaryForm(bytes,0);
-  int error=RegSetKeySecurity(key.Handle,4,bytes);if(error!=0)throw new Win32Exception(error);
- }
- public static byte[] FixtureDacl(string relative,RegistryKey key) {
-  CheckPermissionFixture(relative);uint size=0;int error=RegGetKeySecurity(key.Handle,4,null,ref size);if(error!=122&&error!=0)throw new Win32Exception(error);
-  byte[] bytes=new byte[size];error=RegGetKeySecurity(key.Handle,4,bytes,ref size);if(error!=0)throw new Win32Exception(error);return bytes;
- }
- public static void RestoreFixtureDacl(string relative,RegistryKey key,byte[] bytes) {
-  CheckPermissionFixture(relative);
-  var descriptor=new System.Security.AccessControl.RawSecurityDescriptor(bytes,0);
-  uint information=4u|((descriptor.ControlFlags&System.Security.AccessControl.ControlFlags.DiscretionaryAclProtected)!=0?0x80000000u:0x20000000u);
-  int error=RegSetKeySecurity(key.Handle,information,bytes);if(error!=0)throw new Win32Exception(error);
- }
- public static string[] ClassesBackingSnapshot(string relative,int view) {
-  CheckFixture(relative);if(!IsClasses(relative))throw new ArgumentException("Not a Classes fixture.");
-  var rows=new List<string>();WalkBacking(relative,"",view,rows);rows.Sort(StringComparer.Ordinal);return rows.ToArray();
- }
- static void WalkBacking(string relative,string label,int view,List<string> rows) {
-  CheckFixture(relative);
-  string path=System.Security.Principal.WindowsIdentity.GetCurrent().User.Value+"_Classes\\"+relative.Substring("Software\\Classes\\".Length);
-  SafeRegistryHandle handle;int error=RegOpenKeyExW(new IntPtr(unchecked((int)0x80000003)),path,0,(uint)(0x01020019|(view==32?0x200:0x100)),out handle);
-  if(error!=0)throw new Win32Exception(error);
-  using(var key=RegistryKey.FromHandle(handle,view==32?RegistryView.Registry32:RegistryView.Registry64)) {
-   rows.Add("K:"+label+":"+Security(key));foreach(var name in key.GetValueNames())rows.Add("V:"+label+":"+Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(name))+":"+Value(key,name));
-   foreach(var child in key.GetSubKeyNames())WalkBacking(relative+"\\"+child,label+"\\"+child,view,rows);
-  }
- }
- public static void SetLowIntegrityFixture(string relative,int view) {
-  CheckFixture(relative);
-  var descriptor=new System.Security.AccessControl.RawSecurityDescriptor("S:(ML;;NW;;;LW)");
-  var bytes=new byte[descriptor.BinaryLength];descriptor.GetBinaryForm(bytes,0);
-  SafeRegistryHandle handle;
-  int e=RegOpenKeyExW(Root,relative,0,(uint)(0x80000|(view==32?0x200:0x100)),out handle);
-  if(e!=0)throw new Win32Exception(e);
-  using(handle) { e=RegSetKeySecurity(handle,0x10,bytes);if(e!=0)throw new Win32Exception(e); }
- }
- public static string Value(RegistryKey k,string name) {
-  uint t,l=0;int e=RegQueryValueExW(k.Handle,name,IntPtr.Zero,out t,null,ref l);if(e==2)return null;if(e!=0)throw new Win32Exception(e);
-  byte[] b=new byte[l];e=RegQueryValueExW(k.Handle,name,IntPtr.Zero,out t,b,ref l);if(e!=0)throw new Win32Exception(e);return t+":"+Convert.ToBase64String(b);
- }
- public static string Security(RegistryKey k) {
-  SafeRegistryHandle securityHandle;
-  int e=ReopenSecurity(k.Handle,"",0,0x01020000,out securityHandle);if(e!=0)throw new Win32Exception(e);
-  using(securityHandle) {
-   uint l=0;e=RegGetKeySecurity(securityHandle,0x10000,null,ref l);if(e!=122&&e!=0)throw new Win32Exception(e);
-   byte[] b=new byte[l];e=RegGetKeySecurity(securityHandle,0x10000,b,ref l);if(e!=0)throw new Win32Exception(e);return Convert.ToBase64String(b);
-  }
- }
- public static string[] Snapshot(string relative,int view) {
-  var rows=new List<string>(); Walk(relative,"",view,rows); rows.Sort(StringComparer.Ordinal);return rows.ToArray();
- }
- static void Walk(string relative,string label,int view,List<string> rows) {
-  using(var k=Open(relative,view,true)) { if(k==null)throw new Exception("Snapshot key missing: "+relative);
-   rows.Add("K:"+label+":"+Security(k)); foreach(var name in k.GetValueNames())rows.Add("V:"+label+":"+Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(name))+":"+Value(k,name));
-   foreach(var child in k.GetSubKeyNames())Walk(relative+"\\"+child,label+"\\"+child,view,rows);
-  }
- }
-}
-'@
-$compilerTemp = Join-Path $OutputDirectory 'compiler-temp'; $null = [IO.Directory]::CreateDirectory($compilerTemp)
-$previousTemp = $env:TEMP; $previousTmp = $env:TMP
-try { $env:TEMP = $compilerTemp; $env:TMP = $compilerTemp; Add-Type -TypeDefinition $nativeSource }
-finally { $env:TEMP = $previousTemp; $env:TMP = $previousTmp }
-$securityPrivilege = [PrunletRegistryE2E]::EnableSecurity()
-[PrunletRegistryE2E]::Configure($machineFixture,$runRelative)
+$securityPrivilege = (Enable-RegistryFixtureSecurity)
+Initialize-RegistryFixture $machineFixture $runRelative
 $preflight = @()
 foreach ($view in @(64,32)) {
-    try { $preflight += [PrunletRegistryE2E]::PreflightKtm($view) }
+    try { $preflight += (Test-RegistryFixtureKtm ($view)) }
     catch { $preflight += @{ View=$view; Available=$false; Stage='native preflight exception'; error=$_.Exception.Message; hresult=$_.Exception.HResult } }
 }
 if (@($preflight | Where-Object { !$_.Available }).Count) {
@@ -345,7 +147,7 @@ if (@($preflight | Where-Object { !$_.Available }).Count) {
     $presence = @(); $remaining = $null
     foreach ($view in @(64,32)) {
         try {
-            $existing = [PrunletRegistryE2E]::Open($runRelative,$view)
+            $existing = (Open-RegistryFixtureKey ($runRelative) ($view))
             $exists = $null -ne $existing
             if ($existing) { $existing.Dispose(); $remaining = $runPath }
             $presence += @{ view=$view; exists=$exists; observed=$true }
@@ -353,7 +155,7 @@ if (@($preflight | Where-Object { !$_.Available }).Count) {
     }
     $reason = 'Read-only KTM preflight unavailable; no registry fixture creation was attempted. Registry behavior remains unverified in this process context.'
     Save-Json $ReportPath @{
-        schema=1; timestampUtc=[DateTimeOffset]::UtcNow.ToString('O'); executablePath=$ExecutablePath; moveExecutablePath=$MoveExecutablePath
+        schema=1; timestampUtc=[DateTimeOffset]::UtcNow.ToString('O'); executablePath=$ExecutablePath; sameSourceBuild=$script:RegistryBuildBinding; rustProbePath=$RustProbePath; rustProbeSha256=$(if($RustProbePath){Digest $RustProbePath}else{$null}); moveExecutablePath=$MoveExecutablePath
         passed=0; failed=1; skipped=0; excludedCount=0; createdFixture=$false
         results=@(@{ name='read-only-ktm-preflight'; passed=$false; error=$reason; probes=$preflight })
         preflight=$preflight; securityPrivilegeEnabled=$securityPrivilege; registryFixtureRoot=$RegistryFixtureRoot
@@ -365,14 +167,14 @@ if (@($preflight | Where-Object { !$_.Available }).Count) {
     exit 1
 }
 foreach ($view in @(32,64)) {
-    $existing = [PrunletRegistryE2E]::Open($runRelative,$view)
+    $existing = (Open-RegistryFixtureKey ($runRelative) ($view))
     if ($existing) { $existing.Dispose(); throw 'Unique registry fixture already exists.' }
 }
-$fixture = [PrunletRegistryE2E]::Create($runRelative,64); $fixture.Dispose(); $createdFixture = $true
-function Exists([string]$Relative = $script:Relative, [int]$View = 64) { $k = [PrunletRegistryE2E]::Open($Relative,$View); if ($k) { $k.Dispose(); return $true }; return $false }
+$fixture = (New-RegistryFixtureKey ($runRelative) (64)); $fixture.Dispose(); $createdFixture = $true
+function Exists([string]$Relative = $script:Relative, [int]$View = 64) { $k = (Open-RegistryFixtureKey ($Relative) ($View)); if ($k) { $k.Dispose(); return $true }; return $false }
 function Fixture([switch]$Tree, [int]$View = 64) {
     Assert-True (!(Exists $script:Relative $View)) 'Case fixture already exists.'
-    $k = [PrunletRegistryE2E]::Create($script:Relative,$View)
+    $k = (New-RegistryFixtureKey ($script:Relative) ($View))
     try {
         foreach ($entry in @(
             @('',1,[Text.Encoding]::Unicode.GetBytes("default`0")), @('日本語😀',1,[Text.Encoding]::Unicode.GetBytes("文字`0")),
@@ -380,12 +182,12 @@ function Fixture([switch]$Tree, [int]$View = 64) {
             @('binary',3,[byte[]]@(0,1,128,255)), @('dword',4,[byte[]]@(0x78,0x56,0x34,0x12)),
             @('multi',7,[Text.Encoding]::Unicode.GetBytes("one`0日本語`0`0")), @('qword',11,[BitConverter]::GetBytes([uint64]0x123456789abcdef)),
             @('empty-binary',3,[byte[]]@()), @('empty-string',1,[byte[]]@())
-        )) { [PrunletRegistryE2E]::Set($k,[string]$entry[0],[uint32]$entry[1],[byte[]]$entry[2]) }
-        foreach ($name in $pathValueNames) { [PrunletRegistryE2E]::Set($k,$name,1,[Text.Encoding]::Unicode.GetBytes("fixture:$name`0")) }
+        )) { (Set-RegistryFixtureValue ($k) ([string]$entry[0]) ([uint32]$entry[1]) ([byte[]]$entry[2])) }
+        foreach ($name in $pathValueNames) { (Set-RegistryFixtureValue ($k) ($name) (1) ([Text.Encoding]::Unicode.GetBytes("fixture:$name`0"))) }
     } finally { $k.Dispose() }
-    if ($Tree) { $child = [PrunletRegistryE2E]::Create($script:Relative+'\子\empty',$View); $child.Dispose() }
+    if ($Tree) { $child = (New-RegistryFixtureKey ($script:Relative+'\子\empty') ($View)); $child.Dispose() }
 }
-function Snapshot([int]$View = 64) { [PrunletRegistryE2E]::Snapshot($script:Relative,$View) -join "`n" }
+function Snapshot([int]$View = 64) { (Get-RegistryFixtureSnapshot ($script:Relative) ($View)) -join "`n" }
 function Alias-Content([string]$State) { ($State -split '\|lastwrite:')[0] }
 function Recovery-State { @(Get-ChildItem -LiteralPath $script:Recovery -Recurse -Force | Sort-Object FullName | ForEach-Object { if ($_.PSIsContainer) { $_.FullName+':directory' } else { $_.FullName+':'+(Digest $_.FullName) } }) -join "`n" }
 function Delete-Registry([string[]]$Options = @('--recursive'), [int]$View = 64) {
@@ -436,10 +238,10 @@ Case 'key-mandatory-integrity-label-full-security-roundtrip' {
     Fixture -Tree
     foreach ($relative in @($script:Relative,($script:Relative+'\子'),($script:Relative+'\子\empty'))) {
         # LABEL setterとWRITE_OWNERは、今回作成したsource fixtureの準備だけに使用する。
-        [PrunletRegistryE2E]::SetLowIntegrityFixture($relative,64)
-        $key = [PrunletRegistryE2E]::Open($relative,64,$true)
+        (Set-RegistryFixtureLowIntegrity ($relative) (64))
+        $key = (Open-RegistryFixtureKey ($relative) (64) ($true))
         try {
-            $raw = [Convert]::FromBase64String([PrunletRegistryE2E]::Security($key))
+            $raw = [Convert]::FromBase64String((Get-RegistryFixtureSecurity ($key)))
             $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($raw,0)
             $labels = @($descriptor.SystemAcl | Where-Object { [int]$_.AceType -eq 17 })
             Assert-True ($labels.Count -eq 1) "Full registry security observation omitted the mandatory integrity label: $relative"
@@ -459,7 +261,7 @@ Case 'key-mandatory-integrity-label-full-security-roundtrip' {
 }
 Case 'key-conflict-even-empty-refuses-and-retains-backup' {
     Fixture; $op = Delete-Registry; $hash = Digest $op.Payload
-    $conflict = [PrunletRegistryE2E]::Create($script:Relative,64); $conflict.Dispose(); $before = Snapshot
+    $conflict = (New-RegistryFixtureKey ($script:Relative) (64)); $conflict.Dispose(); $before = Snapshot
     Assert-Rejected @('restore',$op.Id)
     Assert-True ((Snapshot) -ceq $before -and (Digest $op.Payload) -ceq $hash) 'Conflicting key or backup changed.'
 }
@@ -469,8 +271,8 @@ foreach ($name in @('binary','日本語😀','') + $pathValueNames) {
     Case "value-$label-roundtrip-preserves-parent-siblings-security" {
         Fixture; $before = Snapshot
         $op = Delete-Registry @('--value-name',$valueName)
-        $k = [PrunletRegistryE2E]::Open($script:Relative,64,$true)
-        try { Assert-True ($null -eq [PrunletRegistryE2E]::Value($k,$valueName)) 'Selected value remains.' } finally { $k.Dispose() }
+        $k = (Open-RegistryFixtureKey ($script:Relative) (64) ($true))
+        try { Assert-True ($null -eq (Get-RegistryFixtureValue ($k) ($valueName))) 'Selected value remains.' } finally { $k.Dispose() }
         $prefix = 'V::' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($valueName)) + ':'
         $expectedAfterDelete = (($before -split "`n" | Where-Object { !$_.StartsWith($prefix,[StringComparison]::Ordinal) }) -join "`n")
         Assert-True ((Snapshot) -ceq $expectedAfterDelete) 'Value delete changed siblings or parent security.'
@@ -481,15 +283,15 @@ foreach ($name in @('binary','日本語😀','') + $pathValueNames) {
 }
 Case 'default-value-equals-form-and-existing-value-conflict' {
     Fixture; $op = Delete-Registry @('--value-name='); $hash = Digest $op.Payload
-    $k = [PrunletRegistryE2E]::Create($script:Relative,64)
-    try { [PrunletRegistryE2E]::Set($k,'',3,[byte[]]@(99)) } finally { $k.Dispose() }
+    $k = (New-RegistryFixtureKey ($script:Relative) (64))
+    try { (Set-RegistryFixtureValue ($k) ('') (3) ([byte[]]@(99))) } finally { $k.Dispose() }
     $before = Snapshot; Assert-Rejected @('restore',$op.Id)
     Assert-True ((Snapshot) -ceq $before -and (Digest $op.Payload) -ceq $hash) 'Value conflict changed source or snapshot.'
 }
 Case 'identical-existing-value-still-refuses-restore' {
     Fixture; $name = $pathValueNames[0]; $op = Delete-Registry @('--value-name',$name); $hash = Digest $op.Payload
-    $k = [PrunletRegistryE2E]::Create($script:Relative,64)
-    try { [PrunletRegistryE2E]::Set($k,$name,1,[Text.Encoding]::Unicode.GetBytes("fixture:$name`0")) } finally { $k.Dispose() }
+    $k = (New-RegistryFixtureKey ($script:Relative) (64))
+    try { (Set-RegistryFixtureValue ($k) ($name) (1) ([Text.Encoding]::Unicode.GetBytes("fixture:$name`0"))) } finally { $k.Dispose() }
     $before = Snapshot; Assert-Rejected @('restore',$op.Id)
     Assert-True ((Snapshot) -ceq $before -and (Digest $op.Payload) -ceq $hash) 'Identical value conflict changed source or backup.'
 }
@@ -503,7 +305,7 @@ Case 'value-parent-missing-refuses-and-backup-resumes' {
 }
 Case 'key-parent-missing-refuses-and-backup-resumes' {
     $parentRelative = $script:Relative; $parentPath = $script:Path
-    $parent = [PrunletRegistryE2E]::Create($parentRelative,64); $parent.Dispose()
+    $parent = (New-RegistryFixtureKey ($parentRelative) (64)); $parent.Dispose()
     $script:Relative += '\child'; $script:Path += '\child'; Fixture
     $before = Snapshot; $childOp = Delete-Registry; $hash = Digest $childOp.Payload
     $script:Relative = $parentRelative; $script:Path = $parentPath; $parentOp = Delete-Registry
@@ -557,25 +359,25 @@ Case 'literal-colon-key-roundtrip' {
     }
 }
 Case 'classes-alias-cli-values-and-direct-child-keys-both-views' {
-    $aliasBefore = [PrunletRegistryE2E]::ClassesAliasState()
+    $aliasBefore = (Get-RegistryFixtureClassesAliasState)
     foreach ($view in @(32,64)) {
         $script:Relative = $classesRelative+'\cli'+$view; $script:Path = 'HKEY_CURRENT_USER\'+$script:Relative
         Fixture -Tree -View $view; $before = Snapshot $view
-        Assert-True (([PrunletRegistryE2E]::ClassesBackingSnapshot($script:Relative,$view) -join "`n") -ceq $before) 'Classes alias and direct SID_Classes backing disagree.'
-        $sourceBefore = [PrunletRegistryE2E]::ClassesAliasState(); $recordsBefore = Recovery-State
+        Assert-True (((Get-RegistryFixtureClassesBackingSnapshot $script:Relative $view) -join "`n") -ceq $before) 'Classes alias and direct SID_Classes backing disagree.'
+        $sourceBefore = (Get-RegistryFixtureClassesAliasState); $recordsBefore = Recovery-State
         $r = Invoke-RegistryCli @('registry-delete','--view',"$view",'--value-name',$pathValueNames[0],'--dry-run','--',$script:Path)
-        Assert-True ($r.ExitCode -eq 0 -and (Snapshot $view) -ceq $before -and [PrunletRegistryE2E]::ClassesAliasState() -ceq $sourceBefore -and (Recovery-State) -ceq $recordsBefore) 'Classes dry-run changed alias bytes, complete ACL, last-write time, fixture, or metadata.'
+        Assert-True ($r.ExitCode -eq 0 -and (Snapshot $view) -ceq $before -and (Get-RegistryFixtureClassesAliasState) -ceq $sourceBefore -and (Recovery-State) -ceq $recordsBefore) 'Classes dry-run changed alias bytes, complete ACL, last-write time, fixture, or metadata.'
         foreach ($name in $pathValueNames) {
             $op = Delete-Registry @('--value-name',$name) $view
             $prefix = 'V::'+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($name))+':'
             $expected = (($before -split "`n" | Where-Object { !$_.StartsWith($prefix,[StringComparison]::Ordinal) }) -join "`n")
             Assert-True ((Snapshot $view) -ceq $expected) 'Classes value delete changed sibling values, child keys, or complete parent ACL.'
             $null = Restore $op
-            Assert-True ((Snapshot $view) -ceq $before -and ([PrunletRegistryE2E]::ClassesBackingSnapshot($script:Relative,$view) -join "`n") -ceq $before) 'Classes value restore changed literal names, types, raw bytes, siblings, or security.'
+            Assert-True ((Snapshot $view) -ceq $before -and ((Get-RegistryFixtureClassesBackingSnapshot $script:Relative $view) -join "`n") -ceq $before) 'Classes value restore changed literal names, types, raw bytes, siblings, or security.'
         }
         $name = $pathValueNames[0]; $op = Delete-Registry @('--value-name',$name) $view; $hash = Digest $op.Payload
-        $k = [PrunletRegistryE2E]::Create($script:Relative,$view)
-        try { [PrunletRegistryE2E]::Set($k,$name,1,[Text.Encoding]::Unicode.GetBytes("fixture:$name`0")) } finally { $k.Dispose() }
+        $k = (New-RegistryFixtureKey ($script:Relative) ($view))
+        try { (Set-RegistryFixtureValue ($k) ($name) (1) ([Text.Encoding]::Unicode.GetBytes("fixture:$name`0"))) } finally { $k.Dispose() }
         Assert-Rejected @('restore',$op.Id)
         Assert-True ((Snapshot $view) -ceq $before -and (Digest $op.Payload) -ceq $hash) 'Classes value restore conflict changed source or snapshot.'
     }
@@ -584,189 +386,61 @@ Case 'classes-alias-cli-values-and-direct-child-keys-both-views' {
         $op = Delete-Registry @('--recursive') $view
         Assert-True (!(Exists $script:Relative $view)) 'Direct Classes child key remains after CLI delete.'
         $null = Restore $op
-        Assert-True ((Snapshot $view) -ceq $before -and ([PrunletRegistryE2E]::ClassesBackingSnapshot($script:Relative,$view) -join "`n") -ceq $before) 'Direct Classes child restore changed raw tree or complete security.'
+        Assert-True ((Snapshot $view) -ceq $before -and ((Get-RegistryFixtureClassesBackingSnapshot $script:Relative $view) -join "`n") -ceq $before) 'Direct Classes child restore changed raw tree or complete security.'
     }
-    Assert-True ((Alias-Content ([PrunletRegistryE2E]::ClassesAliasState())) -ceq (Alias-Content $aliasBefore)) 'Classes operation changed real ancestor link bytes or complete ACL.'
+    Assert-True ((Alias-Content ((Get-RegistryFixtureClassesAliasState))) -ceq (Alias-Content $aliasBefore)) 'Classes operation changed real ancestor link bytes or complete ACL.'
 }
 Case 'volatile-registry-links-and-link-like-value-refused' {
     # リンク拒否後は削除APIを付け替えない。専用volatile rootだけをログオフ/再起動まで保持する。
     Assert-True (!(Exists $linkRelative)) 'Unique volatile link probe already exists.'
-    $root = [PrunletRegistryE2E]::CreateVolatile($linkRelative); $root.Dispose(); $script:createdLinkFixture = $true
+    $root = (New-RegistryFixtureVolatile ($linkRelative)); $root.Dispose(); $script:createdLinkFixture = $true
     $targetRelative = $linkRelative + '\target'
-    $target = [PrunletRegistryE2E]::CreateVolatile($targetRelative)
-    try { [PrunletRegistryE2E]::Set($target,'sentinel',3,[byte[]]@(42,0,255)) } finally { $target.Dispose() }
-    $child = [PrunletRegistryE2E]::CreateVolatile($targetRelative+'\child'); $child.Dispose()
-    $before = [PrunletRegistryE2E]::Snapshot($targetRelative,64) -join "`n"
-    [PrunletRegistryE2E]::CreateLink($linkRelative+'\link',$targetRelative)
-    Assert-True (([PrunletRegistryE2E]::Snapshot($linkRelative+'\link',64) -join "`n") -ceq $before) 'Probe link does not resolve to its fixture target.'
+    $target = (New-RegistryFixtureVolatile ($targetRelative))
+    try { (Set-RegistryFixtureValue ($target) ('sentinel') (3) ([byte[]]@(42,0,255))) } finally { $target.Dispose() }
+    $child = (New-RegistryFixtureVolatile ($targetRelative+'\child')); $child.Dispose()
+    $before = (Get-RegistryFixtureSnapshot ($targetRelative) (64)) -join "`n"
+    (New-RegistryFixtureLink ($linkRelative+'\link') ($targetRelative))
+    Assert-True (((Get-RegistryFixtureSnapshot ($linkRelative+'\link') (64)) -join "`n") -ceq $before) 'Probe link does not resolve to its fixture target.'
     foreach ($suffix in @('\link','\link\child')) {
         $r = Invoke-RegistryCli @('registry-delete','--view','64','--recursive','--dry-run','--',($fixtureHive+'\'+$linkRelative+$suffix))
         Assert-True ($r.ExitCode -ne 0 -and ($r.Stdout+$r.Stderr) -match 'Registry link or link-like key') 'Actual link was not rejected by the link guard.'
-        Assert-True (([PrunletRegistryE2E]::Snapshot($targetRelative,64) -join "`n") -ceq $before) 'Rejected link probe changed target.'
+        Assert-True (((Get-RegistryFixtureSnapshot ($targetRelative) (64)) -join "`n") -ceq $before) 'Rejected link probe changed target.'
     }
     $ordinaryRelative = $linkRelative+'\ordinary'
-    $ordinary = [PrunletRegistryE2E]::CreateVolatile($ordinaryRelative)
+    $ordinary = (New-RegistryFixtureVolatile ($ordinaryRelative))
     $nativePrefix = if ($machineFixture) { '\Registry\Machine\' } else { '\Registry\User\'+[Security.Principal.WindowsIdentity]::GetCurrent().User.Value+'\' }
     try {
-        [PrunletRegistryE2E]::Set($ordinary,'SymbolicLinkValue',6,[Text.Encoding]::Unicode.GetBytes($nativePrefix+$targetRelative))
-        [PrunletRegistryE2E]::Set($ordinary,'ordinary-sentinel',3,[byte[]]@(17,18))
+        (Set-RegistryFixtureValue ($ordinary) ('SymbolicLinkValue') (6) ([Text.Encoding]::Unicode.GetBytes($nativePrefix+$targetRelative)))
+        (Set-RegistryFixtureValue ($ordinary) ('ordinary-sentinel') (3) ([byte[]]@(17,18)))
     } finally { $ordinary.Dispose() }
-    $ordinaryBefore = [PrunletRegistryE2E]::Snapshot($ordinaryRelative,64) -join "`n"
+    $ordinaryBefore = (Get-RegistryFixtureSnapshot ($ordinaryRelative) (64)) -join "`n"
     $r = Invoke-RegistryCli @('registry-delete','--view','64','--recursive','--dry-run','--',($fixtureHive+'\'+$ordinaryRelative))
     Assert-True ($r.ExitCode -ne 0 -and ($r.Stdout+$r.Stderr) -match 'Registry link or link-like key') 'Ordinary REG_LINK value was not rejected by the link guard.'
-    Assert-True (([PrunletRegistryE2E]::Snapshot($ordinaryRelative,64) -join "`n") -ceq $ordinaryBefore) 'Rejected REG_LINK value probe changed ordinary key.'
+    Assert-True (((Get-RegistryFixtureSnapshot ($ordinaryRelative) (64)) -join "`n") -ceq $ordinaryBefore) 'Rejected REG_LINK value probe changed ordinary key.'
 }
-if ($AssemblyPath) {
+
+if ($RustProbePath) {
     Case 'core-classes-alias-proof-permission-and-staged-commit-conflict' {
-        Assert-True ([IO.File]::Exists($AssemblyPath)) 'Candidate AssemblyPath missing.'
-        if (!(Exists $linkRelative)) { $root = [PrunletRegistryE2E]::CreateVolatile($linkRelative); $root.Dispose(); $script:createdLinkFixture = $true }
-        $assembly = [Reflection.Assembly]::LoadFrom($AssemblyPath)
-        $native = $assembly.GetType('Prunlet.Core.NativeRegistry',$true); $transactionType = $assembly.GetType('Prunlet.Core.NativeRegistry+Transaction',$true)
-        $static = [Reflection.BindingFlags]'Static,NonPublic'; $instance = [Reflection.BindingFlags]'Instance,NonPublic'
-        function Core-Target([string]$Path,[string]$Name) {
-            $request = [Activator]::CreateInstance($assembly.GetType('Prunlet.Core.RegistryDeleteRequest',$true)); $request.Path=$Path; $request.View='64'; $request.ValueName=$Name
-            $native.GetMethod('Target',$static).Invoke($null,[object[]]@($request))
-        }
-        $targetRelatives = @(($linkRelative+'\guard-target-a'),($linkRelative+'\guard-target-b')); $targets = @(); $targetSnapshots = @()
-        foreach ($relative in $targetRelatives) {
-            $targetKey = [PrunletRegistryE2E]::CreateVolatile($relative)
-            [PrunletRegistryE2E]::Set($targetKey,'sentinel',3,[byte[]]@(42,0,255)); $targets += $targetKey
-            $targetSnapshots += [PrunletRegistryE2E]::Snapshot($relative,64) -join "`n"
-        }
-        $nativePrefix = if ($machineFixture) { '\Registry\Machine\' } else { '\Registry\User\'+[Security.Principal.WindowsIdentity]::GetCurrent().User.Value+'\' }
-        $destination = $nativePrefix+$targetRelatives[0]; $original = [Text.Encoding]::Unicode.GetBytes($destination); $changed = [Text.Encoding]::Unicode.GetBytes($nativePrefix+$targetRelatives[1])
-        $aliasRelative=$linkRelative+'\guard-real'; $alias=[PrunletRegistryE2E]::CreateVolatile($aliasRelative,$true)
-        $plain=[PrunletRegistryE2E]::CreateVolatile($linkRelative+'\guard-plain'); $aliasRaw=$null; $denied=$null; $deniedRaw=$null; $savedDacl=$null; $parent=$null; $transaction=$null
-        try {
-            [PrunletRegistryE2E]::Set($alias,'SymbolicLinkValue',6,$original); [PrunletRegistryE2E]::Set($plain,'SymbolicLinkValue',6,$original)
-            $parent=[PrunletRegistryE2E]::Open($linkRelative,64); $proof=$native.GetMethod('VerifyClassesAlias',$static)
-            $aliasRaw=$native.GetMethod('OpenNative',$static).Invoke($null,[object[]]@($null,$parent.Handle,'guard-real',[uint32]0x20119,'Cannot open isolated readonly alias probe',$false))
-            $rejected=$false
-            try { $null=$proof.Invoke($null,[object[]]@($plain.Handle,$parent.Handle,'guard-plain',$destination,[uint32]0x20119,$original)) }
-            catch { $rejected=$_.Exception.ToString() -match 'differs from the explicitly resolved native path' }
-            Assert-True $rejected 'Ordinary matching REG_LINK metadata was accepted as a real alias.'
-            $null=$proof.Invoke($null,[object[]]@($aliasRaw,$parent.Handle,'guard-real',$destination,[uint32]0x20119,$original))
-            $aliasTarget=Core-Target ($fixtureHive+'\'+$aliasRelative) $null
-            $value=$native.GetMethod('ReadValue',$static).Invoke($null,[object[]]@($aliasRaw,'SymbolicLinkValue'))
-            $guard=$native.GetMethod('GuardClassesAlias',$static)
-            $before=[PrunletRegistryE2E]::Value($alias,'SymbolicLinkValue')+'|'+[PrunletRegistryE2E]::KeyLastWrite($alias)
-            $transaction=[Activator]::CreateInstance($transactionType,$true)
-            $null=$guard.Invoke($null,[object[]]@($transaction,$aliasTarget,$aliasRaw,$value,$false)); $transaction.Dispose(); $transaction=$null
-            Assert-True (([PrunletRegistryE2E]::Value($alias,'SymbolicLinkValue')+'|'+[PrunletRegistryE2E]::KeyLastWrite($alias)) -ceq $before) 'Permission-only alias guard wrote bytes or changed last-write time.'
-            $deniedRelative=$linkRelative+'\guard-denied'; $denied=[PrunletRegistryE2E]::CreateVolatile($deniedRelative,$true)
-            [PrunletRegistryE2E]::Set($denied,'SymbolicLinkValue',6,$original)
-            $deniedRaw=$native.GetMethod('OpenNative',$static).Invoke($null,[object[]]@($null,$parent.Handle,'guard-denied',[uint32]0x20119,'Cannot open isolated readonly permission probe',$false))
-            $savedDacl=[PrunletRegistryE2E]::FixtureDacl($deniedRelative,$denied); [PrunletRegistryE2E]::DenyFixtureSetValue($deniedRelative,$denied)
-            $deniedBefore=[PrunletRegistryE2E]::Value($denied,'SymbolicLinkValue')+'|'+[PrunletRegistryE2E]::KeyLastWrite($denied)
-            $transaction=[Activator]::CreateInstance($transactionType,$true); $deniedTarget=Core-Target ($fixtureHive+'\'+$deniedRelative) $null; $deniedError=0
-            try { $null=$guard.Invoke($null,[object[]]@($transaction,$deniedTarget,$deniedRaw,$value,$true)) }
-            catch { $cause=$_.Exception; while ($cause.InnerException) { $cause=$cause.InnerException }; if ($cause -is [ComponentModel.Win32Exception]) { $deniedError=$cause.NativeErrorCode } }
-            $transaction.Dispose(); $transaction=$null
-            Assert-True ($deniedError -eq 5 -and ([PrunletRegistryE2E]::Value($denied,'SymbolicLinkValue')+'|'+[PrunletRegistryE2E]::KeyLastWrite($denied)) -ceq $deniedBefore) 'Denied SetValue permission was not rejected before alias staging.'
-            [PrunletRegistryE2E]::RestoreFixtureDacl($deniedRelative,$denied,$savedDacl); $savedDacl=$null
-            $transaction=[Activator]::CreateInstance($transactionType,$true)
-            $null=$guard.Invoke($null,[object[]]@($transaction,$aliasTarget,$aliasRaw,$value,$true))
-            $target=Core-Target ($fixtureHive+'\'+$targetRelatives[0]) 'sentinel'
-            $bound=$native.GetMethod('BindTransaction',$static).Invoke($null,[object[]]@($transaction,$target,$targets[0].Handle,[uint32]2))
-            $staged=[Activator]::CreateInstance($assembly.GetType('Prunlet.Core.RegistryValueSnapshot',$true),$true); $staged.Name='sentinel'; $staged.Type=[uint32]3; $staged.Data=[byte[]]@(99,88,77)
-            $null=$native.GetMethod('SetRaw',$static).Invoke($null,[object[]]@($bound,$staged))
-            $stagedRead=$native.GetMethod('ReadValue',$static).Invoke($null,[object[]]@($bound,'sentinel'))
-            Assert-True ([Convert]::ToBase64String($stagedRead.Data) -ceq [Convert]::ToBase64String($staged.Data)) 'Target sentinel mutation was not actually staged.'
-            $null=$transactionType.GetMethod('VerifyPinnedNames',$instance).Invoke($transaction,@())
-            # 本番の最終確認後の窓を検証するため、外部writer後は再確認を挟まず同じKTM commitを呼ぶ。
-            $writeError=[PrunletRegistryE2E]::TrySet($alias,'SymbolicLinkValue',6,$changed)
-            $handle=$transactionType.GetProperty('Handle',$instance).GetValue($transaction)
-            $committed=$native.GetMethod('CommitTransaction',$static).Invoke($null,[object[]]@($handle)); $commitError=if($committed){0}else{[Runtime.InteropServices.Marshal]::GetLastWin32Error()}
-            $transaction.Dispose(); $transaction=$null
-            $writerPreserved=[PrunletRegistryE2E]::Value($alias,'SymbolicLinkValue') -ceq ('6:'+[Convert]::ToBase64String($changed)); $targetsPreserved=$true
-            for($i=0;$i -lt $targetRelatives.Count;$i++){ $targetsPreserved=$targetsPreserved -and (([PrunletRegistryE2E]::Snapshot($targetRelatives[$i],64) -join "`n") -ceq $targetSnapshots[$i]) }
-            Save-Json (Join-Path $script:CaseRoot 'classes-guard-evidence.json') @{ assemblyPath=$AssemblyPath; assemblySha256=(Digest $AssemblyPath); ordinaryMatchingBytesRejected=$rejected; deniedSetValueError=$deniedError; externalWriteError=$writeError; committed=$committed; commitError=$commitError; writerBytesPreserved=$writerPreserved; targetMutationRolledBack=$targetsPreserved; scope='Production helper and actual KTM; dedicated volatile real link only; staged target write; external link update after final Verify; raw commit without second check' }
-            Assert-True ($writeError -eq 0 -and !$committed -and $writerPreserved -and $targetsPreserved) 'Staged alias guard did not roll back target mutation and preserve the accepted external writer after the final check.'
-            $renameRelative=$linkRelative+'\guard-rename'; $renameAlias=[PrunletRegistryE2E]::CreateVolatile($renameRelative,$true); $renameRaw=$null; $replacement=$null
-            try {
-                [PrunletRegistryE2E]::Set($renameAlias,'SymbolicLinkValue',6,$original)
-                $renameRaw=$native.GetMethod('OpenNative',$static).Invoke($null,[object[]]@($null,$parent.Handle,'guard-rename',[uint32]0x20119,'Cannot open isolated rename probe',$false))
-                $renameTarget=Core-Target ($fixtureHive+'\'+$renameRelative) $null
-                $transaction=[Activator]::CreateInstance($transactionType,$true)
-                $null=$guard.Invoke($null,[object[]]@($transaction,$renameTarget,$renameRaw,$value,$true))
-                $bound=$native.GetMethod('BindTransaction',$static).Invoke($null,[object[]]@($transaction,$target,$targets[0].Handle,[uint32]2))
-                $null=$native.GetMethod('SetRaw',$static).Invoke($null,[object[]]@($bound,$staged))
-                $null=$transactionType.GetMethod('VerifyPinnedNames',$instance).Invoke($transaction,@())
-                $renameError=[PrunletRegistryE2E]::RenameVolatileLink($renameRelative,$renameAlias,'guard-renamed')
-                $renameCommitted=$false; $renameCommitError=$null; $replacementPreserved=$true
-                if($renameError -eq 0){
-                    $replacement=[PrunletRegistryE2E]::CreateVolatile($renameRelative,$true)
-                    [PrunletRegistryE2E]::Set($replacement,'SymbolicLinkValue',6,$changed)
-                    $handle=$transactionType.GetProperty('Handle',$instance).GetValue($transaction)
-                    $renameCommitted=$native.GetMethod('CommitTransaction',$static).Invoke($null,[object[]]@($handle)); $renameCommitError=if($renameCommitted){0}else{[Runtime.InteropServices.Marshal]::GetLastWin32Error()}
-                }
-                $transaction.Dispose(); $transaction=$null
-                if($replacement){$replacementPreserved=[PrunletRegistryE2E]::Value($replacement,'SymbolicLinkValue') -ceq ('6:'+[Convert]::ToBase64String($changed))}
-                $renamedSourcePreserved=[PrunletRegistryE2E]::Value($renameAlias,'SymbolicLinkValue') -ceq ('6:'+[Convert]::ToBase64String($original)); $renameTargetsPreserved=$true
-                for($i=0;$i -lt $targetRelatives.Count;$i++){$renameTargetsPreserved=$renameTargetsPreserved -and (([PrunletRegistryE2E]::Snapshot($targetRelatives[$i],64) -join "`n") -ceq $targetSnapshots[$i])}
-                Save-Json (Join-Path $script:CaseRoot 'classes-rename-evidence.json') @{ assemblyPath=$AssemblyPath; assemblySha256=(Digest $AssemblyPath); renameError=$renameError; replacementCreated=($null -ne $replacement); committed=$renameCommitted; commitError=$renameCommitError; renamedSourceBytesPreserved=$renamedSourcePreserved; replacementBytesPreserved=$replacementPreserved; targetMutationRolledBack=$renameTargetsPreserved; scope='Production guard + staged target; NtRenameKey after final check; real replacement when accepted; raw KTM commit without second check; isolated volatile fixture only' }
-                Assert-True ((($renameError -eq 6800) -or ($renameError -eq 0 -and !$renameCommitted)) -and $renamedSourcePreserved -and $replacementPreserved -and $renameTargetsPreserved) 'Alias rename/replacement was not blocked or rolled back after the final check.'
-            } finally {if($transaction){$transaction.Dispose();$transaction=$null};if($replacement){$replacement.Dispose()};if($renameRaw){$renameRaw.Dispose()};$renameAlias.Dispose()}
-        } finally {
-            if($transaction){$transaction.Dispose()}; if($denied -and $savedDacl){[PrunletRegistryE2E]::RestoreFixtureDacl($deniedRelative,$denied,$savedDacl)}; if($deniedRaw){$deniedRaw.Dispose()}; if($aliasRaw){$aliasRaw.Dispose()}; if($parent){$parent.Dispose()}; if($denied){$denied.Dispose()}; $plain.Dispose(); $alias.Dispose(); foreach($key in $targets){$key.Dispose()}
-        }
+        $evidence=Invoke-RustNativeContract 'classes-alias-guard' $runPath
+        Assert-True ($evidence.result.retainedVolatileLinkRoot -ceq ($fixtureHive+'\'+$linkRelative)) 'Rust probe volatile link root escaped the owned sibling'
+        $script:createdLinkFixture=$true
+        Save-Json (Join-Path $script:CaseRoot 'classes-guard-evidence.json') $evidence
     }
     Case 'core-incomplete-links-cannot-be-used-as-ordinary-keys' {
-        if (!(Exists $linkRelative)) {
-            $root = [PrunletRegistryE2E]::CreateVolatile($linkRelative); $root.Dispose(); $script:createdLinkFixture = $true
-        }
-        $assembly = [Reflection.Assembly]::LoadFrom($AssemblyPath)
-        $native = $assembly.GetType('Prunlet.Core.NativeRegistry',$true)
-        $flags = [Reflection.BindingFlags]'Static,NonPublic'
-        $ordinaryOpen = $native.GetMethod('OpenOrdinaryKey',$flags)
-        $rawOpen = $native.GetMethod('OpenNative',$flags)
-        $keyName = $native.GetMethod('NtKeyName',$flags)
-        $parent = [PrunletRegistryE2E]::Open($linkRelative,64)
-        $targetRelative = $linkRelative+'\incomplete-target'
-        $target = [PrunletRegistryE2E]::CreateVolatile($targetRelative)
-        $child = [PrunletRegistryE2E]::CreateVolatile($targetRelative+'\child')
-        $plain = [PrunletRegistryE2E]::CreateVolatile($linkRelative+'\incomplete-ordinary')
-        $link = [PrunletRegistryE2E]::CreateVolatile($linkRelative+'\incomplete-source',$true)
-        try {
-            [PrunletRegistryE2E]::Set($target,'sentinel',3,[byte[]]@(42,0,255))
-            [PrunletRegistryE2E]::Set($child,'sentinel',3,[byte[]]@(17,18,19))
-            [PrunletRegistryE2E]::Set($plain,'SymbolicLinkValue',1,[Text.Encoding]::Unicode.GetBytes("ordinary text`0"))
-            $before = [PrunletRegistryE2E]::Snapshot($targetRelative,64) -join "`n"
-            $plainBefore = [PrunletRegistryE2E]::Snapshot($linkRelative+'\incomplete-ordinary',64) -join "`n"
-            $secure = $ordinaryOpen.Invoke($null,[object[]]@($null,$plain.Handle,$parent.Handle,'incomplete-ordinary',[uint32]0x20119))
-            try { Assert-True ($keyName.Invoke($null,[object[]]@($secure)) -ceq $keyName.Invoke($null,[object[]]@($plain.Handle))) 'Ordinary key proof returned another key.' }
-            finally { $secure.Dispose() }
-            $states = @()
-            foreach ($state in @('missing','restored')) {
-                if ($state -eq 'missing') {
-                    $refused = Invoke-RegistryCli @('registry-delete','--view','64','--value-name','sentinel','--dry-run','--',($fixtureHive+'\'+$linkRelative+'\incomplete-source'))
-                    Assert-True ($refused.ExitCode -ne 0 -and $refused.Json.items[0].status -ceq 'failed') 'An incomplete actual link was reported as an absent target.'
-                }
-                if ($state -eq 'restored') {
-                    $destination = $keyName.Invoke($null,[object[]]@($target.Handle))
-                    [PrunletRegistryE2E]::Set($link,'SymbolicLinkValue',6,[Text.Encoding]::Unicode.GetBytes($destination))
-                }
-                $failure = $null
-                try {
-                    $unexpected = $ordinaryOpen.Invoke($null,[object[]]@($null,$link.Handle,$parent.Handle,'incomplete-source',[uint32]0x20119))
-                    $unexpected.Dispose()
-                } catch { $failure = $_.Exception.ToString() }
-                Assert-True ($null -ne $failure) "Actual link with $state metadata passed ordinary-key validation."
-                $states += @{state=$state;refused=$true;error=$failure}
-            }
-            # 分類後にREG_LINK値が復活しても、保持したraw linkを親にした再解析を許さない。
-            $childFailure = $null; $childNativeError = $null
-            try {
-                $unexpected = $rawOpen.Invoke($null,[object[]]@($null,$link.Handle,'child',[uint32]0x20119,'Incomplete-link regression probe',$false))
-                $unexpected.Dispose()
-            } catch {
-                $childFailure = $_.Exception.ToString(); $cause = $_.Exception
-                while ($cause) { if ($cause -is [ComponentModel.Win32Exception]) { $childNativeError = $cause.NativeErrorCode; break }; $cause = $cause.InnerException }
-            }
-            Assert-True ($null -ne $childFailure -and $childNativeError -eq 4395) 'A held raw link was not rejected as a reparse point.'
-            Assert-True (([PrunletRegistryE2E]::Snapshot($targetRelative,64) -join "`n") -ceq $before -and ([PrunletRegistryE2E]::Snapshot($linkRelative+'\incomplete-ordinary',64) -join "`n") -ceq $plainBefore) 'Ordinary-key validation changed fixture values or full security.'
-            Save-Json (Join-Path $script:CaseRoot 'incomplete-link-evidence.json') @{assemblyPath=$AssemblyPath;assemblySha256=(Digest $AssemblyPath);ordinaryKeyAccepted=$true;states=$states;incompleteCliStatus=$refused.Json.items[0].status;restoredRawParentChildRefused=$true;childNativeError=$childNativeError;childError=$childFailure;targetAndOrdinaryPreserved=$true;scope='Production secure ordinary-open and raw-parent no-reparse checks; isolated volatile link; no real Classes metadata removal'}
-        } finally { $link.Dispose(); $plain.Dispose(); $child.Dispose(); $target.Dispose(); $parent.Dispose() }
+        $evidence=Invoke-RustNativeContract 'incomplete-links' $runPath
+        Assert-True ($evidence.result.retainedVolatileLinkRoot -ceq ($fixtureHive+'\'+$linkRelative)) 'Rust probe volatile link root escaped the owned sibling'
+        $script:createdLinkFixture=$true
+        Save-Json (Join-Path $script:CaseRoot 'incomplete-link-evidence.json') $evidence
+    }
+    Case 'core-snapshot-publication-fault-rolls-back-staged-value' {
+        $evidence=Invoke-RustNativeContract 'snapshot-publication-rollback' $runPath
+        # このprobeはリンク領域ではなく、固定した通常fixture直下の新規GUID子だけを使う。
+        Assert-True ($evidence.result.fixture -cmatch ('\A'+[regex]::Escape($runPath+'\rust-publication-fault-')+'[0-9a-f]{32}\z')) 'Rust publication probe escaped the owned fixture child'
+        $metadataParent=Join-Path $script:CaseRoot 'temp'
+        Assert-True ($evidence.result.metadataFixture -cmatch ('\A'+[regex]::Escape($metadataParent+'\registry-publication-fault-')+'[0-9a-f]{32}\\registry-snapshot\.json\z')) 'Rust publication metadata escaped the owned temporary child'
+        $proof=$evidence.result.evidence
+        Assert-True ($proof.realTransactionStaged -eq $true -and $proof.actualPersistedBytesCorrupted -eq $true -and $proof.nativeCommitCalled -eq $false -and $proof.originalRegistryRawBytesAndFullSecurityPreserved -eq $true -and $proof.privateAclFromCreation -eq $true -and $proof.expectedSha256 -cmatch '\A[0-9a-f]{64}\z' -and $proof.actualSha256 -cmatch '\A[0-9a-f]{64}\z' -and $proof.expectedSha256 -cne $proof.actualSha256) 'Rust publication rollback did not establish the native transaction and preservation proof'
+        Save-Json (Join-Path $script:CaseRoot 'staged-publication-rollback-evidence.json') $evidence
     }
 }
 Case 'explicit-views-do-not-touch-distinct-other-view' {
@@ -866,29 +540,26 @@ Case 'capacity-single-oversized-then-normal-budget' {
 Case 'recordless-files-excluded-from-registry-capacity-and-restore-type-guards' {
     . (Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1')
     $script:observed = @{}
-    if (!('Prunlet.RecordlessE2E.FixtureNative' -as [type])) {
-        Add-Type -Path @('NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs' | ForEach-Object { Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $_ }) -CompilerOptions '/unsafe'
-    }
     $fileScope = $script:CaseRoot
     if ($FixtureRoot) {
         $script:fileFixtureRun = New-VerificationFixtureRun -FixtureRoot $FixtureRoot -ForbiddenRoots @($repoRoot,$codexRoot) -NamePrefix 'registry-files'
         $fileScope = $script:fileFixtureRun.directory
     }
     $file = Join-Path $fileScope 'mixed-file.bin'; [IO.File]::WriteAllBytes($file,[byte[]](0..255)*16)
-    $fileBefore = [Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($file)
-    $priorPidls = [string[]]@([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($fileBefore[0].Id) | ForEach-Object Pidl)
+    $fileBefore = Get-FileFixtureSnapshot -Path $file
+    $priorPidls = [string[]]@(Find-FileFixtureBinIdentity -ExpectedId $fileBefore[0].Id | ForEach-Object Pidl)
     Fixture; $registryBefore = Snapshot
     $deleted = Invoke-RegistryCli @('delete','--',$file)
     Assert-True ($deleted.ExitCode -eq 0 -and !$deleted.Json.PSObject.Properties['operationId'] -and $deleted.Json.items[0].status -ceq 'recycled' -and ![IO.File]::Exists($file)) 'Current file deletion must recycle without an operation record.'
-    $bin = [Prunlet.RecordlessE2E.OwnedBinLocator]::FindNew($fileBefore[0].Id,$priorPidls)
-    $binBefore = [Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($bin.PhysicalPath)
+    $bin = Find-FileFixtureBinNew -ExpectedId $fileBefore[0].Id -PriorPidls $priorPidls
+    $binBefore = Get-FileFixtureSnapshot -Path $bin.PhysicalPath
     $registryOp = Delete-Registry; $registryHash = Digest $registryOp.Payload; $registryBytes = [IO.FileInfo]::new($registryOp.Payload).Length
     foreach ($mode in @('--dry-run','--apply')) {
         $config = Read-Json $script:Config; $config.maxRecoveryBytes = $registryBytes; Save-Json $script:Config $config
         $inspection = Invoke-RegistryCli @('maintain',$mode)
         Assert-True ($inspection.ExitCode -eq 0 -and $inspection.Json.capacityKnown -and $inspection.Json.retainedBytesBefore -eq $registryBytes -and $inspection.Json.retainedBytesAfter -eq $registryBytes) 'Registry capacity included Windows-managed file bytes.'
         Assert-True ((Digest $registryOp.Payload) -ceq $registryHash -and ![IO.File]::Exists($file)) 'Registry-only retention changed either source or snapshot.'
-        $binAfter = [Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($bin.PhysicalPath)
+        $binAfter = Get-FileFixtureSnapshot -Path $bin.PhysicalPath
         Assert-True (($binAfter | ConvertTo-Json -Depth 20 -Compress) -ceq ($binBefore | ConvertTo-Json -Depth 20 -Compress)) 'Registry maintenance changed owned Bin native data/security.'
     }
     $p = Start-Child @('mcp'); $completed = $false
@@ -916,10 +587,7 @@ Case 'recordless-files-excluded-from-registry-capacity-and-restore-type-guards' 
     $empty=Invoke-RegistryCli @('maintain','--dry-run');Assert-True ($empty.ExitCode-eq0-and$empty.Json.retainedBytesBefore-eq0) 'Consumed registry snapshot remains in capacity.'
 }
 Case 'backup-restore-protected-cli-mcp-key-value-roundtrip' {
-    $compilerTemp = Join-Path $script:CaseRoot 'temp'; $oldTemp=$env:TEMP; $oldTmp=$env:TMP
-    try { $env:TEMP=$compilerTemp; $env:TMP=$compilerTemp; Add-Type -Path (Join-Path $PSScriptRoot 'ProtectedRegistryAccess.Native.cs') }
-    finally { $env:TEMP=$oldTemp; $env:TMP=$oldTmp }
-    $privileges = [ProtectedRegistryAccessProbe+PrivilegeLease]::new()
+    $privileges = Start-ProtectedFixturePrivileges
     $root = $null; $p = $null
     function Protected-Rpc([object]$Request, [string]$Raw) {
         $line = if ($Raw) { $Raw } else { $Request | ConvertTo-Json -Depth 30 -Compress }
@@ -950,30 +618,31 @@ Case 'backup-restore-protected-cli-mcp-key-value-roundtrip' {
     }
     try {
         foreach ($protocol in @('cli','mcp')) {
-            $parentRelative=$script:Relative+'\'+$protocol; $parent=[PrunletRegistryE2E]::Create($parentRelative,64)
+            $parentRelative=$script:Relative+'\'+$protocol; $parent=(New-RegistryFixtureKey ($parentRelative) (64))
             $relative=$parentRelative+'\restricted'; $path=$fixtureHive+'\'+$relative
-            $target=[PrunletRegistryE2E]::CreateWithClass($relative,('protected '+$protocol+' 日本語 class'))
-            $child=[PrunletRegistryE2E]::CreateWithClass($relative+'\child','protected child class')
+            $target=(New-RegistryFixtureWithClass ($relative) (('protected '+$protocol+' 日本語 class')))
+            $child=(New-RegistryFixtureWithClass ($relative+'\child') ('protected child class'))
             $backup=$null; $originalDacl=$null
             try {
-                [PrunletRegistryE2E]::Set($parent,'sentinel',3,[byte[]]@(99,0,254))
-                [PrunletRegistryE2E]::Set($target,'sentinel',3,[byte[]]@(0,1,128,255))
-                [PrunletRegistryE2E]::Set($target,'',3,[byte[]]@(7,0,255))
-                [PrunletRegistryE2E]::Set($child,'sentinel',11,[BitConverter]::GetBytes([uint64]0x123456789abcdef))
-                $originalDacl=[PrunletRegistryE2E]::FixtureDacl($relative,$target)
-                $childSecurity=[Convert]::ToBase64String([ProtectedRegistryAccessProbe]::Security(($childSecurityOpen=[ProtectedRegistryAccessProbe]::Open($null,$target.Handle,'child',4,$false,[uint32]0x010F013F)).Handle))
-                $childSecurityOpen.Dispose()
-                $childValue=[PrunletRegistryE2E]::Value($child,'sentinel'); $child.Dispose(); $child=$null
-                [ProtectedRegistryAccessProbe]::Restrict($target.Handle)
-                $backup=[ProtectedRegistryAccessProbe]::Open($null,$parent.Handle,'restricted',4,$false,[uint32]0x010F013F)
+                (Set-RegistryFixtureValue ($parent) ('sentinel') (3) ([byte[]]@(99,0,254)))
+                (Set-RegistryFixtureValue ($target) ('sentinel') (3) ([byte[]]@(0,1,128,255)))
+                (Set-RegistryFixtureValue ($target) ('') (3) ([byte[]]@(7,0,255)))
+                (Set-RegistryFixtureValue ($child) ('sentinel') (11) ([BitConverter]::GetBytes([uint64]0x123456789abcdef)))
+                $originalDacl=(Get-RegistryFixtureDacl ($relative) ($target))
+                $childSecurityOpen=Open-ProtectedFixtureKey $null $target.Handle 'child' 4 $false ([uint32]0x010F013F)
+                try { $childSecurity=[Convert]::ToBase64String((Get-ProtectedFixtureSecurity $childSecurityOpen.Handle)) }
+                finally { $childSecurityOpen.Dispose() }
+                $childValue=(Get-RegistryFixtureValue ($child) ('sentinel')); $child.Dispose(); $child=$null
+                (Set-ProtectedFixtureRestriction ($target.Handle))
+                $backup=(Open-ProtectedFixtureKey ($null) ($parent.Handle) ('restricted') (4) ($false) ([uint32]0x010F013F))
                 Assert-True ($backup.Error -eq 0) 'Protected observation open failed.'
-                $security=[Convert]::ToBase64String([ProtectedRegistryAccessProbe]::Security($backup.Handle))
-                $value=[ProtectedRegistryAccessProbe]::Value($backup.Handle,''); $class=[ProtectedRegistryAccessProbe]::Class($backup.Handle)
+                $security=[Convert]::ToBase64String((Get-ProtectedFixtureSecurity ($backup.Handle)))
+                $value=(Get-ProtectedFixtureValue ($backup.Handle) ('')); $class=(Get-ProtectedFixtureClass ($backup.Handle))
                 if ($protocol -eq 'mcp') {
                     $privileges.Dispose(); Assert-True $privileges.Restored 'Observer privileges were not restored before MCP launch.'
                     $p=Start-Child @('mcp'); $stderrTask=$p.StandardError.ReadToEndAsync(); $script:protectedRpcId=100
-                    $processBefore=[ProtectedRegistryAccessProbe]::ProcessPrivileges([uint32]$p.Id)
-                    $privileges=[ProtectedRegistryAccessProbe+PrivilegeLease]::new()
+                    $processBefore=(Get-ProtectedFixtureProcessPrivileges ([uint32]$p.Id))
+                    $privileges=Start-ProtectedFixturePrivileges
                     $initialized=Protected-Rpc @{jsonrpc='2.0';id=1;method='initialize';params=@{protocolVersion='2024-11-05';capabilities=@{};clientInfo=@{name='protected-registry-e2e';version='1'}}}
                     Assert-True ($null -ne $initialized.result) 'Protected MCP initialization failed.'
                     $p.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}'); $p.StandardInput.Flush()
@@ -985,22 +654,22 @@ Case 'backup-restore-protected-cli-mcp-key-value-roundtrip' {
                 }
                 $normal=Protected-Call 'delete_registry' @{path=$path;view='64';valueName='';dryRun=$true;accessMode='normal'}
                 Assert-True (!$normal.ok) 'Normal access unexpectedly bypassed the deny ACL.'
-                $records=Recovery-State; $lastWrite=[PrunletRegistryE2E]::KeyLastWrite($target)
+                $records=Recovery-State; $lastWrite=(Get-RegistryFixtureLastWrite ($target))
                 $normalKey=Protected-Call 'delete_registry' @{path=$path;view='64';recursive=$true;dryRun=$true;accessMode='normal'}
-                Assert-True (!$normalKey.ok -and (Recovery-State) -ceq $records -and [PrunletRegistryE2E]::KeyLastWrite($target) -eq $lastWrite -and [Convert]::ToBase64String([ProtectedRegistryAccessProbe]::Security($backup.Handle)) -ceq $security) 'Normal key access bypassed the deny ACL or changed the source.'
+                Assert-True (!$normalKey.ok -and (Recovery-State) -ceq $records -and (Get-RegistryFixtureLastWrite ($target)) -eq $lastWrite -and [Convert]::ToBase64String((Get-ProtectedFixtureSecurity ($backup.Handle))) -ceq $security) 'Normal key access bypassed the deny ACL or changed the source.'
                 $dry=Protected-Call 'delete_registry' @{path=$path;view='64';valueName='';dryRun=$true;accessMode='backupRestore'}
-                Assert-True ($dry.ok -and $dry.data.items[0].status -eq 'would_delete' -and (Recovery-State) -ceq $records -and [PrunletRegistryE2E]::KeyLastWrite($target) -eq $lastWrite) 'Protected dry-run failed or changed data/records/timestamp.'
+                Assert-True ($dry.ok -and $dry.data.items[0].status -eq 'would_delete' -and (Recovery-State) -ceq $records -and (Get-RegistryFixtureLastWrite ($target)) -eq $lastWrite) 'Protected dry-run failed or changed data/records/timestamp.'
                 $deleted=Protected-Call 'delete_registry' @{path=$path;view='64';valueName='';accessMode='backupRestore'}
                 Assert-True ($deleted.ok -and $deleted.data.operationId) 'Protected value deletion failed.'
                 $id=$deleted.data.operationId; $payload=Join-Path (Join-Path (Join-Path $script:Recovery '.registry-records-v1') $id) 'registry-snapshot.json'; $hash=Digest $payload
                 $normal=Protected-Call 'restore_registry' @{operationId=$id;accessMode='normal'}
                 Assert-True (!$normal.ok -and (Digest $payload) -ceq $hash) 'Restore silently remembered the deletion access mode.'
-                [PrunletRegistryE2E]::Set($target,'',3,[byte[]]@())
+                (Set-RegistryFixtureValue ($target) ('') (3) ([byte[]]@()))
                 $conflict=Protected-Call 'restore_registry' @{operationId=$id;accessMode='backupRestore'}
-                Assert-True (!$conflict.ok -and (Digest $payload) -ceq $hash -and [ProtectedRegistryAccessProbe]::Value($backup.Handle,'') -ceq '3:') 'Protected restore overwrote an existing empty default value.'
+                Assert-True (!$conflict.ok -and (Digest $payload) -ceq $hash -and (Get-ProtectedFixtureValue ($backup.Handle) ('')) -ceq '3:') 'Protected restore overwrote an existing empty default value.'
                 $null=Protected-Call 'delete_registry' @{path=$path;view='64';valueName='';accessMode='backupRestore'}
                 $restored=Protected-Call 'restore_registry' @{operationId=$id;accessMode='backupRestore'}
-                Assert-True ($restored.ok -and [ProtectedRegistryAccessProbe]::Value($backup.Handle,'') -ceq $value -and [Convert]::ToBase64String([ProtectedRegistryAccessProbe]::Security($backup.Handle)) -ceq $security) 'Protected value roundtrip changed raw bytes or parent ACL.'
+                Assert-True ($restored.ok -and (Get-ProtectedFixtureValue ($backup.Handle) ('')) -ceq $value -and [Convert]::ToBase64String((Get-ProtectedFixtureSecurity ($backup.Handle))) -ceq $security) 'Protected value roundtrip changed raw bytes or parent ACL.'
                 $normal=Protected-Call 'delete_registry' @{path=$path;view='64';valueName='';dryRun=$true;accessMode='normal'}
                 Assert-True (!$normal.ok) 'A later normal MCP request inherited backup/restore access.'
                 $backup.Dispose();$backup=$null;$target.Dispose();$target=$null
@@ -1010,22 +679,21 @@ Case 'backup-restore-protected-cli-mcp-key-value-roundtrip' {
                 Assert-True ($keyPayload.schema -eq 5 -and $keyPayload.keys[0].class -ceq $class -and !$keyPayload.ContainsKey('accessMode')) 'Protected snapshot schema/class contract changed.'
                 $restored=Protected-Call 'restore_registry' @{operationId=$deleted.data.operationId;accessMode='backupRestore'}
                 Assert-True $restored.ok 'Protected key restoration failed.'
-                $backup=[ProtectedRegistryAccessProbe]::Open($null,$parent.Handle,'restricted',4,$false,[uint32]0x010F013F)
-                Assert-True ($backup.Error -eq 0 -and [ProtectedRegistryAccessProbe]::Class($backup.Handle) -ceq $class -and [ProtectedRegistryAccessProbe]::Value($backup.Handle,'') -ceq $value -and [Convert]::ToBase64String([ProtectedRegistryAccessProbe]::Security($backup.Handle)) -ceq $security) 'Protected key class/raw/full ACL roundtrip failed.'
-                $childOpen=[ProtectedRegistryAccessProbe]::Open($null,$backup.Handle,'child',4,$false,[uint32]0x010F013F)
-                try { Assert-True ($childOpen.Error -eq 0 -and [ProtectedRegistryAccessProbe]::Value($childOpen.Handle,'sentinel') -ceq $childValue -and [Convert]::ToBase64String([ProtectedRegistryAccessProbe]::Security($childOpen.Handle)) -ceq $childSecurity -and [PrunletRegistryE2E]::Value($parent,'sentinel') -ceq '3:YwD+') 'Child/sibling raw or complete security changed.' }
+                $backup=(Open-ProtectedFixtureKey ($null) ($parent.Handle) ('restricted') (4) ($false) ([uint32]0x010F013F))
+                Assert-True ($backup.Error -eq 0 -and (Get-ProtectedFixtureClass ($backup.Handle)) -ceq $class -and (Get-ProtectedFixtureValue ($backup.Handle) ('')) -ceq $value -and [Convert]::ToBase64String((Get-ProtectedFixtureSecurity ($backup.Handle))) -ceq $security) 'Protected key class/raw/full ACL roundtrip failed.'
+                $childOpen=(Open-ProtectedFixtureKey ($null) ($backup.Handle) ('child') (4) ($false) ([uint32]0x010F013F))
+                try { Assert-True ($childOpen.Error -eq 0 -and (Get-ProtectedFixtureValue ($childOpen.Handle) ('sentinel')) -ceq $childValue -and [Convert]::ToBase64String((Get-ProtectedFixtureSecurity ($childOpen.Handle))) -ceq $childSecurity -and (Get-RegistryFixtureValue ($parent) ('sentinel')) -ceq '3:YwD+') 'Child/sibling raw or complete security changed.' }
                 finally { $childOpen.Dispose() }
                 if ($protocol -eq 'mcp') {
-                    $processAfter=[ProtectedRegistryAccessProbe]::ProcessPrivileges([uint32]$p.Id)
+                    $processAfter=(Get-ProtectedFixtureProcessPrivileges ([uint32]$p.Id))
                     foreach ($name in $processBefore.Keys) { Assert-True ($processBefore[$name] -ceq $processAfter[$name]) "MCP process-token privilege changed: $name" }
                     Save-Json (Join-Path $script:CaseRoot 'protected-mcp-token-attributes.json') @{before=$processBefore;after=$processAfter}
                 }
             } finally {
                 if ($p) { $p.StandardInput.Close(); if (!$p.WaitForExit(15000)) {$p.Kill($true)}; $p.Dispose(); $p=$null }
                 if ($backup) {
-                    $restoredKey=[Microsoft.Win32.RegistryKey]::FromHandle($backup.Handle)
-                    try { if ($originalDacl) {[PrunletRegistryE2E]::RestoreFixtureDacl($relative,$restoredKey,$originalDacl)} } finally {$restoredKey.Dispose();$backup.Dispose()}
-                } elseif ($target -and $originalDacl) { [PrunletRegistryE2E]::RestoreFixtureDacl($relative,$target,$originalDacl) }
+                    try { if ($originalDacl) { Restore-ProtectedFixtureDacl -Lease $backup.Handle -Relative $relative -Security $originalDacl } } finally { $backup.Dispose() }
+                } elseif ($target -and $originalDacl) { (Restore-RegistryFixtureDacl ($relative) ($target) ($originalDacl)) }
                 if ($target) {$target.Dispose()}; if ($child) {$child.Dispose()}; $parent.Dispose()
             }
         }
@@ -1093,18 +761,18 @@ Case 'mcp-schema-errors-roundtrip-and-iserror' {
         Assert-True (!$deleted.result.isError) 'MCP conflict setup delete failed.'
         $valueId = $deleted.result.structuredContent.operationId
         $payload = Join-Path (Join-Path (Join-Path $script:Recovery '.registry-records-v1') $valueId) 'registry-snapshot.json'; $hash = Digest $payload
-        $k = [PrunletRegistryE2E]::Create($script:Relative,64)
-        try { [PrunletRegistryE2E]::Set($k,$name,1,[Text.Encoding]::Unicode.GetBytes("fixture:$name`0")) } finally { $k.Dispose() }
+        $k = (New-RegistryFixtureKey ($script:Relative) (64))
+        try { (Set-RegistryFixtureValue ($k) ($name) (1) ([Text.Encoding]::Unicode.GetBytes("fixture:$name`0"))) } finally { $k.Dispose() }
         $conflictBefore = Snapshot
         $reply = Rpc @{ jsonrpc='2.0'; id=$rpcId++; method='tools/call'; params=@{ name='restore_registry'; arguments=@{ operationId=$valueId } } }
         Assert-True ($reply.result.isError -and (Snapshot) -ceq $conflictBefore -and (Digest $payload) -ceq $hash) 'MCP value conflict changed source or snapshot.'
-        $aliasBefore = [PrunletRegistryE2E]::ClassesAliasState()
+        $aliasBefore = (Get-RegistryFixtureClassesAliasState)
         foreach ($view in @(32,64)) {
             $script:Relative = $classesRelative+'\mcp'+$view; $script:Path = 'HKEY_CURRENT_USER\'+$script:Relative
             Fixture -Tree -View $view; $before = Snapshot $view
-            $sourceBefore = [PrunletRegistryE2E]::ClassesAliasState(); $recordsBefore = Recovery-State
+            $sourceBefore = (Get-RegistryFixtureClassesAliasState); $recordsBefore = Recovery-State
             $dry = Rpc @{ jsonrpc='2.0'; id=$rpcId++; method='tools/call'; params=@{ name='delete_registry'; arguments=@{ path=$script:Path; view="$view"; valueName=$pathValueNames[0]; dryRun=$true } } }
-            Assert-True (!$dry.result.isError -and (Snapshot $view) -ceq $before -and [PrunletRegistryE2E]::ClassesAliasState() -ceq $sourceBefore -and (Recovery-State) -ceq $recordsBefore) 'MCP Classes dry-run changed ancestor timestamp, raw bytes, full ACL, target, or metadata.'
+            Assert-True (!$dry.result.isError -and (Snapshot $view) -ceq $before -and (Get-RegistryFixtureClassesAliasState) -ceq $sourceBefore -and (Recovery-State) -ceq $recordsBefore) 'MCP Classes dry-run changed ancestor timestamp, raw bytes, full ACL, target, or metadata.'
             foreach ($name in $pathValueNames) {
                 $deleted = Rpc @{ jsonrpc='2.0'; id=$rpcId++; method='tools/call'; params=@{ name='delete_registry'; arguments=@{ path=$script:Path; view="$view"; valueName=$name } } }
                 Assert-True (!$deleted.result.isError -and $deleted.result.structuredContent.items[0].kind -ceq 'registry-value') 'MCP Classes value delete failed.'
@@ -1113,15 +781,15 @@ Case 'mcp-schema-errors-roundtrip-and-iserror' {
                 $expected = (($before -split "`n" | Where-Object { !$_.StartsWith($prefix,[StringComparison]::Ordinal) }) -join "`n")
                 Assert-True ((Snapshot $view) -ceq $expected) 'MCP Classes value delete changed siblings or full security.'
                 $reply = Rpc @{ jsonrpc='2.0'; id=$rpcId++; method='tools/call'; params=@{ name='restore_registry'; arguments=@{ operationId=$valueId } } }
-                Assert-True (!$reply.result.isError -and (Snapshot $view) -ceq $before -and ([PrunletRegistryE2E]::ClassesBackingSnapshot($script:Relative,$view) -join "`n") -ceq $before) 'MCP Classes restore changed path-shaped names, raw bytes, siblings, or full ACL.'
+                Assert-True (!$reply.result.isError -and (Snapshot $view) -ceq $before -and ((Get-RegistryFixtureClassesBackingSnapshot $script:Relative $view) -join "`n") -ceq $before) 'MCP Classes restore changed path-shaped names, raw bytes, siblings, or full ACL.'
             }
             $name = $pathValueNames[0]
             $deleted = Rpc @{ jsonrpc='2.0'; id=$rpcId++; method='tools/call'; params=@{ name='delete_registry'; arguments=@{ path=$script:Path; view="$view"; valueName=$name } } }
             Assert-True (!$deleted.result.isError) 'MCP Classes conflict setup failed.'
             $valueId = $deleted.result.structuredContent.operationId
             $payload = Join-Path (Join-Path (Join-Path $script:Recovery '.registry-records-v1') $valueId) 'registry-snapshot.json'; $hash = Digest $payload
-            $k = [PrunletRegistryE2E]::Create($script:Relative,$view)
-            try { [PrunletRegistryE2E]::Set($k,$name,1,[Text.Encoding]::Unicode.GetBytes("fixture:$name`0")) } finally { $k.Dispose() }
+            $k = (New-RegistryFixtureKey ($script:Relative) ($view))
+            try { (Set-RegistryFixtureValue ($k) ($name) (1) ([Text.Encoding]::Unicode.GetBytes("fixture:$name`0"))) } finally { $k.Dispose() }
             $reply = Rpc @{ jsonrpc='2.0'; id=$rpcId++; method='tools/call'; params=@{ name='restore_registry'; arguments=@{ operationId=$valueId } } }
             Assert-True ($reply.result.isError -and (Snapshot $view) -ceq $before -and (Digest $payload) -ceq $hash) 'MCP Classes conflict changed original or snapshot.'
             $script:Relative = $classesRelative; $script:Path = 'HKEY_CURRENT_USER\'+$classesRelative; $beforeRoot = Snapshot $view
@@ -1130,7 +798,7 @@ Case 'mcp-schema-errors-roundtrip-and-iserror' {
             $reply = Rpc @{ jsonrpc='2.0'; id=$rpcId++; method='tools/call'; params=@{ name='restore_registry'; arguments=@{ operationId=$deleted.result.structuredContent.operationId } } }
             Assert-True (!$reply.result.isError -and (Snapshot $view) -ceq $beforeRoot) 'MCP direct Classes child key restore changed tree or full ACL.'
         }
-        Assert-True ((Alias-Content ([PrunletRegistryE2E]::ClassesAliasState())) -ceq (Alias-Content $aliasBefore)) 'MCP Classes operations changed ancestor raw link bytes or full ACL.'
+        Assert-True ((Alias-Content ((Get-RegistryFixtureClassesAliasState))) -ceq (Alias-Content $aliasBefore)) 'MCP Classes operations changed ancestor raw link bytes or full ACL.'
         $mcpCompleted = $true
     } finally {
         $p.StandardInput.Close()
@@ -1143,9 +811,12 @@ Case 'mcp-schema-errors-roundtrip-and-iserror' {
 }
 . (Join-Path $PSScriptRoot 'registry-session-e2e/RegistryControlCases.ps1')
 if (!$results.Count) { $results.Add(@{ name='case-filter-matched-no-cases'; passed=$false; error='CaseFilter matched no cases.' }) }
+# 固定sourceが変わった場合、候補の同一性を主張せずfixtureも保持する。
+$bindingValid=$true
+if($RustProbePath){try{Assert-RegistryRustBinding}catch{$bindingValid=$false;$results.Add(@{name='same-source-build-binding';passed=$false;error=$_.Exception.Message})}}
 # 清掃も今回exeを一度だけ利用する。拒否は別APIへ付け替えず残存パスを報告する。
 $cleanup = @{ attempted = $false; remainingRegistryPath = $runPath; remainingClassesPath = 'HKEY_CURRENT_USER\'+$classesRelative; retainedVolatileLinkPath = $(if ($createdLinkFixture) { $fixtureHive+'\'+$linkRelative } else { $null }); operations = @() }
-if ($createdFixture) {
+if ($createdFixture -and $bindingValid) {
     try {
         New-Case 'fixture-cleanup'
         $cleanup.attempted = $true
@@ -1165,13 +836,14 @@ if ($createdFixture) {
         if (!(Exists $classesRelative 64) -and !(Exists $classesRelative 32)) { $cleanup.remainingClassesPath = $null }
     } catch { $cleanup.error = $_.Exception.Message }
 }
+if($RustProbePath -and $bindingValid){try{Assert-RegistryRustBinding}catch{$results.Add(@{name='same-source-build-binding-final';passed=$false;error=$_.Exception.Message})}}
 $passed = @($results | Where-Object passed).Count; $skipped = @($results | Where-Object skipped).Count; $failed = $results.Count - $passed - $skipped
 $unverified = @('Actual OS Classes alias destination swaps are not performed; the production guard/commit race and source rename/replacement are probed only on dedicated volatile links. Exact privilege-deficient token behavior requires separate native probes.','KTM crash timing requires separate integration probes.','Distinct WOW64 view isolation requires separate views; shared views do not verify isolation. See view-observation.json.')
 if (!@($results | Where-Object { $_.name -eq 'volatile-registry-links-and-link-like-value-refused' -and $_.passed }).Count) { $unverified += 'Actual target/ancestor registry link and ordinary REG_LINK value rejection was not verified because its case was excluded or failed.' }
-if (!@($results | Where-Object { $_.name -eq 'core-classes-alias-proof-permission-and-staged-commit-conflict' -and $_.passed }).Count) { $unverified += 'Production Classes alias guard, SetValue denial, dry-run no-write, and staged-target rollback after the final check were not verified; supply AssemblyPath and include its case.' }
+if (!@($results | Where-Object { $_.name -eq 'core-classes-alias-proof-permission-and-staged-commit-conflict' -and $_.passed }).Count) { $unverified += 'Production Classes alias guard, SetValue denial, dry-run no-write, and staged-target rollback after the final check were not verified; supply the actual candidate RustProbePath and include its case.' }
 if (!@($results | Where-Object { $_.name -eq 'classes-alias-cli-values-and-direct-child-keys-both-views' -and $_.passed }).Count -or !@($results | Where-Object { $_.name -eq 'mcp-schema-errors-roundtrip-and-iserror' -and $_.passed }).Count) { $unverified += 'Classes descendant CLI/MCP values and direct-child keys in both views were not fully verified.' }
 if (!@($results | Where-Object { $_.name -eq 'recordless-files-excluded-from-registry-capacity-and-restore-type-guards' -and $_.passed }).Count) { $unverified += 'Windows-managed file exclusion from registry retention was not verified because its case was excluded, skipped, or failed.' }
 if ($machineFixture) { $unverified += 'Normal HKCU roundtrip was not verified by this HKLM SYSTEM run; HKCU ERROR_RM_NOT_ACTIVE preservation requires a separate probe.' }
-Save-Json $ReportPath @{ schema=1; fileFixtureRun=$script:fileFixtureRun; timestampUtc=[DateTimeOffset]::UtcNow.ToString('O'); executablePath=$ExecutablePath; moveExecutablePath=$MoveExecutablePath; passed=$passed; failed=$failed; skipped=$skipped; excludedCount=$excluded; results=@($results); preflight=$preflight; createdFixture=$createdFixture; securityPrivilegeEnabled=$securityPrivilege; registryFixtureRoot=$RegistryFixtureRoot; registryFixture=$runPath; cleanup=$cleanup; retainedDirectory=$OutputDirectory; unverified=$unverified }
+Save-Json $ReportPath @{ schema=1; fileFixtureRun=$script:fileFixtureRun; timestampUtc=[DateTimeOffset]::UtcNow.ToString('O'); executablePath=$ExecutablePath; sameSourceBuild=$script:RegistryBuildBinding; rustProbePath=$RustProbePath; rustProbeSha256=$(if($RustProbePath){Digest $RustProbePath}else{$null}); moveExecutablePath=$MoveExecutablePath; passed=$passed; failed=$failed; skipped=$skipped; excludedCount=$excluded; results=@($results); preflight=$preflight; createdFixture=$createdFixture; securityPrivilegeEnabled=$securityPrivilege; registryFixtureRoot=$RegistryFixtureRoot; registryFixture=$runPath; cleanup=$cleanup; retainedDirectory=$OutputDirectory; unverified=$unverified }
 [ordered]@{ passed=$passed; failed=$failed; skipped=$skipped; excludedCount=$excluded; reportPath=$ReportPath; remainingRegistryPath=$cleanup.remainingRegistryPath; remainingClassesPath=$cleanup.remainingClassesPath; retainedVolatileLinkPath=$cleanup.retainedVolatileLinkPath } | ConvertTo-Json
 if ($failed) { exit 1 }; exit 0

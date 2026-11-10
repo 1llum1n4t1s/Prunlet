@@ -18,36 +18,26 @@ if ($DefaultBranch -notmatch '^[A-Za-z0-9._/-]+$' -or $DefaultBranch.Contains('.
 }
 if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Repository must be owner/name.' }
 
-Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-
-public static class PrunletPackageNative {
-    [StructLayout(LayoutKind.Sequential)]
-    struct FileInfo {
-        public uint Attributes, CreationLow, CreationHigh, AccessLow, AccessHigh, WriteLow, WriteHigh;
-        public uint VolumeSerial, SizeHigh, SizeLow, NumberOfLinks, IndexHigh, IndexLow;
-    }
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInfo info);
-    public static SafeFileHandle Open(string path, bool directory) {
-        uint access = directory ? 0x80u : 0x80000000u;
-        uint share = directory ? 3u : 1u;
-        uint flags = 0x00200000u | (directory ? 0x02000000u : 0u);
-        var handle = CreateFileW(@"\\?\" + path, access, share, IntPtr.Zero, 3, flags, IntPtr.Zero);
-        if (handle.IsInvalid) { int error = Marshal.GetLastWin32Error(); handle.Dispose(); throw new Win32Exception(error, "Cannot open package input: " + path); }
-        if (!GetFileInformationByHandle(handle, out var info)) { int error = Marshal.GetLastWin32Error(); handle.Dispose(); throw new Win32Exception(error, "Cannot inspect package input: " + path); }
-        if ((info.Attributes & 0x400u) != 0 || (((info.Attributes & 0x10u) != 0) != directory) || (!directory && info.NumberOfLinks != 1)) {
-            handle.Dispose(); throw new InvalidOperationException("Package input is a reparse point, wrong type, or multiply linked: " + path);
-        }
-        return handle;
-    }
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'integration\configuration-common.ps1')
+$script:PackageCreateFile = New-PrunletNativeDelegate kernel32.dll CreateFileW ([IntPtr]) @([string], [uint32], [uint32], [IntPtr], [uint32], [uint32], [IntPtr])
+$script:PackageFileInfo = New-PrunletNativeDelegate kernel32.dll GetFileInformationByHandle ([int]) @([IntPtr], [IntPtr])
+function Open-PrunletPackageHandle([string]$Path, [bool]$Directory) {
+    # 入力は同じhandleでhashからZIP書込み完了まで固定する。
+    $access = if ($Directory) { [uint32]0x80 } else { [uint32]2147483648 }
+    $share = if ($Directory) { [uint32]3 } else { [uint32]1 }
+    $flags = if ($Directory) { [uint32]0x02200000 } else { [uint32]0x00200000 }
+    $raw = $script:PackageCreateFile.Invoke(('\\?\' + $Path), $access, $share, [IntPtr]::Zero, 3, $flags, [IntPtr]::Zero)
+    $handle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($raw, $true)
+    if ($handle.IsInvalid) { $errorCode = [Runtime.InteropServices.Marshal]::GetLastPInvokeError(); $handle.Dispose(); throw [ComponentModel.Win32Exception]::new($errorCode, "Cannot open package input: $Path") }
+    $info = [Runtime.InteropServices.Marshal]::AllocHGlobal(52)
+    try {
+        if (!$script:PackageFileInfo.Invoke($raw, $info)) { throw [ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastPInvokeError(), "Cannot inspect package input: $Path") }
+        $attributes = [Runtime.InteropServices.Marshal]::ReadInt32($info, 0)
+        $links = [Runtime.InteropServices.Marshal]::ReadInt32($info, 40)
+        if (($attributes -band 0x400) -or ([bool]($attributes -band 0x10) -ne $Directory) -or (!$Directory -and $links -ne 1)) { throw "Package input is a reparse point, wrong type, or multiply linked: $Path" }
+        return $handle
+    } catch { $handle.Dispose(); throw } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($info) }
 }
-'@
 
 function Get-LocalAbsolute([string]$Path, [string]$Label) {
     if (![IO.Path]::IsPathFullyQualified($Path)) { throw "$Label must be absolute." }
@@ -64,12 +54,12 @@ function Pin-Directory([string]$Path) {
     $cursor = $drive
     foreach ($part in @('') + @($Path.Substring($drive.Length).Split('\', [StringSplitOptions]::RemoveEmptyEntries))) {
         if ($part) { $cursor = Join-Path $cursor $part }
-        if (!$pins.ContainsKey($cursor)) { $pins.Add($cursor, [PrunletPackageNative]::Open($cursor, $true)) }
+        if (!$pins.ContainsKey($cursor)) { $pins.Add($cursor, (Open-PrunletPackageHandle $cursor $true)) }
     }
 }
 function Open-Input([string]$Path) {
     Pin-Directory ([IO.Path]::GetDirectoryName($Path))
-    $handle = [PrunletPackageNative]::Open($Path, $false)
+    $handle = Open-PrunletPackageHandle $Path $false
     try { return [IO.FileStream]::new($handle, [IO.FileAccess]::Read) } catch { $handle.Dispose(); throw }
 }
 function Get-StreamHash([IO.FileStream]$Stream) {

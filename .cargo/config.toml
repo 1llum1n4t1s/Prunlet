@@ -1,0 +1,7 @@
+# 利用者環境へVCランタイムの追加導入を要求しない配布物にする。
+# target_dirはここで固定せず、検証済みの外部出力先をビルド入口から指定する。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

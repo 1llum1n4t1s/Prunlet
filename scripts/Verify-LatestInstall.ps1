@@ -1,6 +1,9 @@
 #requires -Version 7.0
 [CmdletBinding()]
 param(
+    [Parameter(Mandatory)][string]$ExecutablePath,
+    [string]$BuildManifestPath,
+    [string]$ExpectedBuildManifestSha256,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
     [switch]$CheckPublicHead,
@@ -27,35 +30,26 @@ foreach ($path in @($OutputDirectory, $ReportPath)) {
     if (Test-Path -LiteralPath $full) { throw 'Verification destinations must be new.' }
 }
 New-Item -ItemType Directory -Path $OutputDirectory, (Split-Path -Parent $ReportPath) -Force | Out-Null
+$previousCargoTargetDirectory = $env:PRUNLET_CARGO_TARGET_DIRECTORY
+try {
+# 各導入は実際にCargoを呼び、依存だけを同じ外部targetへ共有する。
+$env:PRUNLET_CARGO_TARGET_DIRECTORY = Join-Path $OutputDirectory 'cargo-target'
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
 . (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')
+. (Join-Path $PSScriptRoot 'RustBuildInputs.Common.ps1')
+. (Join-Path $PSScriptRoot 'FixtureBridge.Common.ps1')
+. (Join-Path $PSScriptRoot 'FileFixtures.Common.ps1')
+$binding = @{ ExecutablePath = $ExecutablePath }
+if ($BuildManifestPath) { $binding.BuildManifestPath = $BuildManifestPath }
+if ($ExpectedBuildManifestSha256) { $binding.ExpectedBuildManifestSha256 = $ExpectedBuildManifestSha256 }
+$null = Initialize-PrunletFixtureBinding @binding
 $fileFixtureRun = if ($FixtureRoot) { New-VerificationFixtureRun -FixtureRoot $FixtureRoot -ForbiddenRoots $forbidden -NamePrefix 'installer-files' } else { $null }
 $fileFixtureDirectory = if ($fileFixtureRun) { $fileFixtureRun.directory } else { $OutputDirectory }
 $fixtureUpdateBackupRoot = Join-Path $OutputDirectory 'update-backups'
 $fixtureVolumeStore = Join-Path $OutputDirectory 'volume-stores'
 $results = [Collections.Generic.List[object]]::new()
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-public static class PrunletLatestMoveIdentity {
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int kind, byte[] data, uint size);
-    public static string Read(string path) {
-        using (var handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
-            if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-            byte[] data = new byte[24];
-            if (!GetFileInformationByHandleEx(handle, 18, data, 24)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-            return BitConverter.ToString(data).Replace("-", "");
-        }
-    }
-}
-'@
 # Windows側でfixture項目だけを照合・復元し、Prunletのファイル記録に依存しない。
-$recordlessHelpers = @('NativeShellFixture.cs', 'FixtureNative.cs', 'OwnedBinLocator.cs') | ForEach-Object { Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $_ }
-if (!('Prunlet.RecordlessE2E.OwnedBinLocator' -as [type])) { Add-Type -Path $recordlessHelpers -CompilerOptions '/unsafe' }
+$recordlessHelpers = @('FixtureBridge.Common.ps1', 'FileFixtures.Common.ps1') | ForEach-Object { Join-Path $PSScriptRoot $_ }
 function Set-FixtureVolumeMap([string]$ConfigPath) {
     $settings = [IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json -AsHashtable
     $settings.volumeRecoveryDirectories = @{ 'D:\' = $fixtureVolumeStore }
@@ -107,7 +101,7 @@ $isolatedCodex = Join-Path $OutputDirectory 'isolated-codex'
 $settingsBackup = Join-Path $OutputDirectory 'settings-backup'
 
 # 起こり得る失敗を列挙してから実システムの検証を組み立てる。
-$failureConditions = @('退役で旧file復元領域や操作記録を作る', '退役が元設定や他の設定を変更する', 'Windowsゴミ箱の退役項目のID/hash不一致', '通常更新で旧領域を再走査する', '復元領域の移行開始後に旧exeへ戻す', '部分保全を移行完了と偽る', 'fixtureが本番専用領域へ書き込む', '未追跡C#がfixture archiveから欠落する', 'フォルダー未登録の初回導入が拒否される', '旧rootsが削除範囲へ再適用される', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '公開HEADに必要ソース欠落', 'ZIP traversal/重複/リンク', 'ビルド失敗', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '旧roots内外の作業場所と復元先の検証', '指示登録オプションの組合せ不備', '指示marker重複・不完全・利用者編集', 'guide既存未所有・利用者編集', '指示登録途中での書込み失敗')
+$failureConditions = @('退役で旧file復元領域や操作記録を作る', '退役が元設定や他の設定を変更する', 'Windowsゴミ箱の退役項目のID/hash不一致', '通常更新で旧領域を再走査する', '復元領域の移行開始後に旧exeへ戻す', '部分保全を移行完了と偽る', 'fixtureが本番専用領域へ書き込む', '未追跡Rustソースがfixture archiveから欠落する', 'フォルダー未登録の初回導入が拒否される', '旧rootsが削除範囲へ再適用される', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '公開HEADに必要ソース欠落', 'ZIP traversal/重複/リンク', 'ビルド失敗', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '旧roots内外の作業場所と復元先の検証', '指示登録オプションの組合せ不備', '指示marker重複・不完全・利用者編集', 'guide既存未所有・利用者編集', '指示登録途中での書込み失敗')
 Test-Case 'Agent instructions require explicit Codex registration' {
     Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -RegisterAgentInstructions } 'requires explicit -RegisterCodex'
 }
@@ -176,20 +170,23 @@ $fixtureRoot = Join-Path $OutputDirectory 'fixture'
 $source = Join-Path $fixtureRoot 'Prunlet-fixture'
 New-Item -ItemType Directory -Path $source, (Join-Path $source 'scripts') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'src'), (Join-Path $repoRoot 'integration') -Destination $source -Recurse
-Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Join-Path $repoRoot 'scripts\Install-Prunlet.ps1') -Destination (Join-Path $source 'scripts')
+Copy-Item -LiteralPath (Join-Path $repoRoot 'tools') -Destination $source -Recurse
+Copy-Item -LiteralPath (Join-Path $repoRoot '.cargo') -Destination $source -Recurse
+Copy-Item -LiteralPath (Join-Path $repoRoot 'Cargo.toml'), (Join-Path $repoRoot 'Cargo.lock'), (Join-Path $repoRoot 'rust-toolchain.toml'), (Join-Path $repoRoot 'build.rs') -Destination $source
+Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Join-Path $repoRoot 'scripts\RustBuildInputs.Common.ps1'), (Join-Path $repoRoot 'scripts\Install-Prunlet.ps1') -Destination (Join-Path $source 'scripts')
 $fixtureGuideSha256 = (Get-FileHash -LiteralPath (Join-Path $source 'integration\PRUNLET.md') -Algorithm SHA256).Hash
 Assert-True ($fixtureGuideSha256 -ceq (Get-FileHash -LiteralPath (Join-Path $repoRoot 'integration\PRUNLET.md') -Algorithm SHA256).Hash) 'Fixture guide differs from the current working tree.'
-# 実行した検証・導入・ビルド・連携元のhashを、C#本文とは別にレポートへ固定する。
-$verificationInputFiles = @(@($PSCommandPath, $installer, (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Join-Path $PSScriptRoot 'Verification-Common.ps1'), (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')) + $recordlessHelpers + @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'integration') -File | ForEach-Object FullName) | Sort-Object -Unique | ForEach-Object {
+# 実行した検証・導入・ビルド・連携元のhashを、製品本文とは別にレポートへ固定する。
+$verificationInputFiles = @(@($PSCommandPath, $installer, (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Join-Path $repoRoot 'scripts\RustBuildInputs.Common.ps1'), (Join-Path $PSScriptRoot 'Verification-Common.ps1'), (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')) + $recordlessHelpers + @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'integration') -File | ForEach-Object FullName) | Sort-Object -Unique | ForEach-Object {
     @{ path = [IO.Path]::GetRelativePath($repoRoot, $_); sha256 = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash }
 })
-$fixtureSourceFiles = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'src') -Filter '*.cs' -File -Recurse | ForEach-Object {
-    $relative = [IO.Path]::GetRelativePath($repoRoot, $_.FullName)
-    $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+$fixtureSourceFiles = @(Get-PrunletRustInputNames $repoRoot | ForEach-Object {
+    $relative = $_
+    $hash = (Get-FileHash -LiteralPath (Join-Path $repoRoot $relative) -Algorithm SHA256).Hash
     Assert-True ((Get-FileHash -LiteralPath (Join-Path $source $relative) -Algorithm SHA256).Hash -ceq $hash) "Fixture source differs: $relative"
     @{ path = $relative; sha256 = $hash }
 })
-Assert-True (@($fixtureSourceFiles | Where-Object path -eq 'src\Prunlet\Core\NativeFiles.Moves.cs').Count -eq 1) 'Fixture archive omitted the new native move source.'
+Assert-True (@($fixtureSourceFiles | Where-Object path -eq 'src/rust/main.rs').Count -eq 1) 'Fixture archive omitted the Rust entry point.'
 $zipPath = Join-Path $OutputDirectory 'fixture.zip'
 [IO.Compression.ZipFile]::CreateFromDirectory($fixtureRoot, $zipPath)
 $global:PrunletLatestFixture = @{ sha = ('a' * 40); zip = $zipPath; requests = [Collections.Generic.List[string]]::new(); failDownload = $false; failCopy = $false }
@@ -370,13 +367,13 @@ try {
         Set-FixtureVolumeMap $installedConfig
         $target = Join-Path $fileFixtureDirectory 'unregistered-install-target.txt'
         [IO.File]::WriteAllText($target, 'unregistered install target')
-        $targetId = [PrunletLatestMoveIdentity]::Read($target)
-        $priorPidls = @([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($targetId) | ForEach-Object Pidl)
+        $targetId = Get-FileFixtureIdentity -Path $target
+        $priorPidls = @(foreach ($item in (Find-FileFixtureBinIdentity -ExpectedId $targetId)) { $item.Pidl })
         $deleted = (& $installedExe --config $installedConfig delete -- $target | ConvertFrom-Json)
         Assert-True ($LASTEXITCODE -eq 0 -and ![IO.File]::Exists($target) -and $deleted.items[0].status -eq 'recycled' -and !$deleted.PSObject.Properties['operationId']) 'Installed CLI did not recycle without a file operation record.'
-        $binItem = [Prunlet.RecordlessE2E.OwnedBinLocator]::FindNew($targetId, [string[]]$priorPidls)
-        $null = [Prunlet.RecordlessE2E.FixtureNative]::RestoreOwned($binItem.Pidl, $binItem.PhysicalPath, $targetId, $target, $fileFixtureDirectory)
-        Assert-True ([IO.File]::ReadAllText($target) -eq 'unregistered install target' -and [PrunletLatestMoveIdentity]::Read($target) -ceq $targetId) 'Windows restoration of installed CLI item differs.'
+        $binItem = Find-FileFixtureBinNew -ExpectedId $targetId -PriorPidls ([string[]]$priorPidls)
+        $null = Restore-FileFixtureOwned -Pidl $binItem.Pidl -PhysicalPath $binItem.PhysicalPath -ExpectedId $targetId -OriginalPath $target -Scope $fileFixtureDirectory
+        Assert-True ([IO.File]::ReadAllText($target) -eq 'unregistered install target' -and (Get-FileFixtureIdentity -Path $target) -ceq $targetId) 'Windows restoration of installed CLI item differs.'
         $protected = Join-Path $install 'recovery\protected-install-target.txt'
         [IO.File]::WriteAllText($protected, 'keep recovery storage')
         $null = & $installedExe --config $installedConfig delete -- $protected
@@ -637,8 +634,8 @@ try {
         $obsoleteBackend = Join-Path $legacyInstall 'bin\codex-pretooluse.ps1'
         [IO.File]::WriteAllText($obsoleteBackend, '# Previous installed PowerShell backend fixture', [Text.UTF8Encoding]::new($false))
         $obsoleteHash = (Get-FileHash -LiteralPath $obsoleteBackend -Algorithm SHA256).Hash
-        $obsoleteId = [PrunletLatestMoveIdentity]::Read($obsoleteBackend)
-        $obsoletePriorPidls = @([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($obsoleteId) | ForEach-Object Pidl)
+        $obsoleteId = Get-FileFixtureIdentity -Path $obsoleteBackend
+        $obsoletePriorPidls = @(foreach ($item in (Find-FileFixtureBinIdentity -ExpectedId $obsoleteId)) { $item.Pidl })
         $legacyConfigPath = Join-Path $legacyInstall 'config.json'
         Set-FixtureVolumeMap $legacyConfigPath
         $mainSettings = Get-Content -LiteralPath $legacyConfigPath -Raw | ConvertFrom-Json -AsHashtable
@@ -666,10 +663,10 @@ try {
         Assert-True (!(Test-Path -LiteralPath (Join-Path $legacyResult.updateBackupDirectory 'retired-recovery')) -and !(Test-Path -LiteralPath (Join-Path $legacyResult.updateBackupDirectory 'retirement-config.json'))) 'Retirement created legacy file recovery storage.'
         $retired = [IO.File]::ReadAllText((Join-Path $legacyResult.updateBackupDirectory 'retired-products.json')) | ConvertFrom-Json -AsHashtable
         Assert-True (!$retired.ContainsKey('operationId') -and @($retired.items).Count -eq 1 -and $retired.items[0].status -ceq 'recycled' -and $retired.items[0].path -ceq $obsoleteBackend) 'Retirement did not use the recordless file result.'
-        $retiredBinItem = [Prunlet.RecordlessE2E.OwnedBinLocator]::FindNew($obsoleteId, [string[]]$obsoletePriorPidls)
+        $retiredBinItem = Find-FileFixtureBinNew -ExpectedId $obsoleteId -PriorPidls ([string[]]$obsoletePriorPidls)
         $retiredPayload = $retiredBinItem.PhysicalPath
         Assert-True ([IO.Path]::IsPathFullyQualified($retiredPayload) -and ($retiredPayload.Split([char]92) -icontains '$Recycle.Bin')) 'Retirement did not use Windows Recycle Bin.'
-        Assert-True ((Get-FileHash -LiteralPath $retiredPayload -Algorithm SHA256).Hash -ceq $obsoleteHash -and [PrunletLatestMoveIdentity]::Read($retiredPayload) -ceq $obsoleteId) 'Retired backend was copied or its bytes changed.'
+        Assert-True ((Get-FileHash -LiteralPath $retiredPayload -Algorithm SHA256).Hash -ceq $obsoleteHash -and (Get-FileFixtureIdentity -Path $retiredPayload) -ceq $obsoleteId) 'Retired backend was copied or its bytes changed.'
         $updated = [IO.File]::ReadAllText($legacyAgents)
         Assert-True ($updated.Contains('Prunlet CLIを最初からCMD（shell=cmd.exe、login=false）で直接実行する。')) 'Legacy instructions did not migrate.'
         Assert-True (!$updated.Contains('Prunlet MCPの`delete_files`を最初から使う。')) 'Legacy normal route survived migration.'
@@ -1119,7 +1116,10 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
     Remove-Item Function:\Get-ScheduledTask, Function:\Export-ScheduledTask, Function:\Register-ScheduledTask, Function:\Unregister-ScheduledTask
     Remove-Variable PrunletMaintenanceFixture -Scope Global
     # junctionと更新バックアップも隔離出力内に残し、結果確認後にPrunletで一括清掃する。
-    [ordered]@{ fileFixtureRun = $fileFixtureRun; verifiedUtc = [DateTimeOffset]::UtcNow.ToString('o'); fixtureSource = 'current working tree including untracked C# files'; fixtureSourceFiles = $fixtureSourceFiles; verificationInputFiles = $verificationInputFiles; fixtureArchiveSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash; fixtureGuideSha256 = $fixtureGuideSha256; publicHeadChecked = [bool]$CheckPublicHead; publicHeadAuthentication = $(if ($UseGitHubCliAuthentication) { 'github-cli' } else { 'unauthenticated' }); failureConditions = $failureConditions; results = @($results.ToArray()); passed = !@($results | Where-Object { !$_.passed }).Count; retention = 'Keep this report as reproducible installer verification evidence; delete when superseded.'; reproduce = 'Run scripts/Verify-LatestInstall.ps1 with new external OutputDirectory and ReportPath.' } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ReportPath -Encoding utf8NoBOM
+    [ordered]@{ fileFixtureRun = $fileFixtureRun; verifiedUtc = [DateTimeOffset]::UtcNow.ToString('o'); fixtureSource = 'current working tree including untracked Rust files'; fixtureSourceFiles = $fixtureSourceFiles; verificationInputFiles = $verificationInputFiles; fixtureArchiveSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash; fixtureGuideSha256 = $fixtureGuideSha256; publicHeadChecked = [bool]$CheckPublicHead; publicHeadAuthentication = $(if ($UseGitHubCliAuthentication) { 'github-cli' } else { 'unauthenticated' }); failureConditions = $failureConditions; results = @($results.ToArray()); passed = !@($results | Where-Object { !$_.passed }).Count; retention = 'Keep this report as reproducible installer verification evidence; delete when superseded.'; reproduce = 'Run scripts/Verify-LatestInstall.ps1 with new external OutputDirectory and ReportPath.' } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ReportPath -Encoding utf8NoBOM
 }
 Get-Content -LiteralPath $ReportPath -Raw
 if (@($results | Where-Object { !$_.passed }).Count) { throw 'Latest installer verification failed; read the JSON report.' }
+} finally {
+    $env:PRUNLET_CARGO_TARGET_DIRECTORY = $previousCargoTargetDirectory
+}

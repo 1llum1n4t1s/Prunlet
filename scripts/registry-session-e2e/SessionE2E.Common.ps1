@@ -1,7 +1,15 @@
 $ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'FixtureBridge.Common.ps1')
+. (Join-Path $PSScriptRoot 'SessionFixtures.Common.ps1')
+. (Join-Path $PSScriptRoot 'RegistryFixtures.Common.ps1')
 if ([IO.File]::Exists((Join-Path $PSScriptRoot 'settings.json')) -and !$script:LaunchPins) {
  . (Join-Path $PSScriptRoot 'SessionLaunch.ps1')
  $script:LaunchPrepared=OpenPreparedPins (Join-Path $PSScriptRoot 'settings.json')
+}
+if ($script:LaunchPrepared) {
+ $null=Initialize-PrunletFixtureBinding -ExecutablePath $script:LaunchPrepared.executablePath -BuildManifestPath $script:LaunchPrepared.fixtureManifestPath -ExpectedBuildManifestSha256 $script:LaunchPrepared.fixtureManifestSha256 -SourceRoot $script:LaunchPrepared.fixtureSourceRoot
+ $fixtureBinding=Get-PrunletFixtureProcessBinding
+ if(!$fixtureBinding.path.Equals([string]$script:LaunchPrepared.fixtureLibraryPath,[StringComparison]::OrdinalIgnoreCase)-or!$fixtureBinding.sha256.Equals([string]$script:LaunchPrepared.fixtureLibrarySha256,[StringComparison]::OrdinalIgnoreCase)){throw 'Prepared fixture binding differs.'}
 }
 
 $utf8=[Text.UTF8Encoding]::new($false)
@@ -42,7 +50,24 @@ function AssertPreparedSettings($Settings){
  Assert ([IO.Path]::IsPathFullyQualified($Settings.registryVerificationScriptPath)-and[IO.File]::Exists($Settings.registryVerificationScriptPath)) 'Registry verification script missing'
  Assert ($Settings.registryVerificationScriptSha256-ceq(Get-FileHash -LiteralPath $Settings.registryVerificationScriptPath -Algorithm SHA256).Hash) 'Registry verification script changed after Prepare'
  if($Settings.moveExecutablePath){Assert ([IO.Path]::IsPathFullyQualified($Settings.moveExecutablePath)-and[IO.File]::Exists($Settings.moveExecutablePath)) 'Move baseline executable missing';Assert ($Settings.moveExecutableSha256-ceq(Get-FileHash -LiteralPath $Settings.moveExecutablePath -Algorithm SHA256).Hash) 'Move baseline executable changed after Prepare'}
- foreach($dependency in @(@{path=$Settings.assemblyPath;hash=$Settings.assemblySha256},@{path=$Settings.legacyRegistryExecutablePath;hash=$Settings.legacyRegistryExecutableSha256})){if($dependency.path){Assert ([IO.Path]::IsPathFullyQualified($dependency.path)-and[IO.File]::Exists($dependency.path)) 'Prepared registry checkpoint dependency missing';Assert ($dependency.hash-ceq(Get-FileHash -LiteralPath $dependency.path -Algorithm SHA256).Hash) 'Prepared registry checkpoint dependency changed'}}
+ foreach($dependency in @(@{path=$Settings.rustProbePath;hash=$Settings.rustProbeSha256},@{path=$Settings.buildManifestPath;hash=$Settings.buildManifestSha256},@{path=$Settings.legacyRegistryExecutablePath;hash=$Settings.legacyRegistryExecutableSha256},@{path=$Settings.latestRegistryExecutablePath;hash=$Settings.latestRegistryExecutableSha256})){if($dependency.path){Assert ([IO.Path]::IsPathFullyQualified($dependency.path)-and[IO.File]::Exists($dependency.path)) 'Prepared registry checkpoint dependency missing';Assert ($dependency.hash-ceq(Get-FileHash -LiteralPath $dependency.path -Algorithm SHA256).Hash) 'Prepared registry checkpoint dependency changed'}}
+ if($Settings.rustProbePath){
+  Assert ($Settings.candidateRuntime-ceq'rust-libtest') 'Prepared runtime differs from Rust selection'
+  Assert ([IO.Path]::GetFullPath($Settings.rustSourceRoot).Equals([IO.Path]::GetFullPath((Split-Path (Split-Path $Settings.registryVerificationScriptPath -Parent) -Parent)),[StringComparison]::OrdinalIgnoreCase)) 'Prepared source root differs from the fixed registry runner'
+  Assert (![string]::IsNullOrWhiteSpace($Settings.buildManifestPath)-and![string]::IsNullOrWhiteSpace($Settings.buildManifestSha256)-and![string]::IsNullOrWhiteSpace($Settings.sourceFingerprint)) 'Prepared Rust build binding is missing'
+  # Prepareで固定済みの元スクリプトと全sourceを使って各processで再照合する。
+  $repo=$Settings.rustSourceRoot;$ExecutablePath=$Settings.executablePath;$RustProbePath=$Settings.rustProbePath
+  $BuildManifestPath=$Settings.buildManifestPath;$ExpectedBuildManifestSha256=$Settings.buildManifestSha256
+  . (Join-Path $repo 'scripts/Verification-Common.ps1')
+  . (Join-Path $repo 'scripts/recordless-e2e/RustFileProbe.Common.ps1')
+  $binding=Assert-RustFileProbeBinding
+  Assert ($binding.sourceFingerprint-ceq$Settings.sourceFingerprint) 'Prepared Rust source fingerprint changed'
+  $pinned=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  foreach($entry in $Settings.inputs){$null=$pinned.Add([IO.Path]::GetFullPath($entry.path))}
+  $required=@($Settings.executablePath,$Settings.rustProbePath,$Settings.buildManifestPath) + @(Get-PrunletRustInputNames $repo | ForEach-Object {Join-Path $repo $_})
+  $required+=@('scripts/Verification-Common.ps1','scripts/RustBuildInputs.Common.ps1','scripts/recordless-e2e/RustFileProbe.Common.ps1','scripts/registry-session-e2e/RustProbe.Common.ps1')|ForEach-Object {Join-Path $repo $_}
+  foreach($path in $required){Assert ($pinned.Contains([IO.Path]::GetFullPath($path))) ('Prepared Rust input was not pinned: '+$path)}
+ }elseif($Settings.buildManifestPath-or$Settings.buildManifestSha256-or$Settings.sourceFingerprint-or$Settings.candidateRuntime-cne'unconfigured'){throw 'Prepared runtime or manifest differs from candidate selection.'}
  Assert ($Settings.runRelative-match'^Software\\PrunletE2E\\[0-9a-f]{32}$') 'Unsafe prepared fixture scope'
  foreach($name in @('config','highConfig','currentConfig','recovery')){
   $path=[IO.Path]::GetFullPath($Settings[$name]);Assert ($path.StartsWith($PSScriptRoot.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)) 'Prepared path escaped run directory'
@@ -91,10 +116,7 @@ function McpData($Reply){
 }
 function McpStop($p){$p.StandardInput.Close();if(!$p.WaitForExit(15000)){$p.Kill($true);throw 'MCP shutdown timeout'};Assert ($p.ExitCode-eq 0) 'MCP shutdown exit';$p.Dispose()}
 function LoadFixture{
- if(!('PrunletRegistryE2E'-as[type])){Add-Type -Path (Join-Path $PSScriptRoot 'FixtureNative.cs')}
- if(!('SessionE2ENative'-as[type])){Add-Type -Path (Join-Path $PSScriptRoot 'SessionFixture.cs')}
- if(!('SessionLaunchNative'-as[type])){Add-Type -Path (Join-Path $PSScriptRoot 'SessionLaunchNative.cs')}
- [PrunletRegistryE2E]::Configure($false,$script:RunRelative)
+ Initialize-RegistryFixture $false $script:RunRelative
 }
 function NativeRequest([string]$Action,$Data=@{}){
  if($script:LaunchPrepared){AssertLaunchLease $script:LaunchPrepared -RequirePermit}

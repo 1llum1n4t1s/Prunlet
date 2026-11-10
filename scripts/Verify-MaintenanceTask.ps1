@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
+    [Parameter(Mandatory)][string]$BuildManifestPath,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBuildManifestSha256,
     [Parameter(Mandatory)][Alias('BaselineMoveExecutablePath')][string]$MoveExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
@@ -8,6 +10,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
+. (Join-Path $PSScriptRoot 'FileFixtures.Common.ps1')
+$null=Initialize-PrunletFixtureBinding -ExecutablePath $ExecutablePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256
 # 想定する失敗: PE種別の誤り、GUIからの通常削除、shell解釈、所有外タスクの変更、
 # 移行時の設定消失、保守の未実行、通常保守によるゴミ箱内の検証物変更、終了コードの欠落、fixture外への書込み。
 $utf8 = [Text.UTF8Encoding]::new($false)
@@ -24,7 +28,7 @@ function Read-Json([string]$Path) { [IO.File]::ReadAllText($Path) | ConvertFrom-
 function Digest([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
 function Get-MaintenanceFileProof([string]$Path) {
     Assert-NoReparse $Path
-    $nodes=[Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($Path)
+    $nodes=(Get-FileFixtureSnapshot -Path ($Path))
     Assert-True ($nodes.Count-eq1-and!$nodes[0].Directory) 'Maintenance native proof expects one ordinary file'
     $node=$nodes[0]
     return [ordered]@{id=$node.Id;nativeOgd=$node.SecurityBase64;attributes=$node.Attributes;streams=@($node.Streams|ForEach-Object {[ordered]@{name=$_.Name;length=$_.Length;sha256=$_.Sha256}})}
@@ -83,8 +87,8 @@ function Get-Subsystem([string]$Path) {
 function New-Operation([string]$Name, [string]$Content, [switch]$LegacyMove) {
     $path = Join-Path $fixture $Name; [IO.File]::WriteAllText($path, $Content, $utf8)
     $originalProof = Get-MaintenanceFileProof $path
-    $recordlessBefore=[Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($path)
-    $prior=[string[]]@([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($recordlessBefore[0].Id)|ForEach-Object Pidl)
+    $recordlessBefore=(Get-FileFixtureSnapshot -Path ($path))
+    $prior=[string[]]@((Find-FileFixtureBinIdentity -ExpectedId ($recordlessBefore[0].Id))|ForEach-Object Pidl)
     # 破棄移行対象は真正な旧exeでschema 4を作る。新版の新規削除は記録なし方式。
     $generator = if ($LegacyMove) { $MoveExecutablePath } else { $ExecutablePath }
     $generatorConfig = $config
@@ -100,7 +104,7 @@ function New-Operation([string]$Name, [string]$Content, [switch]$LegacyMove) {
     $wire=$deleted.stdout|ConvertFrom-Json -AsHashtable -Depth 80
     if(!$LegacyMove){
         Assert-True (!$wire.ContainsKey('operationId')-and$wire.items[0].status-ceq'recycled') 'Current file deletion requires no Prunlet operation record'
-        $item=[Prunlet.RecordlessE2E.OwnedBinLocator]::FindNew($recordlessBefore[0].Id,$prior)
+        $item=(Find-FileFixtureBinNew -ExpectedId ($recordlessBefore[0].Id) -PriorPidls ($prior))
         return @{source=$path;content=$Content;payload=$item.PhysicalPath;binItem=$item;originalProof=$originalProof;recordlessBefore=$recordlessBefore;payloadProof=(Get-MaintenanceFileProof $item.PhysicalPath)}
     }
     $id=$wire.operationId
@@ -115,12 +119,12 @@ function New-Operation([string]$Name, [string]$Content, [switch]$LegacyMove) {
     }
     $payloadProof = Get-MaintenanceFileProof $payload
     Assert-True ($originalProof.id -ceq $payloadProof.id -and ($originalProof.streams | ConvertTo-Json -Depth 5 -Compress) -ceq ($payloadProof.streams | ConvertTo-Json -Depth 5 -Compress)) 'Fixture generation changed native identity or stream bytes.'
-    return @{ id = $id; root = $root; manifestPath = $manifestPath; payload = $payload; source = $path; content = $Content; originalProof = $originalProof; payloadProof = $payloadProof; rawRootId = [Prunlet.RecordlessE2E.FixtureNative]::Identity($root); storeRoot = $entry.storeRoot }
+    return @{ id = $id; root = $root; manifestPath = $manifestPath; payload = $payload; source = $path; content = $Content; originalProof = $originalProof; payloadProof = $payloadProof; rawRootId = (Get-FileFixtureIdentity -Path ($root)); storeRoot = $entry.storeRoot }
 }
-function Restore-WindowsTaskFixture($Operation){$item=$Operation.binItem;$null=[Prunlet.RecordlessE2E.FixtureNative]::RestoreOwned($item.Pidl,$item.PhysicalPath,$item.NativeId,$Operation.source,$fixture);return ,(Assert-SnapshotR $Operation.source $Operation.recordlessBefore -WindowsSecurity)}
+function Restore-WindowsTaskFixture($Operation){$item=$Operation.binItem;$null=(Restore-FileFixtureOwned -Pidl ($item.Pidl) -PhysicalPath ($item.PhysicalPath) -ExpectedId ($item.NativeId) -OriginalPath ($Operation.source) -Scope ($fixture));return ,(Assert-SnapshotR $Operation.source $Operation.recordlessBefore -WindowsSecurity)}
 function Assert-LegacyTaskDiscard(){
     $proofs = foreach($discarded in $script:LegacyDiscardedRoots){
-        $now=[Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($discarded.item.PhysicalPath)
+        $now=(Get-FileFixtureSnapshot -Path ($discarded.item.PhysicalPath))
         Assert-True (($now|ConvertTo-Json -Depth 30 -Compress)-ceq($discarded.proof|ConvertTo-Json -Depth 30 -Compress)) 'Registry-only task changed an owned discarded legacy root in Windows Bin'
         @{path=$discarded.path;item=$discarded.item;proof=$now}
     }
@@ -209,21 +213,20 @@ try {
     $helper = Join-Path ([IO.Path]::GetDirectoryName($ExecutablePath)) 'prunlet-maintenance.exe'
     . (Join-Path $repo 'integration/maintenance-task.ps1')
     . (Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1')
-    if(!('Prunlet.RecordlessE2E.FixtureNative'-as[type])){Add-Type -Path @('NativeShellFixture.cs','FixtureNative.cs','OwnedBinLocator.cs'|ForEach-Object {Join-Path (Join-Path $PSScriptRoot 'recordless-e2e') $_}) -CompilerOptions '/unsafe'}
     Run-Case 'pe-subsystems' { Assert-True ((Get-Subsystem $ExecutablePath) -eq 3) 'CLI must use console subsystem.'; Assert-True ((Get-Subsystem $helper) -eq 2) 'Maintenance helper must use GUI subsystem.' }
     Run-Case 'cli-init-roundtrip' {
         $init = Invoke-Cli @('init', '--backup-directory', $metadata); Assert-True ($init.exitCode -eq 0) "Init failed: $($init.stderr)"
         $settings = Read-Json $config; $settings.volumeRecoveryDirectories = @{ 'D:\' = $store }; $settings.retentionDays = 30; $settings.maxRecoveryBytes = 10737418240; Save-Json $config $settings
         $script:LegacyFixture = New-Operation 'legacy-discard.txt' 'owned legacy discard content' -LegacyMove
         $legacyRoots = @($script:LegacyFixture.storeRoot, $script:LegacyFixture.root)
-        $beforeRoots = @{};foreach($path in $legacyRoots){$beforeRoots[$path]=[Prunlet.RecordlessE2E.FixtureNative]::SnapshotTree($path)}
+        $beforeRoots = @{};foreach($path in $legacyRoots){$beforeRoots[$path]=(Get-FileFixtureSnapshot -Path ($path))}
         $migration=Invoke-Cli @('migrate','--apply');$fixtureEvidence.explicitMigration=$migration
         $migrationResult=$migration.stdout|ConvertFrom-Json -AsHashtable -Depth 80
         Assert-True ($migration.exitCode-eq0-and$migrationResult.registryReady-and$migrationResult.complete) 'Initial registry readiness/legacy discard incomplete'
         $script:LegacyDiscardedRoots = foreach($path in $legacyRoots){
             $operation=@($migrationResult.operations|Where-Object path -CEQ $path)
             Assert-True ($operation.Count-eq1-and$operation[0].status-ceq'recycled'-and!$operation[0].operationId-and$null-eq$operation[0].schema-and!(Test-Path -LiteralPath $path)) 'Owned legacy storage/metadata root was not recycled'
-            $item=@([Prunlet.RecordlessE2E.OwnedBinLocator]::FindIdentity($beforeRoots[$path][0].Id))
+            $item=@((Find-FileFixtureBinIdentity -ExpectedId ($beforeRoots[$path][0].Id)))
             Assert-True ($item.Count-eq1) 'Discarded legacy root must have one owned Windows Bin identity'
             $proof=Assert-SnapshotR $item[0].PhysicalPath $beforeRoots[$path] -WindowsManagedBin
             @{path=$path;item=$item[0];proof=$proof}
