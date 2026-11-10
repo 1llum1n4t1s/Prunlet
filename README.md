@@ -1,6 +1,6 @@
 # Prunlet — Anti “blocked by policy”
 
-Prunletは、`blocked by policy`による清掃の停止を減らすために、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約するWindows用ツールです。許可された削除を最初からPrunletへ任せる使い方に揃えます。
+Prunletは、`blocked by policy`による清掃の停止を減らすために、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約するWindows・Apple Silicon Mac用ツールです。許可された削除を最初からPrunletへ任せる使い方に揃えます。
 
 指定したファイル・フォルダーを通常はWindowsのゴミ箱へ移します。予約名の通常ファイル、Windowsがゴミ箱には大きすぎると判断した対象、および対象ドライブで即時削除が明示設定されWindowsがゴミ箱を利用できないと返した対象は、元の実体と名前を確認できた場合に限り永久削除を試みます。Prunletはファイルの操作記録・操作ID・復元用snapshotを保存せず、ゴミ箱に移った項目の復元と保持期間の管理はWindowsに任せます。レジストリのキー・値は専用snapshotとトランザクションで保全し、操作IDによる非上書き復元を提供します。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
 
@@ -29,6 +29,8 @@ Codexでは、次の順序で利用します。
 CodexからMacなどへ送るPowerShellスクリプトは、[フックの連携手順](docs/integration.md#hookの検査範囲)にある明示的な子PowerShellの形式で渡します。Codexのフック入力には実行shellが渡らないため、`shell: "pwsh"`の指定だけではヒアストリング内の削除を区別できません。
 
 ## インストールと更新
+
+Apple Silicon Macでは、[macOSのインストールと更新](docs/macos.md)を参照してください。ファイル・フォルダーはmacOSのゴミ箱へ移動し、Finderで復元できます。以下はWindowsの手順です。
 
 Windows x64・ARM64に対応します。下のインストーラーは[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の既定ブランチの最新コミットからビルドするため、PowerShell 7、Rustup・Cargo、対象アーキテクチャのMSVCビルドツールとWindows SDKが必要です。ビルドに使うRustの版は[`rust-toolchain.toml`](rust-toolchain.toml)の`channel`で固定されています。Rustターゲットがなければ、`rustup target add --toolchain <channelの値> <ターゲット名>`で追加してください。
 

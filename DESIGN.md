@@ -1,5 +1,7 @@
 # Prunletの設計
 
+Apple Silicon版のファイル操作は `src/rust/platform/macos` が担当する。CLIとstdio MCPは同じTrash処理を使い、結果が不明な場合は再送しない。公開導入では単一の署名済み実行ファイルを使い、配置ルートの固定ロックをCLI・MCP・Machキューworkerが共有する。起動時更新は排他取得後に候補の署名・公証と実体を照合し、同じディレクトリ内で実行ファイルの名前を原子的に置換する。設定と復元領域は置換対象に含めない。詳細は[macOS版](docs/macos.md)を参照。
+
 Prunletは、許可されたWindowsの削除をAIエージェントが同じ検証経路で実行できるよう、CLIとMCPへ集約する。通常経路は、記録を残さないファイル削除と、snapshot・トランザクションを使うレジストリ削除・復元である。ファイルは通常Windowsゴミ箱へ移す。予約名の通常ファイル、明示的なサイズ超過時、対象ボリュームの確認済み即時削除設定時は、実体を再照合して元名の永久削除を試みる。利用手順は[README](README.md)、連携は[docs/integration.md](docs/integration.md)、検証は[docs/verification.md](docs/verification.md)を参照する。
 
 ## 構成と責務

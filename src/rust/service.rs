@@ -43,6 +43,11 @@ impl Runtime {
 
 impl Backend for Runtime {
     fn execute(&self, command: &str, args: &Value, progress: Option<Progress>) -> Result<Value> {
+        // Mach IPCの接続用子プロセスは通常の削除要求とは別の内部入口を使う。
+        #[cfg(target_os = "macos")]
+        if command == "__delete-queue-contact" {
+            return crate::files::execute(&self.config, command, args, progress);
+        }
         let progress: Option<Progress> = Some(Arc::new(move |value: Value| {
             if let Some(message) = value.get("message").and_then(Value::as_str) {
                 // 通知先の切断で処理結果や照合IDを失わない。

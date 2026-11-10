@@ -142,3 +142,8 @@ case-sensitive属性の準備で通常tokenの`fsutil`が拒否された場合�
 ## 検証後の保持と清掃
 
 結果と再現方法は会話内へ残し、再検証に必要なJSON・入力・ログだけを外部作業領域へ保持する。今回のfixtureだけを対象として、利用中プロセス・リンク・混在を確認してからPrunletで清掃する。ゴミ箱全体を空にせず、旧領域や不明な残存データを手動削除しない。保全対象・未清掃パス・理由・再開条件を報告する。
+## Apple Siliconの検証
+
+macOSの通常ビルドで `Verify-MacRecordlessFiles.py` を実行し、Trash往復、CLI・stdio MCP・hookの終了コード、リンク先、切断後の待機キューを照合する。隔離の `PRUNLET_MACOS_UNIT_TEST_ROOT` を指定し、`cargo test --locked --lib -- --test-threads=1` でMach資源・ディレクトリ境界も確認する。Mach IPCと競合を注入する `Verify-MacQueueIpc.py`・`Verify-MacRaceBoundaries.py` は `RUSTFLAGS='--cfg prunlet_macos_race_tests'` のデバッグビルド専用で、配布用ビルドと分ける。
+
+起動時更新は、上記のデバッグcfgで作成した別バージョン・別コミットのA/B/Cを同じDeveloper IDで署名・公証する。Aの実行ファイルとB/Cの公開形式ZIPを `bun scripts/Verify-MacStartupUpdate.ts <新規の外部ディレクトリ> <Aのexe> <BのZIP> <CのZIP>` に渡す。GitHub応答だけをローカルに置換し、署名・ZIP・stdio・排他・置換は製品の経路で確認する。配布用ビルドにはこの応答置換を含めない。

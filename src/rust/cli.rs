@@ -112,6 +112,25 @@ fn write_error(error: &anyhow::Error, stderr: bool) {
 }
 
 fn run_inner(args: &[String]) -> Result<i32> {
+    #[cfg(target_os = "macos")]
+    if args == ["--macos-build-info"] {
+        write_json(&platform::macos::startup::build_info())?;
+        return Ok(0);
+    }
+    #[cfg(target_os = "macos")]
+    if let [option, path] = args
+        && option == "--install-macos"
+    {
+        write_json(&platform::macos::startup::install(Path::new(path))?)?;
+        return Ok(0);
+    }
+    #[cfg(target_os = "macos")]
+    if let [option, path] = args
+        && option == "--package-macos-release"
+    {
+        write_json(&platform::macos::startup::package(Path::new(path))?)?;
+        return Ok(0);
+    }
     if args == ["--startup-update-protocol"] {
         let protocol = json!({"protocol":1,"storageEpoch":1});
         write_json(&protocol)?;
@@ -129,6 +148,8 @@ fn run_inner(args: &[String]) -> Result<i32> {
     ensure!(config_path.is_absolute(), "Config path must be absolute.");
     let command = args[2].as_str();
     let tail = &args[3..];
+    #[cfg(target_os = "macos")]
+    let _installation_lease = platform::macos::startup::enter(&config_path, command, args)?;
     if command == "hook" {
         ensure!(
             tail.is_empty() || (tail.len() == 2 && tail[0] == "--hook-script"),
@@ -137,6 +158,7 @@ fn run_inner(args: &[String]) -> Result<i32> {
         let executable = std::env::current_exe()?;
         return Ok(crate::protocol::hook::run(&config_path, &executable));
     }
+    #[cfg(windows)]
     if !command.starts_with("__begin-")
         && !matches!(
             command,
@@ -281,8 +303,22 @@ fn parse_command(command: &str, args: &[String]) -> Result<Value> {
             )
         }
         "__delete-queue-worker" => {
+            #[cfg(windows)]
             ensure!(args.is_empty(), "Queue worker accepts no arguments.");
-            Ok(json!({}))
+            #[cfg(target_os = "macos")]
+            ensure!(args.len() <= 1, "Queue worker accepts one job id.");
+            Ok(match args.first() {
+                Some(id) => json!({"jobId":id}),
+                None => json!({}),
+            })
+        }
+        #[cfg(target_os = "macos")]
+        "__delete-queue-contact" => {
+            ensure!(
+                args.len() == 2 && matches!(args[1].as_str(), "status" | "cancel" | "probe"),
+                "Invalid macOS queue contact arguments."
+            );
+            Ok(json!({"jobId":args[0],"action":args[1]}))
         }
         "registry-delete" => parse_registry_delete(args),
         "restore" | "registry-restore" => {
@@ -601,6 +637,20 @@ mod tests {
     }
 }
 
+#[cfg(target_os = "macos")]
+const HELP: &str = r#"Prunlet — Apple Silicon macOS Trash.
+prunlet --install-macos <new absolute installation path>
+prunlet --config <absolute-json-path> init --backup-directory <directory>
+prunlet --config <absolute-json-path> validate-config
+prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]
+prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>
+prunlet --config <absolute-json-path> delete-queue [--recursive] -- <absolute-path> [...]
+prunlet --config <absolute-json-path> delete-queue-status <job-id>
+prunlet --config <absolute-json-path> delete-queue-cancel <job-id>
+prunlet --config <absolute-json-path> mcp
+prunlet --config <absolute-json-path> hook
+"#;
+#[cfg(windows)]
 const HELP: &str = r#"Prunlet — Windows Recycle Bin deletion and registry recovery.
 prunlet --config <absolute-json-path> init --backup-directory <directory>
 prunlet --config <absolute-json-path> validate-config
