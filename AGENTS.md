@@ -1,6 +1,8 @@
 # Prunletの開発
 
-現在の構造と設計判断は[DESIGN.md](DESIGN.md)を参照する。削除処理は`src/rust`のファイル・レジストリ・移行Coreに集約し、CLI・MCP・フックで別の削除方式を実装しない。
+現在の構造と設計判断は[DESIGN.md](DESIGN.md)を参照する。削除処理は`src/rust`のファイル・レジストリ・移行Coreに集約し、CLI・MCP・フックで別の削除方式を実装しない。Rustの版は[`rust-toolchain.toml`](rust-toolchain.toml)、依存の解決は`Cargo.lock`に従う。
+
+## Windowsの実装と操作
 
 Windowsのファイル・フォルダー・レジストリ削除は、配置済み共通指示のexe・設定の絶対パスを使い、最初から`cmd.exe`・`login: false`でPrunlet CLIを呼ぶ。空白・Unicode・多数・長いファイル対象は絶対パスのUTF-8 JSON一覧を`delete [--dry-run] --paths-file <絶対パス>`で渡す。レジストリは`registry-delete --view <32|64> ... -- <single-key-path>`を使う。exe・設定自体をCMDで安全に表現できない場合は実行前に同じCoreのMCPを選ぶ。拒否された削除を別shell・Prunletへ付け替えて再試行しない。詳細は[連携手順](docs/integration.md)を参照する。
 
@@ -26,9 +28,15 @@ Codexの`exec_command`が正式なsandbox権限要求に対応し、実効設定
 
 Windowsの管理者起動はsandbox権限申請と区別する。許可済みの削除に管理者権限が必要なら、手動実行を依頼する前に、ホストの許可範囲でエージェントが管理者CMDを起動し、同じ配置済みCLI・設定を直接使う。起動先の実トークン・必要なprivilege・CLIの終了コード・JSON・対象状態を確認する。Prunlet自身の自動昇格禁止と区別し、本人のUAC同意を代行せず、拒否・結果不明を迂回しない。権限不足で停止した後の再実行条件も含め、[sandboxとゴミ箱へのアクセス](docs/integration.md#sandboxとゴミ箱へのアクセス)に従う。
 
+## Apple Silicon版の実装
+
+ファイル削除は`src/rust/platform/macos`の共通Trash経路に集約し、MCPは`delete_files`のみとする。対象と祖先の実体確認、リンク先の保全、Trashの返却実体と元名の照合を維持する。待機キューは協調的な`flock`だけを待ち、開始許可とMach監査トークンの照合を維持する。`ambiguous`は元のパスとゴミ箱を確認し、自動再送しない。配置済みCLI・MCP・workerは固定の更新ロックを共有する。詳しい境界は[macOSの削除設計](DESIGN.md#macosのファイル削除)と[更新の設計](DESIGN.md#macosの起動時自動更新)を参照する。
+
 ## ビルドと検証
 
-Windows・Rustup/Cargo・MSVCビルドツール・Windows SDK・PowerShell 7を使う。Rustの版は[`rust-toolchain.toml`](rust-toolchain.toml)、依存の解決は`Cargo.lock`に従う。ビルドは`scripts/Publish-Prunlet.ps1`に外部の絶対出力先を渡し、Cargoの出力・TEMP/TMPをリポジトリへ置かない。
+### Windows
+
+Windows・Rustup/Cargo・MSVCビルドツール・Windows SDK・PowerShell 7を使う。ビルドは`scripts/Publish-Prunlet.ps1`に外部の絶対出力先を渡し、Cargoの出力・TEMP/TMPをリポジトリへ置かない。
 
 ```powershell
 $buildRoot = Join-Path 'D:\Codex\Prunlet' ('build-' + [guid]::NewGuid().ToString('N'))
@@ -55,14 +63,22 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 
 ゴミ箱全体の空化・既存項目の清掃を行わず、今回fixtureだけを扱う。検証後の保持・清掃は[検証手順](docs/verification.md#検証後の保持と清掃)に従い、未清掃パス・理由・再開条件を返す。
 
+### Apple Silicon
+
+Apple Silicon実機で`aarch64-apple-darwin`をビルドし、`CARGO_TARGET_DIR`と`TMPDIR`をリポジトリ外に置く。通常ビルドの`prunlet`で`Verify-MacRecordlessFiles.py`を実行する。Mach・パス境界は隔離した`PRUNLET_MACOS_UNIT_TEST_ROOT`を指定して`cargo test --locked --lib -- --test-threads=1`で確認する。待機キュー・競合・起動時更新の変更では、影響に応じて`Verify-MacQueueIpc.py`・`Verify-MacRaceBoundaries.py`・`Verify-MacStartupUpdate.ts`を実行する。障害注入とGitHub応答の置換は`prunlet_macos_race_tests`を指定したデバッグビルドに限定する。引数、署名済み更新候補、判定範囲は[Apple Siliconの検証](docs/verification.md#apple-siliconの検証)を参照する。
+
+公開用ビルドはクリーンな対象コミットから`bash scripts/Publish-PrunletMac.sh <外部の新規出力先> <40桁SHA>`を実行する。
+
 ## 導入と文書
+
+Prunletの `vava` で新しいリリースを公開するときは、Apple Silicon版のビルド・署名・公証・ZIP生成を `ssh mac` の実機で行う。[Apple Silicon版の公開手順](docs/distribution.md#apple-silicon版の公開手順)に従い、検証済みZIPを同じGitHub Releaseに添付してから公開する。Mac向けにGitHub Actionsを起動したり、GitHubホストのrunnerへ切り替えたりしない。Windows版は既存の配布workflowを使う。再開時は完了済みの工程と実物を照合して再利用する。
 
 Dependabotと依存検証のworkflowを変更する場合は、[依存更新の境界](DESIGN.md#依存更新の境界)にある検証条件と読取り権限の境界を維持する。依存検証CIの成功は、変更内容に応じた上記の追加E2Eを代替しない。
 
 対外表記ではREADME冒頭の副題を併記する。今後のX告知では本文と紹介画像に同じ副題を毎回含め、GitHubの説明欄も同じ表記に揃える。X告知本文には、README冒頭に沿った紹介文を毎回1文入れる。その紹介文には、`blocked by policy`による清掃の停止を減らす目的と、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約する使い方を含める。
 
-latest導入の検証は`scripts/Install-Prunlet.ps1`の[導入契約](DESIGN.md#導入と検証の境界)に従い、開発クローンやローカルビルドで代用しない。[容量上限の一度だけの移行](DESIGN.md#容量上限の一度だけの移行)、既存設定とACLの保持、再更新時の冪等性、ロック・登録失敗時の原本保全と復旧も確認する。
+Windowsのlatest導入の検証は`scripts/Install-Prunlet.ps1`の[導入契約](DESIGN.md#導入と検証の境界)に従い、開発クローンやローカルビルドで代用しない。[容量上限の一度だけの移行](DESIGN.md#容量上限の一度だけの移行)、既存設定とACLの保持、再更新時の冪等性、ロック・登録失敗時の原本保全と復旧も確認する。
 
-MCP起動時の自動更新は手動導入とは別の経路である。[更新の設計](DESIGN.md#起動時自動更新)に従い、更新状態・製品排他・配布検証・容量検査を迂回しない。配布物は`scripts/Package-PrunletUpdate.ps1`で生成し、公開タグから生成するrelease workflowとの形式の一致を維持する。公開ZIPは`scripts/Verify-ReleasePackage.ps1 -PackagePath <ZIP絶対パス> -SourceRoot <ソース絶対パス> -PublishDirectory <publish絶対パス> -CommitSha <40桁SHA> -DefaultBranch <既定ブランチ> -Runtime <win-x64|win-arm64> -Repository <owner/repo>`で生成元と照合し、返されたZIP全体のSHA-256がアップロード直前にも一致することを確認する。
+WindowsのMCP起動時自動更新は手動導入とは別の経路である。[更新の設計](DESIGN.md#起動時自動更新)に従い、更新状態・製品排他・配布検証・容量検査を迂回しない。Windowsの配布物は`scripts/Package-PrunletUpdate.ps1`で生成し、公開タグから生成するrelease workflowとの形式の一致を維持する。Windowsの公開ZIPは`scripts/Verify-ReleasePackage.ps1 -PackagePath <ZIP絶対パス> -SourceRoot <ソース絶対パス> -PublishDirectory <publish絶対パス> -CommitSha <40桁SHA> -DefaultBranch <既定ブランチ> -Runtime <win-x64|win-arm64> -Repository <owner/repo>`で生成元と照合し、返されたZIP全体のSHA-256がアップロード直前にも一致することを確認する。
 
 コードコメントは日本語。[README](README.md)は利用者向け、[DESIGN.md](DESIGN.md)は現在の設計、連携と検証の詳細は`docs/`、エージェントの作業規約は本ファイルに置き、同じ説明を複製せず参照する。

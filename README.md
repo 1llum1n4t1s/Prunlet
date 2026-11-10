@@ -2,17 +2,15 @@
 
 Prunletは、`blocked by policy`による清掃の停止を減らすために、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約するWindows・Apple Silicon Mac用ツールです。許可された削除を最初からPrunletへ任せる使い方に揃えます。
 
-指定したファイル・フォルダーを通常はWindowsのゴミ箱へ移します。予約名の通常ファイル、Windowsがゴミ箱には大きすぎると判断した対象、および対象ドライブで即時削除が明示設定されWindowsがゴミ箱を利用できないと返した対象は、元の実体と名前を確認できた場合に限り永久削除を試みます。Prunletはファイルの操作記録・操作ID・復元用snapshotを保存せず、ゴミ箱に移った項目の復元と保持期間の管理はWindowsに任せます。レジストリのキー・値は専用snapshotとトランザクションで保全し、操作IDによる非上書き復元を提供します。Codexフックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
+通常はファイル・フォルダーをOSのゴミ箱へ移します。Prunletはファイルの操作記録・操作ID・復元用snapshotを保存せず、ゴミ箱からの復元と保持はOSに任せます。Codexフックは直接削除を検査・拒否し、CLI手順を案内します。提供元はKagayoiです。
 
-ファイルと空フォルダーを扱い、`--recursive`を明示するとフォルダー全体を削除できます。リンク先は辿りません。上記の判定・設定を確認できないゴミ箱の失敗では永久削除や独自退避へ切り替えません。ハードリンクは生存する別名と内容を共有するため、保存時点の不変コピーではありません。
-
-正式なsandbox権限申請に対応し、実効設定で申請が必要かつ許可されるCodexホストでは、実削除を初回から申請付きで実行します。dry-runはゴミ箱へのアクセス許可を保証しません。Windowsの管理者権限が必要な場合は、許可範囲内でエージェントが管理者CMDを起動し、同じ配置済みCLIと設定で実行・結果確認を行います。本人のUAC同意が必要な場合は操作を案内します。Prunlet自身は自動昇格せず、拒否・結果不明を別経路で再試行しません。詳細は[連携手順](docs/integration.md#sandboxとゴミ箱へのアクセス)を参照してください。
+ファイルと空フォルダーを扱い、`--recursive`を明示するとフォルダー全体を削除できます。リンク先は辿りません。ハードリンクはゴミ箱への移動後も生存する別名と内容を共有します。条件付きの永久削除と[レジストリの削除・復元](#レジストリの削除復元)はWindows専用です。
 
 ## `blocked by policy`対策としての使い方
 
-AIが生成した`Remove-Item`や`rm`などの削除コマンドで清掃が止まりやすい環境では、許可された削除を最初からPrunlet CLIへ任せます。対象の検証とWindowsのゴミ箱への移動を専用ツールへ集約できます。
+AIが生成した`Remove-Item`や`rm`などの削除コマンドで清掃が止まりやすい環境では、許可された削除を最初からPrunlet CLIへ任せます。Apple Silicon MacのCodexでは[macOSの導入手順](docs/macos.md)に沿って、配置済みのCLIと設定を使います。
 
-Codexでは、次の順序で利用します。
+WindowsのCodexでは、次の順序で利用します。
 
 1. 下の[インストールと更新](#インストールと更新)のコマンドを、`-RegisterCodex -RegisterAgentInstructions`付きで実行します。CLI・MCP・フックと、Prunlet CLIを最初から使う共通指示を登録します。
 2. Codexで`/hooks`を開いてPrunletフックを信頼し、Codexを再起動して登録内容を読み込みます。
@@ -22,7 +20,7 @@ Codexでは、次の順序で利用します。
 
 > 今回作成した不要な一時ファイルと作業フォルダーを、最初からPrunlet CLIで清掃してください。
 
-空白・Unicode・長いパス・複数対象はUTF-8のJSON一覧を`--paths-file`で渡し、非空フォルダーには`--recursive`を明示します。実際のコマンドと復元方法は、後述の「削除・復元」を参照してください。
+空白・Unicode・長いパス・複数対象はUTF-8のJSON一覧を`--paths-file`で渡し、非空フォルダーには`--recursive`を明示します。実際のコマンドと復元方法は[削除・復元](#削除復元)を参照してください。
 
 フックは直接削除を検出・拒否してCLI手順を案内する補助で、自動変換は行いません。失敗と再試行を繰り返さずに済むよう、共通指示による初回からのCLI利用を基本にします。ホストやOSの権限・承認・管理ポリシーは引き続き適用されます。Prunletの呼出し自体が拒否された場合は停止し、別経路で再試行しません。登録と検査範囲の詳細は[連携手順](docs/integration.md)を参照してください。
 
@@ -30,7 +28,11 @@ CodexからMacなどへ送るPowerShellスクリプトは、[フックの連携�
 
 ## インストールと更新
 
-Apple Silicon Macでは、[macOSのインストールと更新](docs/macos.md)を参照してください。ファイル・フォルダーはmacOSのゴミ箱へ移動し、Finderで復元できます。以下はWindowsの手順です。
+### Apple Silicon Mac
+
+[GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases/latest)から`prunlet-update-osx-arm64.zip`を取得します。署名・公証の確認、専用フォルダーへの新規導入、CodexのMCP登録は[macOSの導入手順](docs/macos.md)に従ってください。登録済みMCPは起動時に更新を確認し、使用中なら次回以降に延期します。
+
+### Windows
 
 Windows x64・ARM64に対応します。下のインストーラーは[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の既定ブランチの最新コミットからビルドするため、PowerShell 7、Rustup・Cargo、対象アーキテクチャのMSVCビルドツールとWindows SDKが必要です。ビルドに使うRustの版は[`rust-toolchain.toml`](rust-toolchain.toml)の`channel`で固定されています。Rustターゲットがなければ、`rustup target add --toolchain <channelの値> <ターゲット名>`で追加してください。
 
@@ -81,7 +83,7 @@ MSIX環境でAppDataが別の実体へ転送される場合は、`-UpdateBackupR
 
 ## 初期設定
 
-インストーラーを利用した場合は初期化済みです。手動ではレジストリ復元データの保存先を指定します。`init`は既存設定を上書きしません。
+macOSの導入時には設定が作成されます。以下はWindowsの初期設定手順です。Windowsのインストーラーを利用した場合は初期化済みです。手動ではレジストリ復元データの保存先を指定します。`init`は既存設定を上書きしません。
 
 ```powershell
 $config = Join-Path $env:USERPROFILE '.local\Prunlet\config.json'
@@ -108,6 +110,16 @@ $exe = Join-Path $env:USERPROFILE '.local\Prunlet\bin\prunlet.exe'
 
 ## 削除・復元
 
+### Apple Silicon Macでの削除・復元
+
+[macOSのCLI例](docs/macos.md)にある実行ファイルと設定の絶対パスを使います。`delete --dry-run -- <絶対パス>`で対象を確認し、実行時は`--dry-run`を外します。`recycled`の項目はFinderのゴミ箱から復元できます。`ambiguous`の場合は元のパスとゴミ箱を確認し、同じ削除を自動再送しないでください。
+
+協調的な`flock`の解放を待つには`delete-queue -- <絶対パス>`で登録し、`delete-queue-status <job-id>`で最終結果を確認します。取消は`pending`の間に`delete-queue-cancel <job-id>`で行います。
+
+### Windowsでの削除・復元
+
+正式なsandbox権限申請に対応し、実効設定で申請が必要かつ許可されるCodexホストでは、実削除を初回から申請付きで実行します。dry-runはゴミ箱へのアクセス許可を保証しません。Windowsの管理者権限が必要な場合は、許可範囲内でエージェントが管理者CMDを起動し、同じ配置済みCLIと設定で実行・結果確認を行います。本人のUAC同意が必要な場合は操作を案内します。Prunlet自身は自動昇格せず、拒否・結果不明を別経路で再試行しません。詳細は[連携手順](docs/integration.md#sandboxとゴミ箱へのアクセス)を参照してください。
+
 ```cmd
 C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete --dry-run --paths-file C:\work\delete-paths.json
 C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete --paths-file C:\work\delete-paths.json
@@ -119,7 +131,7 @@ exe・設定は配置済みの絶対パスへ置き換えてください。Codex
 ["C:\\work\\project\\unused.txt", "C:\\work\\project\\other.txt"]
 ```
 
-空フォルダーは通常の`delete`、内容があるフォルダーは`delete --recursive --paths-file <絶対JSONパス>`で扱います。単純なパスは`delete [--dry-run] [--recursive] -- <絶対パス> [...]`でも渡せます。ワイルドカード・ネットワークパス・未知のreparseタグは扱いません。リンクはリンク自体を削除し、リンク先を走査しません。`NUL`や`NUL.txt`などWindows予約名と同じ名前の通常ファイルは、実体を確認して追加確認なしで永久削除します。ゴミ箱には入りません。予約名の祖先・ディレクトリ・リンクはこの例外の対象外です。
+空フォルダーは通常の`delete`、内容があるフォルダーは`delete --recursive --paths-file <絶対JSONパス>`で扱います。単純なパスは`delete [--dry-run] [--recursive] -- <絶対パス> [...]`でも渡せます。ワイルドカード・ネットワークパス・未知のreparseタグは扱いません。リンクはリンク自体を削除し、リンク先を走査しません。`NUL`や`NUL.txt`などWindows予約名と同じ名前の通常ファイルは、実体を確認して追加確認なしで永久削除します。ゴミ箱には入りません。予約名の祖先・ディレクトリ・リンクはこの例外の対象外です。通常名では、Windowsが対象をゴミ箱には大きすぎると返した場合、またはゴミ箱が利用できず対象ドライブの即時削除設定を確認できた場合に限り、元の実体と名前を照合して永久削除を試みます。
 
 結果は`dryRun`・`items`・`warnings`です。各項目の`path`・`kind`・`status`と任意の`error`を確認します。状態は`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`で、ファイルの操作ID・backupPath・hash・sizeは返しません。`permanently_deleted`は指定した元の名前をゴミ箱に移さず削除したことを示し、他のハードリンクやバックアップの消去は意味しません。`failed`と`ambiguous`は成功扱いになりません。
 
@@ -188,7 +200,7 @@ MSIX由来の仮想viewで6801になる場合は、[通常Windowsの明示セッ
 
 ## MCP
 
-`prunlet --config <絶対パス> mcp`でローカルstdioサーバーを起動します。標準出力はJSON-RPC専用です。MCPプロトコルの2025-11-25・2025-06-18・2024-11-05に対応します。
+`prunlet --config <絶対パス> mcp`でローカルstdioサーバーを起動します。標準出力はJSON-RPC専用です。MCPプロトコルの2025-11-25・2025-06-18・2024-11-05に対応します。`delete_files`は両OSで使えます。表のほかのツールはWindows専用です。
 
 | ツール | 引数 | 用途 |
 | --- | --- | --- |
@@ -198,11 +210,11 @@ MSIX由来の仮想viewで6801になる場合は、[通常Windowsの明示セッ
 | `reconcile_registry` | `operationId` | 切断後に保存済みの結果を読取り確認。削除・復元を再送しない |
 | `list_operations` | なし | レジストリ操作IDの一覧（復元可否は復元時に検証） |
 
-サーバーは削除ツールの用途を`instructions`で通知します。通常入口はCLIで、MCPは配置済みexe・設定をCMDで安全に表現できない場合などの代替入口です。purgeは明示CLI操作です。
+サーバーは削除ツールの用途を`instructions`で通知します。Windowsでは通常CLIを使い、配置済みexe・設定をCMDで安全に表現できない場合などにMCPを使えます。レジストリの`purge`は明示CLI操作です。
 
 ## Codexとの連携
 
-共通MCP登録、削除入力の検査、解除手順は[連携手順](docs/integration.md)を参照してください。ネイティブexeのフックは認識した直接削除を拒否し、検知した命令とshellの解釈を理由として返します。shellが不明な場合は候補としての判定であり、ローカル削除と確定したものではありません。検索文字列やリモートスクリプトが拒否された場合は、[フックの検査範囲](docs/integration.md#hookの検査範囲)を確認してください。案内されるWindows用CLIは、許可されたWindows対象の削除に使います。削除や入力の自動置換は行いません。Codex側の承認や管理ポリシーを維持します。
+Windowsの共通MCP登録、削除入力の検査、解除手順は[連携手順](docs/integration.md)を参照してください。macOSのMCP登録例とフックの起動引数は[macOSの導入手順](docs/macos.md)を参照してください。ネイティブexeのフックは認識した直接削除を拒否し、検知した命令とshellの解釈を理由として返します。shellが不明な場合は候補としての判定であり、ローカル削除と確定したものではありません。検索文字列やリモートスクリプトが拒否された場合は、[フックの検査範囲](docs/integration.md#hookの検査範囲)を確認してください。フックが案内するCLIは、許可されたホストOS上の対象の削除に使います。削除や入力の自動置換は行いません。Codex側の承認や管理ポリシーを維持します。
 
 ## 保存先の実体検証で停止する場合
 
