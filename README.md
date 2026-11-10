@@ -30,9 +30,14 @@ CodexからMacなどへ送るPowerShellスクリプトは、[フックの連携�
 
 ## インストールと更新
 
-Windows x64・ARM64、PowerShell 7に対応します。下記のインストーラーはソースをビルドするため、Rustup・Cargoと対象WindowsのMSVCビルドツール、対象アーキテクチャのRust MSVCターゲットが必要です。Rustのバージョンはソースの`rust-toolchain.toml`で固定します。生成・配布するexeの実行に.NETランタイムは不要です。インストール元は[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の既定ブランチの最新HEADです。開発用クローンは使用しません。
+Windows x64・ARM64に対応します。下のインストーラーは[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の既定ブランチの最新コミットからビルドするため、PowerShell 7、Rustup・Cargo、対象アーキテクチャのMSVCビルドツールとWindows SDKが必要です。ビルドに使うRustの版は[`rust-toolchain.toml`](rust-toolchain.toml)の`channel`で固定されています。Rustターゲットがなければ、`rustup target add --toolchain <channelの値> <ターゲット名>`で追加してください。
 
-Windows ARM64では、下の実行コマンドに`-Runtime win-arm64`を追加してください。既定は`win-x64`で、ARM64での未指定は停止します。x64エミュレーションを選ぶ場合も`-Runtime win-x64`の明示指定が必要です。
+| ビルド先 | Rustターゲット | インストーラーの指定 |
+| --- | --- | --- |
+| Windows x64 | `x86_64-pc-windows-msvc` | `-Runtime win-x64`（既定） |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | `-Runtime win-arm64` |
+
+Windows ARM64では、下の実行コマンドに`-Runtime`を明示してください。x64エミュレーションを選ぶ場合は`-Runtime win-x64`を指定します。
 
 ```powershell
 $installerDirectory = Join-Path ([IO.Path]::GetTempPath()) ('Codex\Prunlet\bootstrap-' + [guid]::NewGuid().ToString('N'))
@@ -48,7 +53,7 @@ GitHub APIの未認証枠が上限に達した場合は、上の`pwsh`コマン�
 
 既定の配置先は`%USERPROFILE%\.local\Prunlet`です。`bin\prunlet.exe`と登録用スクリプト・共通指示を配置し、`source-info.json`に取得元・ブランチ・コミットを記録します。`-RegisterCodex`を指定すると共通MCPとネイティブexeのフックも登録します。
 
-自動更新では、CodexがPrunlet MCPを起動する際に公開済み最新版のバイナリを確認し、旧MCPや保守プロセスが終了しているときに切り替えます。使用中なら終了させず、次のMCP起動時に再確認します。通信や取得に失敗した場合は、更新前の状態が安全に保たれていれば現在の版を使います。
+自動更新では、CodexがPrunlet MCPを起動する際にGitHub Releaseのビルド済みバイナリを確認し、旧MCPや保守プロセスが終了しているときに切り替えます。自動更新ではソースの再ビルドは不要です。製品exeの実行に.NETランタイムやVCランタイムの追加導入は不要です。使用中なら終了させず、次のMCP起動時に再確認します。通信や取得に失敗した場合は、更新前の状態が安全に保たれていれば現在の版を使います。
 
 自動更新はGitHub Releaseの発行者を信頼し、取得した配布物の一致を検査します。検証の仕組みと信頼範囲は[起動時自動更新の設計](DESIGN.md#起動時自動更新)を参照してください。
 
@@ -70,7 +75,7 @@ GitHub APIの未認証枠が上限に達した場合は、上の`pwsh`コマン�
 
 更新前の製品や登録前のCodex設定のバックアップがある場合、導入結果の`updateBackupDirectory`に保存先が表示されます。既定は`%LOCALAPPDATA%\Codex\TaskArtifacts\Prunlet\install-<ID>`です。動作とCodex登録を確認し、復旧が不要になってから、その導入分のバックアップだけを清掃してください。連携スクリプトの設定バックアップは[連携手順](docs/integration.md)を参照してください。
 
-MSIX環境でAppDataが別の実体へ転送される場合は、`-UpdateBackupRoot <実体の絶対パス>`で更新バックアップの親を明示できます。その下へ導入ごとの`install-<ID>`を作ります。導入ごとの保存先がリポジトリ、Codex home、配置先、作業場所、復元データと重なる場合は拒否します。旧PowerShellバックエンドの退役ではPrunlet Coreを使い、`retirement-config.json`と削除結果も同じ更新バックアップへ保持します。
+MSIX環境でAppDataが別の実体へ転送される場合は、`-UpdateBackupRoot <実体の絶対パス>`で更新バックアップの親を明示できます。その下へ導入ごとの`install-<ID>`を作ります。導入ごとの保存先がリポジトリ、Codex home、配置先、作業場所、復元データと重なる場合は拒否します。旧PowerShellフックが残っている場合、インストーラーはPrunletでWindowsのゴミ箱へ移し、結果を同じ更新バックアップの`retired-products.json`に保存します。
 
 ## 初期設定
 

@@ -1,24 +1,27 @@
 # Prunletの設計
 
-現在の通常経路は、記録を残さないファイル削除と、snapshot・トランザクションを使うレジストリ削除・復元である。ファイルは通常Windowsゴミ箱へ移す。予約名の通常ファイル、明示的なサイズ超過時、対象ボリュームの確認済み即時削除設定時は、実体を再照合して元名の永久削除を試みる。利用手順は[README](README.md)、連携は[docs/integration.md](docs/integration.md)、検証は[docs/verification.md](docs/verification.md)を参照する。
+Prunletは、許可されたWindowsの削除をAIエージェントが同じ検証経路で実行できるよう、CLIとMCPへ集約する。通常経路は、記録を残さないファイル削除と、snapshot・トランザクションを使うレジストリ削除・復元である。ファイルは通常Windowsゴミ箱へ移す。予約名の通常ファイル、明示的なサイズ超過時、対象ボリュームの確認済み即時削除設定時は、実体を再照合して元名の永久削除を試みる。利用手順は[README](README.md)、連携は[docs/integration.md](docs/integration.md)、検証は[docs/verification.md](docs/verification.md)を参照する。
 
 ## 構成と責務
 
-製品コードは`src/rust`のRust実装で、`Cargo.toml`を正本とする。`scripts/Publish-Prunlet.ps1`はWindows x64・ARM64向けに実行ファイルを生成し、hook入口にはCLIと同一のバイナリを使う。製品の実行に.NETランタイムは不要である。
+製品コードは`src/rust`のRust実装で、ワークスペースの正本は[`Cargo.toml`](Cargo.toml)である。`scripts/Publish-Prunlet.ps1`は`Cargo.lock`を使ってWindows x64・ARM64向けにビルドする。[MSVCターゲットの設定](.cargo/config.toml)でCランタイムを静的リンクし、製品exeの実行に.NETランタイムやVCランタイムの追加導入を求めない。
 
-- `service::Runtime`が共通の実行境界を担当し、`files`・`registry`・`migration`のCoreへ委譲する。CLI・MCP・hookに別の削除方式を実装しない。
+- `service::Runtime`がCLIとMCPの共通実行境界となり、ファイルを`files`、レジストリと明示移行を`registry`、起動時更新の内部要求を`update`へ渡す。旧ファイルの明示移行は`registry::migration`から`migration`へ委譲する。
 - `cli`はCLIの入力検証とJSON出力、`protocol::mcp`はstdio JSON-RPCを担当する。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールである。`--config <path> mcp`として起動した場合は、起動前・引数検証の例外もstderrへ出してプロトコルstdoutを保つ。他のCLIでは例外をstdoutのJSONで返し、値名などの引数に`mcp`が含まれるだけでは出力先を変えない。
 - `protocol::hook`は認識した直接削除を検査・拒否し、配置済みCLIを案内する。専用入口`prunlet-hook.exe`はCLIと同じバイナリを別名で配置する。ホストの承認・管理ポリシーを維持し、削除の自動代行や自動昇格を行わない。
 - `prunlet-maintenance.exe`は同じCoreをGUI subsystemで発行した定期保守入口で、`--config <path> maintain --apply`だけを受け付ける。コンソールを作らずにレジストリ復元データを整理する。
-- Windows Shellがゴミ箱への移動とファイル復元を担当する。Prunletのファイル復元API・通常の履歴圧縮入口は提供しない。
+- `platform::windows`がパス・実体・ACLの照合やWindows Shellとの接続を担当する。ゴミ箱からの復元と保持期間の管理はWindowsに委ねる。Prunletはファイル復元APIや通常の履歴圧縮入口を提供しない。
+- `integration/`のPowerShellスクリプトはCodex登録、MCP起動時更新の調停、定期保守タスクの登録を担当する。製品Coreの削除処理は持たない。
 
 権限の境界はホストのsandbox承認、Windowsの実トークン、Prunlet Coreの対象検証に分かれる。Prunlet自身は自動昇格しないが、許可された削除についてエージェントが明示的に管理者CMDを起動し、同じ配置済みCLIと設定を使う連携は別の責務である。起動成功だけを削除成功とは扱わず、拒否・結果不明を昇格で迂回しない。起動と結果確認の手順は[連携手順](docs/integration.md#sandboxとゴミ箱へのアクセス)に集約する。
+
+`protocol::bounded_input`はhookとstdio MCPで入力のUTF-8とUTF-16コード単位数の上限を検査する。hookは不正なUTF-8や上限超過を検出した時点で拒否し、入力の終了を待たない。MCPは有効なUnicode空白だけの行を上限超過時も読み飛ばし、次の要求を処理する。
 
 ### フックのshell解析境界
 
 `protocol::hook`は`Bash`・`exec_command`・`functions.exec_command`のコマンド文字列を検査する。`exec_command`系の明示的な`tool_input.shell`がPowerShellまたはCMDなら、その文字列規則を選択する。shell未指定・未知・Posix系の指定、および`Bash`ではCMD・PowerShell・Posixの複数規則で検査する。未知shellをCMDで実行するWindowsホストがあるため、tool名やshell名だけからPosix実行とは推測しない。静的なshell wrapperのコマンド本文も再帰検査し、認識したPowerShell・CMDのwrapperには対応する規則を使う。
 
-拒否理由の検知情報と解析中のshell規則は要求専用の`protocol::hook`インスタンスに保持し、別要求へ持ち越さない。検知した命令・オプションと、その検知に使ったshell解釈を応答へ含め、検査不能な入力には原因を返す。shell未指定・未知の場合は候補の解釈であることを明示し、ローカル削除と断定しない。検索文字列やリモートスクリプトの引用も別shellでは命令になり得るため、CLI案内は許可されたWindows対象に限定する。応答形式と利用時の扱いは[連携手順](docs/integration.md#hookの検査範囲)を参照する。
+拒否理由の検知情報と解析中のshell規則は`protocol::hook`の要求ごとの`Inspector`に保持する。検知した命令・オプションと、その検知に使ったshell解釈を応答へ含め、検査不能な入力には原因を返す。shell未指定・未知の場合は候補の解釈であることを明示し、ローカル削除と断定しない。検索文字列やリモートスクリプトの引用も別shellでは命令になり得るため、CLI案内は許可されたWindows対象に限定する。応答形式と利用時の扱いは[連携手順](docs/integration.md#hookの検査範囲)を参照する。
 
 CMD規則では`#`をコメントとして扱わず、後続のコマンド区切り以降も検査する。静的な`IF`は`/i`・`not`、`exist`・`defined`・`errorlevel`・`cmdextversion`、`==`と`EQU/NEQ/LSS/LEQ/GTR/GEQ`の条件直後のコマンドを検査する。条件の真偽は評価せず、比較値や`echo`の引数を削除コマンドとは扱わない。wrapper本文の再構成では、引用内の`==`と引用外の比較演算子、空の引用文字列を区別して保つ。
 
@@ -40,15 +43,15 @@ Shellが削除元を8.3短縮名で返した場合、非reparseの対象だけ�
 
 Shellがゴミ箱への移動を成功と返した場合は、返却項目だけを一時的に開き、保持した元実体のFile IDと照合する。識別できない場合や不一致は`ambiguous`とし、記録やゴミ箱全体の走査は行わない。この照合は事後の検出であり、Shell直前の名前差し替えによって別実体がゴミ箱へ移ること自体は防げない。
 
-`Delete`は`FileDeleteResult`を返し、`dryRun`・`items`・`warnings`を持つ。項目は`path`・`kind`・`status`・任意の`error`だけであり、状態は`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`である。`permanently_deleted`は対象の元名をゴミ箱へ移さず削除したことを示し、別ハードリンクやバックアップの消去は保証しない。dry-runは予約名の通常ファイルをwould_permanently_deleteで示し、それ以外はWindowsの最終判定を予測できないことを警告する。`failed`・`ambiguous`はCLIの非ゼロ終了とMCPの`isError`へ反映する。結果不明時は同じ削除を再送せず、元対象とWindowsのゴミ箱を確認する。
+`files::recordless`の同期削除結果は、`dryRun`・`items`・`warnings`を持つ。項目は`path`・`kind`・`status`・任意の`error`だけであり、状態は`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`である。`permanently_deleted`は対象の元名をゴミ箱へ移さず削除したことを示し、別ハードリンクやバックアップの消去は保証しない。dry-runは予約名の通常ファイルをwould_permanently_deleteで示し、それ以外はWindowsの最終判定を予測できないことを警告する。`failed`・`ambiguous`はCLIの非ゼロ終了とMCPの`isError`へ反映する。結果不明時は同じ削除を再送せず、元対象とWindowsのゴミ箱を確認する。
 
 復元と保持期間の管理はWindowsのゴミ箱で行う。Windowsが完全削除した実体をPrunletが復元できるとは扱わない。ハードリンクの別名は実体を共有し、生存する外部別名からの書込みがゴミ箱内にも反映される。通常属性・ADS・case-sensitiveな名前とACLはWindowsが移す同じオブジェクトの状態であり、Prunletが保存時点の不変コピーやACL再適用を提供するものではない。
 
 対象のclaim取得順・process共通worker上限・重複/親子の排他・全preflight完了後の実行を維持する。ハードリンクの共有を検出した場合は排他的な実行へ切り替える。MCP要求枠とfile worker枠を分け、registry privilege変更をfile workerと並行させない。
 
-ロック待機の`RecoveryLockProgress`はCoreが発行し、`cli`がstderrへ診断を出す。MCPの並行ファイル要求用serviceもこの購読を引き継ぐ。`McpServer`は要求ごとの`progressToken`がある場合だけ追加購読して`notifications/progress`を返し、処理終了時に解除して最終応答後の通知と別要求への混入を防ぐ。
+共通ロックの待機・取得を`files::coordination`が進捗として通知し、`service::Runtime`がstderrへ診断を出す。`protocol::mcp`は要求に`progressToken`がある場合だけ`notifications/progress`も返し、処理終了時に通知を無効化して最終応答後の通知と別要求への混入を防ぐ。
 
-失敗時の診断はCoreの`FileDeletionDiagnostics`が担当し、`DeletionService`が各項目の`error`へ付加してCLI・MCPへ返す。再帰固定削除の走査中の例外は`FileDeletionEntryException`で失敗entryと元例外のHRESULT・内部例外を保持する。結果DTOの`path`と診断の`Target`は要求rootのまま、`Failure entry`に失敗entryの絶対パスを表示し、保持元の照会もそのentryを対象とする。これにより、要求単位の結果を保ちながら失敗箇所を診断できる。共有・ロック違反と削除元へのアクセス拒否では保持元を観測し、dry-runではプロセス照会を行わない。アクセス拒否だけで保持元や原因を断定しない。診断は失敗後の現在値であり、診断不能でも元の削除結果を維持する。保持元の特定を削除の再試行やプロセス停止へ結び付けない。照会方法と観測範囲の制約は[連携手順](docs/integration.md#使用中のファイルと同時実行)を参照する。
+`files::recordless`は失敗した各項目の`error`を組み立て、必要に応じて`platform::windows::diagnostics`へ保持元を照会する。再帰固定削除では`FailureEntry`で失敗箇所を保持し、元のエラーチェーンも診断に使う。結果DTOの`path`と診断の`Target`は要求rootのまま、`Failure entry`に失敗entryの絶対パスを表示し、保持元の照会もそのentryを対象とする。これにより、要求単位の結果を保ちながら失敗箇所を診断できる。共有・ロック違反と削除元へのアクセス拒否では保持元を観測し、dry-runではプロセス照会を行わない。アクセス拒否だけで保持元や原因を断定しない。診断は失敗後の現在値であり、診断不能でも元の削除結果を維持する。保持元の特定を削除の再試行やプロセス停止へ結び付けない。照会方法と観測範囲の制約は[連携手順](docs/integration.md#使用中のファイルと同時実行)を参照する。
 
 ロード済みモジュールの照会は、一時的なToolhelp process snapshotから自分を含め最大32プロセスの起動元チェーンを先に並べ、残りのプロセスを従来順で一度ずつ調べる。親関係は照会順にだけ使い、保持元の判定には実モジュールパスの一致を必要とする。snapshot取得に失敗した場合は従来順へ戻し、10秒・8件の上限と、全保持元を特定できない場合の注記を維持する。
 
@@ -56,7 +59,7 @@ Shellがゴミ箱への移動を成功と返した場合は、返却項目だけ
 
 ### 明示的な削除待機キュー
 
-通常の同期`Delete`とは別に、CLIの`delete-queue`・`delete-queue-status`・`delete-queue-cancel`で明示的な待機ジョブを扱う。MCPは既存の`delete_files`の`action`に`enqueue`・`status`・`cancel`を追加し、5ツールを維持する。拒否や不明な削除結果からの自動再送には使わない。
+通常の同期削除とは別に、CLIの`delete-queue`・`delete-queue-status`・`delete-queue-cancel`で明示的な待機ジョブを扱う。MCPは既存の`delete_files`の`action`に`enqueue`・`status`・`cancel`を追加し、5ツールを維持する。拒否や不明な削除結果からの自動再送には使わない。
 
 同じexeのジョブ専用一時workerとユーザー限定IPCを使い、ジョブ・実体照合情報・結果をメモリーだけに保持する。SID・Windows sessionごとのnamed Mutexで完了保持中を含め最大8 workerに制限する。1要求1〜256パス・親を含む照合情報4096項目・IPC入力1 MiBを上限とする。対象・親・再帰対象の子を削除前に固定して事前probeのWin32 32/33だけを1秒間隔で期限なく待ち、実体や再帰範囲の変更を検出したら中止する。全対象が削除可能になってから既存Coreの削除経路を一度だけ呼び、削除開始後は再送しない。取消は開始判定と同じlockで`pending`の間だけ受理する。
 
@@ -80,17 +83,17 @@ Shellがゴミ箱への移動を成功と返した場合は、返却項目だけ
 
 キー名内のcolonはリテラル文字として受理する。`C:#...`や`C:%5C...`もキー名の一部であり、ドライブパスやURLとして解釈・展開しない。相対パス・空segment・wildcardの拒否は維持する。
 
-アクセス方式は要求ごとの`normal`（既定）または明示`backupRestore`で選ぶ。`backupRestore`は64bit OS・64bitプロセス・view 64に限定し、view 32は原本・privilege・transactionを開く前に拒否する。バックアップ／復元オプションがaccess maskとともにWOW64 view指定を無視するため、64bitプロセスの既定viewだけを使用し、32bitパスを合成しない。復元時の記録がview 32の場合も同じ制約で停止する。後者は実効呼出し元の`SeBackupPrivilege`・`SeRestorePrivilege`を一時有効にし、既存キーのnative openに`REG_OPTION_BACKUP_RESTORE`を加える。localでは呼出し元tokenの要求ごとの複製を`RunImpersonated`で使い、native brokerでは既存の要求別token隔離を使う。process tokenを強めたまま後続要求へ持ち越さず、privilege復元の失敗と対象transactionのcommit結果は別に報告する。通常・rawリンク検査・同一オブジェクトのtransaction接続・再帰子・復元で同じ方式を使い、`OBJ_DONT_REPARSE`とリンク検査を維持する。ACL・Ownerを書き換えてアクセスを得ず、権限不足から自動切替しない。方式は退避データのidentityではないためschema 5は変えず、復元時も毎回明示選択する。記録から自動的に強い権限を有効化しない。dry-runでも実削除に必要な実効権限・transaction接続を確認し、stage・commit・対象変更を行わない。
+アクセス方式は要求ごとの`normal`（既定）または明示`backupRestore`で選ぶ。`backupRestore`は64bit OS・64bitプロセス・view 64に限定し、view 32は原本・privilege・transactionを開く前に拒否する。バックアップ／復元オプションがaccess maskとともにWOW64 view指定を無視するため、64bitプロセスの既定viewだけを使用し、32bitパスを合成しない。復元時の記録がview 32の場合も同じ制約で停止する。後者は実効呼出し元の`SeBackupPrivilege`・`SeRestorePrivilege`を一時有効にし、既存キーのnative openに`REG_OPTION_BACKUP_RESTORE`を加える。ローカル実行では実効呼出し元tokenの複製を専用スレッドに設定し、native sessionでは認証した呼出し元の要求別tokenを使う。process tokenを強めたまま後続要求へ持ち越さず、privilege復元の失敗と対象transactionのcommit結果は別に報告する。通常・rawリンク検査・同一オブジェクトのtransaction接続・再帰子・復元で同じ方式を使い、`OBJ_DONT_REPARSE`とリンク検査を維持する。ACL・Ownerを書き換えてアクセスを得ず、権限不足から自動切替しない。方式は退避データのidentityではないためschema 5は変えず、復元時も毎回明示選択する。記録から自動的に強い権限を有効化しない。dry-runでも実削除に必要な実効権限・transaction接続を確認し、stage・commit・対象変更を行わない。
 
 schema 5の`registry-manifest`・snapshot・intent・receiptで、未知の値型も含め型のuint値と生バイト列、キーごとのOwner・Group・DACL・SACL（Mandatory Labelを含む）を保持する。実削除は非トランザクションの対象または親HKEYを保持し、その同じオブジェクトをRootDirectory・空の相対名で`NtOpenKeyTransactedEx`に渡す。まず削除をトランザクション内へstageし、外部には元データが見える状態で、保持した非トランザクションHKEYからsnapshotを取得する。snapshot・manifest・intentのflushとハッシュ検証を済ませてからcommitし、完了receiptを永続化する。したがって外部に削除が確定する前に保全データが永続化される。
 
-dry-runは`SnapshotForDeletionPreflight`で実削除と同じ原本オブジェクト・アクセス権・再帰範囲を使い、各対象のtransaction接続を確認してsnapshotを読み、保持した名前の一致も確認する。削除のstage・書込み・commitは行わない。transaction非対応のviewを読取りだけで通過させて`would_delete`とすることを防ぐが、その後の外部変更や実削除の成功までは保証しない。
+dry-runは`registry::native::delete_snapshot`の事前検査経路で実削除と同じ原本オブジェクト・アクセス権・再帰範囲を使い、各対象のtransaction接続を確認してsnapshotを読み、保持した名前の一致も確認する。削除のstage・書込み・commitは行わない。transaction非対応のviewを読取りだけで通過させて`would_delete`とすることを防ぐが、その後の外部変更や実削除の成功までは保証しない。
 
 snapshotを先に読んでから削除をstageすると、その間の外部書込みが成功したまま失われるおそれがあるため、この順序へ戻さない。先行stage後も非トランザクションの外部書込みが受理される場合はあるが、競合したcommitは失敗し、外部の新データを含む元対象を保全する。KTM非対応時の非トランザクション削除は行わない。完全なキーACL取得には`SeSecurityPrivilege`が必要であり、現在のトークンに存在する場合のみ一時有効化し、自動昇格しない。権限不足やsnapshot失敗ではcommitせずロールバックする。値には独立ACLがなく、親ACLを変更しない。
 
 schema 5の原文bytesはpendingファイルの最初の書込み時点から、Ownerを現在のユーザーSID、アクセス主体を現在のユーザーSIDとSYSTEMだけとするprotected DACLを指定してatomicに作成する。操作ディレクトリ・metadata・ロックも同じ非公開ACLで作成し、後からACLを締める公開期間を設けない。読取り・復元・整理でもACLを検証し、改変を検出した記録は処理せず保持する。
 
-manifest・snapshot・intent・receiptの公開は`RegistryPublication`が担当する。snapshotは容量予約に使った確定済みUTF-8 bytesを公開にも使い、公開のための再JSON化を避ける。manifestとreceiptは既存ownerの作成時刻を反映してからJSON化する。空のpendingを作成し、親と本文のidentity・公開先名・長さ・hashを結び付けた所有予約をflushしてから本文を書き、flush・検証後に同じhandleで正式名へrenameする。未公開本文を正式receiptへ昇格してcommit結果を推測しない。正式callerが原本とACLを再検証し、予約した完全bytesと既存prefixが一致した場合だけ書込みを再開できる。公開済み本文のidentity・長さ・hashを確認できれば所有予約を清掃できるが、pendingと正式名の共存、所有不明、改変は保全する。
+manifest・snapshot・intent・receiptの公開は`registry::storage`が担当する。snapshotは容量予約に使った確定済みUTF-8 bytesを公開にも使い、公開のための再JSON化を避ける。manifestとreceiptは既存ownerの作成時刻を反映してからJSON化する。空のpendingを作成し、親と本文のidentity・公開先名・長さ・hashを結び付けた所有予約をflushしてから本文を書き、flush・検証後に同じhandleで正式名へrenameする。未公開本文を正式receiptへ昇格してcommit結果を推測しない。正式callerが原本とACLを再検証し、予約した完全bytesと既存prefixが一致した場合だけ書込みを再開できる。公開済み本文のidentity・長さ・hashを確認できれば所有予約を清掃できるが、pendingと正式名の共存、所有不明、改変は保全する。
 
 キーの生セキュリティ記述子は`BACKUP_SECURITY_INFORMATION`（0x10000）で取得し、Owner・Group・DACL・SACLとMandatory Labelを含めて保持する。Owner/Group/DACL/SACLだけの取得フラグ（0xF）ではMandatory Label ACEが欠落するため使用しない。復元時は完全な記述子を指定して全キーを作成してから、必要なauto-inherited bitだけを要求するsetterを適用し、同じ完全取得方法で再読して生bytesを完全一致で比較する。親のsetterを子の作成前に適用すると、SACL実体がない子のauto-inherited bitが失われるため、この順序を維持する。比較を緩和せず、保持できない場合はロールバックしてsnapshotを保全する。
 
@@ -112,7 +115,7 @@ native scopeの識別はmanifestとsnapshotのhash内に保存し、machine・SI
 
 volume側は8 KiB以内のstore markerでSID・metadata root・StoreKey・volume・root identityとprivate ACLを検証した専用StoreKey/restore rootだけを扱う。privateBase・custom設定dir・他StoreKeyを丸ごと処分しない。中央GUID操作は直下の正規file marker名で分類し、本文が破損・未完了でも処分できる。registry manifest・pending・publication・namespace/controlのsignalは先に保護する。typed file rootは正規layout、既存bundle/journalは予約prefixとprivate metadata所有範囲で限定し、本文の任意Pathへ削除範囲を広げない。
 
-所有inventoryのpinを解放してからdispatchし、直前にpath・root identity・marker・非reparseを再確認する。元実体の共有handleをShell処理中も保持し、返却項目が同じ実体と確認できなければ`ambiguous`で止めてgateを残す。通常削除と同じ`NativeRecycleBin.RecycleUnrecorded`を使い、永久削除・copy fallback・任意対象の保護解除フラグを追加しない。結果はPathと`recycled`・`would_recycle`・`would_permanently_delete`・`already_absent`・`retained`・`failed`・`ambiguous`であり、file操作ID・復元記録を新設しない。
+所有inventoryのpinを解放してからdispatchし、直前にpath・root identity・marker・非reparseを再確認する。元実体の共有handleをShell処理中も保持し、返却項目が同じ実体と確認できなければ`ambiguous`で止めてgateを残す。通常削除と同じ`platform::windows::recycle::recycle`を使い、永久削除・copy fallback・任意対象の保護解除フラグを追加しない。結果はPathと`recycled`・`would_recycle`・`would_permanently_delete`・`already_absent`・`retained`・`failed`・`ambiguous`であり、file操作ID・復元記録を新設しない。
 
 移行全体で固定のprivate空ファイル`.legacy-file-discard-in-progress`を1個だけ使う。これは対象Path・ID・hash・ACL本文を持たない実行gateであり、CreateNew・Flush・検証後にdispatchし、確認済み成功時だけ除去する。存在または不正形はfile discardだけを停止し、registry処理は続ける。installerは解除せず、元フォルダーとWindowsゴミ箱の確認後の`migrate --apply --retry-legacy-discard`だけが、正規の空private gateを解除して再評価する。dry-runとif-neededにackを組み合わせない。
 
@@ -128,7 +131,7 @@ registryの旧記録は専用namespaceへ移し、ID・snapshot・完全ACL・sc
 
 レジストリの復元・purge完了後は、snapshotが消費済みで正式完了receiptがある記録から、残存memberのidentity・security bytes・長さ・hashを束縛する`<id>.terminal.json`を作る。完了時点から保持期間を過ぎた記録だけを整理し、先にterminalのhashに結び付けた`<id>.terminal-cleanup.json`を永続化する。途中でmanifestが消えても保存済みinventoryで残存memberを検証して再開し、未知memberや差替えは保全する。これらはレジストリ専用であり、ファイルの終了履歴を作る機構ではない。
 
-移行・terminal・terminal-cleanupの制御記録は`RegistryControlPublication`が扱う。中断したpendingの再公開には、呼出元が同じ記録の証拠から本文を再構成し、既存prefixとの一致を検証する必要がある。pending本文だけを権威にせず、正式名との共存や不一致は保全する。この再構成方式はsnapshot・receiptの公開には一般化しない。
+移行・terminal・terminal-cleanupの制御記録の公開は`registry::storage`が扱う。中断したpendingの再公開には、呼出元が同じ記録の証拠から本文を再構成し、既存prefixとの一致を検証する必要がある。pending本文だけを権威にせず、正式名との共存や不一致は保全する。この再構成方式はsnapshot・receiptの公開には一般化しない。
 
 ### 容量上限の一度だけの移行
 
@@ -160,12 +163,14 @@ stageは再帰削除せず、完了した世代の正規製品とmetadataをhash
 
 更新用cacheはレジストリ復元領域とは別に合計2 GiBを上限とする。公開ZIP・stage・製品slot・固定candidate/previous・保全した異常世代・各ディレクトリのADS・更新管理ファイルを容量に含め、確保前と完了後に検査する。slotはcache専用で、実行・移動・削除しない。正規hash・長さ・単一linkを同じ排他handleで確認し、通常streamだけをin-place更新する。候補へはそのhandleの通常streamだけをCreateNewコピーする。ADSや不明な部分書込みは保持し、予算不足を自動削除で回避しない。
 
-ビルドと検証の実行規約・必須コマンドは[AGENTS.md](AGENTS.md#ビルドと検証)、各経路の検証範囲とfixtureの保持・清掃は[検証手順](docs/verification.md)を正本とする。
-
 既存のWindowsクライアント向けにも、同一ZIPをR2へ配置してからGitHub Releaseへ添付する。固定配信先・資格情報・順序は[配布手順](docs/distribution.md)を参照する。
+
+## 製品と検証の境界
+
+`Publish-Prunlet.ps1`は入力とCargo設定のビルド前後の一致を検査し、`build-manifest.json`に入力の指紋、toolchain、target、製品のSHA-256を記録する。検証ビルドでは同じ入力からCoreのlibtestプローブを生成し、別crateの`tools/prunlet-fixtures`と`tools/prunlet-support`がfixture DLLと補助CLIを供給する。これらのhashもmanifestに記録し、候補を検証時に照合する。障害注入はテスト用のCoreに限定し、製品exe・配布ZIPには検証入口やツールを含めない。Core境界の結果は製品CLI・MCP・hookの実プロセス検証と区別する。
+
+ビルドと検証の必須コマンドは[AGENTS.md](AGENTS.md#ビルドと検証)、検証範囲とfixtureの保持・清掃は[検証手順](docs/verification.md)を参照する。
 
 ## 依存更新の境界
 
-`.github/dependabot.yml`はGitHub ActionsとCargoの更新を毎週月曜09:00（日本時間）に確認し、minor・patchをまとめ、majorは個別PRにする。`.github/workflows/dependency-validation.yml`はDependabotのPRまたは手動起動を対象に、WindowsでCargo buildとCLI・MCP・hookの通常E2Eを行う。出力はrunnerの一時領域へ分離し、checkoutの認証情報を保持せず、権限はcontentsの読取りに限定する。
-
-依存PRの取り込みは、対象差分と検証結果を確認して個別に行う。依存検証workflowはcontentsの読取り権限で完結する。
+`.github/dependabot.yml`はGitHub ActionsとCargoの更新を毎週月曜09:00（日本時間）に確認し、minor・patchをまとめ、majorは個別PRにする。`.github/workflows/dependency-validation.yml`はDependabotのPRまたは手動起動を対象に、Windows x64向けの検証ビルドを作り、`Verify-RecordlessFiles.ps1`へ製品exe・Coreプローブ・manifest・そのSHA-256を渡す。対象は記録なしファイル削除のCLI・MCP・hookと同じビルドのCoreケースである。レジストリ・移行・導入などの個別検証は別に行う。出力はrunnerの一時領域へ分離し、checkoutの認証情報を保持せず、権限はcontentsの読取りに限定する。
