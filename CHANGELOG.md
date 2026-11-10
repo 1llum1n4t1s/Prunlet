@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.0.41 - 2026-11-11
+
+- WindowsのMCP起動時更新で、`PRUNLET.md`のCRLFとLFだけが異なる場合は既存ガイドを保持したまま更新する。
+- GitHubの未認証API枠を使い切った場合は既存の`gh`認証でリリース情報を取得し、公開ZIPのサイズとSHA-256を検証して更新する。
+
 ## 1.0.40 - 2026-11-10
 
 - Linux x64・ARM64向けに、freedesktop Trashを使うCLI・stdio MCP・Codexフックを追加。
