@@ -1,6 +1,6 @@
 [package]
 name = "prunlet-support"
-version = "1.0.37"
+version = "1.0.38"
 edition = "2024"
 rust-version = "1.99.1"
 publish = false
