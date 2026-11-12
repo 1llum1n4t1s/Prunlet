@@ -18,8 +18,7 @@ foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Absolute paths required.' }
 }
 foreach ($path in @($OutputDirectory, $ReportPath)) {
-    Assert-VerificationDestination $path @($repo, (Join-Path $env:USERPROFILE '.codex'))
-    if (![IO.Path]::GetPathRoot($path).Equals('D:\', [StringComparison]::OrdinalIgnoreCase)) { throw 'External D output required.' }
+    Assert-ExternalVerificationPath $path @($repo)
     if (Test-Path -LiteralPath $path) { throw 'Unused output/report required.' }
     if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) { throw 'Output/report parent must exist.' }
 }

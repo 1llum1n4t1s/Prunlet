@@ -53,8 +53,7 @@ if ($MoveExecutablePath) {
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $ReportPath = [IO.Path]::GetFullPath($ReportPath)
 foreach ($path in @($OutputDirectory, $ReportPath)) {
-    Assert-VerificationDestination $path @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))
-    if (![IO.Path]::GetPathRoot($path).Equals('D:\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Local registry verification requires D: output.' }
+    Assert-ExternalVerificationPath $path @($repoRoot, $codexRoot)
     if (Test-Path -LiteralPath $path) { throw 'Output/report must be new.' }
     if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) { throw 'Create external output/report parents first.' }
 }
@@ -120,7 +119,7 @@ function New-Case([string]$Name) {
     $script:Config = Join-Path $script:CaseRoot 'config.json'; $script:Recovery = Join-Path $script:CaseRoot 'metadata'; $script:Invocation = 0
     $init = Invoke-RegistryCli @('init', '--backup-directory', $script:Recovery)
     Assert-True ($init.ExitCode -eq 0) "Init failed: $($init.Stderr)"
-    $config = Read-Json $script:Config; $config.volumeRecoveryDirectories = @{ 'D:\' = (Join-Path $script:CaseRoot 'volume-store') }; Save-Json $script:Config $config
+    $config = Read-Json $script:Config; $volumeStore = Join-Path $script:CaseRoot 'volume-store'; $config.volumeRecoveryDirectories = @{ (Get-VerificationVolumeRoot $volumeStore) = $volumeStore }; Save-Json $script:Config $config
     $migration = Invoke-RegistryCli @('migrate','--apply')
     Assert-True ($migration.ExitCode -eq 0 -and $migration.Json.registryReady -and $migration.Json.complete) 'Fresh registry namespace preparation failed.'
     $script:Relative = $runRelative + '\' + $Name; $script:Path = $fixtureHive + '\' + $script:Relative
@@ -527,6 +526,30 @@ Case 'operations-explicit-purge-and-expiry' {
     $maintained = Invoke-RegistryCli @('maintain','--apply')
     Assert-True ($maintained.ExitCode -eq 0 -and ![IO.File]::Exists($old.Payload)) 'Expired registry backup not maintained.'
     Assert-True ([IO.File]::Exists($old.Manifest)) 'Expiry removed operation metadata.'
+}
+Case 'uncommitted-before-intent-is-known-capacity-and-purgeable' {
+    # 正式intentの公開前に中断した記録を、実削除の記録からdelete receiptを退避して再現する。
+    # 分類はreceiptの構成だけで決まり、現在のregistryキーの有無からcommitを推測しないことも確認する。
+    Fixture; $op = Delete-Registry
+    foreach ($phase in @('complete','intent')) {
+        [IO.File]::Move((Join-Path $op.Root "registry-delete-$phase.json"), (Join-Path $script:CaseRoot "retained-delete-$phase.json"))
+    }
+    $hash = Digest $op.Payload
+    $reconcile = Invoke-RegistryCli @('registry-reconcile',$op.Id)
+    Assert-True ($reconcile.ExitCode -eq 0 -and $reconcile.Json.items[0].status -ceq 'not_committed') "Uncommitted record was not reconciled as not_committed: $($reconcile.Stdout) $($reconcile.Stderr)"
+    $operations = Invoke-RegistryCli @('operations')
+    Assert-True ($operations.ExitCode -eq 0 -and @($operations.Json.operations | Where-Object { $_.operationId -ceq $op.Id -and $_.lifecycleState -ceq 'not_committed' }).Count -eq 1) 'Uncommitted record was not listed as not_committed.'
+    $rejected = Invoke-RegistryCli @('restore',$op.Id)
+    Assert-True ($rejected.ExitCode -ne 0 -and ($rejected.Stdout + $rejected.Stderr) -match 'not committed') 'Uncommitted record was not refused for its not-committed state.'
+    Assert-True (!(Exists) -and [IO.File]::Exists($op.Payload) -and (Digest $op.Payload) -ceq $hash) 'Uncommitted restore refusal changed the source or snapshot.'
+    # 以前は容量不明として以後の全registry-deleteを拒否していた。未commit記録は既知容量として数える。
+    Fixture; $second = Delete-Registry
+    Assert-True ([IO.File]::Exists($op.Payload) -and (Digest $op.Payload) -ceq $hash) 'Delete capacity gate discarded the retained uncommitted snapshot.'
+    $purged = Invoke-RegistryCli @('purge',$op.Id,'--apply')
+    Assert-True ($purged.ExitCode -eq 0 -and $purged.Json.items[0].status -ceq 'purged' -and ![IO.Directory]::Exists($op.Root)) "Uncommitted record was not purged: $($purged.Stdout) $($purged.Stderr)"
+    $maintained = Invoke-RegistryCli @('maintain','--apply')
+    Assert-True ($maintained.ExitCode -eq 0 -and $maintained.Json.capacityKnown -and [IO.File]::Exists($second.Payload)) 'Maintenance after uncommitted purge was incomplete.'
+    $null = Restore $second
 }
 Case 'capacity-single-oversized-then-normal-budget' {
     $config = Read-Json $script:Config; $config.maxRecoveryBytes = 1; Save-Json $script:Config $config

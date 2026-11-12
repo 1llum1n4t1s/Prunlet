@@ -35,8 +35,7 @@ if ($MoveExecutablePath) {
     if (![IO.File]::Exists($MoveExecutablePath)) { throw 'MoveExecutablePath missing.' }
 }
 foreach ($path in @($OutputDirectory, $ReportPath)) {
-    Assert-VerificationDestination $path @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))
-    if (![IO.Path]::GetPathRoot($path).Equals('D:\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Session verification requires external D: output.' }
+    Assert-ExternalVerificationPath $path @($repoRoot, $codexRoot)
     if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) { throw 'Create external output/report parents first.' }
 }
 if ($ReportPath.Equals($OutputDirectory, [StringComparison]::OrdinalIgnoreCase) -or $ReportPath.StartsWith($OutputDirectory.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Report must be outside the new output directory.' }
@@ -80,7 +79,9 @@ if ($Mode -eq 'Prepare') {
         Assert ($init.exitCode -eq 0) ('Init failed: ' + $init.stdout + $init.stderr)
         $current = ReadJson $currentConfigPath
         $current.registryScope = 'current'; $null = $current.Remove('registrySessionFile')
-        $current.volumeRecoveryDirectories = @{'D:/' = ((Join-Path $OutputDirectory 'volume-store') + '\')}
+        # キーは出力先volumeのroot。従来どおり区切りを'/'にした表記で設定の正規化も確認する。
+        $volumeStore = Join-Path $OutputDirectory 'volume-store'
+        $current.volumeRecoveryDirectories = @{((Get-VerificationVolumeRoot $volumeStore).Replace('\', '/')) = ($volumeStore + '\')}
         $current.backupDirectory = $recovery.Replace('\', '/') + '/'; $current.allowedRoots = $null
         SaveJson $currentConfigPath $current
         $migration = InvokePrunletCli @('migrate','--apply')

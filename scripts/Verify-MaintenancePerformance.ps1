@@ -28,7 +28,7 @@ $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $ReportPath = [IO.Path]::GetFullPath($ReportPath)
 foreach ($path in @($outputRoot, $ReportPath)) {
     Assert-VerificationDestination $path @($repoRoot, $codexRoot, (Join-Path $env:USERPROFILE '.codex'))
-    if (![IO.Path]::GetPathRoot($path).Equals('D:\', [StringComparison]::OrdinalIgnoreCase)) { throw 'External D: output required.' }
+    Assert-ExternalVerificationPath $path @($repoRoot, $codexRoot)
     if (Test-Path -LiteralPath $path) { throw 'Output and report must be new.' }
     if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) { throw 'Create output/report parents first.' }
 }
@@ -164,7 +164,8 @@ try {
     $null = [IO.Directory]::CreateDirectory($metadata)
     Assert-Call (Invoke-Cli @('init', '--backup-directory', $metadata) $BaselineExecutablePath) 'Baseline init'
     $config = Read-Json $configPath
-    $config.volumeRecoveryDirectories = @{ 'D:\' = (Join-Path $outputRoot 'volume-store') }
+    $volumeStore = Join-Path $outputRoot 'volume-store'
+    $config.volumeRecoveryDirectories = @{ (Get-VerificationVolumeRoot $volumeStore) = $volumeStore }
     Save-Json $configPath $config
     # 旧file記録を作る前に空のregistry領域を正規初期化し、通常保守の実行条件を揃える。
     $ready = Invoke-Cli @('migrate', '--apply'); Assert-Call $ready 'Empty registry readiness initialization'

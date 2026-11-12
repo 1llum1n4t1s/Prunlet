@@ -149,7 +149,24 @@ fn marker(location: &Location, identity: &FileIdentity) -> Result<()> {
 }
 
 pub fn validate(location: &Location, expected: Option<&FileIdentity>) -> Result<FileIdentity> {
+    // root自体（と祖先）の不在だけを呼出し元が「旧storeなし」として読み飛ばせるよう、
+    // pin段階のnot-foundはそのまま返す。
     let _parents = path::pin_directories(&location.root)?;
+    // ここから先はrootの実在を固定済み。store.json markerの欠落などのnot-foundは
+    // 「root不在」ではなく所有不明であり、旧版の非原子的作成（root作成後・marker書込み前の中断）
+    // でも生じる。missing判定へ再分類されないよう、io::Errorを含まない新しいエラーへ包み直す。
+    validate_pinned(location, expected).map_err(|error| {
+        if missing(&error) {
+            anyhow::anyhow!(
+                "Recovery store root exists but its ownership marker or member is missing; ownership is unknown and the root is retained: {error:#}"
+            )
+        } else {
+            error
+        }
+    })
+}
+
+fn validate_pinned(location: &Location, expected: Option<&FileIdentity>) -> Result<FileIdentity> {
     let _base = secure_directory(&location.private_base, location.restore)?;
     let root = secure_directory(&location.root, location.restore)?;
     let identity = root.identity()?;
@@ -169,6 +186,16 @@ pub fn validate(location: &Location, expected: Option<&FileIdentity>) -> Result<
     );
     marker(location, &identity)?;
     Ok(identity)
+}
+
+/// 旧store候補の検査結果を分類する。
+/// Noneはroot自体（または祖先）の不在だけで、処分対象にも警告にも入れない。
+/// root実在後の失敗（marker欠落を含む）はSome(Err)として警告・保持し、complete=falseにする。
+fn probe(result: Result<FileIdentity>) -> Option<Result<FileIdentity>> {
+    match result {
+        Err(e) if missing(&e) => None,
+        other => Some(other),
+    }
 }
 
 pub fn inspect(
@@ -208,14 +235,14 @@ pub fn inspect(
                 if !paths.insert(loc.root.to_string_lossy().to_uppercase()) {
                     continue;
                 }
-                match validate(&loc, None) {
-                    Ok(id) => {
+                match probe(validate(&loc, None)) {
+                    Some(Ok(id)) => {
                         if identities.insert((loc.volume_name.to_uppercase(), id.volume, id.id)) {
                             found(loc, id);
                         }
                     }
-                    Err(e) if missing(&e) => {}
-                    Err(e) => unavailable(loc.root.display().to_string(), e),
+                    None => {}
+                    Some(Err(e)) => unavailable(loc.root.display().to_string(), e),
                 }
             }
         }
@@ -293,4 +320,66 @@ pub(crate) fn verification_owned_markers(
     Ok(
         serde_json::json!({"passed":true,"roots":roots,"scope":"synthetic owned marker model; no old schema fixture"}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 外部TEMP配下に一意のprivate_base候補を決め、手組みのLocationを返す。
+    // privateBase・rootの作成は各テストが必要な段階まで行う。
+    fn fixture_location(label: &str) -> Location {
+        let parent = std::env::temp_dir();
+        assert!(parent.is_absolute());
+        assert!(
+            !path::within(&parent, Path::new(env!("CARGO_MANIFEST_DIR"))),
+            "Test TEMP must be outside repository."
+        );
+        let private_base = parent.join(format!(
+            "prunlet-store-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store_key = "0123456789ABCDEF0123456789ABCDEF".to_owned();
+        let volume_name =
+            native::volume_name(&native::volume_mount_root(&parent).unwrap()).unwrap();
+        Location {
+            root: private_base.join(&store_key),
+            metadata: parent.join("prunlet-store-unused-metadata"),
+            private_base,
+            store_key,
+            volume_name,
+            restore: true,
+        }
+    }
+
+    #[test]
+    fn absent_private_base_or_root_is_skipped() {
+        let location = fixture_location("absent");
+        assert!(probe(validate(&location, None)).is_none());
+        // privateBaseだけ実在しrootが無い場合も、root自体の不在として読み飛ばす。
+        drop(security::create_private_directory(&location.private_base).unwrap());
+        assert!(probe(validate(&location, None)).is_none());
+    }
+
+    #[test]
+    fn existing_root_without_marker_is_unavailable_not_absent() {
+        // 旧版の非原子的作成（root作成後・store.json書込み前の中断）と同じ状態を作る。
+        let location = fixture_location("no-marker");
+        drop(security::create_private_directory(&location.private_base).unwrap());
+        drop(security::create_private_directory(&location.root).unwrap());
+        let error = validate(&location, None).unwrap_err();
+        assert!(
+            !missing(&error),
+            "marker欠落をroot不在へ分類してはならない: {error:#}"
+        );
+        match probe(Err(error)) {
+            Some(Err(error)) => {
+                assert!(
+                    error.to_string().contains("ownership is unknown"),
+                    "{error:#}"
+                )
+            }
+            other => panic!("marker欠落は警告・保持されるべき: {other:?}"),
+        }
+    }
 }

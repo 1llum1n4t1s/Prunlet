@@ -20,8 +20,8 @@ foreach($pair in @(@($ExecutablePath,$ExpectedExecutableSha256),@($RustProbePath
     if(![IO.File]::Exists($pair[0]) -or $pair[1] -notmatch '^[0-9a-fA-F]{64}$' -or !(Get-FileHash -LiteralPath $pair[0]).Hash.Equals($pair[1],[StringComparison]::OrdinalIgnoreCase)){throw 'Candidate or test-only Rust probe hash differs.'}
 }
 foreach($path in @($OutputDirectory,$ReportPath)){
-    Assert-VerificationDestination $path @($repo,(Join-Path $env:USERPROFILE '.codex'))
-    if(![IO.Path]::GetPathRoot($path).Equals('D:\',[StringComparison]::OrdinalIgnoreCase) -or (Test-Path -LiteralPath $path) -or ![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))){throw 'Unused external D: output and an existing parent are required.'}
+    Assert-ExternalVerificationPath $path @($repo)
+    if((Test-Path -LiteralPath $path) -or ![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))){throw 'Unused external output and an existing parent are required.'}
 }
 $buildBinding=Assert-RustFileProbeBinding
 $null=[IO.Directory]::CreateDirectory($OutputDirectory)

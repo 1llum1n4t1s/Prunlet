@@ -23,7 +23,20 @@ pub enum Host {
     Maintenance,
 }
 
+/// hookの起動失敗をPreToolUseの拒否JSONとして返す。
+/// hookの呼出し元はstdoutのJSONだけを判定に使うため、起動前の失敗もerror JSON・exit 1ではなく
+/// 理由付きの拒否・exit 0にして、検査されないまま素通しや判定不能にならないようにする。
+fn hook_start_denied(reason: &str) -> i32 {
+    eprintln!("Prunlet hook: {reason}");
+    let value = json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":format!("Prunlet hook could not start: {reason}")}});
+    let _ = write_json(&value);
+    0
+}
+
 pub fn run(args: Vec<OsString>, mut host: Host) -> i32 {
+    // `--config <path> hook`の起動か。Unicode変換や設定・起動処理より前に判定し、
+    // それらの失敗もhook形式の拒否で返す（Windowsのprunlet-hook入口と同じ扱い）。
+    let hook_command = args.get(2).is_some_and(|a| a == "hook");
     if host == Host::Cli
         && std::env::current_exe()
             .ok()
@@ -46,6 +59,7 @@ pub fn run(args: Vec<OsString>, mut host: Host) -> i32 {
         .collect();
     let args = match args {
         Ok(v) => v,
+        Err(e) if host == Host::Hook || hook_command => return hook_start_denied(&e.to_string()),
         Err(e) => {
             write_error(&e, false);
             return 1;
@@ -60,9 +74,7 @@ pub fn run(args: Vec<OsString>, mut host: Host) -> i32 {
             || !Path::new(&args[1]).is_absolute()
             || !Path::new(&args[4]).is_absolute()
         {
-            let value = json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Prunlet hook could not start: Invalid Prunlet hook arguments."}});
-            let _ = write_json(&value);
-            return 0;
+            return hook_start_denied("Invalid Prunlet hook arguments.");
         }
         return crate::protocol::hook::run(Path::new(&args[1]), Path::new(&args[4]));
     }
@@ -76,6 +88,9 @@ pub fn run(args: Vec<OsString>, mut host: Host) -> i32 {
     }
     match run_inner(&args) {
         Ok(code) => code,
+        // hook分岐より前の`--config`・絶対パス検査、非Windowsのstartup::enter、hook引数検査の失敗。
+        // hook::run自体は常にOkを返すため、ここに来るのは起動前の失敗だけである。
+        Err(e) if hook_command => hook_start_denied(&e.to_string()),
         Err(e) => {
             write_error(&e, mcp);
             1
@@ -280,11 +295,10 @@ fn parse_command(command: &str, args: &[String]) -> Result<Value> {
     match command {
         "delete" => {
             let (mut dry_run, mut recursive, mut offset) = (false, false, 0);
+            // 廃止済みの`--permanent-reserved-tree`は受理しない。他の未知optionと同じく
+            // targets()の用法errorで拒否する。
             while offset < args.len()
-                && matches!(
-                    args[offset].as_str(),
-                    "--dry-run" | "--recursive" | "--permanent-reserved-tree"
-                )
+                && matches!(args[offset].as_str(), "--dry-run" | "--recursive")
             {
                 match args[offset].as_str() {
                     "--dry-run" if !dry_run => dry_run = true,
@@ -401,7 +415,7 @@ fn parse_command(command: &str, args: &[String]) -> Result<Value> {
             let retry = args.iter().any(|x| x == "--retry-legacy-discard");
             ensure!(
                 (!if_needed || apply) && (!retry || (apply && !if_needed)),
-                "Use migrate [--dry-run | --apply]. Explicit retry acknowledgement cannot be combined with --if-needed."
+                "Use migrate [--dry-run | --apply [--if-needed | --retry-legacy-discard]]. Explicit retry acknowledgement cannot be combined with --if-needed."
             );
             Ok(json!({"apply":apply,"ifNeeded":if_needed,"retryLegacyDiscard":retry}))
         }
@@ -551,6 +565,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hook_start_failures_are_hook_denials() {
+        // hook分岐より前の検査で失敗する入力。stdinを読む前に失敗するため、テスト中に入力を待たない。
+        let relative: Vec<OsString> = ["--config", "relative.json", "hook"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(run(relative, Host::Cli), 0);
+        // 非Windowsではstartup::enterが配置状態を参照するため、単体テストではWindowsだけで確認する。
+        #[cfg(windows)]
+        let config = std::env::temp_dir().join("prunlet-hook-start-check.json");
+        #[cfg(windows)]
+        {
+            let extra: Vec<OsString> = vec![
+                "--config".into(),
+                config.into_os_string(),
+                "hook".into(),
+                "--unexpected".into(),
+            ];
+            assert_eq!(run(extra, Host::Cli), 0);
+        }
+        // hook以外のcommandは従来どおりerror JSONとexit 1。
+        let other: Vec<OsString> = ["--config", "relative.json", "validate-config"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(run(other, Host::Cli), 1);
+    }
+
+    #[test]
+    fn retired_delete_option_is_an_unknown_option() {
+        let error = parse_command(
+            "delete",
+            &[
+                "--permanent-reserved-tree".into(),
+                "--".into(),
+                r"C:\fixture".into(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.starts_with("Use -- <absolute-path>"), "{error}");
+        assert!(
+            parse_command(
+                "delete",
+                &["--recursive".into(), "--".into(), r"C:\fixture".into()]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn migrate_usage_matches_accepted_option_combinations() {
+        let parse = |args: &[&str]| {
+            parse_command(
+                "migrate",
+                &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(),
+            )
+        };
+        for ok in [
+            &[][..],
+            &["--dry-run"],
+            &["--apply"],
+            &["--apply", "--if-needed"],
+            &["--apply", "--retry-legacy-discard"],
+        ] {
+            assert!(parse(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            &["--if-needed"][..],
+            &["--retry-legacy-discard"],
+            &["--dry-run", "--if-needed"],
+            &["--apply", "--if-needed", "--retry-legacy-discard"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        #[cfg(windows)]
+        assert!(
+            HELP.contains("migrate [--dry-run | --apply [--if-needed | --retry-legacy-discard]]")
+        );
+    }
+
+    #[test]
     fn mcp_cleanup_blocked_is_non_success_even_when_items_are_retained() {
         assert!(command_failed(
             "mcp-cache-maintain",
@@ -687,7 +783,7 @@ prunlet --config <absolute-json-path> restore <registry-operation-id> [--access-
 prunlet --config <absolute-json-path> purge <operation-id> [--dry-run | --apply]
 prunlet --config <absolute-json-path> maintain [--dry-run | --apply] [--audit-records]
 prunlet --config <absolute-json-path> operations
-prunlet --config <absolute-json-path> migrate [--dry-run | --apply]
+prunlet --config <absolute-json-path> migrate [--dry-run | --apply [--if-needed | --retry-legacy-discard]]
 prunlet --config <absolute-json-path> mcp
 prunlet --config <absolute-json-path> hook [--hook-script <legacy-path>]
 Legacy --allowed-root <directory> options are accepted but do not restrict target directories.

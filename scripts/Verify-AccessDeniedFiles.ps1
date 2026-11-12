@@ -11,7 +11,8 @@ $ReportPath = [IO.Path]::GetFullPath($ReportPath)
 if ($ReportPath.Equals($OutputDirectory.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) -or $ReportPath.StartsWith($OutputDirectory.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'ReportPath must be outside OutputDirectory.' }
 foreach ($path in @($OutputDirectory, $ReportPath)) {
     Assert-VerificationDestination $path @($repo, (Join-Path $env:USERPROFILE '.codex'))
-    if ([IO.Path]::GetPathRoot($path) -ine 'D:\' -or (Test-Path -LiteralPath $path)) { throw 'Unused external D output required.' }
+    Assert-ExternalVerificationPath $path @($repo)
+    if (Test-Path -LiteralPath $path) { throw 'Unused external output required.' }
     if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) { throw 'Output parent must exist.' }
 }
 . (Join-Path $PSScriptRoot 'recordless-e2e/RustFileProbe.Common.ps1')

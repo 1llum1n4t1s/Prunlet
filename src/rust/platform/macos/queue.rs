@@ -271,8 +271,16 @@ fn serve(config: &Config, base: &str) -> Result<Value> {
             }
             match operation {
                 Ok(value) => {
-                    let failed = crate::result_status::has_operation_errors(&value);
-                    state.finish(if failed { "failed" } else { "completed" }, Some(value));
+                    // Windowsのキューと同じく、結果不明の項目があればジョブ全体を`ambiguous`にする。
+                    // 上位状態だけを見る呼出元が通常の失敗として再送しないようにするため。
+                    let status = if crate::result_status::has_ambiguous_status(&value) {
+                        "ambiguous"
+                    } else if crate::result_status::has_operation_errors(&value) {
+                        "failed"
+                    } else {
+                        "completed"
+                    };
+                    state.finish(status, Some(value));
                 }
                 Err(error) => state.finish("failed", Some(json!({"error":error.to_string()}))),
             }

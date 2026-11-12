@@ -36,9 +36,9 @@ if ($PSBoundParameters.ContainsKey('LegacyMcpWrapperPath')) {
 }
 foreach ($path in @($OutputDirectory, $ReportPath)) {
     Assert-VerificationDestination $path @($repo, (Join-Path $env:USERPROFILE '.codex'))
-    if (![IO.Path]::GetPathRoot($path).Equals('D:\', [StringComparison]::OrdinalIgnoreCase) -or
-        (Test-Path -LiteralPath $path) -or ![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) {
-        throw 'Unused external D: output with an existing parent is required.'
+    Assert-ExternalVerificationPath $path @($repo)
+    if ((Test-Path -LiteralPath $path) -or ![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) {
+        throw 'Unused external output with an existing parent is required.'
     }
 }
 if ($ReportPath.StartsWith($OutputDirectory.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
@@ -153,9 +153,13 @@ function Enqueue-LockedQ($Fixture) {
 }
 
 function Run-CaseQ([string]$Name, [scriptblock]$Body) {
-    $case = [ordered]@{ name = $Name; passed = $false; observed = @{}; error = $null }
+    $case = [ordered]@{ name = $Name; passed = $false; unverified = $false; observed = @{}; error = $null }
     $cases.Add($case)
-    try { & $Body $case; $case.passed = $true }
+    try {
+        & $Body $case
+        # 前提（ごみ箱が有効なvolume等）を満たさず判定できなかったケースは合格に数えない。
+        $case.passed = !$case.unverified
+    }
     catch { $case.error = $_.Exception.Message }
 }
 
@@ -306,6 +310,32 @@ try {
             $items[0].status -cin @('recycled', 'permanently_deleted')) 'Completed job omitted its successful file result.'
         Assert-Q (![IO.Directory]::Exists($fixture.root)) 'Completed target remains at its original path.'
     }
+    Run-CaseQ 'unlocked-directory-is-recycled-through-queue' {
+        param($case)
+        # 前提: 出力先volumeでWindowsのごみ箱が有効であること。即時削除設定のvolumeでは
+        # Windowsがpermanently_deletedを返すため、このケースは合格にせず未検証として扱う。
+        # 受付時のsnapshotが子のhandleを保持したままShellへ投入すると、配下に開いたhandleがある
+        # ディレクトリの移動がCOPYENGINE_E_ACCESS_DENIED_SRC（0x80270021）で拒否される不具合の回帰検証。
+        $fixture = New-FixtureQ 'unlocked-recycled'
+        $nested = Join-Path $fixture.root 'nested'
+        $null = [IO.Directory]::CreateDirectory($nested)
+        [IO.File]::WriteAllText((Join-Path $nested 'child.txt'), 'nested child of unlocked queue fixture', $utf8)
+        $response = Invoke-Q @('delete-queue', '--recursive', '--', $fixture.root) $AcceptanceTimeoutSeconds
+        $case.observed.accepted = $response.json
+        Assert-Q ($response.exitCode -eq 0 -and $response.json.jobId -cmatch '^[a-f0-9]{32}$') 'Unlocked directory was not accepted.'
+        $ownedJobs.Add($response.json)
+        $result = Wait-TerminalQ $response.json.jobId
+        $case.observed.terminal = $result.json
+        $items = @($result.json.result.items)
+        Assert-Q ($items.Count -eq 1 -and $items[0].path -ceq $fixture.root) 'Queue result omitted the requested directory.'
+        if ($result.json.status -ceq 'completed' -and $items[0].status -ceq 'permanently_deleted') {
+            $case.unverified = $true
+            $case.observed.unverifiedReason = 'Windows permanently deleted the directory; the output volume does not provide a Recycle Bin, so queued recycling is unverified.'
+            return
+        }
+        Assert-Q ($result.exitCode -eq 0 -and $result.json.status -ceq 'completed' -and $items[0].status -ceq 'recycled') ('Unlocked queued directory was not recycled: ' + $items[0].status + ' ' + $items[0].error)
+        Assert-Q (![IO.Directory]::Exists($fixture.root)) 'Recycled directory remains at its original path.'
+    }
     Run-CaseQ 'added-child-stops-and-preserves-target' {
         param($case)
         $fixture = New-FixtureQ 'changed-during-wait'
@@ -372,7 +402,9 @@ try {
         $terminal = Wait-TerminalQ $job.jobId
         $case.observed.terminal = $terminal.json
         if ($replacementInjected) {
-            Assert-Q ($terminal.json.status -cin @('failed', 'ambiguous')) 'Replaced root was not stopped after coordination wait.'
+            # 差し替えはShell投入前の照合（キューまたはCoreの投入前段階）で検出されるため、
+            # 元対象を保持した未開始の失敗として failed になり、結果不明の ambiguous にはならない。
+            Assert-Q ($terminal.json.status -ceq 'failed' -and ([string]$terminal.json.error).StartsWith('Deletion was not started', [StringComparison]::Ordinal)) 'Replaced root was not stopped as an unstarted failure after coordination wait.'
             Assert-Q ([IO.File]::ReadAllText((Join-Path $original 'locked.txt')) -ceq $fixture.content) 'Moved original was changed or deleted.'
             Assert-Q ([IO.File]::ReadAllText($replacement) -ceq 'replacement created while queue waits for coordination') 'Replacement root was changed or deleted.'
             $again = Get-StateQ $job.jobId
@@ -602,7 +634,8 @@ try {
         executablePath = $ExecutablePath; executableSha256 = $exeHash; sourceConfigPath = $ConfigPath; legacyMcpWrapperPath = $LegacyMcpWrapperPath
         fixtureConfigPath = $fixtureConfig; outputDirectory = $OutputDirectory
         startedAtUtc = $started; finishedAtUtc = [DateTimeOffset]::UtcNow
-        passed = @($cases | Where-Object passed).Count; failed = @($cases | Where-Object { !$_.passed }).Count
+        passed = @($cases | Where-Object passed).Count; failed = @($cases | Where-Object { !$_.passed -and !$_.unverified }).Count
+        unverifiedCases = @($cases | Where-Object { $_.unverified } | ForEach-Object { $_.name })
         cases = @($cases.ToArray()); invocations = @($invocations.ToArray()); workerCleanup = @($workerCleanup.ToArray())
         unverified = @('ambiguous outcome after deletion has started (no deterministic fault injection)', 'Windows Recycle Bin content and restoration', 'queue retention expiry and process restart')
         retained = @(@{ path = $OutputDirectory; reason = 'Failed-closed fixtures, CLI JSON, and isolated metadata retained for review. No unrelated Recycle Bin items were touched.' })
@@ -610,5 +643,5 @@ try {
     if (!$LegacyMcpWrapperPath) { $report.unverified += 'legacy MCP wrapper with the candidate executable (LegacyMcpWrapperPath not supplied)' }
     [IO.File]::WriteAllText($ReportPath, ($report | ConvertTo-Json -Depth 60), $utf8)
 }
-[pscustomobject]$report | Select-Object passed, failed, outputDirectory | ConvertTo-Json
+[pscustomobject]$report | Select-Object passed, failed, unverifiedCases, outputDirectory | ConvertTo-Json
 if ($report.failed -gt 0) { exit 1 }

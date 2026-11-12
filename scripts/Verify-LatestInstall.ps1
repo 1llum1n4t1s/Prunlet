@@ -52,7 +52,7 @@ $results = [Collections.Generic.List[object]]::new()
 $recordlessHelpers = @('FixtureBridge.Common.ps1', 'FileFixtures.Common.ps1') | ForEach-Object { Join-Path $PSScriptRoot $_ }
 function Set-FixtureVolumeMap([string]$ConfigPath) {
     $settings = [IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json -AsHashtable
-    $settings.volumeRecoveryDirectories = @{ 'D:\' = $fixtureVolumeStore }
+    $settings.volumeRecoveryDirectories = @{ (Get-VerificationVolumeRoot $fixtureVolumeStore) = $fixtureVolumeStore }
     [IO.File]::WriteAllText($ConfigPath, ($settings | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
 }
 # 実ホストのタスクは一切登録せず、Task Scheduler境界だけをメモリー上で代替する。
@@ -856,6 +856,37 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         Assert-True ([IO.File]::ReadAllText($instructionGuide).Contains('Fixture guide update.')) 'Owned guide did not update.'
         Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $instructionAgents).Hash) 'Guide update changed existing AGENTS.'
     }
+    $lineEndingZip = Join-Path $OutputDirectory 'line-ending-guide-fixture.zip'
+    try {
+        [IO.File]::AppendAllText($fixtureGuide, "`nFixture guide update.`nLine-ending fixture update.`n", [Text.UTF8Encoding]::new($false))
+        [IO.Compression.ZipFile]::CreateFromDirectory($fixtureRoot, $lineEndingZip)
+    } finally { [IO.File]::WriteAllBytes($fixtureGuide, $originalGuideBytes) }
+    Test-Case 'Non-managed update accepts a registered guide that differs from the previous bin only by line endings' {
+        $installedGuide = Join-Path $instructionInstall 'bin\PRUNLET.md'
+        $installedText = [IO.File]::ReadAllText($installedGuide)
+        $lfText = $installedText.Replace("`r`n", "`n")
+        # 前回binと逆の改行形式で登録済みガイドを置き、本文は変えない。
+        $variant = if ($installedText.Contains("`r`n")) { $lfText } else { $lfText.Replace("`n", "`r`n") }
+        Assert-True ($variant -cne $installedText) 'Line-ending fixture did not change the registered guide bytes.'
+        [IO.File]::WriteAllText($instructionGuide, $variant, [Text.UTF8Encoding]::new($false))
+        Assert-True ((Get-FileHash -LiteralPath $instructionGuide).Hash -cne (Get-FileHash -LiteralPath $installedGuide).Hash) 'Line-ending fixture equals the installed guide bytes.'
+        $agentHash = (Get-FileHash -LiteralPath $instructionAgents).Hash
+        # このケースだけ別fixtureを使い、後続ケースの入力は従来のupdated fixtureへ戻す。
+        $global:PrunletLatestFixture.zip = $lineEndingZip
+        $global:PrunletLatestFixture.sha = 'e' * 40
+        try {
+            & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-line-ending-work') | Out-Null
+            Assert-True ([IO.File]::ReadAllText($instructionGuide).Contains('Line-ending fixture update.')) 'Line-ending-only registered guide blocked the non-managed guide update.'
+            Assert-True ((Get-FileHash -LiteralPath $instructionGuide).Hash -ceq (Get-FileHash -LiteralPath $installedGuide).Hash) 'Non-managed guide update did not install the verified guide.'
+            Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $instructionAgents).Hash) 'Line-ending guide update changed existing AGENTS.'
+        } finally {
+            # 後続ケースが前提とする「updated fixtureのbinと同じ登録ガイド」へ戻す（登録実物は所有判定を通る状態）。
+            $global:PrunletLatestFixture.zip = $updatedZip
+            $global:PrunletLatestFixture.sha = 'd' * 40
+            & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-line-ending-restore-work') | Out-Null
+        }
+        Assert-True (![IO.File]::ReadAllText($instructionGuide).Contains('Line-ending fixture update.') -and (Get-FileHash -LiteralPath $instructionGuide).Hash -ceq (Get-FileHash -LiteralPath $installedGuide).Hash) 'Line-ending case did not restore the updated fixture guide for later cases.'
+    }
     Test-Case 'Update without instruction flag preserves existing edited guide' {
         [byte[]]$original = [IO.File]::ReadAllBytes($instructionGuide)
         try {
@@ -943,6 +974,40 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
             Assert-True ($originalHash -eq (Get-FileHash -LiteralPath $agentPath).Hash) 'Instruction roundtrip changed original encoding or EOF.'
         }
     }
+    Test-Case 'Instruction helper treats line-ending-only guide differences as owned in real calls' {
+        $lineCodex = Join-Path $OutputDirectory 'instruction-line-ending-helper'
+        New-Item -ItemType Directory -Path $lineCodex | Out-Null
+        $agentPath = Join-Path $lineCodex 'AGENTS.md'
+        $guidePath = Join-Path $lineCodex 'PRUNLET.md'
+        [IO.File]::WriteAllText($agentPath, "利用者の本文`n", [Text.UTF8Encoding]::new($false))
+        $originalHash = (Get-FileHash -LiteralPath $agentPath).Hash
+        $helper = Join-Path $instructionInstall 'bin\install-agent-instructions.ps1'
+        $helperParameters = @{ SourceGuidePath = (Join-Path $instructionInstall 'bin\PRUNLET.md'); CodexHome = $lineCodex; BackupDirectory = $instructionBackup }
+        & $helper @helperParameters | Out-Null
+        $sourceText = [IO.File]::ReadAllText($guidePath)
+        $lfText = $sourceText.Replace("`r`n", "`n")
+        $variant = if ($sourceText.Contains("`r`n")) { $lfText } else { $lfText.Replace("`n", "`r`n") }
+        Assert-True ($variant -cne $sourceText) 'Line-ending fixture did not change the registered guide bytes.'
+        # 改行差だけなら所有と判定する。ValidateOnlyは変更不要とし、明示登録の実呼出しは検証済みsourceのバイト列を配置する。
+        [IO.File]::WriteAllText($guidePath, $variant, [Text.UTF8Encoding]::new($false))
+        $preview = & $helper @helperParameters -ValidateOnly
+        Assert-True (!$preview.guideChanged) 'Line-ending-only registered guide was reported as changed.'
+        & $helper @helperParameters | Out-Null
+        Assert-True ((Get-FileHash -LiteralPath $guidePath).Hash -ceq (Get-FileHash -LiteralPath $helperParameters.SourceGuidePath).Hash) 'Explicit registration did not install the verified guide bytes.'
+        # 改行以外の編集はValidateOnly・実呼出しの解除とも拒否して保全する。
+        [IO.File]::WriteAllText($guidePath, ($variant + 'Edited body'), [Text.UTF8Encoding]::new($false))
+        $editedHash = (Get-FileHash -LiteralPath $guidePath).Hash
+        Expect-Failure { & $helper @helperParameters -Uninstall -ValidateOnly } 'edited or belongs'
+        Expect-Failure { & $helper @helperParameters -Uninstall } 'edited or belongs'
+        Assert-True ($editedHash -ceq (Get-FileHash -LiteralPath $guidePath).Hash) 'Rejected uninstall changed the edited guide.'
+        # PreviousGuideSha256なしの実呼出し（uninstall-codex.ps1と同じ形）でも改行差だけなら解除できる。
+        [IO.File]::WriteAllText($guidePath, $variant, [Text.UTF8Encoding]::new($false))
+        $state = & $helper @helperParameters -Uninstall -ValidateOnly
+        Assert-True ($state.instructionsPresent) 'Line-ending-only guide was not recognized as owned.'
+        & $helper @helperParameters -Uninstall | Out-Null
+        Assert-True (!(Test-Path -LiteralPath $guidePath)) 'Uninstall retained the line-ending-only owned guide.'
+        Assert-True ($originalHash -eq (Get-FileHash -LiteralPath $agentPath).Hash) 'Line-ending-only uninstall did not restore original AGENTS bytes.'
+    }
     Test-Case 'Prepended instructions stay outside EOF fences and fake Lessons code examples' {
         foreach ($kind in @('fence-eof', 'fake-lessons')) {
             $fencedCodex = Join-Path $OutputDirectory "instruction-fenced-$kind"
@@ -1019,7 +1084,7 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
             $before = (Get-FileHash -LiteralPath (Join-Path $managedRoot 'source-info.json')).Hash
             $Repository='1llum1n4t1s/Prunlet'; $Runtime='win-x64'; $CodexHome=$managedCodex
             $script:ForbiddenRoots=@($repoRoot,$managedCodex,(Join-Path $env:USERPROFILE '.codex'))
-            foreach ($definition in $installerAst.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Test-InTree','Assert-PlainPath','Assert-ExternalPath','Test-RegisteredManagedInstallation','Assert-ManagedExistingPath','Read-ManagedInstallationJson','Get-ManagedInstallationSnapshot','Assert-ManagedInstallationSnapshot','Get-ManagedGuideRegistrationHash')},$true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
+            foreach ($definition in $installerAst.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Test-InTree','Assert-PlainPath','Assert-ExternalPath','Test-RegisteredManagedInstallation','Assert-ManagedExistingPath','Read-ManagedInstallationJson','Get-ManagedInstallationSnapshot','Assert-ManagedInstallationSnapshot','Get-GuideRegistrationPreviousHash','Get-ManagedGuideRegistrationHash')},$true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
             $snapshot=Get-ManagedInstallationSnapshot $managedRoot
             $registeredGuide=Join-Path $managedCodex 'PRUNLET.md'
             $guideText=[IO.File]::ReadAllText((Join-Path $managedRoot 'bin\PRUNLET.md')).Replace("`r`n","`n").Replace("`n","`r`n")
@@ -1083,7 +1148,7 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         New-Item -ItemType Directory -Path $alternate | Out-Null
         try {
             $document = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json -AsHashtable
-            $document.volumeRecoveryDirectories = @{ 'D:\' = $alternate }
+            $document.volumeRecoveryDirectories = @{ (Get-VerificationVolumeRoot $alternate) = $alternate }
             [IO.File]::WriteAllText($configPath,($document | ConvertTo-Json -Depth 20))
             Expect-Failure { Assert-ManagedRecoveryBinding $snapshot } 'changed'
             [IO.File]::WriteAllBytes($configPath,$original)

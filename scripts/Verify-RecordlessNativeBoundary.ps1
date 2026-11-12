@@ -5,7 +5,7 @@ $ErrorActionPreference='Stop'
 # DELETE名前pin不足、pin解放後のrename拒否、ACL修復失敗、原本native証拠の欠落。
 $repo=Split-Path $PSScriptRoot -Parent;. (Join-Path $PSScriptRoot 'Verification-Common.ps1')
 foreach($path in @($ExecutablePath,$RustProbePath,$BuildManifestPath,$OutputDirectory,$ReportPath)){if(![IO.Path]::IsPathFullyQualified($path)){throw 'Absolute paths required'}}
-foreach($path in @($OutputDirectory,$ReportPath)){Assert-VerificationDestination $path @($repo,(Join-Path $env:USERPROFILE '.codex'));if(![IO.Path]::GetPathRoot($path).Equals('D:\',[StringComparison]::OrdinalIgnoreCase)-or(Test-Path -LiteralPath $path)){throw 'Unused external D output required'}}
+foreach($path in @($OutputDirectory,$ReportPath)){Assert-ExternalVerificationPath $path @($repo);if(Test-Path -LiteralPath $path){throw 'Unused external output required'}}
 . (Join-Path $PSScriptRoot 'recordless-e2e/RustFileProbe.Common.ps1')
 $buildBinding=Assert-RustFileProbeBinding
 . (Join-Path $PSScriptRoot 'FileFixtures.Common.ps1')

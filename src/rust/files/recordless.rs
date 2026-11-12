@@ -309,6 +309,33 @@ pub fn validate_queued_paths(config: &Config, paths: &[PathBuf]) -> Result<()> {
     }
     Ok(())
 }
+/// 削除要求全体の失敗を、Windowsへの投入有無で区別したもの。
+///
+/// 通常の同期削除は[`delete`]で従来どおり`anyhow::Error`だけを返し、文面・DTOを変えない。
+/// 待機キューのように「開始後の失敗」を一律に結果不明とする呼出元は[`delete_checked`]を使い、
+/// 投入前に止まったことがCoreで確定した場合だけ`failed`へ写像できる。
+#[derive(Debug)]
+pub enum DeleteFailure {
+    /// Shell・永久削除へ1件も投入していないことが確定した失敗。元対象は保持されている。
+    NotSubmitted(anyhow::Error),
+    /// 投入後の失敗、または投入の有無を確定できない失敗。既定はこちらで、結果不明として扱う。
+    Unknown(anyhow::Error),
+}
+impl DeleteFailure {
+    pub fn is_not_submitted(&self) -> bool {
+        matches!(self, Self::NotSubmitted(_))
+    }
+    pub fn error(&self) -> &anyhow::Error {
+        match self {
+            Self::NotSubmitted(error) | Self::Unknown(error) => error,
+        }
+    }
+    pub fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::NotSubmitted(error) | Self::Unknown(error) => error,
+        }
+    }
+}
 pub fn delete(
     config: &Config,
     paths: &[PathBuf],
@@ -317,6 +344,18 @@ pub fn delete(
     progress: Option<Progress>,
     snapshots: Option<&Mutex<Vec<Snapshot>>>,
 ) -> Result<DeleteResult> {
+    // 同期削除の契約（エラー文面を含む）を維持するため、区別を外して元のエラーだけを返す。
+    delete_checked(config, paths, dry_run, recursive, progress, snapshots)
+        .map_err(DeleteFailure::into_error)
+}
+pub fn delete_checked(
+    config: &Config,
+    paths: &[PathBuf],
+    dry_run: bool,
+    recursive: bool,
+    progress: Option<Progress>,
+    snapshots: Option<&Mutex<Vec<Snapshot>>>,
+) -> std::result::Result<DeleteResult, DeleteFailure> {
     let first = delete_inner(
         config,
         paths,
@@ -328,8 +367,11 @@ pub fn delete(
     )?;
     match first {
         Some(result) => Ok(result),
+        // 共有ハードリンク検出による排他再実行は、初回でShellへ何も投入していない。
         None => delete_inner(config, paths, dry_run, recursive, true, progress, snapshots)?
-            .ok_or_else(|| anyhow::anyhow!("Exclusive preflight did not complete")),
+            .ok_or_else(|| {
+                DeleteFailure::NotSubmitted(anyhow::anyhow!("Exclusive preflight did not complete"))
+            }),
     }
 }
 fn verify_snapshots(snapshots: Option<&Mutex<Vec<Snapshot>>>) -> Result<()> {
@@ -374,6 +416,53 @@ fn release_snapshot_tree(snapshots: Option<&Mutex<Vec<Snapshot>>>, target: &Path
     }
     Ok(())
 }
+/// キュー受付時に固定した子孫の照合用handleを、Shell投入の直前にだけ閉じる。
+///
+/// NTFSは配下に開いたhandleがあるディレクトリのrenameを共有モードに関係なく拒否するため、
+/// 子のhandleを保持したままだとごみ箱への移動が`COPYENGINE_E_ACCESS_DENIED_SRC`で失敗する。
+/// 呼出し側は`verify_target_snapshot`で子を含む全体の照合が通った後にだけ呼ぶ。
+/// rootのhandleはrenameを妨げないため保持し、識別子・子の名前一覧は永久削除fallbackの
+/// 再照合（`verify_snapshot_baseline`）のためにsnapshotへ残す。
+fn release_snapshot_children(
+    snapshots: Option<&Mutex<Vec<Snapshot>>>,
+    target: &Path,
+) -> Result<()> {
+    if let Some(snapshots) = snapshots {
+        for snapshot in snapshots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Queue snapshot unavailable"))?
+            .iter_mut()
+        {
+            if snapshot.root() == target {
+                snapshot.release_children();
+            }
+        }
+    }
+    Ok(())
+}
+/// 永久削除で新たに捕捉した木を、キュー受付時の基準と突き合わせる。
+///
+/// 子の照合用handleはShell投入前に閉じているため、Shellが投入せずに永久削除を許可した場合でも
+/// 受付時の子の実体・属性・リンク内容・ディレクトリの名前一覧が変わっていないことをここで確認する。
+/// 不一致は削除開始前に拒否する。
+fn verify_snapshot_baseline(
+    snapshots: Option<&Mutex<Vec<Snapshot>>>,
+    target: &Path,
+    tree: &[TreeEntry],
+) -> Result<()> {
+    if let Some(snapshots) = snapshots {
+        for snapshot in snapshots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Queue snapshot unavailable"))?
+            .iter()
+        {
+            if snapshot.root() == target {
+                snapshot.matches_tree(tree)?;
+            }
+        }
+    }
+    Ok(())
+}
 fn attempt_recycle(
     entry: &mut Prepared,
     recursive: bool,
@@ -397,7 +486,9 @@ fn attempt_recycle(
                 bail!("Shared source changed after a prior confirmed deletion");
             }
         }
-        recycle::recycle(
+        // beforeは別名を「非reparseかつ解決後に正規名と完全一致」の場合だけ受理するため、
+        // その別名をFileFailure照合にも使い、8.3表記のサイズ超過通知を固定元として扱う。
+        recycle::recycle_accepting_resolved_alias(
             &entry.path,
             entry.identity.is_directory() && !entry.identity.is_reparse(),
             |physical| {
@@ -440,6 +531,10 @@ fn attempt_recycle(
                 {
                     bail!("Nonrecursive directory is no longer empty");
                 }
+                // 全照合が通った後で子の照合用handleを閉じる。保持したままでは配下に開いたhandleが
+                // 残り、Shellのディレクトリ移動がアクセス拒否になる。ここから投入までの差し替えは
+                // 同期削除と同じく直前の照合とShell返却実体の照合で扱う。
+                release_snapshot_children(snapshots, &entry.path)?;
                 drop(fixed);
                 started = true;
                 #[cfg(test)]
@@ -461,6 +556,21 @@ fn attempt_recycle(
     })();
     (action, started)
 }
+/// 投入前段階の結果。`Ready`はShell投入に必要な状態と、要求全体の排他を保持し続ける。
+enum Preflight {
+    /// 共有ハードリンクを検出し、排他batchで最初からやり直す。
+    Exclusive,
+    /// dry-runは投入せずに結果を返す。
+    Finished(DeleteResult),
+    Ready(Ready),
+}
+struct Ready {
+    // 投入段階の終わりまで共通・対象別のロックを保持する。早く解放すると並行削除と競合する。
+    coordination: Option<coordination::Coordination>,
+    result: DeleteResult,
+    prepared: Vec<Option<Prepared>>,
+    token: native::EffectiveToken,
+}
 fn delete_inner(
     config: &Config,
     paths: &[PathBuf],
@@ -469,8 +579,33 @@ fn delete_inner(
     exclusive: bool,
     progress: Option<Progress>,
     snapshots: Option<&Mutex<Vec<Snapshot>>>,
-) -> Result<Option<DeleteResult>> {
-    let _coordination = if dry_run {
+) -> std::result::Result<Option<DeleteResult>, DeleteFailure> {
+    // 投入前段階のErrだけを「未投入確定」とし、投入段階のErrは既定で結果不明に分類する。
+    // 投入段階に将来`?`が増えても未投入と誤認しないよう、呼出位置ではなく段階で区別する。
+    let ready = match preflight(
+        config, paths, dry_run, recursive, exclusive, progress, snapshots,
+    )
+    .map_err(DeleteFailure::NotSubmitted)?
+    {
+        Preflight::Exclusive => return Ok(None),
+        Preflight::Finished(result) => return Ok(Some(result)),
+        Preflight::Ready(ready) => ready,
+    };
+    submit(config, recursive, exclusive, snapshots, ready)
+        .map(Some)
+        .map_err(DeleteFailure::Unknown)
+}
+/// Shellへ何も投入しない段階。ここで返るErrはすべて元対象を保持したまま止まっている。
+fn preflight(
+    config: &Config,
+    paths: &[PathBuf],
+    dry_run: bool,
+    recursive: bool,
+    exclusive: bool,
+    progress: Option<Progress>,
+    snapshots: Option<&Mutex<Vec<Snapshot>>>,
+) -> Result<Preflight> {
+    let coordination = if dry_run {
         None
     } else {
         Some(coordination::acquire(
@@ -521,13 +656,13 @@ fn delete_inner(
         }
     }
     if hardlinks && !exclusive {
-        return Ok(None);
+        return Ok(Preflight::Exclusive);
     }
     if dry_run {
         if result.items.iter().any(|x| x.status == "would_recycle") {
             result.warnings.push("Dry-run cannot determine whether Windows will recycle an item; an oversized file or directory, or an item on a volume configured for immediate deletion, may be permanently deleted.".into());
         }
-        return Ok(Some(result));
+        return Ok(Preflight::Finished(result));
     }
     if result.items.iter().any(|x| x.status == "failed") {
         bail!(
@@ -540,13 +675,34 @@ fn delete_inner(
                 .join(" ")
         );
     }
+    let token = native::EffectiveToken::capture()?;
+    Ok(Preflight::Ready(Ready {
+        coordination,
+        result,
+        prepared,
+        token,
+    }))
+}
+/// Shell・永久削除へ投入する段階。ここで返るErrは投入の有無を確定できないため結果不明とする。
+fn submit(
+    config: &Config,
+    recursive: bool,
+    exclusive: bool,
+    snapshots: Option<&Mutex<Vec<Snapshot>>>,
+    ready: Ready,
+) -> Result<DeleteResult> {
+    let Ready {
+        coordination: _coordination,
+        mut result,
+        mut prepared,
+        token,
+    } = ready;
     let mut permanent: Vec<(usize, Option<ImmediateDeleteSetting>, bool)> = vec![];
     // 共有hardlinkは排他batchを保持し、全Shell完了後に限定された永久削除へ進む。
     let mut changed: BTreeMap<(u64, [u8; 16]), FileIdentity> = BTreeMap::new();
     let mut uncertain = BTreeSet::new();
     let mut permanent_guards: BTreeMap<(u64, [u8; 16]), HardlinkGuard> = BTreeMap::new();
     let mut concurrent: BTreeMap<usize, (Result<RecycleOutcome>, bool)> = BTreeMap::new();
-    let token = native::EffectiveToken::capture()?;
     if !exclusive {
         for (base, chunk) in prepared.chunks_mut(4).enumerate() {
             let completed = std::thread::scope(|scope| -> Result<Vec<_>> {
@@ -754,7 +910,7 @@ fn delete_inner(
             result.items[index].error = error;
         }
     }
-    Ok(Some(result))
+    Ok(result)
 }
 #[derive(Debug)]
 struct FailureEntry(PathBuf);
@@ -1167,6 +1323,8 @@ fn permanent_delete(
     {
         bail!("Permanent source identity changed");
     }
+    // キュー経由では、Shell投入前に閉じた子の照合を受付時の基準で補う。
+    verify_snapshot_baseline(snapshots, &root.path, &tree)?;
     #[cfg(test)]
     if let Some(checkpoint) = PERMANENT_AFTER_CAPTURE.lock().unwrap().take() {
         checkpoint()?;
@@ -1525,6 +1683,44 @@ impl Snapshot {
                 entry.original.take();
             }
         }
+    }
+    /// root以外の照合用handleを閉じる。識別子と名前一覧は基準として残す。
+    fn release_children(&mut self) {
+        for entry in self.entries.iter_mut().skip(1) {
+            entry.original.take();
+        }
+    }
+    /// 新たに捕捉した木が受付時の基準と同じ実体・構成かを確認する。
+    ///
+    /// 照合は`verify`と同じ項目（同一実体・属性・リンク内容・ディレクトリの変更時刻と名前一覧）とし、
+    /// 項目の追加・欠落も不一致として拒否する。
+    fn matches_tree(&self, tree: &[TreeEntry]) -> Result<()> {
+        let current: BTreeMap<&Path, &TreeEntry> = tree
+            .iter()
+            .map(|entry| (entry.path.as_path(), entry))
+            .collect();
+        if current.len() != self.entries.len() || tree.len() != self.entries.len() {
+            bail!("Queued tree membership changed before permanent deletion");
+        }
+        for entry in &self.entries {
+            let Some(actual) = current.get(entry.path.as_path()) else {
+                bail!("Queued tree membership changed before permanent deletion");
+            };
+            let directory = entry.identity.is_directory() && !entry.identity.is_reparse();
+            if !entry.identity.same_object(&actual.identity)
+                || entry.identity.attributes != actual.identity.attributes
+                || entry.reparse != actual.reparse
+                || (directory
+                    && (entry.identity.change_time != actual.identity.change_time
+                        || entry.children != actual.children))
+            {
+                bail!(
+                    "Queued entry changed before permanent deletion: {}",
+                    entry.path.display()
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1964,14 +2160,71 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn delete_failure_keeps_sync_error_and_classification() {
+        // 同期削除へ返すエラーは区別を外しても元の文面・原因連鎖を変えない。
+        let inner = anyhow::Error::new(std::io::Error::from_raw_os_error(5))
+            .context("Deletion preflight failed; original targets were retained.");
+        let expected = format!("{inner:#}");
+        let failure = DeleteFailure::NotSubmitted(inner);
+        assert!(failure.is_not_submitted());
+        let error = failure.into_error();
+        assert_eq!(format!("{error:#}"), expected);
+        assert!(error.chain().any(|e| {
+            e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.raw_os_error() == Some(5))
+        }));
+        assert!(!DeleteFailure::Unknown(anyhow::anyhow!("after Shell")).is_not_submitted());
+    }
+    #[test]
+    fn queue_snapshot_child_handles_block_directory_rename_until_released() -> Result<()> {
+        // キューのsnapshotが子のhandleを保持したままだと、NTFSは共有モードに関係なく
+        // ディレクトリのrename（同一volumeのごみ箱移動と同じ操作）を拒否する。
+        // Shell投入直前に子だけを閉じれば、rootのhandleを保持したままrenameできることを確認する。
+        let root = fixture("queue-snapshot-rename")?;
+        let target = root.join("target");
+        std::fs::create_dir_all(target.join("sub"))?;
+        std::fs::write(target.join("a.txt"), b"a")?;
+        std::fs::write(target.join("sub").join("b.txt"), b"b")?;
+        let moved = root.join("moved");
+        let mut snapshot = Snapshot::capture(&target, true)?;
+        let blocked = std::fs::rename(&target, &moved)
+            .expect_err("Directory rename succeeded while child handles were held");
+        assert_eq!(blocked.raw_os_error(), Some(5), "{blocked}");
+        snapshot.release_children();
+        assert!(snapshot.entries[0].original.is_some());
+        std::fs::rename(&target, &moved)?;
+        Ok(())
+    }
+    #[test]
+    fn queue_snapshot_baseline_rejects_replaced_child_after_release() -> Result<()> {
+        // 子のhandleを閉じた後も、受付時の基準で子の差し替え・追加を拒否する。
+        let root = fixture("queue-snapshot-baseline")?;
+        let target = root.join("target");
+        std::fs::create_dir(&target)?;
+        std::fs::write(target.join("a.txt"), b"a")?;
+        let mut snapshot = Snapshot::capture(&target, true)?;
+        snapshot.release_children();
+        let mut same = vec![];
+        capture_tree(&target, true, &mut same, usize::MAX, None)?;
+        snapshot.matches_tree(&same)?;
+        drop(same);
+        // 同じ名前の別実体へ差し替える。rootの名前一覧は変わらない。
+        std::fs::rename(target.join("a.txt"), root.join("a-original.txt"))?;
+        std::fs::write(target.join("a.txt"), b"a")?;
+        let mut replaced = vec![];
+        capture_tree(&target, true, &mut replaced, usize::MAX, None)?;
+        assert!(snapshot.matches_tree(&replaced).is_err());
+        drop(replaced);
+        std::fs::write(target.join("extra.txt"), b"x")?;
+        let mut added = vec![];
+        capture_tree(&target, true, &mut added, usize::MAX, None)?;
+        assert!(snapshot.matches_tree(&added).is_err());
+        Ok(())
+    }
     fn fixture(label: &str) -> Result<PathBuf> {
-        let temp = PathBuf::from(
-            std::env::var_os("TEMP").ok_or_else(|| anyhow::anyhow!("TEMP is required"))?,
-        );
-        let temp = path::absolute(&temp)?;
-        if !temp.to_string_lossy().starts_with("D:\\") {
-            bail!("Native fixture TEMP must be external D:");
-        }
+        // TEMPはドライブ文字を問わず、リポジトリとCodex homeの外にある通常のドライブ絶対パスだけを使う。
+        let temp = path::external_test_temp()?;
         let _parents = path::pin_directories(&temp)?;
         let root = temp.join(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&root)?;
@@ -1980,6 +2233,15 @@ mod tests {
             root.display()
         );
         Ok(root)
+    }
+    /// ネイティブRecycle検証の根。`PRUNLET_NATIVE_RECYCLE_ROOT`があればそれを使い、
+    /// 未指定ならTEMP配下（外部検証パスのみ許可）に一意のfixtureを作る。
+    /// 開発者固有の固定パスへは依存しない。どのvolumeで検証するかは指定したパス（TEMP）のvolumeで決まる。
+    fn native_recycle_root(label: &str) -> Result<PathBuf> {
+        match std::env::var_os("PRUNLET_NATIVE_RECYCLE_ROOT") {
+            Some(root) => Ok(PathBuf::from(root)),
+            None => fixture(label),
+        }
     }
     pub(super) fn before_recycle_contract(mode: &str, root: &Path) -> Result<Value> {
         use std::{
@@ -2261,13 +2523,7 @@ mod tests {
     }
     #[test]
     fn native_before_recycle_replacement_retains_both_identities() -> Result<()> {
-        let root = std::env::var_os("PRUNLET_NATIVE_RECYCLE_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default())
-                    .join("PrunletValidation")
-                    .join("rust-migration-20261103")
-            });
+        let root = native_recycle_root("native-before-recycle")?;
         for mode in ["replace", "alias", "attributes", "large"] {
             let result = before_recycle_contract(mode, &root)?;
             eprintln!("Retained before-recycle proof: {result}");
@@ -2427,10 +2683,8 @@ mod tests {
     #[test]
     fn native_spawn_failure_keeps_completed_effects_and_unstarted_targets() -> Result<()> {
         let _serial = PERMANENT_TEST_SERIAL.lock().unwrap();
-        let base = PathBuf::from(r"C:\Users\IMT\PrunletValidation\rust-migration-20261103");
-        let _parents = path::pin_directories(&base)?;
-        let data = base.join(format!("spawn-fault-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&data)?;
+        // 対象データは開発者固有の固定パスではなく、外部TEMP配下の一意なfixtureへ作る。
+        let data = fixture("spawn-fault-data")?;
         let metadata_scope = fixture("spawn-fault-metadata")?;
         let metadata = metadata_scope.join("metadata");
         std::fs::create_dir(&metadata)?;
@@ -2543,13 +2797,8 @@ mod tests {
     }
     #[test]
     pub(super) fn native_hardlink_entry_time_contract() -> Result<()> {
-        let temp = PathBuf::from(
-            std::env::var_os("TEMP").ok_or_else(|| anyhow::anyhow!("TEMP is required"))?,
-        );
-        let temp = path::absolute(&temp)?;
-        if !temp.to_string_lossy().starts_with("D:\\") {
-            bail!("Native fixture TEMP must be on external D:");
-        }
+        // TEMPはドライブ文字を問わず、リポジトリとCodex homeの外にある通常のドライブ絶対パスだけを使う。
+        let temp = path::external_test_temp()?;
         let _parents = path::pin_directories(&temp)?;
         let root = temp.join(format!("hardlink-time-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&root)?;
@@ -2786,13 +3035,7 @@ mod tests {
     }
     #[test]
     fn native_post_shell_failure_keeps_every_item_result() -> Result<()> {
-        let bin_root = std::env::var_os("PRUNLET_NATIVE_RECYCLE_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default())
-                    .join("PrunletValidation")
-                    .join("rust-migration-20261103")
-            });
+        let bin_root = native_recycle_root("native-post-shell")?;
         native_post_shell_at(&bin_root)
     }
     pub(super) fn native_post_shell_at(bin_root: &Path) -> Result<()> {

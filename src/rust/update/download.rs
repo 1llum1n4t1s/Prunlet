@@ -165,12 +165,8 @@ mod tests {
 
     #[test]
     fn selected_endpoint_stream_is_verified_and_failure_has_no_fallback() -> Result<()> {
-        let parent =
-            std::path::PathBuf::from(std::env::var_os("TEMP").context("External TEMP required")?);
-        ensure!(
-            parent.is_absolute() && parent.to_string_lossy().starts_with("D:\\"),
-            "External D TEMP required"
-        );
+        // TEMPはドライブ文字を問わず、リポジトリとCodex homeの外にある通常のドライブ絶対パスだけを使う。
+        let parent = native::path::external_test_temp()?;
         let _parents = native::path::pin_directories(&parent)?;
         let root = parent.join(format!(
             "distribution-stream-{}",

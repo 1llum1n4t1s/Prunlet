@@ -58,6 +58,28 @@ pub(crate) fn has_operation_errors(value: &Value) -> bool {
     false
 }
 
+/// 結果DTOのどこかに`ambiguous`（結果不明・自動再送禁止）の項目があるかを判定する。
+/// キューのジョブ全体の状態を`failed`と`ambiguous`に分けるために使う。
+/// `ambiguous`を`failed`へ畳むと、呼出元が通常の失敗として再送し得るため区別して返す。
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn has_ambiguous_status(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.get("status").and_then(Value::as_str) == Some("ambiguous") {
+        return true;
+    }
+    if object.get("result").is_some_and(has_ambiguous_status) {
+        return true;
+    }
+    ["items", "operations"].iter().any(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(has_ambiguous_status))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +127,19 @@ mod tests {
         assert!(!has_operation_errors(
             &json!({"capacityKnown":true,"complete":true,"budgetSatisfied":true})
         ));
+    }
+
+    #[test]
+    fn ambiguous_items_are_distinguished_from_plain_failures() {
+        assert!(has_ambiguous_status(
+            &json!({"items":[{"status":"recycled"},{"status":"ambiguous"}]})
+        ));
+        assert!(has_ambiguous_status(
+            &json!({"operations":[{"result":{"items":[{"status":"ambiguous"}]}}]})
+        ));
+        assert!(!has_ambiguous_status(
+            &json!({"items":[{"status":"failed"},{"status":"recycled"}]})
+        ));
+        assert!(!has_ambiguous_status(&json!({"error":"denied"})));
     }
 }

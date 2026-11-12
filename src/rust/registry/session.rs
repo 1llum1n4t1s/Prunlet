@@ -1416,10 +1416,9 @@ mod windows {
         fn session_cli_error_child() -> Result<()> {
             let path =
                 std::path::PathBuf::from(std::env::var("PRUNLET_SESSION_ERROR_CHILD_CONFIG")?);
-            ensure!(
-                path.is_absolute() && path.to_string_lossy().starts_with("D:\\"),
-                "Private external CLI fixture required"
-            );
+            // 親テストが外部TEMPへ作った設定だけを受け付ける（親側と同じ外部判定を使う）。
+            let path = crate::platform::windows::path::external_verification_path(&path)
+                .context("Private external CLI fixture required")?;
             let parent = path.parent().context("Missing CLI fixture parent")?;
             ensure!(
                 parent
@@ -1497,11 +1496,8 @@ mod windows {
         fn session_cli_json_error_types_preserve_causes() -> Result<()> {
             use std::process::{Command, Stdio};
             let me = Peer::new(std::process::id())?;
-            let temp = std::env::temp_dir();
-            ensure!(
-                temp.is_absolute() && temp.to_string_lossy().starts_with("D:\\"),
-                "External D: TEMP required"
-            );
+            // TEMPはドライブ文字を問わず、リポジトリとCodex homeの外にある通常のドライブ絶対パスだけを使う。
+            let temp = path::external_verification_path(&std::env::temp_dir())?;
             let _pins = path::pin_directories(&temp)?;
             let root = temp.join(format!(
                 "session-cli-errors-{}",
@@ -1856,11 +1852,8 @@ mod windows {
                             )?;
                         }
                         let marker = if matches!(case, "effect-error" | "result-write-fail") {
-                            let temp = std::env::temp_dir();
-                            ensure!(
-                                temp.is_absolute() && temp.to_string_lossy().starts_with("D:\\"),
-                                "Pipe fault fixture requires external D: TEMP"
-                            );
+                            // 外部（リポジトリとCodex homeの外）のTEMPだけをmarker置き場に使う。
+                            let temp = path::external_verification_path(&std::env::temp_dir())?;
                             let _pins = path::pin_directories(&temp)?;
                             let marker = temp.join(format!(
                                 "session-effect-{}.marker",

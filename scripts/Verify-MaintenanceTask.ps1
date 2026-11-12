@@ -194,9 +194,9 @@ try {
     $MoveExecutablePath = [IO.Path]::GetFullPath($MoveExecutablePath)
     Assert-True ([IO.File]::Exists($MoveExecutablePath)) 'MoveExecutablePath must be an existing pre-migration schema 4 executable.'
     $ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath); $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory); $ReportPath = [IO.Path]::GetFullPath($ReportPath)
-    Assert-True ($OutputDirectory.StartsWith('D:\', [StringComparison]::OrdinalIgnoreCase)) 'D volume fixture required.'
     $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-    Assert-True ($ReportPath.StartsWith('D:\', [StringComparison]::OrdinalIgnoreCase)) 'External D volume report required.'
+    # 出力・reportはドライブ文字を問わず、リポジトリとCodex homeの外の通常のドライブ絶対パスに限る。
+    foreach ($destination in @($OutputDirectory, $ReportPath)) { Assert-ExternalVerificationPath $destination @($repo) }
     foreach ($forbidden in @($repo, (Join-Path $env:USERPROFILE '.codex'))) {
         foreach ($destination in @($OutputDirectory, $ReportPath)) { Assert-True (!$destination.StartsWith($forbidden.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -and $destination -ine $forbidden) 'External output required.' }
     }
@@ -216,7 +216,7 @@ try {
     Run-Case 'pe-subsystems' { Assert-True ((Get-Subsystem $ExecutablePath) -eq 3) 'CLI must use console subsystem.'; Assert-True ((Get-Subsystem $helper) -eq 2) 'Maintenance helper must use GUI subsystem.' }
     Run-Case 'cli-init-roundtrip' {
         $init = Invoke-Cli @('init', '--backup-directory', $metadata); Assert-True ($init.exitCode -eq 0) "Init failed: $($init.stderr)"
-        $settings = Read-Json $config; $settings.volumeRecoveryDirectories = @{ 'D:\' = $store }; $settings.retentionDays = 30; $settings.maxRecoveryBytes = 10737418240; Save-Json $config $settings
+        $settings = Read-Json $config; $settings.volumeRecoveryDirectories = @{ (Get-VerificationVolumeRoot $store) = $store }; $settings.retentionDays = 30; $settings.maxRecoveryBytes = 10737418240; Save-Json $config $settings
         $script:LegacyFixture = New-Operation 'legacy-discard.txt' 'owned legacy discard content' -LegacyMove
         $legacyRoots = @($script:LegacyFixture.storeRoot, $script:LegacyFixture.root)
         $beforeRoots = @{};foreach($path in $legacyRoots){$beforeRoots[$path]=(Get-FileFixtureSnapshot -Path ($path))}

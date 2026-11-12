@@ -454,13 +454,8 @@ mod tests {
         assert!(migration::require_membership(&expected, &unknown, true).is_err());
     }
     fn filesystem_fixture() -> Result<(crate::config::Config, String)> {
-        let temp = std::env::temp_dir();
-        ensure!(
-            temp.is_absolute()
-                && temp.starts_with("D:\\")
-                && !win::path::within(&temp, std::path::Path::new(env!("CARGO_MANIFEST_DIR"))),
-            "Test TEMP must be external D."
-        );
+        // TEMPはドライブ文字を問わず、リポジトリとCodex homeの外にある通常のドライブ絶対パスだけを使う。
+        let temp = win::path::external_verification_path(&std::env::temp_dir())?;
         let _parents = win::path::pin_directories(&temp)?;
         let base = temp.join(format!(
             "registry-terminal-race-{}",

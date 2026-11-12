@@ -8,7 +8,7 @@ $verificationRoot=Split-Path $PSScriptRoot -Parent;$repo=Split-Path $verificatio
 $script:fixtureRun=$null;if($FixtureRoot){$script:fixtureRun=New-VerificationFixtureRun -FixtureRoot $FixtureRoot -ForbiddenRoots @($repo,(Join-Path $env:USERPROFILE '.codex')) -NamePrefix 'legacy-discard'}
 $script:legacyRecordFixtureRun=$null;if($LegacyRecordFixtureRoot){$script:legacyRecordFixtureRun=New-VerificationFixtureRun -FixtureRoot $LegacyRecordFixtureRoot -ForbiddenRoots @($repo,(Join-Path $env:USERPROFILE '.codex'),$OutputDirectory) -NamePrefix 'legacy-records'}
 foreach($path in @($ExecutablePath,$LegacyExecutablePath,$MoveExecutablePath,$BaselineExecutablePath,$OutputDirectory,$ReportPath)){if(!$path-or![IO.Path]::IsPathFullyQualified($path)){throw 'Candidate, old producers, output and report must be absolute'}}
-foreach($path in @($OutputDirectory,$ReportPath)){Assert-VerificationDestination $path @($repo,(Join-Path $env:USERPROFILE '.codex'));if(![IO.Path]::GetPathRoot($path).Equals('D:\',[StringComparison]::OrdinalIgnoreCase)-or(Test-Path -LiteralPath $path)){throw 'Unused external D output/report required'};if(![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))){throw 'Output parent missing'}}
+foreach($path in @($OutputDirectory,$ReportPath)){Assert-ExternalVerificationPath $path @($repo);if(Test-Path -LiteralPath $path){throw 'Unused external output/report required'};if(![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))){throw 'Output parent missing'}}
 $producerRecords=@()
 if($ProducerProvenancePath){if(![IO.Path]::IsPathFullyQualified($ProducerProvenancePath)){throw 'Producer provenance path must be absolute'};$record=Get-Content -LiteralPath $ProducerProvenancePath -Raw|ConvertFrom-Json -AsHashtable;if($record.schema-ne1){throw 'Unsupported producer provenance schema'};$producerRecords=@($record.producers)}
 $producerPins=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -238,6 +238,14 @@ try {
   if($damage-ceq'oversized'){[IO.File]::WriteAllText($marker,('x'*8193),$utf8)}else{$body[$damage]=if($damage-ceq'ownerSid'){'S-1-5-18'}elseif($damage-ceq'metadataRoot'){Join-Path $f.scope.root 'another-config-root'}else{'00000000000000000000000000000000'};Save-R $marker $body}
   $before=Snapshot-R $f.storeRoot;$r=Invoke-R $f.scope @('migrate','--apply');Assert-ApplyM $r -Partial;Assert-R (!$r.json.complete) 'Invalid owned-store marker was accepted';$null=Assert-SnapshotR $f.storeRoot $before;Assert-R (Test-Path -LiteralPath $f.scope.store) 'Invalid store caused private-base deletion'
  }}
+ Case-M 'store-root-without-marker-is-preserved-with-warning' {
+  # 旧版の非原子的作成（root作成後・marker書込み前の中断）と同じ状態。markerは削除せず同じscope内へ退避（移動）する。
+  $f=New-LegacyM 4 'marker-missing';$marker=Join-Path $f.storeRoot 'store.json';$parked=Join-Path $f.scope.root 'parked-store-marker.json';Assert-R (!(Test-Path -LiteralPath $parked)) 'Parked marker destination occupied';[IO.File]::Move($marker,$parked);Assert-R (!(Test-Path -LiteralPath $marker)) 'Store marker fixture is still present'
+  $before=Snapshot-R $f.storeRoot
+  $preview=Invoke-R $f.scope @('migrate');$script:observed.preview=$preview;Assert-R ($preview.exitCode-eq0-and$preview.json.dryRun-and!$preview.json.complete-and@($preview.json.warnings|Where-Object {$_-match'(?i)ownership is unknown'}).Count-ge1) 'Marker-less store root was skipped as absent in preview'
+  $r=Invoke-R $f.scope @('migrate','--apply');$script:observed.apply=$r;Assert-ApplyM $r -Partial;Assert-R (!$r.json.complete-and@($r.json.warnings|Where-Object {$_-match'(?i)ownership is unknown'}).Count-ge1) 'Marker-less store root was not warned and retained'
+  Assert-R (!@($r.json.operations|Where-Object {$_.path-ceq$f.storeRoot}).Count) 'Marker-less store root became a discard target';$null=Assert-SnapshotR $f.storeRoot $before;Assert-R (Test-Path -LiteralPath $f.scope.store) 'Marker-less store caused private-base deletion'
+ }
  Case-M 'state-version-zero-reassessed-to-discard-policy-two' {
   $s=New-ScopeR 'state-v0';Assert-ApplyM (Invoke-R $s @('migrate','--apply'));$statePath=Join-Path $s.metadata '.registry-records-v1/storage-migration-v1.json';$state=Get-Content -LiteralPath $statePath -Raw|ConvertFrom-Json -AsHashtable;$null=$state.Remove('legacyFilePolicyVersion');Save-R $statePath $state
   $f=New-LegacyM 1 'unused' $s;$proof=Proof-M $f.record;$r=Invoke-R $s @('migrate','--apply','--if-needed');Assert-ApplyM $r;$null=Assert-BinM $proof;Assert-R ((Get-Content -LiteralPath $statePath -Raw|ConvertFrom-Json).legacyFilePolicyVersion-eq2) 'Legacy assessment did not move from absent policy version to version 2'
@@ -256,9 +264,12 @@ try {
   }catch{$script:observed.primaryFailure=@{error=$_.Exception.ToString();stack=$_.ScriptStackTrace};throw}finally{if((Get-FileFixtureIdentity -Path $old)-cne$before[0].Id){$script:observed.aclRetained=@{leaseId=$aclLease.LeaseId;reason='Original fixture identity changed';resubmitted=$false};throw 'Old root changed; ACL lease retained'};try{$aclLease.Dispose()}catch{$script:observed.aclRetained=@{leaseId=$aclLease.LastLeaseId;state=$aclLease.ReleaseState;error=$_.Exception.ToString();resubmitted=$false};throw}};$null=Assert-SnapshotR $old $before
  }
  Case-M 'owned-volume-root-with-registry-signal-is-preserved' {
+  # 投入前（gate取得前）に検出したregistry signalは中央候補と同じく警告して保持（retained）し、dry-run・applyとも終了コード0にする。
   $f=New-LegacyM 4 'store-registry-signal';$signal=Join-Path $f.storeRoot 'registry-owned-signal';[IO.File]::WriteAllText($signal,'protected registry signal before migration',$utf8);$proof=Proof-M $f.storeRoot
+  $preview=Invoke-R $f.scope @('migrate');$script:observed.preview=$preview;$previewItem=@($preview.json.operations|Where-Object {$_.path-ceq$f.storeRoot});Assert-R ($preview.exitCode-eq0-and$preview.json.dryRun-and!$preview.json.complete-and$previewItem.Count-eq1-and$previewItem[0].status-ceq'retained'-and$previewItem[0].error-match'(?i)registry') 'Registry-bearing owned store preview was not retained with exit code 0'
+  Assert-R (!(Test-Path -LiteralPath (Join-Path $f.scope.metadata '.legacy-file-discard-in-progress'))) 'Registry-signal preview created discard gate'
   $r=Invoke-R $f.scope @('migrate','--apply');$script:observed.apply=$r;$null=Assert-SnapshotR $f.storeRoot $proof.before;Assert-R (@((Find-FileFixtureBinIdentity -ExpectedId ($proof.before[0].Id))|Where-Object {$_.Pidl-notin$proof.prior}).Count-eq0) 'Registry-bearing owned store moved to Bin'
-  $item=@($r.json.operations|Where-Object {$_.path-ceq$f.storeRoot});Assert-R ($r.exitCode-eq1-and$r.json.registryReady-and!$r.json.dryRun-and!$r.json.complete-and$item.Count-eq1-and$item[0].status-ceq'failed'-and$item[0].error-match'(?i)registry') 'Registry-bearing owned store was not rejected'
+  $item=@($r.json.operations|Where-Object {$_.path-ceq$f.storeRoot});Assert-R ($r.exitCode-eq0-and$r.json.registryReady-and!$r.json.dryRun-and!$r.json.complete-and$item.Count-eq1-and$item[0].status-ceq'retained'-and$item[0].error-match'(?i)registry') 'Registry-bearing owned store was not retained'
  }
  Case-M 'discard-shell-ready-added-registry-signal-retains-gate' {
   $f=New-LegacyM 4 'late-store-registry-signal';$prior=Proof-M $f.storeRoot;$signal=Join-Path $f.storeRoot 'registry-late-signal';$gate=Join-Path $f.scope.metadata '.legacy-file-discard-in-progress'

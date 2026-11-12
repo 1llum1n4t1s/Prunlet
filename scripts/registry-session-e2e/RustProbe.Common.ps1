@@ -23,7 +23,11 @@ function New-RustProbeStartInfo([string]$ProbePath,[string]$TestName,[hashtable]
     if ($TestName -notin @('checkpoint','native_contract','files_contract','snapshot_publication','legacy_discard','owned_markers')) { throw 'Unknown Rust verification entry point.' }
     if (![IO.Path]::IsPathFullyQualified($Root)) { throw 'Rust verification requires an absolute output scope.' }
     $rootPath=[IO.Path]::GetFullPath($Root)
-    if (![IO.Path]::GetPathRoot($rootPath).Equals('D:\',[StringComparison]::OrdinalIgnoreCase) -or ![IO.Directory]::Exists($rootPath)) { throw 'Rust verification requires a fixed existing external D: scope.' }
+    # ドライブ文字は問わず、通常のドライブ絶対パス（UNC・デバイスパス不可）の既存scopeに限る。
+    # リポジトリ・Codex homeの外であることはRust側（bin/verification.rs）も同じ条件で検査する。
+    # このファイルは出力先へ複製して使われるため、共通helperが読み込まれている場合だけ追加で照合する。
+    if ($rootPath -notmatch '^[A-Za-z]:\\' -or ![IO.Directory]::Exists($rootPath)) { throw 'Rust verification requires a fixed existing external scope (ordinary drive-absolute path outside repository and Codex home).' }
+    if (Get-Command Assert-ExternalVerificationPath -CommandType Function -ErrorAction SilentlyContinue) { Assert-ExternalVerificationPath $rootPath @($repo) }
     $item=Get-Item -LiteralPath $rootPath -Force
     while($item){if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Rust verification output must not pass through a reparse point.'};$item=$item.Parent}
     $Request.schema=1;$Request.rootPath=$rootPath;$Request.candidatePath=$ExecutablePath

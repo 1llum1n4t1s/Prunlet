@@ -78,18 +78,9 @@ fn input(native_registry: bool) -> Result<Request> {
     );
     let mut request: Request = serde_json::from_value(json::parse_unique(&request_bytes)?)?;
     ensure!(request.schema == 1, "Unsupported verification request.");
-    let root = path::absolute(Path::new(&request.root_path))?;
-    ensure!(
-        root.to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("D:\\"),
-        "Native verification requires external D: outputs."
-    );
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
-    ensure!(
-        !path::within(&root, repository),
-        "Verification output must not be inside the source repository."
-    );
+    // 出力rootはドライブ文字を問わず、通常のドライブ絶対パスでリポジトリとCodex homeの外に限る。
+    // 呼出し元のRustProbe.Common.ps1も同じ条件で検査する。
+    let root = path::external_verification_path(Path::new(&request.root_path))?;
     request.root_pin = Some(path::pin_directories(&root)?);
     contained(
         &root,

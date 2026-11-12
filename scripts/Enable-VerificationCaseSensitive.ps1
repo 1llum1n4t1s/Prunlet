@@ -23,7 +23,7 @@ $FixturePath=[IO.Path]::GetFullPath($FixturePath)
 $ReportPath=[IO.Path]::GetFullPath($ReportPath)
 $TempDirectory=[IO.Path]::GetFullPath($TempDirectory)
 if($FixturePath-notmatch'\\recordless-[a-f0-9]{32}\\case-sensitive\\files\\case-sensitive$'){throw 'Only an isolated recordless case-sensitive fixture is supported'}
-foreach($path in @($ReportPath,$TempDirectory)) {if([IO.Path]::GetPathRoot($path)-ine'D:\'){throw 'External D output required'}}
+foreach($path in @($ReportPath,$TempDirectory)) {Assert-ExternalVerificationPath $path @($repo)}
 if([IO.File]::Exists($ReportPath)-or[IO.Directory]::Exists($ReportPath)){throw 'Unused report required'}
 if(![IO.Directory]::Exists($TempDirectory)-or![IO.Directory]::Exists([IO.Path]::GetDirectoryName($ReportPath))){throw 'Existing output parents required'}
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent()

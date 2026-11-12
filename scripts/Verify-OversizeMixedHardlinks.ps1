@@ -24,8 +24,7 @@ $null=Initialize-PrunletFixtureBinding -ExecutablePath $ExecutablePath -BuildMan
 . (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')
 foreach ($path in @($ExecutablePath, $OutputDirectory, $ReportPath)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Absolute paths required.' }
-    if (![IO.Path]::GetPathRoot([IO.Path]::GetFullPath($path)).Equals('D:\', [StringComparison]::OrdinalIgnoreCase)) { throw 'External D paths required.' }
-    Assert-VerificationDestination ([IO.Path]::GetFullPath($path)) @($repo, (Join-Path $env:USERPROFILE '.codex'))
+    Assert-ExternalVerificationPath ([IO.Path]::GetFullPath($path)) @($repo)
 }
 $ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath)
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)

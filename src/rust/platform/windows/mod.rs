@@ -716,7 +716,8 @@ pub fn validate_stream_name(name: &str) -> Result<()> {
         || name.encode_utf16().count() > 255
         || name
             .chars()
-            .any(|c| c.is_control() || ":\\/*?\"<>|".contains(c))
+            // 制御文字はパス部品と同じくWin32の禁止範囲（NUL・U+0001〜U+001F）だけを拒否する。
+            .any(|c| path::is_forbidden_name_control(c) || ":\\/*?\"<>|".contains(c))
     {
         bail!("Invalid named stream name");
     }
@@ -855,10 +856,8 @@ mod tests {
     use super::*;
     #[test]
     fn fixed_directory_empty_scan_keeps_validation_and_predicate_order() -> Result<()> {
-        let temp = path::absolute(Path::new(&std::env::var("TEMP")?))?;
-        if !temp.starts_with("D:\\") {
-            bail!("External D TEMP required");
-        }
+        // TEMPはドライブ文字を問わず、リポジトリとCodex homeの外にある通常のドライブ絶対パスだけを使う。
+        let temp = path::external_test_temp()?;
         let _parents = path::pin_directories(&temp)?;
         let root = temp.join(format!("directory-scan-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&root)?;
@@ -1013,13 +1012,9 @@ mod shell_tests {
     use super::*;
     #[test]
     fn native_recycle_contract() -> Result<()> {
-        let temp = PathBuf::from(
-            std::env::var_os("TEMP").ok_or_else(|| anyhow::anyhow!("TEMP is required"))?,
-        );
+        // TEMPはドライブ文字を問わず、リポジトリとCodex homeの外にある通常のドライブ絶対パスだけを使う。
+        let temp = path::external_test_temp()?;
         let _parents = path::pin_directories(&temp)?;
-        if !temp.to_string_lossy().starts_with("D:\\") {
-            bail!("Native test TEMP must be external D:");
-        }
         let root = temp.join(format!("shell-recycle-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&root)?;
         let source = root.join("one-byte.dat");

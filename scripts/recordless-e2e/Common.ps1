@@ -25,12 +25,12 @@ function Finish-R($Session,[string]$InputText='',[ValidateRange(1,3600)][int]$Ti
 function Invoke-R($Scope,[string[]]$Arguments,[string]$InputText='',[string]$Exe=$ExecutablePath,[ValidateRange(1,3600)][int]$TimeoutSeconds=240){return Finish-R (Start-R $Exe $Scope.config $Arguments) $InputText -TimeoutSeconds $TimeoutSeconds}
 function New-ScopeR([string]$Name,[switch]$HostVolume){
  $root=Join-Path $OutputDirectory $Name;$null=[IO.Directory]::CreateDirectory($root)
- # 即時削除と意図的なvolume不一致だけは元のD配置を使う。設定・paths JSONは常にDへ置く。
+ # 即時削除と意図的なvolume不一致だけは出力先（OutputDirectory）の配置を使う。設定・paths JSONは常に出力先へ置く。
  $files=Join-Path $root 'files';if($script:fixtureRun-and!$HostVolume){$files=Join-Path (Join-Path $script:fixtureRun.directory $Name) 'files'}
  $s=@{root=$root;files=$files;metadata=(Join-Path $root 'metadata');store=(Join-Path $root 'store');config=(Join-Path $root 'config.json')}
  $null=[IO.Directory]::CreateDirectory($s.files);$null=[IO.Directory]::CreateDirectory($s.metadata)
  $r=Invoke-R $s @('init','--backup-directory',$s.metadata);Assert-R ($r.exitCode-eq0) 'Fixture init failed'
- $config=Get-Content $s.config -Raw|ConvertFrom-Json -AsHashtable;$config.volumeRecoveryDirectories=@{'D:\'=$s.store};Save-R $s.config $config;return $s
+ $config=Get-Content $s.config -Raw|ConvertFrom-Json -AsHashtable;$config.volumeRecoveryDirectories=@{(Get-VerificationVolumeRoot $s.store)=$s.store};Save-R $s.config $config;return $s
 }
 function File-R($Scope,[string]$Name,[int]$Length=97){$p=Join-Path $Scope.files $Name;$null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($p));$b=[byte[]]::new($Length);for($i=0;$i-lt$Length;$i++){$b[$i]=[byte](($i*17+13)%251)};[IO.File]::WriteAllBytes($p,$b);return $p}
 function Delete-R($Scope,[string[]]$Paths,[switch]$Recursive,[switch]$DryRun,[ValidateRange(1,3600)][int]$TimeoutSeconds=240){$pathFile=Join-Path $Scope.root ('paths-'+[guid]::NewGuid().ToString('N')+'.json');Save-R $pathFile $Paths;$arguments=@('delete');if($Recursive){$arguments+='--recursive'};if($DryRun){$arguments+='--dry-run'};$arguments+=@('--paths-file',$pathFile);return Invoke-R $Scope $arguments -TimeoutSeconds $TimeoutSeconds}

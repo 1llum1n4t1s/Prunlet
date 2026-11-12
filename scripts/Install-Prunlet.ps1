@@ -214,20 +214,31 @@ function Assert-ManagedInstallationSnapshot($Snapshot) {
     $current = Get-ManagedInstallationSnapshot $Snapshot.root
     if (![string]::Equals(($current | ConvertTo-Json -Depth 5 -Compress),($Snapshot | ConvertTo-Json -Depth 5 -Compress),[StringComparison]::Ordinal)) { throw 'Managed installation or recovery configuration changed; nothing was replaced.' }
 }
+# 登録helperへ渡すPreviousGuideSha256を決める。管理モード・非管理モードで共通に使う。
+# 前回のbin\PRUNLET.mdと登録済みガイドが改行形式（CRLF/LF）の差だけなら登録実物のhashを、
+# それ以外（未登録・本文差・厳密UTF-8として読めない）は前回binのhashを返す。
+# 本文が一致する改行差だけを認識し、編集済み本文の拒否は登録helperに委ねる。
+function Get-GuideRegistrationPreviousHash([byte[]]$PreviousBytes) {
+    $expected = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($PreviousBytes))
+    $current = Assert-PlainPath (Join-Path $CodexHome 'PRUNLET.md') 'Registered guide'
+    if (!(Test-Path -LiteralPath $current -PathType Leaf)) { return $expected }
+    $currentBytes = [IO.File]::ReadAllBytes($current)
+    $utf8 = [Text.UTF8Encoding]::new($false,$true)
+    try {
+        $previousText = $utf8.GetString($PreviousBytes).Replace("`r`n","`n")
+        $currentText = $utf8.GetString($currentBytes).Replace("`r`n","`n")
+    } catch { return $expected }
+    if ([string]::Equals($previousText,$currentText,[StringComparison]::Ordinal)) {
+        return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($currentBytes))
+    }
+    return $expected
+}
 function Get-ManagedGuideRegistrationHash($Snapshot) {
     $previous = Assert-PlainPath (Join-Path $Snapshot.root 'bin\PRUNLET.md') 'Managed guide'
     $expected = $Snapshot.products['bin\PRUNLET.md']
     $previousBytes = [IO.File]::ReadAllBytes($previous)
     if ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($previousBytes)) -ine $expected) { throw 'Managed installation auxiliary hash mismatch.' }
-    $current = Assert-PlainPath (Join-Path $CodexHome 'PRUNLET.md') 'Registered guide'
-    if (!(Test-Path -LiteralPath $current -PathType Leaf)) { return $expected }
-    $currentBytes = [IO.File]::ReadAllBytes($current)
-    $utf8 = [Text.UTF8Encoding]::new($false,$true)
-    # 本文が一致する改行形式の差だけを認識し、編集済み本文の拒否は登録helperに委ねる。
-    if ([string]::Equals($utf8.GetString($previousBytes).Replace("`r`n","`n"),$utf8.GetString($currentBytes).Replace("`r`n","`n"),[StringComparison]::Ordinal)) {
-        return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($currentBytes))
-    }
-    return $expected
+    return Get-GuideRegistrationPreviousHash $previousBytes
 }
 function Assert-ManagedRecoveryBinding($Snapshot,[string]$ExpectedConfigHash = $Snapshot.configHash) {
     $registered = Test-RegisteredManagedInstallation $Snapshot.root
@@ -320,7 +331,8 @@ if (!(Get-Command cargo.exe -ErrorAction SilentlyContinue) -and !(Test-Path -Lit
 $products = @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\prunlet-hook.exe', 'bin\Install-Prunlet.ps1', 'bin\start-prunlet-mcp.ps1', 'bin\configuration-common.ps1', 'bin\maintenance-task.ps1', 'bin\uninstall-maintenance.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
 $retiredProducts = @('bin\codex-pretooluse.ps1')
 $previousGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
-$previousGuideSha256 = if ($managedInstallation -and $RegisterAgentInstructions) { Get-ManagedGuideRegistrationHash $managedInstallation } elseif (Test-Path -LiteralPath $previousGuidePath -PathType Leaf) { (Get-FileHash -LiteralPath $previousGuidePath -Algorithm SHA256).Hash } else { $null }
+# 非管理モードでも、前回binと登録済みガイドが改行差だけなら登録実物のhashをPreviousに使う（管理モードと同じ判定）。
+$previousGuideSha256 = if ($managedInstallation -and $RegisterAgentInstructions) { Get-ManagedGuideRegistrationHash $managedInstallation } elseif (Test-Path -LiteralPath $previousGuidePath -PathType Leaf) { if ($RegisterAgentInstructions) { Get-GuideRegistrationPreviousHash ([IO.File]::ReadAllBytes($previousGuidePath)) } else { (Get-FileHash -LiteralPath $previousGuidePath -Algorithm SHA256).Hash } } else { $null }
 foreach ($relative in @($products + $retiredProducts)) {
     $target = Assert-PlainPath (Join-Path $InstallDirectory $relative) 'Installed product path'
     if (Test-Path -LiteralPath $target -PathType Container) { throw "Installed product path is a directory: $target" }

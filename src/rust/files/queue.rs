@@ -695,15 +695,26 @@ fn run_execution(
                 state["waitReason"] = Value::Null;
                 started = true;
             }
-            let result =
-                recordless::delete(config, paths, false, recursive, None, Some(snapshots))?;
-            return Ok(Some(result));
+            // Coreの失敗はWindowsへの投入有無を区別したまま受け取り、下の写像で状態を決める。
+            return Ok(Some(recordless::delete_checked(
+                config,
+                paths,
+                false,
+                recursive,
+                None,
+                Some(snapshots),
+            )));
         }
     })();
     let mut state = state.lock().unwrap();
     if !terminal(&state) {
         match action {
-            Ok(Some(result)) => {
+            Ok(Some(Err(failure))) => {
+                let (status, error) = core_failure_state(&failure);
+                state["status"] = json!(status);
+                state["error"] = json!(error);
+            }
+            Ok(Some(Ok(result))) => {
                 let status = if result.items.iter().any(|x| x.status == "ambiguous") {
                     "ambiguous"
                 } else if result.items.iter().any(|x| x.status == "failed") {
@@ -737,6 +748,29 @@ fn run_execution(
     }
     snapshots.lock().unwrap().clear();
 }
+/// `running`へ移った後にCore全体が失敗したときのジョブ状態。
+///
+/// Coreが投入前で止まったと確定した場合だけ`failed`とし、元対象が保持された原因を残す。
+/// それ以外（投入後・投入有無不明）は`ambiguous`のまま再送禁止を明示する。
+fn core_failure_state(failure: &recordless::DeleteFailure) -> (&'static str, String) {
+    if failure.is_not_submitted() {
+        (
+            "failed",
+            format!(
+                "Deletion was not started; no item was submitted to Windows. {:#}",
+                failure.error()
+            ),
+        )
+    } else {
+        (
+            "ambiguous",
+            format!(
+                "Deletion started; outcome is unknown. Do not resend deletion. {:#}",
+                failure.error()
+            ),
+        )
+    }
+}
 fn stop_pending_on_server_failure(state: &Mutex<Value>, error: &anyhow::Error) {
     let mut state = state.lock().unwrap();
     if state["status"] == "pending" {
@@ -752,6 +786,24 @@ fn stop_pending_on_server_failure(state: &Mutex<Value>, error: &anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn core_failure_maps_only_confirmed_unsubmitted_to_failed() {
+        // 投入前確定のCore失敗は元対象保持の原因を残して failed にする。
+        let (status, error) = core_failure_state(&recordless::DeleteFailure::NotSubmitted(
+            anyhow::anyhow!("Deletion preflight failed; original targets were retained."),
+        ));
+        assert_eq!(status, "failed");
+        assert!(error.starts_with("Deletion was not started;"));
+        assert!(error.contains("original targets were retained"));
+        assert!(!error.contains("outcome is unknown"));
+        // それ以外の失敗は ambiguous と再送禁止を維持する。
+        let (status, error) = core_failure_state(&recordless::DeleteFailure::Unknown(
+            anyhow::anyhow!("Shell worker failed"),
+        ));
+        assert_eq!(status, "ambiguous");
+        assert!(error.contains("Do not resend deletion."));
+        assert!(error.contains("Shell worker failed"));
+    }
     #[test]
     fn contact_waits_for_exact_missing_pipe_gap_and_sends_one_status_frame() -> Result<()> {
         let id = uuid::Uuid::new_v4().simple().to_string();
@@ -827,13 +879,8 @@ mod tests {
         Ok(())
     }
     fn status_peer_failure_contract(immediate_close: bool) -> Result<()> {
-        let temp = PathBuf::from(
-            std::env::var_os("TEMP").ok_or_else(|| anyhow::anyhow!("TEMP required"))?,
-        );
-        let temp = native::path::absolute(&temp)?;
-        if !temp.to_string_lossy().starts_with("D:\\") {
-            bail!("External D TEMP required");
-        }
+        // TEMPはドライブ文字を問わず、リポジトリとCodex homeの外にある通常のドライブ絶対パスだけを使う。
+        let temp = native::path::external_test_temp()?;
         let _parents = native::path::pin_directories(&temp)?;
         let root = temp.join(format!(
             "queue-peer-disconnect-{}",
@@ -1047,13 +1094,8 @@ mod tests {
     }
     #[test]
     fn flush_setup_failure_stops_pending_execution_and_never_retries_running() -> Result<()> {
-        let temp = PathBuf::from(
-            std::env::var_os("TEMP").ok_or_else(|| anyhow::anyhow!("TEMP required"))?,
-        );
-        let temp = native::path::absolute(&temp)?;
-        if !temp.to_string_lossy().starts_with("D:\\") {
-            bail!("External D TEMP required");
-        }
+        // TEMPはドライブ文字を問わず、リポジトリとCodex homeの外にある通常のドライブ絶対パスだけを使う。
+        let temp = native::path::external_test_temp()?;
         let _parents = native::path::pin_directories(&temp)?;
         let root = temp.join(format!(
             "queue-resource-fault-{}",

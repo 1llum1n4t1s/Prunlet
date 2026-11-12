@@ -43,22 +43,22 @@ Windowsの管理者起動はsandbox権限申請と区別する。許可済みの
 Windows・Rustup/Cargo・MSVCビルドツール・Windows SDK・PowerShell 7を使う。ビルドは`scripts/Publish-Prunlet.ps1`に外部の絶対出力先を渡し、Cargoの出力・TEMP/TMPをリポジトリへ置かない。
 
 ```powershell
-$buildRoot = Join-Path 'D:\Codex\Prunlet' ('build-' + [guid]::NewGuid().ToString('N'))
+$buildRoot = Join-Path '<外部の作業ディレクトリ>' ('build-' + [guid]::NewGuid().ToString('N'))
 pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 ```
 
-製品exeは`$buildRoot\publish`へ出力する。既定は`win-x64`（`x86_64-pc-windows-msvc`）、ARM64向けは`-Runtime win-arm64`（`aarch64-pc-windows-msvc`）を指定する。Cargo target・metadata・TEMP/TMP・fixture・reportは外部D絶対パスへ隔離し、reportの親を事前作成する。
+製品exeは`$buildRoot\publish`へ出力する。既定は`win-x64`（`x86_64-pc-windows-msvc`）、ARM64向けは`-Runtime win-arm64`（`aarch64-pc-windows-msvc`）を指定する。Cargo target・metadata・TEMP/TMP・fixture・reportはリポジトリ外の外部絶対パス（`~/.codex`の外、ドライブ文字は問わない）へ隔離し、reportの親を事前作成する。ゴミ箱往復を確認するfixtureは、ごみ箱が有効（即時削除設定でない）ボリュームに置く。`-FixtureRoot`で指定できる。
 
 検証時は`-IncludeVerificationProbe`で`publish/prunlet-verification.exe`・`publish/prunlet_fixtures.dll`・`publish/prunlet-support.exe`を同時に生成し、`build-manifest.json`で製品と検証用出力を照合する。Coreプローブを使う検証には`-RustProbePath`・`-BuildManifestPath`・`-ExpectedBuildManifestSha256`を一組で渡す。検証用出力は製品ZIPに含めない。
 
 実装後は[検証手順](docs/verification.md)の記録なしファイルE2Eと、影響に応じたレジストリ・旧データ移行・導入検証を行う。CLI・stdio MCP・hookの実プロセス、終了コード・passed/failed・外部JSONを読んで判定する。skip・CaseFilterだけの成功や未実行を全件合格にしない。
 
 - ファイル: `scripts/Verify-RecordlessFiles.ps1`へ今回のexe、上記のプローブ・manifest・SHA-256、および新しい外部出力・reportを渡す。プローブを省略した場合は該当するCoreケースを未検証とする。結果DTO、操作記録不作成、dry-run不変更、Windowsゴミ箱往復、内容/ID/属性/ACL/ADS、リンク先保全・ハードリンク共有、再帰・拒否・不明状態を確認する。再帰固定削除の診断では、CLI・MCPのロード中DLLケースで要求rootの結果DTOと失敗entry・保持元の診断を区別して確認する。Shell返却パスの照合を変更した場合は`Verify-LongPathFiles.ps1`のPrepare・VerifyDryRun・VerifyDeleteも行う。外部TEMP/TMP・fixture・CLI出力と終了コードの渡し方は[通常E2Eの検証範囲](docs/verification.md#通常e2eの検証範囲)に従う。
-- フック解析: shell選択・文字列解析・拒否理由を変更した場合は`scripts/Verify-HookParsing.ps1 -ExecutablePath <今回のexe絶対パス> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSON絶対パス> -ConfigPath <設定絶対パス>`を実行する。検査用コマンド文字列を直接実行せず、hookへのJSON入力で許可・拒否とfixture不変更を確認する。拒否理由の`reasonValid`も確認し、検知命令・shell解釈または検査不能の原因、およびshell不明時の候補判定の説明を検証する。範囲と判定は[検証手順](docs/verification.md#通常e2eの検証範囲)に従う。
+- フック解析: shell選択・文字列解析・拒否理由を変更した場合は`scripts/Verify-HookParsing.ps1 -ExecutablePath <今回のexe絶対パス> -OutputDirectory <未使用の外部絶対パス> -ReportPath <外部JSON絶対パス> -ConfigPath <設定絶対パス>`を実行する。検査用コマンド文字列を直接実行せず、hookへのJSON入力で許可・拒否とfixture不変更を確認する。拒否理由の`reasonValid`も確認し、検知命令・shell解釈または検査不能の原因、およびshell不明時の候補判定の説明を検証する。範囲と判定は[検証手順](docs/verification.md#通常e2eの検証範囲)に従う。
 - 旧データ移行: `scripts/Verify-FileRecordMigration.ps1`へ今回のexe・同じビルドのプローブ照合用3引数と、検証対象の真正な旧版exeを渡す。旧schema fixtureを新版で捏造せず、所有済み旧rootの直接Bin破棄、壊れたfile本文の非読取、registry混在/他config/未知非所有領域の保護、dry-run不変更・gate不作成、中断後の自動再送拒否・明示ack、policy 0→2と更新時の後online store回収を確認する。旧file復元・bundle・sidecar・copy・履歴圧縮は成功条件へ残さない。
 - 並行・待機: `scripts/Verify-ConcurrentDeletion.ps1`へ今回のexe・同じビルドのプローブ照合用3引数・新しい外部出力とreportを渡し、Coreのclaimと実CLI/MCPのロック待機・MCP進捗の分離を確認する。全preflight失敗時の保全、共有ハードリンク、process worker上限、入力順、60秒超の待機と解放後続行・EOF後完了は、記録なしファイルE2Eの該当ケースも確認する。
-- 削除待機キュー: キュー・実体照合・CLI/MCP入口を変更した場合は`scripts/Verify-DeferredDeleteQueue.ps1 -ExecutablePath <今回のexe絶対パス> -ConfigPath <設定絶対パス> -OutputDirectory <未使用の外部D絶対パス> -ReportPath <外部JSON絶対パス>`を実行する。待機・取消・解放後の削除・stdio切断後の継続を確認し、保持期限や各上限などの追加検証範囲は[検証手順](docs/verification.md#一時的なロックとロード中dll)と照合する。通常の同期削除の検証だけで代替しない。
-- 再帰永久削除: 子の実体・時刻照合を変更した場合は`scripts/Verify-HardlinkEntryTimes.ps1`へ`-ExecutablePath`・`-RustProbePath`・`-BuildManifestPath`・`-ExpectedBuildManifestSha256`・未使用の外部D絶対パスの`-OutputDirectory`・外部JSONの`-ReportPath`を渡す。CLI/MCPのハードリンク削除と別名の保全、Core境界での変更検知と診断値を区別して確認する。候補Rustプローブは今回のexeと同じビルドを使う。
+- 削除待機キュー: キュー・実体照合・CLI/MCP入口を変更した場合は`scripts/Verify-DeferredDeleteQueue.ps1 -ExecutablePath <今回のexe絶対パス> -ConfigPath <設定絶対パス> -OutputDirectory <未使用の外部絶対パス> -ReportPath <外部JSON絶対パス>`を実行する。待機・取消・解放後の削除・stdio切断後の継続を確認し、保持期限や各上限などの追加検証範囲は[検証手順](docs/verification.md#一時的なロックとロード中dll)と照合する。通常の同期削除の検証だけで代替しない。
+- 再帰永久削除: 子の実体・時刻照合を変更した場合は`scripts/Verify-HardlinkEntryTimes.ps1`へ`-ExecutablePath`・`-RustProbePath`・`-BuildManifestPath`・`-ExpectedBuildManifestSha256`・未使用の外部絶対パスの`-OutputDirectory`・外部JSONの`-ReportPath`を渡す。CLI/MCPのハードリンク削除と別名の保全、Core境界での変更検知と診断値を区別して確認する。候補Rustプローブは今回のexeと同じビルドを使う。
 - レジストリ: `scripts/Verify-RegistryRecovery.ps1`と、native sessionの`Verify-RegistrySession.ps1`のPrepare・Start（`-AssertNativeWindows`）・Current・Runを使う。完全ACL/raw bytes・競合・transaction・snapshot保全・専用namespace/予算を確認する。同じexeのcurrent側6801拒否保全と明示native側CLI/MCP正常往復、実token・view/scopeを区別し、権限・KTM・viewの未検証を成功に数えない。
 - 保護アクセス・診断: 保護レジストリのopen・privilege・viewを変更した場合は`Verify-ProtectedRegistryAccess.ps1`と`Verify-ProtectedRegistryViews.ps1`、ファイルのアクセス拒否・削除後確認の診断を変更した場合は`Verify-AccessDeniedFiles.ps1`も実行する。引数とfixture条件は[検証手順](docs/verification.md)に従い、API適合性probeとCLI/MCP E2Eの結果を区別する。
 - snapshot公開: 容量予約・本文のシリアライズ・公開処理を変更した場合は`scripts/Verify-RegistrySnapshotPublication.ps1`も実行する。必須引数と保存境界の検証範囲は[レジストリ検証](docs/verification.md#レジストリの削除と復元)に従い、実レジストリの往復検証とは区別する。

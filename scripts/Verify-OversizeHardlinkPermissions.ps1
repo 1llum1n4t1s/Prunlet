@@ -24,8 +24,7 @@ $null=Initialize-PrunletFixtureBinding -ExecutablePath $ExecutablePath -BuildMan
 foreach ($path in @($ExecutablePath,$OutputDirectory,$ReportPath)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Absolute paths required.' }
     $full=[IO.Path]::GetFullPath($path)
-    if (![IO.Path]::GetPathRoot($full).Equals('D:\',[StringComparison]::OrdinalIgnoreCase)) { throw 'External D paths required.' }
-    Assert-VerificationDestination $full @($repo,(Join-Path $env:USERPROFILE '.codex'))
+    Assert-ExternalVerificationPath $full @($repo)
 }
 $ExecutablePath=[IO.Path]::GetFullPath($ExecutablePath); $OutputDirectory=[IO.Path]::GetFullPath($OutputDirectory); $ReportPath=[IO.Path]::GetFullPath($ReportPath)
 if (![IO.File]::Exists($ExecutablePath)) { throw 'Candidate executable missing.' }

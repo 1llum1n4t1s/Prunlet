@@ -418,7 +418,7 @@ pub fn run(args: &[String]) -> Result<()> {
     if args.first().is_some_and(|s| s == "--self-test") {
         ensure!(
             args.len() == 2,
-            "--self-test requires one new external D directory"
+            "--self-test requires one new external directory (outside the repository and Codex home)"
         );
         return self_test(Path::new(&args[1]));
     }

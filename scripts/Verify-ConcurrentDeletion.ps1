@@ -19,7 +19,8 @@ foreach($path in @($ExecutablePath,$RustProbePath,$BuildManifestPath,$OutputDire
 }
 foreach($path in @($OutputDirectory,$ReportPath)){
  Assert-VerificationDestination $path @($repo,$codexRoot)
- if(![IO.Path]::GetPathRoot($path).Equals('D:\',[StringComparison]::OrdinalIgnoreCase)-or(Test-Path -LiteralPath $path)-or![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))){throw 'New external D: output and report with existing parents are required.'}
+ Assert-ExternalVerificationPath $path @($repo,$codexRoot)
+ if((Test-Path -LiteralPath $path)-or![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))){throw 'New external output and report with existing parents are required.'}
 }
 $OutputDirectory=[IO.Path]::GetFullPath($OutputDirectory);$ReportPath=[IO.Path]::GetFullPath($ReportPath)
 if($ReportPath.Equals($OutputDirectory,[StringComparison]::OrdinalIgnoreCase)-or$ReportPath.StartsWith($OutputDirectory.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Report must be outside the output directory.'}
@@ -100,7 +101,7 @@ function Test-Case([string]$Name,[scriptblock]$Body){
  $script:Config=Join-Path $script:CaseRoot 'config.json';$script:Sessions=[Collections.Generic.List[object]]::new();$script:Claims=[Collections.Generic.List[object]]::new();$script:Evidence=@{};$configPin=$null
  try{
   $init=Complete-Child (Start-Child @('init','--backup-directory',$script:Recovery));Assert-True ($init.exitCode-eq0) ('Init failed: '+$init.stderr)
-  $config=[IO.File]::ReadAllText($script:Config)|ConvertFrom-Json -AsHashtable -Depth 80;$config.volumeRecoveryDirectories=@{'D:\'=(Join-Path $script:CaseRoot 'volume-store')};Save-Json $script:Config $config
+  $config=[IO.File]::ReadAllText($script:Config)|ConvertFrom-Json -AsHashtable -Depth 80;$volumeStore=Join-Path $script:CaseRoot 'volume-store';$config.volumeRecoveryDirectories=@{(Get-VerificationVolumeRoot $volumeStore)=$volumeStore};Save-Json $script:Config $config
   $configPin=[IO.File]::Open($script:Config,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
   & $Body
   $results.Add(@{name=$Name;passed=$true;evidence=$script:Evidence})

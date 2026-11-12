@@ -18,7 +18,7 @@ foreach($path in @($OutputDirectory,$ReportPath,$FixtureRoot)) {
  if(Test-Path -LiteralPath $path){throw 'Unused output, report and fixture paths required'}
  if(![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))){throw 'Existing parent required'}
 }
-foreach($path in @($OutputDirectory,$ReportPath)) {if(![IO.Path]::GetPathRoot($path).Equals('D:\',[StringComparison]::OrdinalIgnoreCase)){throw 'External D output required'}}
+foreach($path in @($OutputDirectory,$ReportPath)) {Assert-ExternalVerificationPath $path @($repo)}
 $null=Assert-RustFileProbeBinding
 $null=[IO.Directory]::CreateDirectory($OutputDirectory)
 $null=[IO.Directory]::CreateDirectory($FixtureRoot)

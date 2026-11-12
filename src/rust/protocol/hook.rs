@@ -35,6 +35,9 @@ struct Token {
     equality: Option<usize>,
     quoted_after_equality: bool,
     dynamic: bool,
+    /// CMD規則で、引用外かつ`^`で退避されていない`,`の位置（`text`内のbyte offset）。
+    /// cmd.exeは`,`を空白相当の区切りとして読むため、`if`の条件を語に割り直すのに使う。
+    commas: Vec<usize>,
 }
 impl Token {
     fn new(text: impl Into<String>) -> Self {
@@ -48,8 +51,41 @@ impl Token {
             equality: None,
             quoted_after_equality: false,
             dynamic: false,
+            commas: Vec::new(),
         }
     }
+}
+
+/// CMD規則の語を、引用外の`,`で割り直す（`if exist x,del y`の条件末尾に直結した実行名を分離する）。
+///
+/// cmd.exeは`if`の条件を`,`でも区切るが、字句解析は`,`を語の区切りにしない（`cmd ,/c`のような
+/// switch解析や他の判定を変えないため）。`if`の検査に限ってこの関数で語を分ける。
+/// 各片の引用・`==`の情報は、元の語での位置が片の範囲に入る場合だけ引き継ぐ。
+/// 2つ目以降の引用は位置を保持していないため、その片は引用外として扱う（判定は拒否側に倒れる）。
+fn split_cmd_commas(words: &[Token]) -> Vec<Token> {
+    let mut out = Vec::with_capacity(words.len());
+    for word in words {
+        if word.commas.is_empty() {
+            out.push(word.clone());
+            continue;
+        }
+        let mut start = 0;
+        for end in word.commas.iter().copied().chain([word.text.len()]) {
+            if end > start {
+                let mut piece = Token::new(&word.text[start..end]);
+                let inside = |position: usize| position >= start && position < end;
+                piece.quote_start = word.quote_start.filter(|&q| inside(q)).map(|q| q - start);
+                piece.quoted = piece.quote_start.is_some();
+                if let Some(e) = word.equality.filter(|&e| inside(e)) {
+                    piece.equality = Some(e - start);
+                    piece.quoted_after_equality = word.quoted_after_equality;
+                }
+                out.push(piece);
+            }
+            start = end + 1;
+        }
+    }
+    out
 }
 fn leaf(value: &str) -> String {
     raw_leaf(value).to_ascii_lowercase()
@@ -93,11 +129,268 @@ fn command_option(v: &str) -> bool {
     let n = option(v);
     !n.is_empty() && ("command".starts_with(&n) || matches!(n.as_str(), "cwa" | "commandwithargs"))
 }
+/// cmd.exe の起動switchを解析した結果。
+#[derive(Debug, PartialEq, Eq)]
+enum CmdSwitches {
+    /// 本文switch（/C・/K・/R）を見つけた。`token`はそのswitchを含む語の位置、
+    /// `attached`はswitch文字の直後に直結した本文（例: `/cdel x`の`del x`）。
+    Body { token: usize, attached: String },
+    /// 本文switchがない（対話起動や`/?`）。実行される本文が無いため検査対象もない。
+    NoBody,
+    /// 解釈できないswitchや、本文switchより前の未知の引数。安全側に拒否する。
+    Unknown(String),
+}
+
+/// cmd.exe のswitch列を左から解析し、本文の開始位置を返す。
+///
+/// cmd.exe は `/` の後の1文字でswitchを判定し、`/d/c`のような連結や`/cdel`のような直結本文も受け付ける。
+/// MSYS/Git Bash ではパス変換を避けるため`//c`のように`/`を重ねるので、先頭の`/`の連続は1つと同等に扱う。
+/// 大文字小文字は区別しない。既知の非本文switchだけを読み飛ばし、未知のswitchは途中に本文switchが
+/// 隠れている可能性があるため`Unknown`として呼出し元で拒否させる。PowerShell の`-c`系とは別関数で扱う。
+fn cmd_switches(words: &[Token], start: usize) -> CmdSwitches {
+    // 本文switchより前に現れた`/`で始まらない語。後ろに本文switchが続いた時点で拒否理由にする。
+    let mut stray: Option<&str> = None;
+    for (index, word) in words.iter().enumerate().skip(start) {
+        let text = word.text.as_str();
+        if !text.starts_with('/') {
+            // 旧実装はcmdでも`-c`・`-lc`・`-Command`を本文switchとして検査していたため、
+            // 検知範囲を狭めないよう互換として本文扱いを維持する。
+            if matches!(text, "-c" | "-lc" | "-Command" | "-command") {
+                return match stray {
+                    Some(s) => CmdSwitches::Unknown(s.to_owned()),
+                    None => CmdSwitches::Body {
+                        token: index,
+                        attached: String::new(),
+                    },
+                };
+            }
+            // cmd.exe はコマンドライン全体から`/C`・`/K`を探すため、`x/c del …`や`,/c del …`のように
+            // 語の途中にある`/`以降も本文switchになり得る。途中の`/`を含む語は解釈を推測せず拒否する。
+            if text.contains('/') {
+                return CmdSwitches::Unknown(text.to_owned());
+            }
+            stray.get_or_insert(text);
+            continue;
+        }
+        let mut rest = text;
+        let mut first = true;
+        loop {
+            rest = rest.trim_start_matches('/');
+            if rest.is_empty() {
+                // `/`だけの語は意味を確定できない。連結の末尾の`/`は無害として扱う。
+                if first {
+                    return CmdSwitches::Unknown(text.to_owned());
+                }
+                break;
+            }
+            first = false;
+            let mut chars = rest.chars();
+            let letter = chars.next().map(|c| c.to_ascii_lowercase());
+            rest = chars.as_str();
+            match letter {
+                Some('c' | 'k' | 'r') => {
+                    return match stray {
+                        Some(s) => CmdSwitches::Unknown(s.to_owned()),
+                        None => CmdSwitches::Body {
+                            token: index,
+                            attached: rest.to_owned(),
+                        },
+                    };
+                }
+                Some('?') => return CmdSwitches::NoBody,
+                Some('d' | 'q' | 's' | 'a' | 'u' | 'x' | 'y') => {}
+                Some(kind @ ('e' | 'v' | 'f' | 't')) => {
+                    if let Some(value) = rest.strip_prefix(':') {
+                        let end = value.find('/').unwrap_or(value.len());
+                        let (argument, tail) = value.split_at(end);
+                        let valid = if kind == 't' {
+                            // 色指定は1〜2桁の16進数。
+                            (1..=2).contains(&argument.len())
+                                && argument.chars().all(|c| c.is_ascii_hexdigit())
+                        } else {
+                            argument.eq_ignore_ascii_case("on")
+                                || argument.eq_ignore_ascii_case("off")
+                        };
+                        if !valid {
+                            return CmdSwitches::Unknown(text.to_owned());
+                        }
+                        rest = tail;
+                    } else if kind == 't' {
+                        return CmdSwitches::Unknown(text.to_owned());
+                    }
+                }
+                _ => return CmdSwitches::Unknown(text.to_owned()),
+            }
+            // 非本文switchの直後は語の終わりか次の`/`だけを許す（`/dq`などは解釈を推測しない）。
+            if !rest.is_empty() && !rest.starts_with('/') {
+                return CmdSwitches::Unknown(text.to_owned());
+            }
+        }
+    }
+    CmdSwitches::NoBody
+}
+
+/// CMD規則での実行名の先頭から落とす文字。
+///
+/// cmd.exe は `,` `;` `=` を空白と同じ区切りとして読み飛ばすため、`,del x`や`=del x`も`del x`として
+/// 実行される。`@`（echo抑制）と同じく、実行名の判定前に落とす。実行名の位置だけに適用し、
+/// `set X=1`や`if a==b`のような引数側の`=`には触れない。
+const CMD_NAME_PREFIX: [char; 4] = ['@', ',', ';', '='];
+
+/// CMD規則で、実行名が`cmd`/`cmd.exe`のまま直後に区切り文字や`/`が直結した語を分解する。
+///
+/// cmd.exe は実行名を最初の `/` `,` `;` `=` で打ち切るため、`cmd/c del x`・`cmd.exe/c del x`・
+/// `cmd,/c del x`・`cmd=/c del x` はいずれも`cmd`＋`/c del x`として実行される。
+/// 一方、`leaf()`は`/`で語を切って`c`と判定してしまい、wrapper本文が素通りしていた。
+/// `C:/Windows/System32/cmd.exe/c`のように`/`区切りの経路が前置される形も受けるため、
+/// パス区切り（`/` `\`）で更新する語頭から区切り文字までを区間として照合する（1回の走査で線形）。
+/// 区間が`cmd`・`cmd.exe`なら、その区切り文字以降（区切りを含む）を返す。該当なしは`None`。
+fn cmd_glued_tail(text: &str, explicit: bool) -> Option<&str> {
+    let mut segment_start = 0;
+    for (position, c) in text.char_indices() {
+        if matches!(c, '/' | ',' | ';' | '=') {
+            let segment = &text[segment_start..position];
+            // 区間が`cmd`の場合だけ`=`の打切り条件を確かめる。先に区間を比べることで、
+            // `x=,=,=,…`のような語でも`=`ごとの前方走査が起きず、全体が線形に保たれる。
+            if (segment.eq_ignore_ascii_case("cmd") || segment.eq_ignore_ascii_case("cmd.exe"))
+                && cmd_cut_at(text, position, explicit)
+            {
+                return Some(&text[position..]);
+            }
+        }
+        if matches!(c, '/' | '\\') {
+            segment_start = position + c.len_utf8();
+        }
+    }
+    None
+}
+
+/// 実行名の判定結果。`glued`はCMD規則で`cmd`の直後に直結していた残り（区切り文字を含む）。
+struct ExecName<'a> {
+    name: String,
+    /// 拒否理由に表示する実行名（先頭記号を落とし、`.exe`を除いた元の大小文字の名前）。
+    shown: &'a str,
+    glued: Option<&'a str>,
+}
+
+/// 実行名の位置で削除命令とみなす名前（POSIX以外の規則）。`Inspector::command`の判定と同じ集合。
+fn non_posix_delete_name(name: &str) -> bool {
+    matches!(
+        name,
+        "remove-item"
+            | "ri"
+            | "rm"
+            | "rmdir"
+            | "rd"
+            | "del"
+            | "erase"
+            | "remove-itemproperty"
+            | "rp"
+    )
+}
+
+/// CMD規則で、最初の`/` `,` `;` `=`より前の部分（`head`）が「単純名」かどうか。
+///
+/// cmd.exe は`\`や`:`を含まず`.`で始まらない単純名の実行名を、最初の`/` `,` `;` `=`で打ち切る
+/// （`rd/s/q x`は`rd /s/q x`、`del,x`は`del x`）。`C:/tools/del/x`（headが`C:`）・`./del`（headが`.`）・
+/// `/c/bin/del`（headが空）のような経路形式では`/`が経路区切りとして読まれ得るため、
+/// 呼出し側は従来どおり`leaf()`（最後の区切り以降）で判定する。
+fn cmd_simple_name(head: &str) -> bool {
+    !head.is_empty() && !head.contains(['\\', ':']) && !head.starts_with('.')
+}
+
+/// CMD規則で、`text`の`position`にある区切り文字で実行名を打ち切るか。
+///
+/// `/` `,` `;`は常に打ち切る。`=`はshellがcmdと明示された場合（`explicit`）だけ無条件に打ち切る。
+/// shell不明でCMD規則を候補として当てる場合、`rm=1`・`ri=0`・`rp=$(...)`のようなPOSIX代入を
+/// 削除命令と誤認しないよう、`=`（続く`, ; =`を含む）の直後が`/`のとき（`rd=/s x`）に限って打ち切る。
+fn cmd_cut_at(text: &str, position: usize, explicit: bool) -> bool {
+    if explicit || !text[position..].starts_with('=') {
+        return true;
+    }
+    text[position..]
+        .trim_start_matches([',', ';', '='])
+        .starts_with('/')
+}
+
+/// CMD規則で実行名の位置に置かれ、直結した残りを次の実行名として扱う語。
+/// `call,del x`・`call=del x`・`for … do,del %i`・`… else,del x`はcmd.exeでいずれも`del`を実行する。
+fn cmd_prefix_word(name: &str) -> bool {
+    matches!(name, "call" | "do" | "else")
+}
+
+/// 1語の中で区切りにより直結した制御語（`do,do,call,del`等）を順に剥がす回数の上限。
+/// 実用の命令では数個で足りる。超えた入力は検査せず拒否し、計算量を入力長に対して線形に保つ。
+const CMD_GLUED_PREFIX_LIMIT: usize = 32;
+
+/// 語の実行名を求める。CMD規則だけ、先頭の`@ , ; =`を落とし、`cmd`直結の残りを分離する。
+/// 単純名が最初の`/ , ; =`で切れて削除命令・`reg`・`call`・`do`・`else`になる場合は、
+/// その名前と残り（区切りを含む）を返す。
+/// POSIX・PowerShell規則では従来どおり先頭の`@`だけを落として`leaf()`で判定する。
+/// shellがcmdと明示された前提で判定する。shell不明の候補判定は`exec_name_in`で`explicit=false`を渡す。
+#[cfg(test)]
+fn exec_name(text: &str, mode: Option<Mode>) -> ExecName<'_> {
+    exec_name_in(text, mode, true)
+}
+
+/// `exec_name`の本体。`explicit`はCMD規則がshellの明示によるものか（`cmd_cut_at`参照）。
+fn exec_name_in(text: &str, mode: Option<Mode>, explicit: bool) -> ExecName<'_> {
+    if mode == Some(Mode::Cmd) {
+        let trimmed = text.trim_start_matches(CMD_NAME_PREFIX);
+        if let Some(glued) = cmd_glued_tail(trimmed, explicit) {
+            return ExecName {
+                name: "cmd".into(),
+                shown: raw_leaf(&trimmed[..trimmed.len() - glued.len()]),
+                glued: Some(glued),
+            };
+        }
+        // 単純名かどうかは区切りより前の部分で判断する。`del,"C:\x"`の`C:\x`は引数側なので経路扱いしない。
+        // 最初の区切りで判断する。打ち切らない`=`（shell不明時のPOSIX代入）に当たった場合は切らない。
+        if let Some(cut) = trimmed.find(['/', ',', ';', '='])
+            && cmd_cut_at(trimmed, cut, explicit)
+            && cmd_simple_name(&trimmed[..cut])
+        {
+            let head = &trimmed[..cut];
+            let name = leaf(head);
+            // 削除命令・`reg`・後続を実行名とする語だけを切った名前で判定する。その他の名前は
+            // 従来の`leaf()`判定を保ち、`foo/rm x`のような既存の拒否を緩めない。
+            if non_posix_delete_name(&name) || name == "reg" || cmd_prefix_word(&name) {
+                return ExecName {
+                    name,
+                    shown: raw_leaf(head),
+                    glued: Some(&trimmed[cut..]),
+                };
+            }
+        }
+        return ExecName {
+            name: leaf(trimmed),
+            shown: raw_leaf(trimmed),
+            glued: None,
+        };
+    }
+    let trimmed = text.trim_start_matches('@');
+    ExecName {
+        name: leaf(trimmed),
+        shown: raw_leaf(trimmed),
+        glued: None,
+    }
+}
+
 #[derive(Default)]
 struct Inspector {
     mode: Option<Mode>,
+    /// CMD規則で、いま検査している文の直後が`;`だったか。cmd.exeでは`;`は空白相当の区切りで、
+    /// `cmd /d;/c del x`のように`cmd`の引数列を途中で割れない。字句解析は`;`を文境界にするため、
+    /// 本文switchを持たない`cmd`の直後に`;`が続く形をwrapper側で拒否するのに使う。
+    cmd_semicolon: bool,
+    /// いまのshell規則が明示されたものか（hookのshell指定・`cmd /c`等の本文）。
+    /// shell不明で候補の規則を順に当てている間はfalse。CMD規則の`=`での実行名打切りに使う。
+    explicit: bool,
     detection: Option<String>,
     posix_script: bool,
+    /// 入力全体が単独の静的EncodedCommandで、復号本文をPowerShellとして確定検査したか。
+    /// このときshell不明時の「候補の解釈」注記とEncodedCommand案内は事実に合わないため付けない。
+    standalone_encoded: bool,
 }
 impl Inspector {
     fn detected(&mut self, reason: &str, token: &str) -> bool {
@@ -122,11 +415,9 @@ impl Inspector {
         mode: Option<Mode>,
         strict: bool,
     ) -> Result<bool> {
+        // 深さ上限を超えた本文は検査していないため、shell規則を問わず安全側に拒否する。
         if depth > 4 {
-            return Ok(
-                (strict || mode == Some(Mode::Posix) || self.mode == Some(Mode::Posix))
-                    && self.detected("inspection depth limit exceeded", &depth.to_string()),
-            );
+            return Ok(self.detected("inspection depth limit exceeded", &depth.to_string()));
         }
         if depth == 0 {
             let re = Regex::new(
@@ -149,6 +440,7 @@ impl Inspector {
                 if decoded.contains('\0') {
                     bail!("EncodedCommand contains a NUL character.");
                 }
+                self.standalone_encoded = true;
                 return self.contains(&decoded, depth + 1, Some(Mode::PowerShell), true);
             }
         }
@@ -161,13 +453,18 @@ impl Inspector {
         };
         for m in modes {
             let previous = self.mode;
+            let previous_semicolon = self.cmd_semicolon;
+            let previous_explicit = self.explicit;
             self.mode = Some(m);
+            self.explicit = mode.is_some();
             let result = (|| {
                 let tokens = tokens(script, m, strict)?;
                 let mut words = Vec::new();
                 let mut control = self.posix_script;
                 for token in tokens {
                     if token.boundary {
+                        // CMD規則の字句解析だけが`;`の境界に";"を載せる。直前の文の末尾が`;`かを伝える。
+                        self.cmd_semicolon = token.text == ";";
                         if self.statement(&words, depth, strict, &mut control)? {
                             return Ok(true);
                         }
@@ -176,9 +473,15 @@ impl Inspector {
                         words.push(token);
                     }
                 }
+                // 最後の文の後ろは、入れ子の本文ならそれを含む外側の文の終端を引き継ぐ。
+                // cmd.exeは`cmd /c cmd;/c del x`の本文を`;`以降まで含めて渡すため、本文末尾の`cmd`も
+                // `;`に続く引数を受ける。最上位（previous_semicolon=false）では終端なしになる。
+                self.cmd_semicolon = previous_semicolon;
                 self.statement(&words, depth, strict, &mut control)
             })();
             self.mode = previous;
+            self.cmd_semicolon = previous_semicolon;
+            self.explicit = previous_explicit;
             if result? {
                 return Ok(true);
             }
@@ -221,9 +524,9 @@ impl Inspector {
         if w.is_empty() {
             return Ok(false);
         }
+        // contains()と同じく、深さ上限はshell規則を問わずfail-closedにする。
         if depth > 4 {
-            return Ok((strict || self.mode == Some(Mode::Posix))
-                && self.detected("inspection depth limit exceeded", &depth.to_string()));
+            return Ok(self.detected("inspection depth limit exceeded", &depth.to_string()));
         }
         if self.noncanonical(w, depth)? {
             return Ok(true);
@@ -237,44 +540,116 @@ impl Inspector {
             }
         }
         let mut i = 0;
-        let mut name = leaf(w[i].text.trim_start_matches('@'));
+        // CMD規則では先頭の`, ; =`も落とし、`cmd`直結の`/c`等を分離する（exec_name参照）。
+        let mut current = exec_name_in(&w[0].text, self.mode, self.explicit);
+        // CMDの`for ... do <cmd>`・`... else <cmd>`は括弧なしでも後続をコマンドとして実行する。
+        // 字句解析で括弧は文の境界になるため、先頭に残った`do`/`else`を剥がして残りを検査する。
+        // `do,del %i`・`else=del x`・`call,del x`のように区切りで直結した残りも、cmd.exeは
+        // 次の実行名として実行するため、同じ語の位置のまま残りを評価し直す（残りは`w`を借用するだけで複製しない）。
+        // 再帰でなくループで剥がし、大量に並んだ入力でも深さや計算量を増やさない。
+        // POSIXの制御語はposix_prefixが別に扱うため、ここではCMD規則に限定する。
+        // 直結のない`call`は従来どおり下の`call|command|exec`分岐で扱い、正規CLI呼出しの判定を変えない。
+        if self.mode == Some(Mode::Cmd) {
+            // いま実行名として評価している文字列（語全体か、制御語に直結した残り）。
+            let mut text = w[0].text.as_str();
+            // 同じ語の中で直結した残りを評価し直した回数。各評価は残りの長さに比例するため、
+            // `do,do,do,…`のような1語の連鎖で計算量が二乗にならないよう上限を設け、超えたら拒否する。
+            let mut glued_steps = 0usize;
+            loop {
+                let control = match current.glued {
+                    // 区切りで切れた名前（cmd_prefix_word）。語の引用の有無は問わない（`call,"del" x`）。
+                    Some(_) => cmd_prefix_word(&current.name),
+                    // 引用されていない語全体が`do`/`else`（先頭の`@ , ; =`は落として比べる）。
+                    // 経路形式（`x/do`）や引用された`"do"`は従来どおり制御語とみなさない。
+                    None => {
+                        let bare = text.trim_start_matches(CMD_NAME_PREFIX);
+                        !w[i].quoted
+                            && (bare.eq_ignore_ascii_case("do")
+                                || bare.eq_ignore_ascii_case("else"))
+                    }
+                };
+                if !control {
+                    break;
+                }
+                let rest = current
+                    .glued
+                    .map(|tail| tail.trim_start_matches([',', ';', '=']))
+                    .filter(|tail| !tail.is_empty());
+                text = match rest {
+                    Some(rest) => {
+                        glued_steps += 1;
+                        if glued_steps > CMD_GLUED_PREFIX_LIMIT {
+                            return Ok(self.detected(
+                                "too many CMD control words joined by delimiters cannot be inspected",
+                                &current.name,
+                            ));
+                        }
+                        rest
+                    }
+                    None => {
+                        i += 1;
+                        if i == w.len() {
+                            return Ok(false);
+                        }
+                        &w[i].text
+                    }
+                };
+                current = exec_name_in(text, self.mode, self.explicit);
+            }
+        }
+        let ExecName {
+            name: first_name,
+            shown: first_shown,
+            glued: first_glued,
+        } = current;
+        let mut name = first_name;
+        let mut shown = first_shown;
+        let mut glued = first_glued;
         if strict && w[i].quote_start == Some(0) {
             return Ok(false);
+        }
+        // PowerShellのdot呼出し演算子（`. <command>`）は後続語をコマンドとして現在のscopeで実行する。
+        // strictでは字句解析の段階で拒否済みなので、ここに来るのは非strictのPowerShell規則だけである。
+        // `.\x.ps1`や`./x`は語全体が実行名なので対象外とし、語がちょうど`.`の場合だけ後続を実行名にする。
+        if self.mode == Some(Mode::PowerShell) && w[i].text == "." && !w[i].quoted {
+            i += 1;
+            if i >= w.len() {
+                return Ok(false);
+            }
+            let next = exec_name_in(&w[i].text, self.mode, self.explicit);
+            name = next.name;
+            shown = next.shown;
+            glued = next.glued;
         }
         if matches!(name.as_str(), "call" | "command" | "exec") {
             i += 1;
             if i >= w.len() || w[i].text.starts_with('-') {
                 return Ok(false);
             }
-            name = leaf(w[i].text.trim_start_matches('@'));
+            let next = exec_name_in(&w[i].text, self.mode, self.explicit);
+            name = next.name;
+            shown = next.shown;
+            glued = next.glued;
         }
         // 条件中のquoted dataをCMD/PowerShellのalias名だけでPOSIX削除と推定しない。
         let posix_delete =
             self.mode == Some(Mode::Posix) && matches!(name.as_str(), "rm" | "rmdir" | "unlink");
-        if posix_delete
-            || self.mode != Some(Mode::Posix)
-                && matches!(
-                    name.as_str(),
-                    "remove-item"
-                        | "ri"
-                        | "rm"
-                        | "rmdir"
-                        | "rd"
-                        | "del"
-                        | "erase"
-                        | "remove-itemproperty"
-                        | "rp"
-                )
-        {
-            return Ok(self.detected(
-                "deletion command",
-                raw_leaf(w[i].text.trim_start_matches('@')),
-            ));
+        if posix_delete || self.mode != Some(Mode::Posix) && non_posix_delete_name(&name) {
+            // 報告する語も判定と同じ名前にする（`,del`は`del`、`rd/s/q`は`rd`）。
+            return Ok(self.detected("deletion command", shown));
         }
         if name == "reg" {
-            return Ok(w
+            // CMD規則で`reg,delete x`・`reg/delete x`のように実行名へ直結した残りがある場合、
+            // reg.exeが受け取る引数の区切りを確定できないため、残りの先頭が`delete`なら拒否側に倒す。
+            let attached_delete = glued.is_some_and(|tail| {
+                let tail = tail.trim_start_matches(['/', ',', ';', '=']);
+                tail.get(..6)
+                    .is_some_and(|head| head.eq_ignore_ascii_case("delete"))
+            });
+            let next_delete = w
                 .get(i + 1)
-                .is_some_and(|t| t.text.eq_ignore_ascii_case("delete"))
+                .is_some_and(|t| t.text.eq_ignore_ascii_case("delete"));
+            return Ok((attached_delete || next_delete)
                 && self.detected("registry deletion command", "reg delete"));
         }
         if strict
@@ -294,15 +669,42 @@ impl Inspector {
                 &name,
             ));
         }
-        if strict {
+        // 代入右辺や`return`等の式はPowerShellではコマンドとして実行される。
+        // EncodedCommand復号本文（strict）だけでなく、明示pwshや`pwsh -Command`本文などの
+        // 非strictなPowerShell規則でも検査する。引用された右辺・ヒアストリングはdataとして扱う。
+        if strict || self.mode == Some(Mode::PowerShell) {
             if matches!(name.as_str(), "return" | "throw" | "exit") {
-                return self.expression(w, i + 1, depth);
+                return self.expression(w, i + 1, depth, strict);
             }
-            if let Some(v) = self.assignment(w, i, depth)? {
+            if let Some(v) = self.assignment(w, i, depth, strict)? {
                 return Ok(v);
             }
         }
         if name == "if" {
+            // CMD規則では、条件の語に引用外の`,`が直結した形（`if exist x,del y`・
+            // `if exist C:\x,del/q,C:\x`）もcmd.exeは`,`で区切って後続を実行する。
+            // `if_command`は語単位で条件を数えるため、先に引用外の`,`で語を割り直してから判定する。
+            // 割り直しは`,`を含む語がある場合だけ行い、それ以外は従来の語列をそのまま使う。
+            if self.mode == Some(Mode::Cmd) && w[i + 1..].iter().any(|t| !t.commas.is_empty()) {
+                let split = split_cmd_commas(&w[i + 1..]);
+                let mut c = 0;
+                if split
+                    .get(c)
+                    .is_some_and(|t| t.text.eq_ignore_ascii_case("/i"))
+                {
+                    c += 1;
+                }
+                if split
+                    .get(c)
+                    .is_some_and(|t| t.text.eq_ignore_ascii_case("not"))
+                {
+                    c += 1;
+                }
+                return match if_command(&split, c) {
+                    Some(s) => self.command(&split[s..], depth + 1, strict),
+                    None => Ok(false),
+                };
+            }
             let mut c = i + 1;
             if w.get(c).is_some_and(|t| t.text.eq_ignore_ascii_case("/i")) {
                 c += 1;
@@ -318,6 +720,66 @@ impl Inspector {
         if !wrapper(&name) {
             return Ok(false);
         }
+        // cmd.exeはPowerShell・POSIX shellと異なるswitch規則を持つため専用に解析する。
+        if name == "cmd" {
+            // 実行名に直結した`/c`・`,/c`・`=/c`は、直結部分を先頭の語として差し替えた複製で解析する。
+            // 先頭の`, ; =`を落として何も残らない（`cmd,`など）場合は、その語を読み飛ばして続きを解析する。
+            let replaced;
+            let (words, start): (&[Token], usize) = match glued {
+                Some(tail) => {
+                    let head = tail.trim_start_matches([',', ';', '=']);
+                    let mut copy = w.to_vec();
+                    copy[i].text = head.to_owned();
+                    replaced = copy;
+                    (&replaced, if head.is_empty() { i + 1 } else { i })
+                }
+                None => (w, i + 1),
+            };
+            let w = words;
+            return match cmd_switches(w, start) {
+                CmdSwitches::NoBody => {
+                    // cmd.exeでは`;`は引数の区切りなので、本文switchを持たない`cmd`の直後の`;`は
+                    // 後続を引数として受ける（`cmd /d;/c del x`）。字句解析で割れた後続を見落とさない。
+                    if self.cmd_semicolon && self.mode == Some(Mode::Cmd) {
+                        Ok(
+                            self.detected(
+                                "unsupported CMD wrapper switch cannot be inspected",
+                                ";",
+                            ),
+                        )
+                    } else {
+                        Ok(false)
+                    }
+                }
+                CmdSwitches::Unknown(token) => {
+                    Ok(self.detected("unsupported CMD wrapper switch cannot be inspected", &token))
+                }
+                CmdSwitches::Body { token, attached } => {
+                    let rest = &w[token + 1..];
+                    let body = if attached.is_empty() {
+                        if rest.is_empty() {
+                            return Ok(false);
+                        }
+                        if rest.len() == 1 && rest[0].quoted {
+                            rest[0].text.clone()
+                        } else {
+                            rest.iter()
+                                .map(|t| quote_token(t, true))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        }
+                    } else {
+                        // 直結本文は引用し直さず生のまま使う。`/c"rd /s /q x"`を再引用すると
+                        // 1つの実行名になり、本文中の削除を見逃すため。
+                        std::iter::once(attached)
+                            .chain(rest.iter().map(|t| quote_token(t, true)))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    self.contains(&body, depth + 1, Some(Mode::Cmd), strict)
+                }
+            };
+        }
         let ps = shell(&name) == Some(Mode::PowerShell);
         for j in i + 1..w.len() {
             if ps && encoded(&w[j].text) {
@@ -326,6 +788,8 @@ impl Inspector {
             if ps && file_option(&w[j].text) {
                 return Ok(false);
             }
+            // `/c`・`/k`はcmd専用分岐へ移したが、cmd以外のwrapperでも従来どおり本文として検査し、
+            // 検知範囲を狭めない。
             if !(ps && command_option(&w[j].text))
                 && !matches!(
                     w[j].text.as_str(),
@@ -683,14 +1147,24 @@ impl Inspector {
         // 外部script本文や対話入力は読まない。
         Ok(Some(false))
     }
-    fn expression(&mut self, w: &[Token], i: usize, depth: usize) -> Result<bool> {
+    /// 式の位置にある語をコマンドとして検査する。引用で始まる式は文字列dataとして扱う。
+    /// `strict`は呼出し元の規則を引き継ぎ、非strictのPowerShell規則でEncodedCommand専用の拒否を働かせない。
+    fn expression(&mut self, w: &[Token], i: usize, depth: usize, strict: bool) -> Result<bool> {
         if i >= w.len() || w[i].quote_start == Some(0) {
             Ok(false)
         } else {
-            self.command(&w[i..], depth + 1, true)
+            self.command(&w[i..], depth + 1, strict)
         }
     }
-    fn assignment(&mut self, w: &[Token], mut i: usize, depth: usize) -> Result<Option<bool>> {
+    /// PowerShellの代入・`foreach ($x in ...)`の右辺をコマンドとして検査する。
+    /// 代入でない場合は`None`を返し、呼出し元が通常のコマンド検査を続ける。
+    fn assignment(
+        &mut self,
+        w: &[Token],
+        mut i: usize,
+        depth: usize,
+        strict: bool,
+    ) -> Result<Option<bool>> {
         if w[i].text.eq_ignore_ascii_case("foreach")
             && w.get(i + 1).is_some_and(|t| t.text.starts_with('$'))
         {
@@ -702,7 +1176,9 @@ impl Inspector {
             return Ok(None);
         }
         if let Some(eq) = v.find('=') {
-            if t.quote_start.is_some_and(|q| q <= eq) {
+            // 引用を含む代入先は、復号本文（strict）では解釈を確定できないため拒否する。
+            // 非strictでは入力全体を拒否せず、右辺の検査を続ける。
+            if strict && t.quote_start.is_some_and(|q| q <= eq) {
                 bail!("EncodedCommand quoted assignment targets cannot be inspected.");
             }
             if t.quote_start == Some(eq + 1) {
@@ -710,18 +1186,18 @@ impl Inspector {
             }
             let rhs = &v[eq + 1..];
             if rhs.is_empty() {
-                return Ok(Some(self.expression(w, i + 1, depth)?));
+                return Ok(Some(self.expression(w, i + 1, depth, strict)?));
             }
             let mut expression = vec![Token::new(rhs)];
             expression[0].quoted = t.quoted;
             expression.extend_from_slice(&w[i + 1..]);
-            return Ok(Some(self.command(&expression, depth + 1, true)?));
+            return Ok(Some(self.command(&expression, depth + 1, strict)?));
         }
         if let Some(n) = w.get(i + 1) {
             if (v.starts_with('$') && n.text.eq_ignore_ascii_case("in"))
                 || (n.text.ends_with('=') && n.text.chars().all(|c| "=+-*/%?".contains(c)))
             {
-                return Ok(Some(self.expression(w, i + 2, depth)?));
+                return Ok(Some(self.expression(w, i + 2, depth, strict)?));
             }
         }
         Ok(None)
@@ -887,28 +1363,44 @@ impl Inspector {
                 });
             }
         }
-        for (i, part) in parts.iter().enumerate() {
-            let mut part = part.as_str();
-            if let Some(eq) = part.rfind('=') {
-                if eq + 1 < part.len() {
-                    part = &part[eq + 1..];
+        // 各PowerShell実行名の後ろで、最初に現れるEncodedCommand系optionが
+        // -File/-Commandより前にあれば非正規の呼出しとして拒否する。
+        // 実行名ごとに前方へ走査すると実行名が大量に並ぶ入力で二次計算量になるため、
+        // 後ろから1回だけ走査し「直後で最初に現れるencoded/停止option」を保持して線形にする。
+        // 報告するtokenは従来の前方走査と同じく、最も前の実行名に対応するものにする。
+        enum Next<'a> {
+            Encoded(&'a str),
+            Stop,
+        }
+        let mut next: Option<Next> = None;
+        let mut hit: Option<&str> = None;
+        for part in parts.iter().rev() {
+            let original = part.as_str();
+            let mut name = original;
+            if let Some(eq) = name.rfind('=') {
+                if eq + 1 < name.len() {
+                    name = &name[eq + 1..];
                 }
             }
-            if let Some(sub) = part.rfind("$(") {
-                part = &part[sub + 2..];
+            if let Some(sub) = name.rfind("$(") {
+                name = &name[sub + 2..];
             }
-            part = part.trim_matches(['@', '$', '(', ')', '{', '}', '`']);
-            if shell(&leaf(part)) != Some(Mode::PowerShell) {
-                continue;
+            name = name.trim_matches(['@', '$', '(', ')', '{', '}', '`']);
+            // 後ろから走査しているため、上書きし続けると最も前の実行名の結果が残る。
+            if let Some(Next::Encoded(token)) = next
+                && shell(&leaf(name)) == Some(Mode::PowerShell)
+            {
+                hit = Some(token);
             }
-            for p in &parts[i + 1..] {
-                if encoded(p) {
-                    return Ok(self.detected("noncanonical EncodedCommand invocation", p));
-                }
-                if file_option(p) || command_option(p) {
-                    break;
-                }
+            // 従来の前方走査と同じく、encodedの判定を停止optionより優先する。
+            if encoded(original) {
+                next = Some(Next::Encoded(original));
+            } else if file_option(original) || command_option(original) {
+                next = Some(Next::Stop);
             }
+        }
+        if let Some(token) = hit {
+            return Ok(self.detected("noncanonical EncodedCommand invocation", token));
         }
         Ok(false)
     }
@@ -1223,8 +1715,20 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             previous_equal = false;
             if is_boundary {
                 boundary(&mut out);
+                // CMDでは`;`は空白相当の区切りで文の境界ではない。検査のため文は割るが、
+                // 境界が`;`だったことを残し、`cmd`wrapperの引数列が割れた形を呼出し側で拒否できるようにする。
+                if mode == Mode::Cmd
+                    && c == ';'
+                    && let Some(last) = out.last_mut()
+                {
+                    last.text = ";".into();
+                }
             }
         } else {
+            // 引用外・非退避の`,`だけを記録する（引用内は上で、`^,`は退避分岐で処理済み）。
+            if mode == Mode::Cmd && c == ',' {
+                t.commas.push(t.text.len());
+            }
             append(&mut t, c, &mut previous_equal);
         }
         i += 1;
@@ -1268,10 +1772,13 @@ fn inspect(input: &Value, config: &Path, cli: &Path) -> Result<Value> {
     if !inspection.contains(command, 0, mode, false)? {
         return Ok(json!({}));
     }
+    // 単独EncodedCommandは復号本文をPowerShellとして確定検査しているため、
+    // shell不明時の候補注記とEncodedCommandへの変換案内を付けない。
+    let standalone_encoded = inspection.standalone_encoded;
     let mut reason = inspection.detection.unwrap_or_else(|| {
         "Prunlet rejected this command because an invocation could not be safely classified.".into()
     });
-    if mode.is_none() && cfg!(windows) {
+    if mode.is_none() && cfg!(windows) && !standalone_encoded {
         reason.push_str(" Shell metadata is missing or unsupported; this is a candidate interpretation, not a confirmed local deletion. Quoted search text or remote script data may be interpreted as command syntax. If the host forwards the tool as Bash without shell metadata, setting exec_command.shell alone cannot resolve this ambiguity. For an authorized SSH script sent from PowerShell, encode the entire local PowerShell script as UTF-16LE Base64 and submit the standalone form pwsh -NoProfile -EncodedCommand <base64>. The hook decodes and inspects that script; it does not exempt SSH names or remote deletion targets from inspection. See docs/integration.md for the supported form.");
     }
     let executable = cli.to_string_lossy();
@@ -1336,6 +1843,833 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    /// hook入力を組み立ててinspectへ渡し、拒否なら理由を返す。検査errorもrun()と同じく拒否として扱う。
+    /// 文字列はhookへ渡すだけで実行しない。
+    fn reason(command: &str, tool: &str, shell: Option<&str>) -> Option<String> {
+        let mut tool_input = json!({ "command": command });
+        if let Some(shell) = shell {
+            tool_input["shell"] = json!(shell);
+        }
+        let input = json!({ "tool_name": tool, "tool_input": tool_input });
+        match inspect(
+            &input,
+            Path::new(r"C:\fixture\config.json"),
+            Path::new(r"C:\fixture\prunlet.exe"),
+        ) {
+            Ok(value) if value == json!({}) => None,
+            Ok(value) => Some(
+                value["hookSpecificOutput"]["permissionDecisionReason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+            Err(error) => Some(format!("Prunlet could not inspect the hook input: {error}")),
+        }
+    }
+    fn denied(command: &str, shell: &str) -> bool {
+        reason(command, "exec_command", Some(shell)).is_some()
+    }
+
+    // 正規のPrunlet CLI呼出し。`/d /c`とMSYS向けの`//d //c`、call付きの各形を通過させる。
+    const CANONICAL_CLI: [&str; 4] = [
+        r#"cmd.exe /d /c "C:\Users\me\.local\Prunlet\bin\prunlet.exe --config C:\Users\me\.local\Prunlet\config.json delete --paths-file D:\work\paths.json""#,
+        r#"cmd.exe //d //c "C:\Users\me\.local\Prunlet\bin\prunlet.exe --config C:\Users\me\.local\Prunlet\config.json delete --paths-file D:\work\paths.json""#,
+        r#"cmd.exe /d /c call "C:\Users\me\.local\Prunlet\bin\prunlet.exe" --config "C:\Users\me\.local\Prunlet\config.json" delete --paths-file "D:\work\paths.json""#,
+        r#"cmd.exe //d //c call "C:\Users\me\.local\Prunlet\bin\prunlet.exe" --config "C:\Users\me\.local\Prunlet\config.json" delete --paths-file "D:\work\paths.json""#,
+    ];
+
+    #[test]
+    fn cmd_wrapper_switch_forms_inspect_the_body() {
+        for command in [
+            r"cmd.exe //c del C:\fixture\file.txt",
+            r"cmd.exe //d //c del C:\fixture\file.txt",
+            r"cmd /R del C:\fixture\file.txt",
+            r"cmd /r del C:\fixture\file.txt",
+            r"cmd /K del C:\fixture\file.txt",
+            r"cmd /cdel C:\fixture\file.txt",
+            r"cmd /d/c del C:\fixture\file.txt",
+            r"cmd //d//c del C:\fixture\file.txt",
+            r#"cmd /D/Q/C "del C:\fixture\file.txt""#,
+            r#"cmd /c"rd /s /q C:\fixture\dir""#,
+            r"cmd /e:on /v:off /f:ON /t:0a /s /a /u /c del C:\fixture\file.txt",
+            r"cmd /d /c reg delete HKCU\Software\PrunletHookProbe /f",
+            r#"cmd /c "echo ok & del C:\fixture\file.txt""#,
+            r"cmd -c del C:\fixture\file.txt",
+        ] {
+            for shell in ["cmd.exe", "pwsh"] {
+                assert!(denied(command, shell), "{shell}: {command}");
+            }
+        }
+        // 未知switch・本文前の未知引数は本文を確定できないためfail-closedにする。
+        for command in [
+            "cmd /z /c echo ok",
+            "cmd /dq /c echo ok",
+            "cmd /t:zz /c echo ok",
+            "cmd / /c echo ok",
+            "cmd stray /c echo ok",
+        ] {
+            let reason = reason(command, "exec_command", Some("cmd.exe")).expect(command);
+            assert!(
+                reason.contains("unsupported CMD wrapper switch"),
+                "{command}: {reason}"
+            );
+        }
+        for command in CANONICAL_CLI.into_iter().chain([
+            "cmd /?",
+            "cmd",
+            "cmd /d",
+            "cmd /c",
+            r"cmd /c reg query HKCU\Software\PrunletHookProbe",
+            r"cmd /c echo del C:\fixture\file.txt",
+            r"cmd //c echo rd /s /q",
+        ]) {
+            for shell in ["cmd.exe", "pwsh"] {
+                assert!(!denied(command, shell), "{shell}: {command}");
+            }
+        }
+        if cfg!(windows) {
+            for command in CANONICAL_CLI {
+                assert_eq!(reason(command, "Bash", None), None, "{command}");
+            }
+            assert!(reason(r"cmd.exe //d //c del C:\fixture\file.txt", "Bash", None).is_some());
+        }
+    }
+
+    /// scripts/Verify-HookParsing.ps1 に追加した回帰ケースと同じ文字列・期待値。
+    /// E2EではBashはshellを無視して全規則で検査されるため、Bash側の期待値もここで確かめる。
+    #[test]
+    fn verify_script_regression_cases_match_expectations() {
+        let file = r"D:\fixture\hook-sentinel.txt";
+        // 文字列としてhookへ渡すだけの架空パス。特定の開発環境のパスに依存させない。
+        let exe = r"D:\example\build\publish\prunlet.exe";
+        let config = r"C:\Users\example\.local\Prunlet\config.json";
+        let json = r"D:\example\hook\hook-paths.json";
+        let here = "$script = @'\nRemove-Item -LiteralPath \"<FILE>\"\n$y = Remove-Item -LiteralPath \"<FILE>\"\n'@\nWrite-Output $script";
+        let canonical =
+            format!(r#"cmd.exe /d /c "{exe} --config {config} delete --paths-file {json}""#);
+        let canonical_msys =
+            format!(r#"cmd.exe //d //c "{exe} --config {config} delete --paths-file {json}""#);
+        let call = format!(
+            r#"cmd.exe /d /c call "{exe}" --config "{config}" delete --paths-file "{json}""#
+        );
+        let call_msys = format!(
+            r#"cmd.exe //d //c call "{exe}" --config "{config}" delete --paths-file "{json}""#
+        );
+        // (コマンド, shell, exec_commandでの通過, Bashでの通過)
+        let cases: Vec<(&str, Option<&str>, bool, bool)> = vec![
+            (r#"cmd.exe //c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (
+                r#"cmd.exe //d //c del "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r#"cmd.exe //d //c del "<FILE>""#,
+                Some("pwsh"),
+                false,
+                false,
+            ),
+            (r#"cmd /R del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd /cdel "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd /d/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd /D/Q/C "del <FILE>""#, Some("cmd.exe"), false, false),
+            (
+                r#"cmd /e:on /v:off /t:0a /s /c del "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r"cmd.exe //d //c reg delete HKCU\Software\PrunletHookProbe /f",
+                None,
+                false,
+                false,
+            ),
+            ("cmd /z /c echo ok", Some("cmd.exe"), false, false),
+            ("cmd stray /c echo ok", Some("cmd.exe"), false, false),
+            ("cmd /?", Some("cmd.exe"), true, true),
+            (
+                r"cmd.exe //d //c reg query HKCU\Software\PrunletHookProbe",
+                Some("cmd.exe"),
+                true,
+                true,
+            ),
+            (
+                r#"cmd.exe //d //c echo del "<FILE>""#,
+                Some("cmd.exe"),
+                true,
+                true,
+            ),
+            (&canonical, Some("cmd.exe"), true, true),
+            (&canonical, None, true, true),
+            (&canonical_msys, None, true, true),
+            (&call, Some("cmd.exe"), true, true),
+            (&call_msys, None, true, true),
+            (
+                "cmd /c cmd /c cmd /c cmd /c echo ok",
+                Some("cmd.exe"),
+                true,
+                true,
+            ),
+            (
+                "cmd /c cmd /c cmd /c cmd /c cmd /c echo ok",
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                "pwsh -c pwsh -c pwsh -c pwsh -c pwsh -c Write-Output ok",
+                Some("pwsh"),
+                false,
+                false,
+            ),
+            (
+                r#"for %i in ("<FILE>") do del %i"#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r#"for %i in ("<FILE>") do if exist %i del %i"#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r#"if exist "<FILE>" (echo keep) else del "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r"if 1==2 (echo keep) else reg delete HKCU\Software\PrunletHookProbe /f",
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            ("for %i in (a) do echo del %i", Some("cmd.exe"), true, false),
+            (
+                "if 1==1 (echo keep) else echo del",
+                Some("cmd.exe"),
+                true,
+                true,
+            ),
+            (
+                r#"$x = Remove-Item -LiteralPath "<FILE>""#,
+                Some("pwsh"),
+                false,
+                false,
+            ),
+            (
+                r#"$x=Remove-Item -LiteralPath "<FILE>""#,
+                Some("pwsh"),
+                false,
+                false,
+            ),
+            (
+                r#"return Remove-Item -LiteralPath "<FILE>""#,
+                Some("pwsh"),
+                false,
+                false,
+            ),
+            (
+                r#". Remove-Item -LiteralPath "<FILE>""#,
+                Some("pwsh"),
+                false,
+                false,
+            ),
+            (
+                r#"pwsh -Command "$x = Remove-Item -LiteralPath <FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r#"$x = 'Remove-Item -LiteralPath "<FILE>"'"#,
+                Some("pwsh"),
+                true,
+                true,
+            ),
+            (here, Some("pwsh"), true, false),
+            (
+                r#"$hits = Select-String -Pattern 'Remove-Item' -Path "<FILE>""#,
+                Some("pwsh"),
+                true,
+                true,
+            ),
+            (
+                r#"rg -n '$x = Remove-Item' "<FILE>""#,
+                Some("pwsh"),
+                true,
+                true,
+            ),
+            (r". .\env.ps1", Some("pwsh"), true, true),
+            // 語の途中の本文switch（cmd.exeはコマンドライン全体から/Cを探す）。
+            (r#"cmd x/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd "x"/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd ,/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd /d x/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            // cmd.exeは`;` `,` `=`を空白相当の区切りとして扱い、実行名も最初の`/ , ; =`で打ち切る。
+            // `;`で割れた`cmd`wrapper、実行名直結の`/c`、実行名・本文先頭の`, =`はいずれも本文を実行する。
+            (r#"cmd;/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd ;/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd /d;/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            ("cmd\t;/c del \"<FILE>\"", Some("cmd.exe"), false, false),
+            (r#"cmd,/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd=/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd.exe/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (
+                r#"C:/Windows/System32/cmd.exe/c del "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r#"C:\Windows\System32\cmd.exe/c del "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (r#"call cmd/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (
+                r#"cmd /c cmd;/c del "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (r#"cmd /c=del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd /c,del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#",del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"=del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd /c ,del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd =/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"cmd /d/q=/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (
+                r#"cmd /e:on,/c del "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (r#"cmd /c;del "<FILE>""#, Some("cmd.exe"), false, false),
+            ("cmd\t/c del \"<FILE>\"", Some("cmd.exe"), false, false),
+            (r#"cmd ';/c' del "<FILE>""#, Some("pwsh"), false, false),
+            // 単純名の削除命令に直結した`/ , =`も、cmd.exeは実行名の終端として読む。
+            (r#"rd/s/q "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"RD/S/Q "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"del/q "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"del,"<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"rd=/s "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"erase/f "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"rmdir/s "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"call del/q "<FILE>""#, Some("cmd.exe"), false, false),
+            (
+                r#"if exist "<FILE>" del/q "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (r#"cmd /c rd/s/q "<FILE>""#, Some("cmd.exe"), false, false),
+            (
+                r"reg,delete HKCU\Software\PrunletHookProbe /f",
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            // 経路形式（`:` `\`を含む・`.` `/`始まり）の実行名は`/`を経路区切りとして読み、
+            // 最後の要素で判定する。`C:/tools/del/x`は外部プログラム`x`の実行とみなして通す。
+            (r"C:/tools/del/x", Some("cmd.exe"), true, true),
+            ("tools/del/x", Some("cmd.exe"), true, true),
+            ("echo del/q x", Some("cmd.exe"), true, true),
+            ("dir/b", Some("cmd.exe"), true, true),
+            ("reg/?", Some("cmd.exe"), true, true),
+            // 誤拒否してはいけない形。`=` `,` `;` `/`は実行名とcmdのswitch位置以外では通常の文字として扱う。
+            (r#"cmd /k echo hi/there"#, Some("cmd.exe"), true, true),
+            ("cmd /c echo a;b", Some("cmd.exe"), true, true),
+            ("echo ok;cmd /c echo hi", Some("cmd.exe"), true, true),
+            ("set X=1", Some("cmd.exe"), true, true),
+            ("if a==b echo x", Some("cmd.exe"), true, true),
+            ("echo a;b", Some("cmd.exe"), true, true),
+            ("echo a/b", Some("cmd.exe"), true, true),
+            ("echo ,del x", Some("cmd.exe"), true, true),
+            (r"dir C:/Windows /b", Some("cmd.exe"), true, true),
+            (
+                r"reg query HKCU\Software\PrunletHookProbe",
+                Some("cmd.exe"),
+                true,
+                true,
+            ),
+            // 制御語（call・do・else）や`if`の条件に`, =`で直結した実行名も、cmd.exeは実行する。
+            // `=`での打切りはshellがcmdと明示された場合だけ無条件に行い、shell不明（Bash）では
+            // POSIX代入と区別できないため`=`の直後が`/`の場合に限る（`call=del`はBashでは通す）。
+            (r#"call,del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"call=del "<FILE>""#, Some("cmd.exe"), false, true),
+            (r#"call,cmd/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"call,"del" "<FILE>""#, Some("cmd.exe"), false, false),
+            (
+                r#"if exist "<FILE>",del "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r"if exist <FILE>,del/q,<FILE>",
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r#"if not exist "<FILE>.x",del "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r#"for %i in ("<FILE>") do,del %i"#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            // Bashでは`do=del`をCMD候補では通すが、POSIX候補の`for`構文検査で拒否される。
+            (
+                r#"for %i in ("<FILE>") do=del %i"#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r#"if 1==2 (echo no) else,del "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r#"if 1==2 (echo no) else=del "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                true,
+            ),
+            (r#"cmd=/c del "<FILE>""#, Some("cmd.exe"), false, false),
+            // shell不明（Bash）でのPOSIX代入は削除命令とみなさない。
+            ("rm=1; echo ok", None, true, true),
+            ("ri=0", None, true, true),
+            ("rd=foo", None, true, true),
+            ("rp=$(realpath x)", None, true, true),
+            ("cmd=1; echo ok", None, true, true),
+            // 引用内の`,`や、削除命令以外への直結は通す。
+            (r#"if exist "a,b.txt" echo ok"#, Some("cmd.exe"), true, true),
+            ("if exist a,b echo ok", Some("cmd.exe"), true, true),
+            ("type a.txt,b.txt", Some("cmd.exe"), true, true),
+            ("call,echo ok", Some("cmd.exe"), true, true),
+            ("for %i in (a;b) do echo %i", Some("cmd.exe"), true, false),
+            ("set PATH=C:\\x;%PATH%", Some("cmd.exe"), true, true),
+        ];
+        for (command, shell, pass, bash_pass) in cases {
+            let command = command.replace("<FILE>", file);
+            let actual = reason(&command, "exec_command", shell);
+            assert_eq!(
+                actual.is_none(),
+                pass,
+                "exec_command {shell:?}: {command}: {actual:?}"
+            );
+            if cfg!(windows) {
+                let actual = reason(&command, "Bash", None);
+                assert_eq!(actual.is_none(), bash_pass, "Bash: {command}: {actual:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cmd_switch_parser_separates_switches_and_attached_body() {
+        let words = |s: &str| tokens(s, Mode::Cmd, false).unwrap();
+        assert_eq!(
+            cmd_switches(&words("cmd /d/cdel x"), 1),
+            CmdSwitches::Body {
+                token: 1,
+                attached: "del".into()
+            }
+        );
+        assert_eq!(
+            cmd_switches(&words("cmd //D //Q //E:OFF //K"), 1),
+            CmdSwitches::Body {
+                token: 4,
+                attached: String::new()
+            }
+        );
+        assert_eq!(cmd_switches(&words("cmd /d /q"), 1), CmdSwitches::NoBody);
+        assert_eq!(
+            cmd_switches(&words("cmd /w /c x"), 1),
+            CmdSwitches::Unknown("/w".into())
+        );
+        assert_eq!(
+            cmd_switches(&words("cmd x /c y"), 1),
+            CmdSwitches::Unknown("x".into())
+        );
+        // 語の途中にある本文switchもcmd.exeは解釈するため、解析せず拒否側へ倒す。
+        for command in ["cmd x/c y", "cmd ,/c y", "cmd /d x/c y"] {
+            assert!(
+                matches!(cmd_switches(&words(command), 1), CmdSwitches::Unknown(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_executable_name_is_cut_at_the_first_delimiter() {
+        // 実行名が`cmd`/`cmd.exe`で直後に区切りが直結した形だけを分解し、区切り以降を返す。
+        for (text, tail) in [
+            ("cmd/c", "/c"),
+            ("cmd.exe/c", "/c"),
+            ("CMD.EXE/C", "/C"),
+            ("cmd,/c", ",/c"),
+            ("cmd=/c", "=/c"),
+            ("cmd;/c", ";/c"),
+            ("cmd/cdel", "/cdel"),
+            (r"C:\Windows\System32\cmd.exe/c", "/c"),
+            ("C:/Windows/System32/cmd.exe/c", "/c"),
+        ] {
+            assert_eq!(cmd_glued_tail(text, true), Some(tail), "{text}");
+        }
+        // 直結のない通常の実行名・経路・他のコマンド名は分解しない。
+        for text in [
+            "cmd",
+            "cmd.exe",
+            r"C:\Windows\System32\cmd.exe",
+            "C:/Windows/System32/cmd.exe",
+            "/c/Windows/System32/cmd.exe",
+            "echo",
+            "echo/c",
+            "x/cmd",
+            "cmdx/c",
+            "C:/Windows",
+            "",
+        ] {
+            assert_eq!(cmd_glued_tail(text, true), None, "{text}");
+        }
+        // 先頭の`@ , ; =`はCMD規則だけで落とす。POSIX・PowerShell規則の判定は変えない。
+        assert_eq!(exec_name(",del", Some(Mode::Cmd)).name, "del");
+        assert_eq!(exec_name("@=,del", Some(Mode::Cmd)).name, "del");
+        assert_eq!(exec_name("cmd/c", Some(Mode::Cmd)).name, "cmd");
+        assert_eq!(exec_name("cmd.exe/c", Some(Mode::Cmd)).glued, Some("/c"));
+        assert_eq!(exec_name(",del", Some(Mode::Posix)).name, ",del");
+        assert_eq!(exec_name("=del", Some(Mode::PowerShell)).name, "=del");
+        assert_eq!(exec_name("@del", Some(Mode::Posix)).name, "del");
+        assert_eq!(exec_name("cmd/c", Some(Mode::Posix)).glued, None);
+        // 単純名の削除命令・regは最初の`/ , ; =`で切る。表示名も切った名前にする。
+        for (text, name, shown, glued) in [
+            ("rd/s/q", "rd", "rd", "/s/q"),
+            ("RD/S/Q", "rd", "RD", "/S/Q"),
+            ("del,x", "del", "del", ",x"),
+            ("rd=/s", "rd", "rd", "=/s"),
+            ("erase/f", "erase", "erase", "/f"),
+            ("rmdir/s", "rmdir", "rmdir", "/s"),
+            ("@,del/q", "del", "del", "/q"),
+            ("reg,delete", "reg", "reg", ",delete"),
+        ] {
+            let found = exec_name(text, Some(Mode::Cmd));
+            assert_eq!(
+                (found.name.as_str(), found.shown, found.glued),
+                (name, shown, Some(glued)),
+                "{text}"
+            );
+        }
+        // 経路形式と、削除命令以外の単純名は従来の`leaf()`判定のまま（`x/del`の既存拒否も保つ）。
+        for (text, name) in [
+            ("C:/tools/del/x", "x"),
+            (r"C:\tools\del/x", "x"),
+            ("./del", "del"),
+            ("/c/bin/rd/x", "x"),
+            ("tools/del/x", "x"),
+            ("x/del", "del"),
+            ("dir/b", "b"),
+        ] {
+            let found = exec_name(text, Some(Mode::Cmd));
+            assert_eq!((found.name.as_str(), found.glued), (name, None), "{text}");
+        }
+        // 制御語（call・do・else）も切った名前と直結した残りを返す。
+        for (text, name, glued) in [
+            ("call,del", "call", ",del"),
+            ("call=del", "call", "=del"),
+            ("DO,del", "do", ",del"),
+            ("else=del", "else", "=del"),
+        ] {
+            let found = exec_name(text, Some(Mode::Cmd));
+            assert_eq!(
+                (found.name.as_str(), found.glued),
+                (name, Some(glued)),
+                "{text}"
+            );
+        }
+        // shell不明の候補判定では、`=`は直後（`, ; =`を除く）が`/`の場合だけ打ち切る。
+        for (text, name, glued) in [
+            ("rm=1", "rm=1", None),
+            ("rd=foo", "rd=foo", None),
+            ("call=del", "call=del", None),
+            ("rd=/s", "rd", Some("=/s")),
+            ("rd=,/s", "rd", Some("=,/s")),
+            ("del,x", "del", Some(",x")),
+        ] {
+            let found = exec_name_in(text, Some(Mode::Cmd), false);
+            assert_eq!((found.name.as_str(), found.glued), (name, glued), "{text}");
+        }
+        assert_eq!(cmd_glued_tail("cmd=1", false), None);
+        assert_eq!(cmd_glued_tail("cmd=/c", false), Some("=/c"));
+        assert_eq!(cmd_glued_tail("cmd=1", true), Some("=1"));
+        // POSIX・PowerShell規則では切らない。
+        assert_eq!(exec_name("rd/s/q", Some(Mode::Posix)).name, "q");
+        assert_eq!(exec_name("del,x", Some(Mode::PowerShell)).name, "del,x");
+    }
+
+    #[test]
+    fn cmd_semicolon_boundary_is_marked_only_in_cmd_rules() {
+        let marks = |mode: Mode, s: &str| -> Vec<String> {
+            tokens(s, mode, false)
+                .unwrap()
+                .into_iter()
+                .filter(|t| t.boundary)
+                .map(|t| t.text)
+                .collect()
+        };
+        assert_eq!(marks(Mode::Cmd, "cmd;/c x & y"), [";", ""]);
+        assert_eq!(marks(Mode::Posix, "cmd;/c x"), [""]);
+        assert_eq!(marks(Mode::PowerShell, "cmd;/c x"), [""]);
+        // 引用された`;`は境界ではない。
+        assert!(marks(Mode::Cmd, r#"cmd "a;b""#).is_empty());
+    }
+
+    #[test]
+    fn cmd_wrapper_split_by_semicolon_is_rejected_only_without_a_body() {
+        // 本文switchを持たない`cmd`の直後の`;`は拒否する。理由はswitch解析不能と同じ。
+        for command in [
+            "cmd;/c del x",
+            "cmd /d;/c del x",
+            "cmd ;/c echo ok",
+            "cmd;",
+            "cmd /?;",
+        ] {
+            let reason = reason(command, "exec_command", Some("cmd.exe")).expect(command);
+            assert!(
+                reason.contains("unsupported CMD wrapper switch"),
+                "{command}: {reason}"
+            );
+        }
+        // 本文switchが`;`より前にあれば従来どおり本文を検査し、無害な本文は通す。
+        for command in [
+            "cmd /c echo a;b",
+            "cmd /d /c echo a;b",
+            "echo a; cmd",
+            "echo a;cmd /c echo b",
+        ] {
+            assert!(!denied(command, "cmd.exe"), "{command}");
+        }
+        // 先頭の`,`や`=`を付けた削除命令は、記号を落とした名前で報告する。
+        for command in [",del x", "=del x", "cmd /c,del x", "cmd /c=del x"] {
+            let reason = reason(command, "exec_command", Some("cmd.exe")).expect(command);
+            assert!(
+                reason.contains(r#"detected token "del""#),
+                "{command}: {reason}"
+            );
+        }
+        for (command, token) in [
+            ("rd/s/q x", "rd"),
+            ("RD/S/Q x", "RD"),
+            ("erase/f x", "erase"),
+            ("del,x", "del"),
+        ] {
+            let reason = reason(command, "exec_command", Some("cmd.exe")).expect(command);
+            assert!(
+                reason.contains(&format!(r#"detected token "{token}""#)),
+                "{command}: {reason}"
+            );
+        }
+        let reason_reg =
+            reason(r"reg/delete HKCU\x /f", "exec_command", Some("cmd.exe")).expect("reg/delete");
+        assert!(
+            reason_reg.contains("registry deletion command"),
+            "{reason_reg}"
+        );
+        // CMD以外のshell規則では`;`は通常の文境界で、判定を変えない。
+        assert!(!denied("cmd;/c echo ok", "pwsh"));
+        if cfg!(windows) {
+            // shell不明（Bash）ではCMD規則でも検査するため拒否される。
+            assert!(reason("cmd;/c echo ok", "Bash", None).is_some());
+        }
+    }
+
+    #[test]
+    fn cmd_do_and_else_bodies_are_inspected() {
+        for command in [
+            r"for %i in (a b) do del %i",
+            r"for /f %i in ('dir /b') do del %i",
+            r"for %i in (a) do if exist %i del %i",
+            r"for %i in (a) do DO call del %i",
+            r"if exist x (echo a) else del x",
+            r"if exist x (echo a) ELSE reg delete HKCU\Software\PrunletHookProbe /f",
+            r#"cmd /c "for %i in (a) do del %i""#,
+            // `, =`で直結した形と、`do,`のように残りが空の形（次の語が実行名）。
+            r"for %i in (a) do,del %i",
+            r"for %i in (a) do=del %i",
+            r"for %i in (a) do, del %i",
+            r"for %i in (a) do,do,call,del %i",
+            r"if exist x (echo a) else,del x",
+            r"if exist x (echo a) ELSE=reg delete HKCU\Software\PrunletHookProbe /f",
+            r"if exist x,del x",
+            r"if /i not exist x,del x",
+            r"call,cmd/c del x",
+        ] {
+            assert!(denied(command, "cmd.exe"), "{command}");
+        }
+        for command in [
+            r"for %i in (a) do echo del %i",
+            r"if 1==1 (echo a) else echo del",
+            "do",
+            "else",
+            "do,",
+            "call,echo ok",
+        ] {
+            assert!(!denied(command, "cmd.exe"), "{command}");
+        }
+        // 上限以内の直結連鎖は削除命令として報告し、上限を超える連鎖は検査不能として拒否する。
+        let within = format!("{}del x", "do,".repeat(CMD_GLUED_PREFIX_LIMIT));
+        let found = reason(&within, "exec_command", Some("cmd.exe")).expect("within");
+        assert!(found.contains(r#"detected token "del""#), "{found}");
+        // 入力上限に近い1語の連鎖でも、評価し直す回数を抑えて線形時間で終わる。
+        let long = format!("{}echo x", "do,".repeat(300_000));
+        let found = reason(&long, "exec_command", Some("cmd.exe")).expect("long");
+        assert!(
+            found.contains("too many CMD control words joined by delimiters"),
+            "{found}"
+        );
+        // shell不明時の`=`判定も、`x=,=,=,…`のような語で`=`ごとに前方走査しない。
+        let equals = format!("x{}", "=,".repeat(400_000));
+        assert!(cmd_glued_tail(&equals, false).is_none());
+        assert_eq!(exec_name_in(&equals, Some(Mode::Cmd), false).glued, None);
+        let equals_cmd = format!("cmd{}", "=,".repeat(400_000));
+        assert!(cmd_glued_tail(&equals_cmd, false).is_none());
+    }
+
+    #[test]
+    fn non_strict_powershell_assignments_and_dot_calls_are_inspected() {
+        for command in [
+            r#"$x = Remove-Item -LiteralPath "C:\fixture\file.txt""#,
+            r"$x=Remove-Item C:\fixture\file.txt",
+            r"[string]$x = rm C:\fixture\file.txt",
+            r"$x += del C:\fixture\file.txt",
+            r"return Remove-Item C:\fixture\file.txt",
+            r"foreach ($f in Remove-Item C:\fixture\file.txt) { $f }",
+            r"$x = reg.exe delete HKCU\Software\PrunletHookProbe /f",
+            r"$o.'Length' = Remove-Item C:\fixture\file.txt",
+            r"$x = cmd //c del C:\fixture\file.txt",
+            r". Remove-Item C:\fixture\file.txt",
+            r". rm C:\fixture\file.txt",
+        ] {
+            assert!(denied(command, "pwsh"), "{command}");
+        }
+        assert!(denied(
+            r#"pwsh -Command "$x = Remove-Item C:\fixture\file.txt""#,
+            "cmd.exe"
+        ));
+        // 検索文字列・引用・ヒアストリング内のdataは誤拒否しない。
+        for command in [
+            r"$x = 'Remove-Item C:\fixture\file.txt'",
+            r#"$pattern = "rm -rf""#,
+            "$script = @'\nRemove-Item C:\\fixture\\file.txt\n$y = rm x\n'@\nWrite-Output $script",
+            "$script=@'\n. Remove-Item x\n'@",
+            r"rg -n '$x = Remove-Item' .",
+            r"$hits = Select-String -Pattern 'Remove-Item' -Path a.txt",
+            r". .\env.ps1",
+            r"$o.'Length' = 5",
+            r"$files = Get-ChildItem; foreach ($f in $files) { $f.Name }",
+            r"$x -= 1",
+        ] {
+            assert!(!denied(command, "pwsh"), "{command}");
+        }
+        assert!(!denied(
+            r#"pwsh -Command "$x = 'Remove-Item C:\fixture\file.txt'""#,
+            "cmd.exe"
+        ));
+    }
+
+    #[test]
+    fn depth_limit_is_fail_closed_for_every_shell() {
+        let chain =
+            |prefix: &str, count: usize, tail: &str| format!("{}{tail}", prefix.repeat(count));
+        for (prefix, shell) in [
+            ("cmd /c ", "cmd.exe"),
+            ("pwsh -c ", "pwsh"),
+            ("cmd /c ", "pwsh"),
+        ] {
+            assert!(
+                !denied(&chain(prefix, 4, "echo ok"), shell),
+                "{shell}: 4 levels"
+            );
+            let reason = reason(&chain(prefix, 5, "echo ok"), "exec_command", Some(shell))
+                .expect("5 levels must be denied");
+            assert!(
+                reason.contains("inspection depth limit exceeded"),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn noncanonical_scan_is_linear_and_reports_the_first_match() {
+        let detection = |command: &str| {
+            let mut inspector = Inspector::default();
+            let found = inspector
+                .contains(command, 0, Some(Mode::Posix), false)
+                .unwrap();
+            found.then(|| inspector.detection.unwrap())
+        };
+        // 最初のpwshは-Fileで停止し、2つ目のpwshの直後の-encを検出する。
+        let found = detection("time pwsh -File x pwsh -enc AAAA").unwrap();
+        assert!(found.contains(r#"detected token "-enc""#), "{found}");
+        // 複数該当時は最も前の実行名に対応するtokenを報告する（従来の前方走査と同じ）。
+        let found = detection("time pwsh -enc AAAA pwsh -ec BBBB").unwrap();
+        assert!(found.contains(r#"detected token "-enc""#), "{found}");
+        // -Commandより後ろのencoded optionは本文側の語として扱い、ここでは検出しない。
+        assert!(detection("time pwsh -Command Write-Output -enc").is_none());
+        // 実行名が大量に並ぶ入力でも1回の走査で完了する。
+        let many = format!("time {}-enc AAAA", "pwsh ".repeat(20_000));
+        let found = detection(&many).unwrap();
+        assert!(found.contains(r#"detected token "-enc""#), "{found}");
+    }
+
+    #[test]
+    fn standalone_encoded_detection_has_no_candidate_note() {
+        if !cfg!(windows) {
+            return;
+        }
+        let encode = |script: &str| {
+            let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            STANDARD.encode(bytes)
+        };
+        let data = encode(r"Remove-Item -LiteralPath C:\fixture\file.txt");
+        let confirmed = reason(
+            &format!("pwsh -NoProfile -EncodedCommand {data}"),
+            "Bash",
+            None,
+        )
+        .expect("standalone encoded delete must be denied");
+        assert!(
+            confirmed.contains("interpretation=PowerShell"),
+            "{confirmed}"
+        );
+        assert!(
+            !confirmed.contains("candidate interpretation"),
+            "{confirmed}"
+        );
+        assert!(!confirmed.contains("UTF-16LE Base64"), "{confirmed}");
+        // 単独形式でない呼出しは従来どおり候補注記と変換案内を付ける。
+        let candidate = reason(&format!("pwsh -NoProfile -e {data}"), "Bash", None)
+            .expect("noncanonical encoded command must be denied");
+        assert!(
+            candidate.contains("candidate interpretation"),
+            "{candidate}"
+        );
     }
 
     #[test]

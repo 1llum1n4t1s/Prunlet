@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory)][string]$BuildManifestPath,
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBuildManifestSha256,
     [Parameter(Mandatory)][string]$OutputDirectory,
-    [string]$FixtureRoot='C:\Prunlet-Validation-session-scan-20261107',
+    # 開発者固有の既定値は持たない。全Phaseで同じ未使用（Prepare時）の外部絶対パスを明示する。
+    [Parameter(Mandatory)][string]$FixtureRoot,
     [int]$CliExitCode=0
 )
 $ErrorActionPreference='Stop'
@@ -22,13 +23,14 @@ $FixtureRoot=[IO.Path]::GetFullPath($FixtureRoot)
 foreach($path in @($OutputDirectory,$FixtureRoot)) {
     Assert-VerificationDestination $path @($repo,(Join-Path $env:USERPROFILE '.codex'))
 }
-if(![IO.Path]::GetPathRoot($OutputDirectory).Equals('D:\',[StringComparison]::OrdinalIgnoreCase)){throw 'External D output required'}
+Assert-ExternalVerificationPath $OutputDirectory @($repo)
 $manifestPath=Join-Path $OutputDirectory 'fixture.json'
 function Assert-LongPathTemp {
     foreach($tempPath in @($env:TEMP,$env:TMP)) {
-        if(!$tempPath-or![IO.Path]::IsPathFullyQualified($tempPath)){throw 'Existing external D TEMP/TMP required'}
+        if(!$tempPath-or![IO.Path]::IsPathFullyQualified($tempPath)){throw 'Existing external TEMP/TMP required'}
         $tempPath=[IO.Path]::GetFullPath($tempPath)
-        if(![IO.Path]::GetPathRoot($tempPath).Equals('D:\',[StringComparison]::OrdinalIgnoreCase)-or![IO.Directory]::Exists($tempPath)){throw 'Existing external D TEMP/TMP required'}
+        Assert-ExternalVerificationPath $tempPath @($repo)
+        if(![IO.Directory]::Exists($tempPath)){throw 'Existing external TEMP/TMP required'}
         Assert-VerificationDestination $tempPath @($repo,(Join-Path $env:USERPROFILE '.codex'))
     }
 }

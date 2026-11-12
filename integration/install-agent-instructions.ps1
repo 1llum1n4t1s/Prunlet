@@ -42,6 +42,33 @@ function Read-AgentDocument([string]$Path) {
     return @{ bytes = $bytes; text = $encoding.GetString($bytes, $prefixLength, $bytes.Length - $prefixLength); encoding = $encoding; prefix = $prefix }
 }
 function Encode-AgentDocument($Document, [string]$Text) { return ,([byte[]]($Document.prefix + $Document.encoding.GetBytes($Text))) }
+# 改行形式（CRLF/LF）だけを揃えた本文を返す。厳密なUTF-8として読めない場合は$nullとし、本文一致の根拠に使わない。
+function Get-LineEndingNormalizedText([byte[]]$Bytes) {
+    try { return ([Text.UTF8Encoding]::new($false, $true)).GetString($Bytes).Replace("`r`n", "`n") } catch { return $null }
+}
+# 登録済みPRUNLET.mdの所有判定。ValidateOnly・実呼出し・変更要否で同じ述語を使う。
+# - sameSource: 実物がsourceとバイト一致、または改行正規化後の本文がsourceと一致する。
+# - owned: sameSource、またはPreviousGuideSha256が指す本文と改行正規化後に一致する。
+#   Previousはhashしか無いため、実物そのもの・LFへ揃えた本文・CRLFへ揃えた本文のいずれかのhashが一致する場合に限る。
+# 改行以外の差（編集済み本文）は所有と判定せず、呼出し元で拒否して保全する。
+function Test-RegisteredGuideOwnership([byte[]]$GuideBytes, [byte[]]$SourceBytes, [string]$PreviousSha256) {
+    $guideHash = Get-BytesHash $GuideBytes
+    $guideText = Get-LineEndingNormalizedText $GuideBytes
+    $sourceText = Get-LineEndingNormalizedText $SourceBytes
+    $sameSource = ($guideHash -ceq (Get-BytesHash $SourceBytes)) -or ($null -ne $guideText -and $null -ne $sourceText -and $guideText.Equals($sourceText, [StringComparison]::Ordinal))
+    $samePrevious = $false
+    if ($PreviousSha256) {
+        $candidates = [Collections.Generic.List[string]]::new()
+        $candidates.Add($guideHash)
+        if ($null -ne $guideText) {
+            $utf8 = [Text.UTF8Encoding]::new($false, $true)
+            $candidates.Add((Get-BytesHash $utf8.GetBytes($guideText)))
+            $candidates.Add((Get-BytesHash $utf8.GetBytes($guideText.Replace("`n", "`r`n"))))
+        }
+        $samePrevious = @($candidates | Where-Object { $_ -ieq $PreviousSha256 }).Count -gt 0
+    }
+    return @{ sameSource = $sameSource; owned = ($sameSource -or $samePrevious) }
+}
 
 $CodexHome = Resolve-Absolute $CodexHome 'CodexHome'
 $BackupDirectory = Assert-ExternalBackup $BackupDirectory $CodexHome -AllowStartupStage:$StartupUpdate
@@ -97,20 +124,13 @@ $SourceGuidePath = Assert-AgentFilePath $SourceGuidePath
 if (!(Test-Path -LiteralPath $SourceGuidePath -PathType Leaf)) { throw 'SourceGuidePath does not exist.' }
 [byte[]]$sourceBytes = [IO.File]::ReadAllBytes($SourceGuidePath)
 if (![IO.File]::ReadAllText($SourceGuidePath).StartsWith($guideHeader, [StringComparison]::Ordinal)) { throw 'Source guide has no Prunlet ownership header.' }
-$sourceHash = Get-BytesHash $sourceBytes
 $sameGuide = $false
 if ($guideExists) {
     $guideBytes = [IO.File]::ReadAllBytes($guidePath)
-    $guideHash = Get-BytesHash $guideBytes
-    $sameGuide = $guideHash -ceq $sourceHash
-    if ($ValidateOnly -and !$sameGuide) {
-        # 自動更新の検証ではCRLF/LF差だけなら登録済みの実物を保全する。
-        $utf8 = [Text.UTF8Encoding]::new($false, $true)
-        $existingText = $utf8.GetString($guideBytes).Replace("`r`n", "`n")
-        $sourceText = $utf8.GetString($sourceBytes).Replace("`r`n", "`n")
-        $sameGuide = $existingText.Equals($sourceText, [StringComparison]::Ordinal)
-    }
-    if (!$sameGuide -and (!$PreviousGuideSha256 -or $guideHash -ine $PreviousGuideSha256)) { throw 'PRUNLET.md was edited or belongs to another registration; it was preserved.' }
+    # CRLF/LF差だけなら、ValidateOnlyでも実呼出し（連携解除を含む）でも同じく所有と判定し、登録済みの実物を保全する。
+    $guideOwnership = Test-RegisteredGuideOwnership $guideBytes $sourceBytes $PreviousGuideSha256
+    $sameGuide = $guideOwnership.sameSource
+    if (!$guideOwnership.owned) { throw 'PRUNLET.md was edited or belongs to another registration; it was preserved.' }
     if (![IO.File]::ReadAllText($guidePath).StartsWith($guideHeader, [StringComparison]::Ordinal)) { throw 'Existing PRUNLET.md has no Prunlet ownership header.' }
 }
 if ($Uninstall) { $updatedText = $document.text.Remove($blockMatch.Index, $blockMatch.Length) }
@@ -140,7 +160,9 @@ if ($ValidateOnly) {
 $changes = [Collections.Generic.List[object]]::new()
 if ((Get-BytesHash $updatedAgent) -cne (Get-BytesHash $document.bytes)) { $changes.Add(@{ target = $agentPath; bytes = $updatedAgent; remove = $false }) }
 if ($Uninstall) { $changes.Add(@{ target = $guidePath; bytes = $null; remove = $true }) }
-elseif (!$guideExists -or $guideHash -cne $sourceHash) { $changes.Add(@{ target = $guidePath; bytes = $sourceBytes; remove = $false }) }
+# 所有判定は上の共通述語で済ませ、明示登録の実呼出しでは検証済みsourceのバイト列を配置する（改行差だけでも置換する）。
+# 起動時更新のValidateOnlyは改行差だけならguideChanged=falseとして登録実物を保全する（従来どおり）。
+elseif (!$guideExists -or (Get-BytesHash $guideBytes) -cne (Get-BytesHash $sourceBytes)) { $changes.Add(@{ target = $guidePath; bytes = $sourceBytes; remove = $false }) }
 if (!$changes.Count) { return @{ status = 'unchanged'; instructionsPresent = $true; agentPath = $agentPath; guidePath = $guidePath } }
 $snapshots = [Collections.Generic.List[object]]::new()
 $changed = [Collections.Generic.List[object]]::new()

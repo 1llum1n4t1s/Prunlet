@@ -249,6 +249,30 @@ struct State {
     failure: Option<i32>,
     uncertain: bool,
     had_failure: bool,
+    /// 投入直前の`before`が受理したShell物理パスの別名（8.3短縮名など）。
+    /// `before`側で非reparseかつ解決後の正規名との完全一致を確認済みの場合だけ設定される。
+    /// FileFailure通知の照合では、この受理済み文字列との完全一致だけを追加で認める。
+    accepted: Option<PathBuf>,
+}
+/// FileFailure通知の項目が、投入した固定元そのものかを判定する純関数。
+///
+/// - 物理パスは正規完全名`expected`か、`before`が受理した別名`accepted`との完全一致だけを認める。
+///   IDや大小文字無視で照合を緩めない（Sink内でファイルを開いて解決し直すこともしない）。
+/// - `name`が通知された場合は、通知された物理パスの葉名との完全一致を従来どおり要求する。
+///   別名と長い名前のように表記が食い違う場合は不一致とし、保守的に結果不明へ倒す。
+fn failure_item_matches(
+    actual: &Path,
+    name: Option<&str>,
+    expected: &Path,
+    accepted: Option<&Path>,
+) -> bool {
+    if actual != expected && accepted != Some(actual) {
+        return false;
+    }
+    match name {
+        Some(name) => actual.file_name().and_then(|x| x.to_str()) == Some(name),
+        None => true,
+    }
 }
 fn permits_permanent_failure(state: &State, code: i32, created: bool) -> bool {
     !created
@@ -370,20 +394,28 @@ unsafe extern "system" fn sink_file(
                 return Ok(false);
             }
             let actual = physical(item)?;
-            if actual != (*this).expected {
-                return Ok(false);
-            }
-            if !name.is_null() {
+            let name = if name.is_null() {
+                None
+            } else {
                 let mut n = 0;
                 while *name.add(n) != 0 && n < 32768 {
                     n += 1;
                 }
-                let name = String::from_utf16(std::slice::from_raw_parts(name, n))?;
-                if actual.file_name().and_then(|x| x.to_str()) != Some(&name) {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
+                Some(String::from_utf16(std::slice::from_raw_parts(name, n))?)
+            };
+            // 受理済み別名は投入前に記録されるため、ここではロックを短く取って複製する。
+            let accepted = (*this)
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Shell observation state is unavailable"))?
+                .accepted
+                .clone();
+            Ok(failure_item_matches(
+                &actual,
+                name.as_deref(),
+                &(*this).expected,
+                accepted.as_deref(),
+            ))
         })();
         if let Ok(mut state) = (*this).state.lock() {
             state.had_failure = true;
@@ -434,9 +466,42 @@ static VTABLE: SinkVtable = SinkVtable {
 };
 
 /// 呼出元の実効tokenを固定して専用STAへ渡す。Shell実行後の再送は行わない。
+///
+/// FileFailure通知は正規完全名との完全一致だけを固定元として扱う。
 pub fn recycle<F, V>(
     source: &Path,
     allow_folder_progress: bool,
+    before: F,
+    verify: V,
+) -> Result<RecycleOutcome>
+where
+    F: FnOnce(&Path) -> Result<()> + Send,
+    V: FnOnce(&Path) -> Result<()> + Send,
+{
+    recycle_core(source, allow_folder_progress, false, before, verify)
+}
+/// [`recycle`]に加え、`before`が受理したShell物理パスの別名（長いパスの8.3表記など）を
+/// FileFailure通知の照合にも使う。
+///
+/// 呼出元の`before`は、別名を受理する条件を「非reparseで、`path::resolve`後に正規名と
+/// 完全一致した場合だけ」に限定していなければならない。大小文字無視などで受理する呼出元は
+/// [`recycle`]を使い、永久削除へ切り替える条件を広げない。
+pub fn recycle_accepting_resolved_alias<F, V>(
+    source: &Path,
+    allow_folder_progress: bool,
+    before: F,
+    verify: V,
+) -> Result<RecycleOutcome>
+where
+    F: FnOnce(&Path) -> Result<()> + Send,
+    V: FnOnce(&Path) -> Result<()> + Send,
+{
+    recycle_core(source, allow_folder_progress, true, before, verify)
+}
+fn recycle_core<F, V>(
+    source: &Path,
+    allow_folder_progress: bool,
+    accept_alias: bool,
     before: F,
     verify: V,
 ) -> Result<RecycleOutcome>
@@ -489,7 +554,10 @@ where
   let state=Arc::new(Mutex::new(State::default()));let sink=Box::into_raw(Box::new(Sink{vtable:&VTABLE,refs:AtomicU32::new(1),state:state.clone(),expected:source.clone(),allow_progress:allow_folder_progress}));struct SinkRef(*mut Sink);impl Drop for SinkRef{fn drop(&mut self){unsafe{sink_release(self.0);}}}let _sink=SinkRef(sink);
   let advise:unsafe extern "system" fn(*mut c_void,*mut Sink,*mut u32)->i32=std::mem::transmute(slot(transfer.0,3));let mut cookie=0;ok(advise(transfer.0,sink,&mut cookie),"Cannot observe Shell transfer")?;
   struct Subscription{transfer:*mut c_void,cookie:u32}impl Drop for Subscription{fn drop(&mut self){unsafe{let call:unsafe extern "system" fn(*mut c_void,u32)->i32=std::mem::transmute(slot(self.transfer,4));call(self.transfer,self.cookie);}}}let _subscription=Subscription{transfer:transfer.0,cookie};
-  before(&physical(item.0)?)?;let immediate=ImmediateDeleteSetting::capture(&source);
+  // beforeが受理した物理パスだけを、FileFailure照合用の別名としてRecycleItem前に記録する。
+  let shell_physical=physical(item.0)?;before(&shell_physical)?;
+  if accept_alias&&shell_physical!=source{state.lock().map_err(|_|anyhow::anyhow!("Shell observation state is unavailable"))?.accepted=Some(shell_physical);}
+  let immediate=ImmediateDeleteSetting::capture(&source);
   let call:unsafe extern "system" fn(*mut c_void,*mut c_void,*mut c_void,u32,*mut *mut c_void)->i32=std::mem::transmute(slot(transfer.0,8));let mut created=null_mut();let code=call(transfer.0,item.0,bin.0,0,&mut created);
   #[cfg(test)]
   eprintln!("Native Shell RecycleItem: HRESULT=0x{:08X}, created={}, immediateSetting={:?}",code as u32,!created.is_null(),immediate);
@@ -532,6 +600,47 @@ mod tests {
             &state.lock().unwrap(),
             UNAVAILABLE,
             false
+        ));
+    }
+    #[test]
+    fn failure_item_accepts_only_fixed_name_or_accepted_alias() {
+        let expected = Path::new(r"D:\long\very-long-directory-name\oversized.dat");
+        let alias = Path::new(r"D:\long\VERY-L~1\oversized.dat");
+        // 正規完全名は従来どおり一致する。
+        assert!(failure_item_matches(expected, None, expected, None));
+        assert!(failure_item_matches(
+            expected,
+            Some("oversized.dat"),
+            expected,
+            None
+        ));
+        // beforeが受理した8.3別名だけを追加で認める。
+        assert!(failure_item_matches(alias, None, expected, Some(alias)));
+        assert!(failure_item_matches(
+            alias,
+            Some("oversized.dat"),
+            expected,
+            Some(alias)
+        ));
+        // 未受理の別名、大小文字だけ違う表記、別の受理済み別名は一致しない。
+        assert!(!failure_item_matches(alias, None, expected, None));
+        let upper = Path::new(r"D:\LONG\VERY-LONG-DIRECTORY-NAME\OVERSIZED.DAT");
+        assert!(!failure_item_matches(upper, None, expected, None));
+        let other = Path::new(r"D:\long\OTHER~1\oversized.dat");
+        assert!(!failure_item_matches(other, None, expected, Some(alias)));
+        // name引数は通知された物理パスの葉名と完全一致を要求し続ける。
+        assert!(!failure_item_matches(
+            expected,
+            Some("OVERSIZED.DAT"),
+            expected,
+            None
+        ));
+        let short_leaf = Path::new(r"D:\long\VERY-L~1\OVERSI~1.DAT");
+        assert!(!failure_item_matches(
+            short_leaf,
+            Some("oversized.dat"),
+            expected,
+            Some(short_leaf)
         ));
     }
     #[test]

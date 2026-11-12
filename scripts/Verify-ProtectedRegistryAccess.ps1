@@ -17,9 +17,8 @@ $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 . (Join-Path $PSScriptRoot 'ProtectedRegistryFixtures.Common.ps1')
 $excludedRoots = @($repoRoot, (Join-Path $env:USERPROFILE '.codex'))
 foreach ($path in @($OutputDirectory, $ReportPath)) {
-    if (![IO.Path]::IsPathFullyQualified($path)) { throw 'External D: absolute paths are required.' }
-    Assert-VerificationDestination $path $excludedRoots
-    if (![IO.Path]::GetPathRoot($path).Equals('D:\', [StringComparison]::OrdinalIgnoreCase)) { throw 'External D: paths are required.' }
+    if (![IO.Path]::IsPathFullyQualified($path)) { throw 'External absolute paths (outside repository and Codex home) are required.' }
+    Assert-ExternalVerificationPath $path $excludedRoots
     if (Test-Path -LiteralPath $path) { throw 'Output and report must be new.' }
     if (![IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) { throw 'Create output/report parent directories first.' }
 }

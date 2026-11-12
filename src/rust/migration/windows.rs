@@ -57,16 +57,45 @@ fn same_identity(expected: &FileIdentity, actual: &FileIdentity) -> Result<()> {
     );
     Ok(())
 }
+/// 旧ディレクトリ直下にregistry signalがあることを示すエラー。
+/// 呼出し元が「所有不明として保持（retained）」と「処分の失敗（failed）」を型で区別するために使う。
+#[derive(Debug)]
+struct RegistrySignal;
+impl std::fmt::Display for RegistrySignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Registry signals protect this legacy directory.")
+    }
+}
+impl std::error::Error for RegistrySignal {}
+
 fn no_registry(path: &Path, expected: &FileIdentity) -> Result<()> {
     let handle = PinnedFile::open(path, INSPECT, SHARE_ALL)?;
     let actual = handle.identity()?;
     same_identity(expected, &actual)?;
     ensure!(
-        actual.is_directory() && !native::any_pinned_directory_name(handle.raw(), registry_signal)?,
-        "Registry signals protect this legacy directory."
+        actual.is_directory(),
+        "Legacy candidate is no longer a directory."
     );
+    if native::any_pinned_directory_name(handle.raw(), registry_signal)? {
+        return Err(RegistrySignal.into());
+    }
     handle.verify_named()?;
     Ok(())
+}
+
+/// 個別対象の失敗状態を決める。
+/// Shell投入後は結果不明（ambiguous）。gate取得前（dry-runは常にこちら）の事前検査でregistry signalを
+/// 検出した場合は、中央候補と同じく警告して保持（retained）する。
+/// 先行対象の処理でgateを取得済みなら、gate保持で停止する従来の扱いを変えず失敗（failed）とし、
+/// 不確実性gateが残ったままCLIが成功終了しないようにする。それ以外も失敗（failed）。
+fn failure_status(started: bool, registry_signal: bool, gate_attempted: bool) -> &'static str {
+    if started {
+        "ambiguous"
+    } else if registry_signal && !gate_attempted {
+        "retained"
+    } else {
+        "failed"
+    }
 }
 fn private_file(path: &Path, limit: usize) -> Result<serde_json::Value> {
     let fixed = security::open_lifecycle_metadata(path)?;
@@ -336,6 +365,9 @@ pub fn migrate(
             ..Default::default()
         };
         let started = Arc::new(AtomicBool::new(false));
+        // 投入前の事前検査でregistry signalを検出したか。gate取得前ならdry-runでもCLIを非0にしないため、
+        // failedではなくretainedへ分類する（failure_status参照）。
+        let mut signal_detected = false;
         let attempt = (|| -> Result<()> {
             let Some(original) = inspect(&target.path)? else {
                 item.status = "already_absent".into();
@@ -343,7 +375,9 @@ pub fn migrate(
             };
             validate(config, &target)?;
             if target.identity.is_directory() {
-                no_registry(&target.path, &target.identity)?;
+                no_registry(&target.path, &target.identity).inspect_err(|error| {
+                    signal_detected = error.is::<RegistrySignal>();
+                })?;
             }
             if !apply {
                 return Ok(());
@@ -418,11 +452,13 @@ pub fn migrate(
             Ok(())
         })();
         if let Err(error) = attempt {
-            item.status = if started.load(Ordering::Acquire) {
-                "ambiguous"
-            } else {
-                "failed"
-            }
+            // 事前検査はこの対象のgate取得より前なので、ここでのgate_attemptedは先行対象で取得済みかを表す。
+            // gate取得後の不確実性の扱い（下のgate_attempted分岐）は従来どおり。
+            item.status = failure_status(
+                started.load(Ordering::Acquire),
+                signal_detected,
+                gate_attempted,
+            )
             .into();
             item.error = Some(error.to_string());
             result.complete = false;
@@ -480,5 +516,63 @@ fn verification_checkpoint(phase: &str, target: &Path) {
         .clone();
     if let Some(callback) = callback {
         callback(phase, target);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // テスト用の外部TEMP配下に一意の通常ディレクトリを作る。リポジトリ内には作らない。
+    fn fixture_directory(label: &str) -> PathBuf {
+        let parent = std::env::temp_dir();
+        assert!(parent.is_absolute());
+        assert!(
+            !path::within(&parent, Path::new(env!("CARGO_MANIFEST_DIR"))),
+            "Test TEMP must be outside repository."
+        );
+        let directory = parent.join(format!(
+            "prunlet-migration-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn pre_dispatch_registry_signal_is_retained_not_failed() {
+        let directory = fixture_directory("registry-signal");
+        std::fs::create_dir(directory.join(".registry-records-v1")).unwrap();
+        let identity = PinnedFile::open(&directory, 0x80, SHARE_ALL)
+            .unwrap()
+            .identity()
+            .unwrap();
+        let error = no_registry(&directory, &identity).unwrap_err();
+        assert!(error.is::<RegistrySignal>());
+        assert_eq!(
+            failure_status(false, error.is::<RegistrySignal>(), false),
+            "retained"
+        );
+        // 先行対象でgate取得済みなら、gate保持で停止する従来どおりfailedとする。
+        assert_eq!(
+            failure_status(false, error.is::<RegistrySignal>(), true),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn directory_without_registry_signal_passes_and_other_failures_stay_failed() {
+        let directory = fixture_directory("no-signal");
+        std::fs::create_dir(directory.join("ordinary-child")).unwrap();
+        let identity = PinnedFile::open(&directory, 0x80, SHARE_ALL)
+            .unwrap()
+            .identity()
+            .unwrap();
+        no_registry(&directory, &identity).unwrap();
+        assert_eq!(failure_status(false, false, false), "failed");
+        assert_eq!(failure_status(false, false, true), "failed");
+        // Shell投入後はregistry signalの有無に関わらず結果不明として扱う。
+        assert_eq!(failure_status(true, false, true), "ambiguous");
+        assert_eq!(failure_status(true, true, true), "ambiguous");
     }
 }

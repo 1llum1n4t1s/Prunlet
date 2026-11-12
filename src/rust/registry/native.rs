@@ -778,15 +778,9 @@ mod verification {
         let tree = target(&fixture, None)?;
         let selected = target(&fixture, Some("sentinel"))?;
         let before = read_snapshot(None, &tree, true)?;
-        let temp = std::env::temp_dir();
-        ensure!(
-            temp.is_absolute()
-                && temp
-                    .to_string_lossy()
-                    .get(..3)
-                    .is_some_and(|s| s.eq_ignore_ascii_case("D:\\")),
-            "Native fault proof requires isolated external D: TEMP."
-        );
+        // TEMPはドライブ文字を問わず、リポジトリとCodex homeの外にある通常のドライブ絶対パスだけを使う。
+        let temp =
+            crate::platform::windows::path::external_verification_path(&std::env::temp_dir())?;
         let _pins = crate::platform::windows::path::pin_directories(&temp)?;
         let directory = temp.join(format!(
             "registry-publication-fault-{}",

@@ -15,8 +15,7 @@ $sourceRoot = Split-Path -Parent $PSScriptRoot
 $forbidden = @($sourceRoot, (Join-Path $env:USERPROFILE '.codex'))
 if ($env:CODEX_HOME) { $forbidden += $env:CODEX_HOME }
 foreach ($destination in @($OutputDirectory, $ReportPath)) {
-    if (![IO.Path]::IsPathFullyQualified($destination) -or $destination -notmatch '^D:\\') { throw 'Verification output must be an absolute external D path.' }
-    Assert-VerificationDestination $destination $forbidden
+    Assert-ExternalVerificationPath $destination $forbidden
     if (Test-Path -LiteralPath $destination) { throw 'Verification destinations must be unused.' }
 }
 foreach ($inputPath in @($ExecutablePath, $PublishDirectory)) {

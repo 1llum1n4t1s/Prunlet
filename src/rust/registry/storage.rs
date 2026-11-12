@@ -928,8 +928,12 @@ impl<'a> Store<'a> {
             !(receipts.contains(&receipt_name("purge", "complete")) && payload.is_some()),
             "Completed registry purge still has its snapshot."
         );
+        // 正式receiptが1つもない記録は未commitが確定している（delete()は正式intentの公開後にだけcommitする）。
+        // その記録の整理途中（snapshot消費後・manifest消費前）も読めるよう、snapshot不在を許容する。
+        // receiptがある記録では従来どおり確認済みの消費actionを要求する。
         ensure!(
             payload.is_some()
+                || receipts.is_empty()
                 || receipts.contains(&receipt_name("restore", "complete"))
                 || receipts.contains(&receipt_name("purge", "intent")),
             "Registry snapshot is absent without a confirmed consuming action."
@@ -1208,6 +1212,199 @@ impl<'a> Store<'a> {
         }
         Ok(clean)
     }
+    // 正式manifestの公開前に止まった操作ディレクトリを分類する。
+    // delete()はcreate_record→snapshot公開→manifest公開→intent公開→commitの順なので、正式manifestが
+    // 無い記録は未commitが確定している。ただし本文の正しさは所有予約に結び付く範囲でしか検証できない。
+    // - 許容するmemberは空のoperation.lock、正式snapshot、snapshot/manifestの所有予約とpendingだけ。
+    //   receiptの予約・未知member・予約の無いpendingは検証できないためErrを返し、呼出元は容量不明として保全する。
+    // - 容量はsnapshotの所有予約があれば予約長（pendingはそれ以下に制限済み）、予約が無い正式snapshotは
+    //   固定handleで測った実サイズを数える。本文を権威にせず、削除もしない（検証できないものは保全）。
+    // - emptyはoperation.lockだけ（またはmember無し）の記録で、discard_empty_recordで整理できる。
+    pub fn unpublished(&self, id: &str) -> Result<Unpublished> {
+        operation_id(id)?;
+        let path = self.root.join(id);
+        let parent = directory(&path)?;
+        ensure!(
+            !exists(&path.join(MANIFEST))?,
+            "Registry record has a published manifest."
+        );
+        let names = win::directory_names(parent.raw())?;
+        ensure!(
+            names.is_empty() || names.iter().any(|n| n == "operation.lock"),
+            "Registry record without its lock has members; retained."
+        );
+        let mut bytes = 0u64;
+        for name in &names {
+            if name == "operation.lock" {
+                let lock = sec::open_lifecycle_metadata(&path.join(name))?;
+                verify(&lock, false)?;
+                ensure!(
+                    file(lock.raw())?.metadata()?.len() == 0,
+                    "Registry operation lock is not empty."
+                );
+                continue;
+            }
+            if name == SNAPSHOT {
+                // 公開済みで予約が残る場合は予約側で計上し、二重に数えない。
+                if exists(&path.join(owner_name(SNAPSHOT)))? {
+                    continue;
+                }
+                let pin = sec::open_lifecycle_metadata(&path.join(name))?;
+                verify(&pin, false)?;
+                let size = file(pin.raw())?.metadata()?.len();
+                ensure!(
+                    size > 0 && size <= MAX_BYTES as u64,
+                    "Unpublished registry snapshot size is invalid."
+                );
+                bytes = bytes
+                    .checked_add(size)
+                    .context("Recovery capacity overflow")?;
+                continue;
+            }
+            let Some(final_name) = publication_final(name)? else {
+                bail!("Unknown registry recovery member was retained: {name}")
+            };
+            ensure!(
+                matches!(final_name.as_str(), SNAPSHOT | MANIFEST),
+                "Registry receipt reservation has no published manifest; retained."
+            );
+            if name.starts_with(".registry-pending-") {
+                ensure!(
+                    exists(&path.join(owner_name(&final_name)))?,
+                    "Registry pending body has no reservation; retained."
+                );
+                continue;
+            }
+            // 所有予約の親・本文identity、長さ上限、正式本文のhashを既存の検査で確認する。
+            self.inspect_publication(id, &path, &final_name)?;
+            if final_name == SNAPSHOT {
+                bytes = bytes
+                    .checked_add(self.publication(id, &path, SNAPSHOT)?.length)
+                    .context("Recovery capacity overflow")?;
+            }
+        }
+        Ok(Unpublished {
+            bytes,
+            empty: names.iter().all(|n| n == "operation.lock"),
+        })
+    }
+    // operation.lockだけ（またはmember無し）の未commit記録を整理する。
+    // 呼出元は共通ロックを排他取得していること（registry-delete・purge/maintain --applyだけが到達する）。
+    // その間に同じ記録へ公開中のdelete()は存在しないため、残骸と確定できる。
+    // ディレクトリをDELETE付き・共有読取りだけで固定し、空のlockを固定handleで削除してから、
+    // 空になった同じディレクトリを削除する。他のmemberが現れた場合は保全して停止する。
+    pub fn discard_empty_record(&self, id: &str) -> Result<()> {
+        operation_id(id)?;
+        let path = self.root.join(id);
+        win::path::reject_reparse_ancestors(&path)?;
+        let directory = PinnedFile::open(
+            &path,
+            DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+            1,
+        )?;
+        verify(&directory, true)?;
+        let names = win::directory_names(directory.raw())?;
+        ensure!(
+            names.iter().all(|n| n == "operation.lock"),
+            "Unpublished registry record gained members; retained."
+        );
+        Self::discard_lock_and_directory(&path, &directory, !names.is_empty())
+    }
+    // 正式receiptが無い（未commit確定）記録で、snapshot消費後に残るmanifest・lock・ディレクトリを整理する。
+    // receiptやsnapshotの所有予約・pendingが残る場合は、本文を検証できないためOk(false)で保全する。
+    // 呼出元は共通ロックを排他取得していること。recordが固定していたidentityとmanifest hashを再照合し、
+    // terminal整理と同じくDELETE付きの固定handleでmemberを消してから空のディレクトリを削除する。
+    pub fn discard_uncommitted(&self, record: Record) -> Result<bool> {
+        ensure!(
+            record.not_committed() && record.payload.is_none(),
+            "Only an uncommitted registry record without its snapshot can be discarded."
+        );
+        let names = win::directory_names(record.parent.raw())?;
+        if names
+            .iter()
+            .any(|n| !matches!(n.as_str(), "operation.lock" | MANIFEST))
+        {
+            return Ok(false);
+        }
+        let directory_identity = record.parent.identity()?;
+        let manifest_identity = record
+            .held
+            .first()
+            .context("Registry record manifest is not held.")?
+            .pin
+            .identity()?;
+        let manifest_hash = record.manifest_hash.clone();
+        let id = record.manifest.operation_id.clone();
+        let path = record.directory.clone();
+        // recordの共有handleはDELETE共有を許さないため、再照合する前提で解放する。
+        drop(record);
+        let directory = PinnedFile::open(
+            &path,
+            DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+            1,
+        )?;
+        verify(&directory, true)?;
+        ensure!(
+            directory_identity.same_object(&directory.identity()?),
+            "Uncommitted registry directory changed before discard."
+        );
+        let names = win::directory_names(directory.raw())?;
+        ensure!(
+            names.iter().any(|n| n == MANIFEST)
+                && names
+                    .iter()
+                    .all(|n| matches!(n.as_str(), "operation.lock" | MANIFEST)),
+            "Uncommitted registry membership changed before discard; retained."
+        );
+        let manifest = Held::read_delete(&path.join(MANIFEST))?;
+        ensure!(
+            hash(&manifest.bytes) == manifest_hash
+                && manifest_identity.same_object(&manifest.pin.identity()?),
+            "Uncommitted registry manifest changed before discard."
+        );
+        let current: Manifest = manifest.decode()?;
+        current.validate(
+            &id,
+            &self.config.data.backup_directory,
+            &self.state.owner_sid,
+        )?;
+        manifest.consume()?;
+        Self::discard_lock_and_directory(
+            &path,
+            &directory,
+            names.iter().any(|n| n == "operation.lock"),
+        )?;
+        Ok(true)
+    }
+    // 固定済みディレクトリ内の空lockを消し、空を再確認してから同じディレクトリhandleを削除する。
+    fn discard_lock_and_directory(
+        path: &Path,
+        directory: &PinnedFile,
+        has_lock: bool,
+    ) -> Result<()> {
+        if has_lock {
+            let lock = sec::open_lifecycle_delete(&path.join("operation.lock"))?;
+            verify(&lock, false)?;
+            ensure!(
+                file(lock.raw())?.metadata()?.len() == 0,
+                "Registry operation lock is not empty."
+            );
+            sec::delete_fixed(lock.raw(), false)?;
+        }
+        verify(directory, true)?;
+        ensure!(
+            win::directory_names(directory.raw())?.is_empty(),
+            "Registry record directory is not empty; retained."
+        );
+        sec::delete_fixed(directory.raw(), false)
+    }
+}
+// manifest公開前の記録の分類結果（Store::unpublished）。新しい永続fieldは作らずファイル構成から導出する。
+pub struct Unpublished {
+    // 既知として数えるsnapshot容量（所有予約の長さ、または予約の無い正式snapshotの実サイズ）。
+    pub bytes: u64,
+    // operation.lockだけ（またはmember無し）で、データを持たない記録。
+    pub empty: bool,
 }
 fn duplicate(handle: HANDLE) -> Result<OwnedHandle> {
     unsafe {
@@ -1287,8 +1484,18 @@ impl Record {
     pub fn has(&self, action: &str, phase: &str) -> bool {
         self.receipts.contains(&receipt_name(action, phase))
     }
+    // 未commit確定: 正式receiptが1つもない記録。
+    // delete()とC#旧版はいずれも正式な削除intentを公開してからcommitするため、正式intentが無ければ
+    // registryのtransactionはcommitされていない。pendingのintent本文や公開予約は正式intentへ昇格せず、
+    // 現在のregistryキーの有無からもcommitを推測しない。record_atの不変条件により、他のreceiptは
+    // いずれも削除intentを前提とするので、receipt集合が空であることと正式削除intentの不在は同値である。
+    pub fn not_committed(&self) -> bool {
+        self.receipts.is_empty()
+    }
+    // 結果不明: 正式intentの公開後にcompleteを確認できない削除、または復元。
+    // 未commit確定の記録は含めない（容量を既知として数え、purge・自動整理の対象にできる）。
     pub fn ambiguous(&self) -> bool {
-        !self.has("delete", "complete")
+        (!self.not_committed() && !self.has("delete", "complete"))
             || (self.has("restore", "intent") && !self.has("restore", "complete"))
     }
     pub fn receipt(&mut self, store: &Store, action: &str, phase: &str) -> Result<()> {
@@ -1345,6 +1552,53 @@ impl Record {
     }
 }
 
+// 中断した公開と同じ所有予約・pending（先頭prefixだけ書込み済み）を作るテスト用fixture。
+// 全プロセス共通のcheckpoint hookを使わず、並列テストの干渉を避ける。実registryには触れない。
+#[cfg(test)]
+pub(crate) fn test_reservation(
+    store: &Store,
+    id: &str,
+    name: &str,
+    fresh: &[u8],
+    prefix: usize,
+) -> Result<()> {
+    ensure!(is_final(name) && prefix <= fresh.len());
+    let path = store.root.join(id);
+    let parent = directory(&path)?;
+    let handle = sec::create_private_file(&path.join(pending_name(name)))?;
+    let created = if name == SNAPSHOT {
+        DateTime::parse_from_rfc3339("0001-01-01T00:00:00+00:00")?
+    } else {
+        crate::json::parse_unique(fresh)?
+            .get("createdUtc")
+            .and_then(Value::as_str)
+            .context("Missing publication timestamp")?
+            .parse()?
+    };
+    let owner = Publication {
+        schema: 1,
+        operation_id: id.into(),
+        metadata_root_identity: store.state.metadata_root_identity.clone(),
+        registry_root_identity: store.state.registry_root_identity.clone(),
+        machine_name: store.state.machine_name.clone(),
+        owner_sid: store.state.owner_sid.clone(),
+        directory_identity: MoveIdentity::of(parent.raw())?,
+        final_name: name.into(),
+        pending_name: pending_name(name),
+        pending_identity: MoveIdentity::of(handle.raw())?,
+        length: fresh.len() as u64,
+        sha256: hash(fresh),
+        created_utc: created,
+    };
+    let reservation = sec::create_private_file(&path.join(owner_name(name)))?;
+    write_handle(reservation.raw(), &serialize(&owner)?)?;
+    drop(reservation);
+    if prefix > 0 {
+        write_handle(handle.raw(), &fresh[..prefix])?;
+    }
+    store.publication(id, &path, name)?;
+    Ok(())
+}
 #[cfg(test)]
 pub(crate) fn verification_snapshot_publication(config: &Config) -> Result<Value> {
     let _coord = crate::files::coordination::acquire(config, None, None)?;

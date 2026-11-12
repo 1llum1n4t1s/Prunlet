@@ -36,7 +36,7 @@ RTKの共通指示と同様、エージェントのツール選択を案内す�
 
 ファイル・フォルダーは通常Windowsのゴミ箱へ移し、復元はWindowsの画面で行います。末尾名がWindows予約名の通常ファイルは、実体と親・名前・属性を固定して照合し、追加確認やShell試行なしで永久削除します。予約名の祖先・ディレクトリ・reparse pointは対象外です。通常名の対象は、Windowsが対象をゴミ箱に対して大きすぎると判定し、元の実体を再確認できた場合は、元の名前の永久削除を試みます。削除の完了を確認できたときだけ`permanently_deleted`を返します。サイズ超過以外の失敗からは永久削除へ切り替えません。CLIの`restore`（`registry-restore`の別名）とMCPの`restore_registry`はレジストリ専用です。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールです。`operations`と`list_operations`にもファイル削除を載せません。
 
-旧ファイルデータと旧レジストリ配置を扱うのは`migrate [--dry-run | --apply]`だけです。旧ファイルの復元互換は終了し、所有確認済みの旧退避rootと操作記録を本文の展開・hash・コピー・bundle化なしでWindowsゴミ箱へ破棄します。レジストリの完全保全と非上書き復元は維持します。インストーラーの`migrate --apply --if-needed`はpolicy 2評価済みの中央旧GUID走査を省き、更新時のonline owned store/restore rootの固定位置と小markerだけを確認します。通常削除・一覧・保守に旧ファイル走査を入れません。所有不明・registry signal・offline・拒否は警告して残し、file整理の未完了だけでregistry通常操作を止めません。中断gateは自動解除せず、元フォルダーとWindowsゴミ箱を確認後の`migrate --apply --retry-legacy-discard`だけで明示再評価します。設定検証は無走査・不変更の`validate-config`を使います。移行開始後の導入失敗では新exe・設定・登録を保持します。
+旧ファイルデータと旧レジストリ配置を扱うのは`migrate [--dry-run | --apply [--if-needed | --retry-legacy-discard]]`だけです。旧ファイルの復元互換は終了し、所有確認済みの旧退避rootと操作記録を本文の展開・hash・コピー・bundle化なしでWindowsゴミ箱へ破棄します。レジストリの完全保全と非上書き復元は維持します。インストーラーの`migrate --apply --if-needed`はpolicy 2評価済みの中央旧GUID走査を省き、更新時のonline owned store/restore rootの固定位置と小markerだけを確認します。通常削除・一覧・保守に旧ファイル走査を入れません。所有不明・registry signal・offline・拒否は警告して残し、file整理の未完了だけでregistry通常操作を止めません。中断gateは自動解除せず、元フォルダーとWindowsゴミ箱を確認後の`migrate --apply --retry-legacy-discard`だけで明示再評価します。設定検証は無走査・不変更の`validate-config`を使います。移行開始後の導入失敗では新exe・設定・登録を保持します。
 
 ## sandboxとゴミ箱へのアクセス
 
@@ -115,6 +115,8 @@ MCP登録の実行内容は次のとおりです。
 
 `exec_command`系で`tool_input.shell`が`pwsh`・`powershell`・`cmd`（`.exe`や絶対パスを含む）と明示された場合は、その文字列規則を使います。`Bash`への追加property、shell未指定・未知・`bash`等の指定だけでは実行器を推測せず、複数の規則で安全側に検査します。Windowsのホストには未知shellをCMDで実行するものがあるためです。
 
+`cmd`のwrapperは、Git Bash向けに`/`を重ねた`//d //c`、`/C`と同じ意味の`/R`、`/d/c`のような連結、`/cdel`のような直結本文も本文として検査します。本文switchより前の未知のswitchや引数、5段以上の静的wrapperの入れ子は、検査できないため拒否します。CMD規則では括弧なしの`for ... do <command>`・`... else <command>`の後続を、PowerShell規則では代入の右辺、`return`等の式、dot呼出し（`. <command>`）の後続をコマンドとして検査します。CMD規則では、cmd.exeが実行名を最初の`/` `,` `;` `=`で打ち切ることに合わせ、`rd/s`・`del,x`・`call,del`・`do,del`・`else=del`や、`if exist x,del y`のように`if`の条件へ引用外の`,`で直結した実行名も検査します。`=`での打切りはshellがcmdと明示された場合（`cmd /c`等の本文を含む）に限り、shell不明時は`rm=1`のようなPOSIX代入と区別するため、`=`の直後が`/`の形（`rd=/s`）だけを対象にします。引用文字列・ヒアストリング内のdataは従来どおり通過します。正規のPrunlet CLI呼出し（`cmd.exe /d /c "<prunlet.exe> --config <config> delete --paths-file <json>"`、Git Bashからの`//d //c`形、`call`付き）は本文を検査したうえで通過します。
+
 Codexの`exec_command`はフックへ`Bash`とコマンド文字列を渡し、実行shellを渡しません。`shell: "pwsh"`だけではPowerShellと別shellを区別できないため、そのままのヒアストリングは安全側に拒否されることがあります。SSHの存在や接続先の名前を使った削除の素通し例外は設けません。
 
 Mac等へ送るシェルスクリプトを単引用ヒアストリングに入れた**ローカルPowerShellスクリプト全体**は、shellを起動せずにUTF-16LE Base64へ変換し、単独の`pwsh -NoProfile -EncodedCommand <base64>`として渡します。たとえばCodexのJavaScript実行環境では次の形です。`script`は実際に使うローカルPowerShellスクリプトへ置き換えます。
@@ -134,7 +136,7 @@ text(result.output);
 
 先頭のASCIIコメントはGit Bashによる先頭スラッシュのパス変換を避けます。Base64は暗号化ではないため、秘密をコマンドやログへ埋め込まないでください。フックはこの単独・無引用の形式だけを厳密に復号し、PowerShellの文字列とローカルの直接削除を検査します。認識した省略形やwrapper、動的な引数、追加コマンド、不正なBase64・UTF-16は拒否します。復号本文では、`& 'C:\Program Files\Git\usr\bin\ssh.exe'`のような完全な単引用リテラルの実行名も検査します。同じ構文でのローカル削除、`reg`、別shellや`Start-Process`の呼び出しは拒否します。引用した`reg`は動的な動詞やネイティブ引数の解釈を保証できないため、照会も含めて従来どおり拒否します。SSHへの単引用文字列・単引用ヒアストリングの引数はデータとして扱い、その前後のローカルコマンドは引き続き検査します。未対応構文（展開文字列の`$()`、ブロックコメント、ハッシュ表、スマート引用符、Unicode escape、変数・式・部分引用を使う動的な実行名、末尾に空白やドットのある実行名など）は安全側に拒否します。shell不明の元コマンドをSSH名だけで許可する例外はありません。未認識の外部wrapper・動的生成・外部スクリプト・他言語APIを含むすべての削除を検出する保証はありません。
 
-登録するWindows hookコマンドは`<Systemのcmd.exe絶対パス> /d /c call "<exe>" --config "<config>" hook`です。Codexは環境の既定シェルをフックへ引き継ぐため、CMDを明示して`call`をCMD内で実行します。登録パスにCMD再展開文字やPowerShellの展開文字（ドル記号・バッククォート）が含まれる場合は、書込み前に自動登録を拒否します。旧`--hook-script <script>`は互換引数として受理するだけで、PowerShell backendを起動しません。更新で配置済み旧backendを退役させる際は、製品バックアップを保全してCoreによるWindowsゴミ箱への削除を使います。
+登録するWindows hookコマンドは`<Systemのcmd.exe絶対パス> /d /c call "<prunlet-hook.exe>" --config "<config>" hook --cli-executable "<prunlet.exe>"`です。`prunlet-hook.exe`は`prunlet.exe`と同じexeを同じフォルダーへ別名で配置した入口で、ファイル名によりhook入口として動作し、この5引数の形（configと`--cli-executable`はどちらも絶対パス）だけを受理して、それ以外は理由付きで拒否します。`--cli-executable`の値は拒否時に案内するCLIの実行パスです。Codexは環境の既定シェルをフックへ引き継ぐため、CMDを明示して`call`をCMD内で実行します。登録パスにCMD再展開文字やPowerShellの展開文字（ドル記号・バッククォート）が含まれる場合は、書込み前に自動登録を拒否します。旧`--hook-script <script>`は互換引数として受理するだけで、PowerShell backendを起動しません。更新で配置済み旧backendを退役させる際は、製品バックアップを保全してCoreによるWindowsゴミ箱への削除を使います。
 
 | 入力 | 結果 |
 | --- | --- |
@@ -156,7 +158,7 @@ text(result.output);
 
 MCPの1行とhookの入力全体は、UTF-16の文字数で1,048,576文字まで受理します。MCPは空白だけの行を従来どおり無視します。それ以外の超過行は残りを改行まで読み捨ててエラーを返し、次の要求を処理します。hookは上限超過を検出するとEOFを待たず拒否します。読み取り中も保持する入力をこの上限までに抑えます。
 
-このhookは任意コードの全削除を検出する境界ではありません。動的なコマンド名、独自alias、.NETのファイルAPI、他言語のコード、外部スクリプト、エンコード済みコマンド、対話型shellへ後から送る入力などは検出対象外です。Prunletのローカル絶対パス検査・復元データ保存先の保護はCLIとMCPの入口で別途適用されます。通常の削除例とJSON一覧の制限は[README](../README.md#削除復元)を参照してください。
+このhookは任意コードの全削除を検出する境界ではありません。動的なコマンド名、独自alias、.NETのファイルAPI、他言語のコード、外部スクリプト、対話型shellへ後から送る入力などは検出対象外です。エンコード済みコマンドは、単独の`pwsh -NoProfile -EncodedCommand <base64>`だけを復号して検査し、それ以外の形（省略形のoption、wrapper内、追加コマンドとの併用、引用・動的な値など）で認識したものは検査できないため拒否します。Prunletのローカル絶対パス検査・復元データ保存先の保護はCLIとMCPの入口で別途適用されます。通常の削除例とJSON一覧の制限は[README](../README.md#削除復元)を参照してください。
 
 ## 保護されたレジストリへの明示アクセス
 

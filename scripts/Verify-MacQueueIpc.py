@@ -105,7 +105,7 @@ def main():
         _, value = invoke("delete-queue-status", job)
         if value.get("serverPid"):
             assert value["serverPid"] == int(job.split('.')[-1]), value
-            assert value["status"] in ("cancelled", "completed", "failed", "unavailable"), value
+            assert value["status"] in ("cancelled", "completed", "failed", "ambiguous", "unavailable"), value
             os.kill(value["serverPid"], signal.SIGKILL)
 
     try:

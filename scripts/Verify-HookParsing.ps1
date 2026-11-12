@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ReportPath,
-    [string]$ConfigPath = 'C:\Users\IMT\.local\Prunlet\config.json'
+    # 開発者固有の既定値は持たない。検証するPrunlet設定の絶対パスを明示する。
+    [Parameter(Mandatory)][string]$ConfigPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -94,6 +95,150 @@ $cases = @(
 foreach ($operator in @('EQU', 'NEQ', 'LSS', 'LEQ', 'GTR', 'GEQ')) {
     $cases += @{ name="cmd-if-$operator"; command="if 1 $operator 1 del <FILE>"; shell='cmd.exe'; pass=$false }
 }
+
+# cmd.exe wrapperのswitch形。MSYSの二重スラッシュ・/R・連結・直結本文を本文として検査する。
+# 未知switchと5段以上の入れ子はfail-closed。正規のPrunlet CLI呼出しは/d /cと//d //cの両形で通過する。
+$pathsJson = Join-Path $OutputDirectory 'hook-paths.json'
+$cases += @(
+    @{ name='cmd-wrapper-double-slash'; command='cmd.exe //c del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-double-slash-d'; command='cmd.exe //d //c del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-double-slash-pwsh'; command='cmd.exe //d //c del "<FILE>"'; shell='pwsh'; pass=$false },
+    @{ name='cmd-wrapper-r-switch'; command='cmd /R del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-attached-body'; command='cmd /cdel "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-joined-switches'; command='cmd /d/c del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-joined-quoted-body'; command='cmd /D/Q/C "del <FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-known-switches'; command='cmd /e:on /v:off /t:0a /s /c del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-registry-double-slash'; command='cmd.exe //d //c reg delete HKCU\Software\PrunletHookProbe /f'; pass=$false },
+    @{ name='cmd-wrapper-unknown-switch'; command='cmd /z /c echo ok'; shell='cmd.exe'; pass=$false; reason='unsupported CMD wrapper switch' },
+    @{ name='cmd-wrapper-stray-argument'; command='cmd stray /c echo ok'; shell='cmd.exe'; pass=$false; reason='unsupported CMD wrapper switch' },
+    # cmd.exeはコマンドライン全体から/Cを探すため、語の途中にある本文switchも拒否する。
+    @{ name='cmd-wrapper-mid-word-switch'; command='cmd x/c del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='unsupported CMD wrapper switch' },
+    @{ name='cmd-wrapper-mid-word-quoted-switch'; command='cmd "x"/c del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-mid-word-comma-switch'; command='cmd ,/c del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-mid-word-after-known-switch'; command='cmd /d x/c del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='unsupported CMD wrapper switch' },
+    # cmd.exeは`;` `,` `=`を空白相当の区切りとし、実行名も最初の`/ , ; =`で打ち切る。
+    # `;`で割れたwrapper・実行名直結の`/c`・実行名や本文先頭の`, =`も本文を実行するため拒否する（Bashは全規則で検査）。
+    @{ name='cmd-wrapper-semicolon-switch'; command='cmd;/c del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='unsupported CMD wrapper switch' },
+    @{ name='cmd-wrapper-space-semicolon-switch'; command='cmd ;/c del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='unsupported CMD wrapper switch' },
+    @{ name='cmd-wrapper-known-switch-semicolon'; command='cmd /d;/c del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='unsupported CMD wrapper switch' },
+    @{ name='cmd-wrapper-tab-semicolon-switch'; command=('cmd' + [char]9 + ';/c del "<FILE>"'); shell='cmd.exe'; pass=$false; reason='unsupported CMD wrapper switch' },
+    @{ name='cmd-wrapper-nested-semicolon-switch'; command='cmd /c cmd;/c del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='unsupported CMD wrapper switch' },
+    @{ name='cmd-wrapper-comma-glued-switch'; command='cmd,/c del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-equals-glued-switch'; command='cmd=/c del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-slash-glued-switch'; command='cmd/c del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-exe-slash-glued-switch'; command='cmd.exe/c del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-forward-slash-path-glued-switch'; command='C:/Windows/System32/cmd.exe/c del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-call-slash-glued-switch'; command='call cmd/c del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-wrapper-switch-equals-body'; command='cmd /c=del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-wrapper-switch-comma-body'; command='cmd /c,del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-leading-comma-delete'; command=',del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-leading-equals-delete'; command='=del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-wrapper-space-equals-switch'; command='cmd =/c del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='unsupported CMD wrapper switch' },
+    @{ name='cmd-wrapper-known-switch-equals-switch'; command='cmd /d/q=/c del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='unsupported CMD wrapper switch' },
+    @{ name='cmd-wrapper-extension-switch-comma'; command='cmd /e:on,/c del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='unsupported CMD wrapper switch' },
+    @{ name='cmd-wrapper-switch-semicolon-body'; command='cmd /c;del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-wrapper-tab-separated-switch'; command=('cmd' + [char]9 + '/c del "<FILE>"'); shell='cmd.exe'; pass=$false },
+    # 単純名の削除命令に直結した`/ , =`もcmd.exeは実行名の終端として読み、残りを引数にする。
+    @{ name='cmd-delete-glued-rd-switches'; command='rd/s/q "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "rd"' },
+    @{ name='cmd-delete-glued-rd-upper'; command='RD/S/Q "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "RD"' },
+    @{ name='cmd-delete-glued-del-switch'; command='del/q "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-delete-glued-del-comma'; command='del,"<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-delete-glued-rd-equals'; command='rd=/s "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "rd"' },
+    @{ name='cmd-delete-glued-erase-switch'; command='erase/f "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "erase"' },
+    @{ name='cmd-delete-glued-rmdir-switch'; command='rmdir/s "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "rmdir"' },
+    @{ name='cmd-delete-glued-call'; command='call del/q "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-delete-glued-if'; command='if exist "<FILE>" del/q "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-delete-glued-wrapper-body'; command='cmd /c rd/s/q "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "rd"' },
+    @{ name='cmd-registry-glued-delete'; command='reg,delete HKCU\Software\PrunletHookProbe /f'; shell='cmd.exe'; pass=$false; reason='registry deletion command' },
+    # 経路形式の実行名は`/`を経路区切りとして最後の要素で判定する（`C:/tools/del/x`は外部プログラムxとして通す）。
+    @{ name='cmd-path-executable-with-del-directory'; command='C:/tools/del/x'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-relative-path-with-del-directory'; command='tools/del/x'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-echo-glued-delete-data'; command='echo del/q x'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-dir-glued-switch'; command='dir/b'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-reg-glued-help'; command='reg/?'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-wrapper-pwsh-quoted-semicolon-switch'; command='cmd '';/c'' del "<FILE>"'; shell='pwsh'; pass=$false; reason='unsupported CMD wrapper switch' },
+    @{ name='cmd-wrapper-mid-word-switch-bash'; command='cmd x/c del "<FILE>"'; pass=$false },
+    @{ name='cmd-wrapper-help'; command='cmd /?'; shell='cmd.exe'; pass=$true },
+    # 実行名と本文switch以外の`/ , ; =`は通常の文字なので誤拒否しない。
+    @{ name='cmd-wrapper-keep-slash-argument'; command='cmd /k echo hi/there'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-wrapper-body-semicolon-data'; command='cmd /c echo a;b'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-semicolon-before-wrapper-data'; command='echo ok;cmd /c echo hi'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-set-assignment'; command='set X=1'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-if-equal-echo'; command='if a==b echo x'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-echo-semicolon'; command='echo a;b'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-echo-slash'; command='echo a/b'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-echo-comma-data'; command='echo ,del x'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-dir-forward-slash-path'; command='dir C:/Windows /b'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-reg-query'; command='reg query HKCU\Software\PrunletHookProbe'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-wrapper-double-slash-query'; command='cmd.exe //d //c reg query HKCU\Software\PrunletHookProbe'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-wrapper-double-slash-echo'; command='cmd.exe //d //c echo del "<FILE>"'; shell='cmd.exe'; pass=$true },
+    @{ name='canonical-cli-cmd'; command=('cmd.exe /d /c "' + $ExecutablePath + ' --config ' + $ConfigPath + ' delete --paths-file ' + $pathsJson + '"'); shell='cmd.exe'; pass=$true },
+    @{ name='canonical-cli-cmd-no-shell'; command=('cmd.exe /d /c "' + $ExecutablePath + ' --config ' + $ConfigPath + ' delete --paths-file ' + $pathsJson + '"'); pass=$true },
+    @{ name='canonical-cli-msys'; command=('cmd.exe //d //c "' + $ExecutablePath + ' --config ' + $ConfigPath + ' delete --paths-file ' + $pathsJson + '"'); pass=$true },
+    @{ name='canonical-cli-call'; command=('cmd.exe /d /c call "' + $ExecutablePath + '" --config "' + $ConfigPath + '" delete --paths-file "' + $pathsJson + '"'); shell='cmd.exe'; pass=$true },
+    @{ name='canonical-cli-call-msys'; command=('cmd.exe //d //c call "' + $ExecutablePath + '" --config "' + $ConfigPath + '" delete --paths-file "' + $pathsJson + '"'); pass=$true },
+    @{ name='cmd-wrapper-depth-four'; command='cmd /c cmd /c cmd /c cmd /c echo ok'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-wrapper-depth-limit'; command='cmd /c cmd /c cmd /c cmd /c cmd /c echo ok'; shell='cmd.exe'; pass=$false; reason='inspection depth limit exceeded' },
+    @{ name='pwsh-wrapper-depth-limit'; command='pwsh -c pwsh -c pwsh -c pwsh -c pwsh -c Write-Output ok'; shell='pwsh'; pass=$false; reason='inspection depth limit exceeded' }
+)
+
+# CMDの括弧なしfor ... do / ... elseの後続コマンド。POSIX解釈ではfor構文自体を検査不能として拒否する。
+$cases += @(
+    @{ name='cmd-for-do-delete'; command='for %i in ("<FILE>") do del %i'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-for-do-if-delete'; command='for %i in ("<FILE>") do if exist %i del %i'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-else-delete'; command='if exist "<FILE>" (echo keep) else del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-else-registry'; command='if 1==2 (echo keep) else reg delete HKCU\Software\PrunletHookProbe /f'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-for-do-data'; command='for %i in (a) do echo del %i'; shell='cmd.exe'; pass=$true; bashPass=$false },
+    @{ name='cmd-else-data'; command='if 1==1 (echo keep) else echo del'; shell='cmd.exe'; pass=$true }
+)
+
+# 制御語（call・do・else）やifの条件に`, =`で直結した実行名もcmd.exeは実行する。
+# `=`での打切りはshellがcmdと明示された場合だけ無条件に行い、shell不明（Bash）ではPOSIX代入と区別できないため
+# `=`の直後が`/`の場合（rd=/s）に限る。Bashの`do=del`はPOSIX候補のfor構文検査で拒否される。
+$cases += @(
+    @{ name='cmd-call-comma-delete'; command='call,del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-call-equals-delete'; command='call=del "<FILE>"'; shell='cmd.exe'; pass=$false; bashPass=$true; reason='detected token "del"' },
+    @{ name='cmd-call-comma-wrapper'; command='call,cmd/c del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-call-comma-quoted-delete'; command='call,"del" "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-if-exist-comma-delete'; command='if exist "<FILE>",del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-if-exist-single-word-delete'; command='if exist <FILE>,del/q,<FILE>'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-if-not-exist-comma-delete'; command='if not exist "<FILE>.x",del "<FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-for-do-comma-delete'; command='for %i in ("<FILE>") do,del %i'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-for-do-equals-delete'; command='for %i in ("<FILE>") do=del %i'; shell='cmd.exe'; pass=$false },
+    @{ name='cmd-else-comma-delete'; command='if 1==2 (echo no) else,del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-else-equals-delete'; command='if 1==2 (echo no) else=del "<FILE>"'; shell='cmd.exe'; pass=$false; bashPass=$true },
+    @{ name='cmd-wrapper-equals-glued-switch-bash'; command='cmd=/c del "<FILE>"'; pass=$false },
+    @{ name='cmd-delete-glued-rd-equals-bash'; command='rd=/s "<FILE>"'; pass=$false },
+    # shell不明（Bash）のPOSIX代入は削除命令とみなさない。
+    @{ name='posix-assignment-rm-name'; command='rm=1; echo ok'; pass=$true },
+    @{ name='posix-assignment-ri-name'; command='ri=0'; pass=$true },
+    @{ name='posix-assignment-rd-name'; command='rd=foo'; pass=$true },
+    @{ name='posix-assignment-rp-substitution'; command='rp=$(realpath x)'; pass=$true },
+    @{ name='posix-assignment-cmd-name'; command='cmd=1; echo ok'; pass=$true },
+    # 引用内の`,`、削除命令以外への直結、`,`を含む引数は誤拒否しない。
+    @{ name='cmd-if-exist-quoted-comma-data'; command='if exist "a,b.txt" echo ok'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-if-exist-comma-echo'; command='if exist a,b echo ok'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-type-comma-files'; command='type a.txt,b.txt'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-call-comma-echo'; command='call,echo ok'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-for-semicolon-list'; command='for %i in (a;b) do echo %i'; shell='cmd.exe'; pass=$true; bashPass=$false },
+    @{ name='cmd-set-path-semicolon'; command='set PATH=C:\x;%PATH%'; shell='cmd.exe'; pass=$true }
+)
+
+# 非strictのPowerShell規則でも代入右辺・dot呼出しの後続をコマンドとして検査する。
+# 引用・ヒアストリング・検索文字列のdataは誤拒否しない。
+$assignmentHereData = @('$script = @''', 'Remove-Item -LiteralPath "<FILE>"', '$y = Remove-Item -LiteralPath "<FILE>"', '''@', 'Write-Output $script') -join "`n"
+$cases += @(
+    @{ name='pwsh-assignment-delete'; command='$x = Remove-Item -LiteralPath "<FILE>"'; shell='pwsh'; pass=$false; reason='detected token "Remove-Item"' },
+    @{ name='pwsh-assignment-compact-delete'; command='$x=Remove-Item -LiteralPath "<FILE>"'; shell='pwsh'; pass=$false },
+    @{ name='pwsh-return-delete'; command='return Remove-Item -LiteralPath "<FILE>"'; shell='pwsh'; pass=$false },
+    @{ name='pwsh-dot-call-delete'; command='. Remove-Item -LiteralPath "<FILE>"'; shell='pwsh'; pass=$false; reason='detected token "Remove-Item"' },
+    @{ name='pwsh-command-assignment-delete'; command='pwsh -Command "$x = Remove-Item -LiteralPath <FILE>"'; shell='cmd.exe'; pass=$false },
+    @{ name='pwsh-assignment-quoted-data'; command='$x = ''Remove-Item -LiteralPath "<FILE>"'''; shell='pwsh'; pass=$true },
+    @{ name='pwsh-assignment-here-data'; command=$assignmentHereData; shell='pwsh'; pass=$true; bashPass=$false },
+    @{ name='pwsh-assignment-search-data'; command='$hits = Select-String -Pattern ''Remove-Item'' -Path "<FILE>"'; shell='pwsh'; pass=$true },
+    @{ name='pwsh-search-assignment-text'; command='rg -n ''$x = Remove-Item'' "<FILE>"'; shell='pwsh'; pass=$true },
+    @{ name='pwsh-dot-source-script'; command='. .\env.ps1'; shell='pwsh'; pass=$true }
+)
 
 # 実ホストの Bash 入力では shell がない。対象文字列は UTF-16LE にして hook へ渡すだけで、実行しない。
 function ConvertTo-EncodedHookCommand([string]$scriptText) {
@@ -348,6 +493,12 @@ foreach ($case in $cases) {
             if ($case.name -eq 'file-remove-item') { $reasonValid = $reasonValid -and $reason.Contains('detected token "Remove-Item"') }
             if ($case.name -eq 'registry-delete') { $reasonValid = $reasonValid -and $reason.Contains('registry deletion command') -and $reason.Contains('"reg delete"') }
             if ($case.name -in @('quoted-search-ambiguous-shell','ssh-quoted-path-unknown-shell')) { $reasonValid = $reasonValid -and $reason.Contains('Shell metadata is missing or unsupported') -and $reason.Contains('interpretation=CMD') }
+            # 回帰ケースが期待する拒否理由（検知命令・検査不能の原因）を含むこと。
+            if ($case.ContainsKey('reason')) { $reasonValid = $reasonValid -and $reason.Contains($case.reason) }
+            # 単独EncodedCommandを復号して確定検出した場合は、候補注記と変換案内を付けない。
+            if ($case.name -in @('encoded-delete-before-here','encoded-japanese-delete','encoded-registry-after-here') -and !$case.ContainsKey('shell')) { $reasonValid = $reasonValid -and !$reason.Contains('candidate interpretation') -and $reason.Contains('interpretation=PowerShell') }
+            # 単独形式でない呼出しは、shell不明時に従来どおり候補注記を付ける。
+            if ($case.name -eq 'encoded-flag-delete--e' -and !$case.ContainsKey('shell')) { $reasonValid = $reasonValid -and $reason.Contains('candidate interpretation') }
         }
         $results.Add([pscustomobject]@{ name=$case.name; tool=$tool; input=$event; inputJson=$json; expected=$expected; decision=$decision; exitCode=$process.ExitCode; stdout=$stdout; stderr=$stderr; fixtureUnchanged=$fixtureUnchanged; reasonValid=$reasonValid; passed=($process.ExitCode -eq 0 -and $decision -ceq $expected -and $fixtureUnchanged -and $reasonValid) })
         $process.Dispose()
