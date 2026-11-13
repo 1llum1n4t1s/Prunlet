@@ -81,7 +81,7 @@ x64・ARM64ともにGitHub ActionsのGitHub提供ランナー（x64は`ubuntu-la
 
 ## 導入と文書
 
-Prunletの `vava` で新しいリリースを公開するときは、Apple Silicon版のビルド・署名・公証・ZIP生成を `ssh mac` の実機で行う。[Apple Silicon版の公開手順](docs/distribution.md#apple-silicon版の公開手順)に従い、検証済みZIPを同じGitHub Releaseに添付してから公開する。Mac向けにGitHub Actionsを起動したり、GitHubホストのrunnerへ切り替えたりしない。Windows版は公開後に既存の配布workflowがビルド・Sigiluneでの署名・R2配置・添付を行う。jobはEnvironment `release`の承認を待つので、公開後に本人へ承認を依頼し、署名・検証・添付の結果を確認する。手順は[Windowsの公開の順序](docs/distribution.md#公開の順序)に従う。未署名のZIPを手動で添付したり、署名用Secretsをビルドstepや別のjobへ渡したりしない。署名の失敗を自動で再実行せず、原因を確認してから再実行する。再開時は完了済みの工程と実物を照合して再利用する。
+Prunletの `vava` で新しいリリースを公開するときは、Apple Silicon版のビルド・署名・公証・ZIP生成を `ssh mac` の実機で行う。[Apple Silicon版の公開手順](docs/distribution.md#apple-silicon版の公開手順)に従い、検証済みZIPを同じGitHub Releaseに添付してから公開する。Mac向けにGitHub Actionsを起動したり、GitHubホストのrunnerへ切り替えたりしない。Windows版は公開後に既存の配布workflowがビルド・Sigiluneでの署名・R2配置・添付を行う。jobは承認待ちなしで動くので、公開後に署名・検証・添付の結果を確認する。手順は[Windowsの公開の順序](docs/distribution.md#公開の順序)に従う。未署名のZIPを手動で添付したり、署名用Secretsをビルドstepや別のjobへ渡したりしない。署名の失敗を自動で再実行せず、原因を確認してから再実行する。再開時は完了済みの工程と実物を照合して再利用する。
 
 Linuxのリリースビルドは、上記のGitHub提供ランナーで`bash scripts/Publish-PrunletLinux.sh <新規の絶対出力先> <40桁SHA> <linux-x64|linux-arm64>`を各CPU向けに実行する。[Linux版の公開手順](docs/distribution.md#linux版の公開手順)に従い、検証済みtar.gzとチェックサムを同じGitHub Releaseへ添付する。
 

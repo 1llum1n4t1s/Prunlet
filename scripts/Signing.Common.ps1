@@ -3,7 +3,7 @@
 #
 # 署名はSigilune（https://github.com/1llum1n4t1s/Sigilune）で、Certum SimplySignの
 # クラウド鍵を使う。SimplySign Desktopは不要で、GitHub Actionsではrelease workflowが
-# 承認付きEnvironment `release`のSecrets（SIGILUNE_EMAIL・SIGILUNE_TOTP_URI）を
+# Environment `release`（承認者なし・ブランチ制限あり）のSecrets（SIGILUNE_EMAIL・SIGILUNE_TOTP_URI）を
 # 署名stepだけへ渡して実行する。手元ではSigiluneの登録（sigilune setup）を使う。
 #
 # Sigilune自身も署名後に検証するが、Prunletの配布条件として、Windowsの判定が`Valid`、
