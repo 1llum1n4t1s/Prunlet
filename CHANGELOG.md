@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.45 - 2026-11-14
+
+- Windows版をAIツールに付属しない単独のアプリとして導入するよう変更。インストーラーは既定でCodexなどの設定へ書き込まず、MCPの起動スクリプトの`-CodexHome`も不要にした。ToolportやClaude CodeなどのMCPホストへの登録方法をREADMEに追加し、Codexへの登録は`-RegisterCodex`を指定した場合だけ行う。
+- MCPとして起動されたことをCodexへの登録ありとはみなさず、Codexに以前の登録が残っている場合だけ読取り専用で確認して保護する。Codexの設定を消したPCでも、他のMCPホストからの起動時更新が止まらない。
+- インストーラーのバックアップと作業場所の既定を、Codex名義の場所から`%LOCALAPPDATA%\Prunlet\Backups`と`%TEMP%\Prunlet`へ変更。
+
 ## 1.0.44 - 2026-11-13
 
 - フックが、PowerShellで引数として渡す単独の`.`（`rg x .`・`Get-ChildItem -Path .`・`git grep x -- .`）をdot-sourcingと誤って拒否しないよう修正。文頭・区切り・キーワード直後の`.`は従来どおり拒否する。
