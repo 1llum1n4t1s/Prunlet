@@ -427,6 +427,24 @@ $encodedCases += @(
 for ($index = 0; $index -lt $processStarts.Count; $index++) {
     $encodedCases += @{ name="encoded-process-start-$index"; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand $processStarts[$index])); pass=$false }
 }
+# 共通指示の管理者起動: 静的なcmd.exeと単一引用の引数だけを、CMD本文の検査付きで通す。
+$adminCli = '""' + $ExecutablePath + '" --config "' + $ConfigPath + '" registry-delete --view 64 --recursive -- HKEY_CURRENT_USER\Software\PrunletHookProbe"'
+$encodedCases += @(
+    @{ name='encoded-admin-cmd-prunlet-cli'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand ("Start-Process -FilePath cmd.exe -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList '/d /c " + $adminCli + "'"))); pass=$true },
+    @{ name='encoded-admin-cmd-body-delete'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand "Start-Process -FilePath cmd.exe -Verb RunAs -ArgumentList '/d /c del ""<FILE>""'")); pass=$false },
+    @{ name='encoded-admin-cmd-body-nested-shell'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand "Start-Process -FilePath cmd.exe -Verb RunAs -ArgumentList '/d /c pwsh -Command Remove-Item ""<FILE>""'")); pass=$false },
+    @{ name='encoded-admin-cmd-array-arguments'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand "Start-Process -FilePath cmd.exe -Verb RunAs -ArgumentList '/d','/c','dir'")); pass=$false },
+    @{ name='encoded-admin-cmd-expandable-arguments'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand 'Start-Process -FilePath cmd.exe -Verb RunAs -ArgumentList "/d /c $body"')); pass=$false },
+    # cmd.exeの解釈と検査器の解釈がずれうる形（文の分割・引用された実行名・位置引数・既定値注入）は固定形の外なので拒否する。
+    @{ name='encoded-admin-cmd-ampersand-before-switch'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand "Start-Process -FilePath cmd.exe -Verb RunAs -ArgumentList '& /d /c del ""<FILE>""'")); pass=$false },
+    @{ name='encoded-admin-cmd-quoted-command-name'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand "Start-Process -FilePath cmd.exe -Verb RunAs -ArgumentList '/d /c ""del"" ""<FILE>""'")); pass=$false },
+    @{ name='encoded-admin-cmd-positional-parenthesized'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand "Start-Process cmd.exe ('/d /c del ""<FILE>""') -Verb RunAs")); pass=$false },
+    @{ name='encoded-admin-cmd-default-parameter-injection'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand "`$PSDefaultParameterValues.Add('Start-Process:ArgumentList','/d /c del ""<FILE>""'); Start-Process -FilePath cmd.exe -Verb RunAs")); pass=$false },
+    @{ name='encoded-admin-cmd-other-prunlet-path'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand ("Start-Process -FilePath cmd.exe -Verb RunAs -ArgumentList '/d /c """"D:\other\prunlet.exe"" --config """ + $ConfigPath + """ delete --paths-file D:\a.json""'"))); pass=$false },
+    @{ name='encoded-admin-cmd-non-json-redirect'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand ("Start-Process -FilePath cmd.exe -Verb RunAs -ArgumentList '/d /c " + $adminCli.TrimEnd('"') + " > C:\Windows\System32\drivers\etc\hosts 2>&1""'"))); pass=$false },
+    @{ name='encoded-admin-cmd-missing-argument-list'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand 'Start-Process -FilePath cmd.exe -Verb RunAs')); pass=$false },
+    @{ name='encoded-admin-cmd-trailing-statement-in-body'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand ("Start-Process -FilePath cmd.exe -Verb RunAs -ArgumentList '/d /c " + $adminCli.TrimEnd('"') + " & del ""<FILE>""""'"))); pass=$false }
+)
 for ($index = 0; $index -lt $assignmentDeletes.Count; $index++) {
     $encodedCases += @{ name="encoded-command-$($assignmentNames[$index])"; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand $assignmentDeletes[$index])); pass=$false }
 }
@@ -443,7 +461,23 @@ foreach ($flag in @('-e', '-ec', '-en', '-enc', '-ENCODEDCOMMAND', '--EncodedCom
 $nested = 'Write-Output "safe"'
 for ($depth = 0; $depth -lt 10; $depth++) { $nested = 'pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand $nested) }
 $encodedCases += @{ name='encoded-excessive-nesting'; command=$nested; pass=$false }
+# EncodedCommand内の参照だけの`$(...)`と静的な.ps1の`-File`実行は通し、メソッド呼出し・標準入力・変数のパスは拒否する。
+$encodedCases += @(
+    @{ name='encoded-property-subexpression'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand '$sw = [Diagnostics.Stopwatch]::StartNew(); "sec: $($sw.Elapsed.TotalSeconds)"')); pass=$true },
+    @{ name='encoded-method-subexpression'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand '"$((Get-Item ''<FILE>'').Delete())"')); pass=$false },
+    @{ name='encoded-command-subexpression'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand '"$(Remove-Item -LiteralPath ''<FILE>'')"')); pass=$false },
+    @{ name='encoded-pwsh-static-file'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand 'pwsh -NoProfile -File D:\example\run.ps1 -Label a')); pass=$true },
+    @{ name='encoded-pwsh-stdin-file'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand 'pwsh -NoProfile -File -')); pass=$false },
+    @{ name='encoded-pwsh-dynamic-file'; command=('pwsh -NoProfile -EncodedCommand ' + (ConvertTo-EncodedHookCommand 'pwsh -NoProfile -File $script')); pass=$false }
+)
 $cases += $encodedCases
+# 引用終端のヒアドキュメント本文は、ファイルへのcatだけがdataとして受け取る。本文の後ろ・shellへ渡る形の削除は拒否する。
+$cases += @(
+    @{ name='posix-heredoc-file-sink-body'; command="cat > /d/example/loop.sh <<'EOF'`nwhile true; do echo x; done`nEOF"; pass=$true },
+    @{ name='posix-heredoc-delete-after-body'; command="cat > /d/example/a.txt <<'EOF'`nx`nEOF`nrm -f `"<FILE>`""; pass=$false },
+    @{ name='posix-heredoc-piped-to-shell'; command="cat <<'EOF' | sh`nrm -f `"<FILE>`"`nEOF"; pass=$false },
+    @{ name='posix-loop-assignment-and-test'; command='for f in a b; do n=$(basename $f); if [ -f "$f" ]; then echo $n; fi; done 2>&1'; pass=$true }
+)
 
 $results = [Collections.Generic.List[object]]::new()
 $cases += @(

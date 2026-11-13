@@ -38,6 +38,14 @@ struct Token {
     /// CMD規則で、引用外かつ`^`で退避されていない`,`の位置（`text`内のbyte offset）。
     /// cmd.exeは`,`を空白相当の区切りとして読むため、`if`の条件を語に割り直すのに使う。
     commas: Vec<usize>,
+    /// 語に含まれる引用の区間数（`'a'`は1、`'a','b'`や`'a'"b"`は2）。
+    quote_segments: usize,
+    /// 単一引用以外（二重引用・ヒアストリング）を含むか。PowerShellの二重引用は変数展開しうる。
+    non_single_quote: bool,
+    /// 引用外（退避を含む）で語へ加えた文字数。完全な単一引用リテラルかの判定に使う。
+    bare_chars: usize,
+    /// 引用外で退避文字（PowerShellの`` ` ``）を含むか。字句解析後は元の綴りを失うため、静的値として扱わない。
+    escaped: bool,
 }
 impl Token {
     fn new(text: impl Into<String>) -> Self {
@@ -52,7 +60,20 @@ impl Token {
             quoted_after_equality: false,
             dynamic: false,
             commas: Vec::new(),
+            quote_segments: 0,
+            non_single_quote: false,
+            bare_chars: 0,
+            escaped: false,
         }
+    }
+    /// 語全体が1つの単一引用だけでできたPowerShellの静的リテラルか（`'...'`、`''`は`'`）。
+    /// 二重引用・ヒアストリング・連結（`'a'$x`・`'a','b'`）は値が展開や配列になりうるため含めない。
+    fn single_quoted_literal(&self) -> bool {
+        self.quoted
+            && self.quote_start == Some(0)
+            && self.quote_segments == 1
+            && !self.non_single_quote
+            && self.bare_chars == 0
     }
 }
 
@@ -86,6 +107,262 @@ fn split_cmd_commas(words: &[Token]) -> Vec<Token> {
         }
     }
     out
+}
+/// 共通指示の管理者起動`Start-Process -FilePath cmd.exe -ArgumentList '<引数>' ...`だけを許可するか判定する。
+///
+/// 起動先と引数文字列は、次をすべて満たす場合に限る許可リスト照合で受理する。
+/// - `-FilePath`と`-ArgumentList`は両方とも名前付き・必須。位置引数・省略形・`-Name:value`形・重複・未知の引数は受理しない。
+///   位置引数を許すと`(…)`・`{…}`が文境界として落ち、検査していない値が束縛されうる。
+///   ArgumentListの省略も、`$PSDefaultParameterValues`で注入された値が使われうるため受理しない。
+/// - 起動先は静的な`cmd`・`cmd.exe`・`C:\Windows\System32\cmd.exe`。引用なしの素の語か単一引用リテラルのみ。
+/// - 引数は完全な単一引用リテラル1つで、`admin_cmd_arguments`の固定形に一致すること。
+///   cmd.exeが実際に解釈する形（先頭・末尾の引用剥がし、`&`・`|`・改行による文の分割等）とのずれを避けるため、
+///   cmd規則で再び字句解析せず、メタ文字を含められない形だけを許可する。
+/// - 併用できるのは`-Verb`・`-WindowStyle`・`-WorkingDirectory`（静的な値）と
+///   `-Wait`・`-PassThru`・`-NoNewWindow`（値なしswitch）だけ。
+fn admin_cmd_start_process(args: &[Token], cli: &str, config: &str) -> bool {
+    // 値として静的に読める語（引用なしの素の語、または単一引用リテラル）。バッククォートで退避した語は
+    // 字句解析後に元の綴りを失うため受理しない。
+    fn static_value(t: &Token) -> Option<&str> {
+        if t.escaped {
+            return None;
+        }
+        if t.single_quoted_literal() {
+            return Some(&t.text);
+        }
+        let plain = !t.quoted
+            && !t.text.is_empty()
+            && !t.text.starts_with('-')
+            && !t.text.contains(['$', '@', '\'', '"', ',', '(', ')', '[', ']', '{', '}']);
+        plain.then_some(t.text.as_str())
+    }
+    let mut file: Option<&str> = None;
+    let mut arguments: Option<&Token> = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut k = 0;
+    while k < args.len() {
+        let t = &args[k];
+        // 引数名は引用なし・退避なしの`-名前`だけを受理する（それ以外は位置引数になるため拒否）。
+        if t.quoted || t.escaped || !t.text.starts_with('-') {
+            return false;
+        }
+        let parameter = t.text[1..].to_ascii_lowercase();
+        let canonical = match parameter.as_str() {
+            "filepath" => "filepath",
+            "argumentlist" => "argumentlist",
+            "verb" => "verb",
+            "windowstyle" => "windowstyle",
+            "workingdirectory" => "workingdirectory",
+            "wait" | "passthru" | "nonewwindow" => {
+                if !seen.insert(parameter) {
+                    return false;
+                }
+                k += 1;
+                continue;
+            }
+            _ => return false,
+        };
+        if !seen.insert(canonical.to_owned()) {
+            return false;
+        }
+        let Some(value) = args.get(k + 1) else {
+            return false;
+        };
+        match canonical {
+            "filepath" => match static_value(value) {
+                Some(v) => file = Some(v),
+                None => return false,
+            },
+            "argumentlist" => {
+                if value.escaped || !value.single_quoted_literal() {
+                    return false;
+                }
+                arguments = Some(value);
+            }
+            _ => {
+                if static_value(value).is_none() {
+                    return false;
+                }
+            }
+        }
+        k += 2;
+    }
+    let (Some(file), Some(arguments)) = (file, arguments) else {
+        return false;
+    };
+    matches!(
+        file.to_ascii_lowercase().as_str(),
+        "cmd" | "cmd.exe" | r"c:\windows\system32\cmd.exe"
+    ) && admin_cmd_arguments(&arguments.text, cli, config)
+}
+/// 管理者起動のcmd.exeへ渡す引数文字列が、固定形
+/// `/d /c ""<hookのCLI>" --config "<hookの設定>" <引数>[ > <出力jsonの絶対パス> 2>&1]"`
+/// に一致するか。
+/// - 実行体と設定は、このhookを起動した配置済みCLI（`--cli-executable`）と設定（`--config`）に限る
+///   （ASCII大文字小文字のみ無視）。名前だけの照合では、同名の任意exeが昇格して動きうるため。
+/// - `<引数>`・出力先・CLI/設定のパスは、cmd.exeの区切り・演算子・展開に使われる文字
+///   （`& | < > ^ % ( ) ! " ; , '`と改行等）を含められないASCIIの許可文字だけにする。
+/// - 出力リダイレクト先は拡張子`.json`に限る。cmd.exeは起動前に対象を管理者権限で切り詰めるため、
+///   任意のファイルを指せると内容破壊になる。
+fn admin_cmd_arguments(arguments: &str, cli: &str, config: &str) -> bool {
+    fn safe_path(path: &str) -> bool {
+        let bytes = path.as_bytes();
+        bytes.len() >= 4
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\'
+            // `:`はドライブ指定の位置だけ（NTFSの代替データストリーム指定を含めない）。
+            && bytes[2..]
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b' ' | b'\\' | b'-'))
+    }
+    // 先頭からASCII大文字小文字を無視して`expected`を剥がす。
+    fn strip<'a>(text: &'a str, expected: &str) -> Option<&'a str> {
+        let head = text.get(..expected.len())?;
+        head.eq_ignore_ascii_case(expected)
+            .then(|| &text[expected.len()..])
+    }
+    if !safe_path(cli) || !safe_path(config) {
+        return false;
+    }
+    let Some(rest) = strip(arguments, "/d /c \"\"")
+        .and_then(|r| strip(r, cli))
+        .and_then(|r| strip(r, "\" --config \""))
+        .and_then(|r| strip(r, config))
+        .and_then(|r| strip(r, "\" "))
+        .and_then(|r| r.strip_suffix('"'))
+    else {
+        return false;
+    };
+    // 末尾の任意の出力リダイレクト` > <X:\…\name.json> 2>&1`を分離する。
+    let body = match rest.strip_suffix(" 2>&1").and_then(|r| r.rsplit_once(" > ")) {
+        Some((body, output)) => {
+            let lower = output.to_ascii_lowercase();
+            if !safe_path(output) || output.contains(' ') || !lower.ends_with(".json") {
+                return false;
+            }
+            body
+        }
+        None => rest,
+    };
+    !body.is_empty()
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'\\' | b' ' | b'=' | b'-'))
+}
+/// pwshの引数が`[-NoProfile|-NonInteractive|-NoLogo|-ExecutionPolicy <値>]... -File <静的な.ps1> [script引数...]`か。
+/// 名前は完全一致だけを受理し、省略形・`-Command`・`-EncodedCommand`・`-File -`（標準入力）は含めない。
+fn static_powershell_file(args: &[Token]) -> bool {
+    let plain = |t: &Token| {
+        !t.escaped
+            && !t.text.is_empty()
+            && !t.text.contains(['$', '(', ')', '@', '{', '}', '`', '\'', '"', ',', ';'])
+    };
+    let mut k = 0;
+    while k < args.len() {
+        let word = &args[k];
+        if word.quoted || word.escaped || !word.text.starts_with('-') {
+            return false;
+        }
+        match word.text.to_ascii_lowercase().as_str() {
+            "-noprofile" | "-noninteractive" | "-nologo" => k += 1,
+            "-executionpolicy" => {
+                if !args.get(k + 1).is_some_and(|value| !value.quoted && plain(value)) {
+                    return false;
+                }
+                k += 2;
+            }
+            "-file" => {
+                let Some(path) = args.get(k + 1) else {
+                    return false;
+                };
+                // 単一引用の静的リテラルか、引用なしの素の語に限る（変数・式でスクリプトを差し替えない）。
+                let literal = (path.single_quoted_literal() && !path.text.contains(['$', '`']))
+                    || (!path.quoted && plain(path));
+                return literal && path.text.to_ascii_lowercase().ends_with(".ps1");
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+/// `$(`の直後から`)`までが、`$名前`（`$env:名前`可）に`.プロパティ名`・`[数字]`だけが続く形か。
+/// メソッド呼出し（`(`）・演算子・引用・入れ子の`$`は含めない。
+fn powershell_property_subexpression(rest: &[char]) -> bool {
+    let identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut k = 0;
+    if rest.first() != Some(&'$') {
+        return false;
+    }
+    k += 1;
+    let start = k;
+    while k < rest.len() && identifier(rest[k]) {
+        k += 1;
+    }
+    if k == start {
+        return false;
+    }
+    // スコープ・ドライブ修飾（`$env:PATH`・`$script:x`）は1回だけ。
+    if rest.get(k) == Some(&':') {
+        k += 1;
+        let start = k;
+        while k < rest.len() && identifier(rest[k]) {
+            k += 1;
+        }
+        if k == start {
+            return false;
+        }
+    }
+    loop {
+        match rest.get(k) {
+            Some(')') => return true,
+            Some('.') => {
+                k += 1;
+                let start = k;
+                while k < rest.len() && identifier(rest[k]) {
+                    k += 1;
+                }
+                if k == start {
+                    return false;
+                }
+            }
+            Some('[') => {
+                k += 1;
+                let start = k;
+                while k < rest.len() && rest[k].is_ascii_digit() {
+                    k += 1;
+                }
+                if k == start || rest.get(k) != Some(&']') {
+                    return false;
+                }
+                k += 1;
+            }
+            _ => return false,
+        }
+    }
+}
+/// POSIXの`[`・`[[`（test組込み）か。引用なしの語がちょうどこの綴りの場合だけ。
+/// 字句解析は`[`をglob文字として動的扱いにするが、`[`単独は一致する名前がなく展開されない。
+fn posix_test_builtin(word: &Token) -> bool {
+    !word.quoted && matches!(word.text.as_str(), "[" | "[[")
+}
+/// 語列がリダイレクト（`2>`・`>/dev/null`・`< file`等）とその対象だけでできているか。
+/// 演算子だけの語（`<`・`2>`）の次の語は対象として読み飛ばす（`&`で割れた`2>&1`は演算子で終わる）。
+fn posix_redirections_only(words: &[Token]) -> Result<bool> {
+    let redirection = compiled(&REDIRECTION)?;
+    let mut index = 0;
+    while index < words.len() {
+        let text = words[index].text.as_str();
+        if words[index].quoted || !redirection.is_match(text) {
+            return Ok(false);
+        }
+        let operator_only = text
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .chars()
+            .all(|c| matches!(c, '<' | '>' | '|'));
+        index += if operator_only { 2 } else { 1 };
+    }
+    Ok(true)
 }
 fn leaf(value: &str) -> String {
     raw_leaf(value).to_ascii_lowercase()
@@ -391,10 +668,18 @@ struct Inspector {
     /// 入力全体が単独の静的EncodedCommandで、復号本文をPowerShellとして確定検査したか。
     /// このときshell不明時の「候補の解釈」注記とEncodedCommand案内は事実に合わないため付けない。
     standalone_encoded: bool,
+    /// このhookを起動した配置済みCLIと設定の絶対パス。管理者起動の許可リスト照合だけに使う。
+    /// 空のとき（単体の検査器テスト等）は管理者起動を一切許可しない。
+    admin_cli: String,
+    admin_config: String,
+    /// 最初の検知が削除命令（ファイル・レジストリ）か。検査不能による拒否と区別し、
+    /// 拒否理由に付ける案内の長さを変えるのに使う。
+    deletion: bool,
 }
 impl Inspector {
     fn detected(&mut self, reason: &str, token: &str) -> bool {
         if self.detection.is_none() {
+            self.deletion = matches!(reason, "deletion command" | "registry deletion command");
             let label = match self.mode {
                 Some(Mode::Cmd) => "CMD",
                 Some(Mode::PowerShell) => "PowerShell",
@@ -510,7 +795,15 @@ impl Inspector {
                         | "case"
                         | "coproc"
                 );
-                if *control && (first.dynamic || compiled(&REDIRECTION)?.is_match(&first.text)) {
+                // 代入（`b=$(basename $f)`）の右辺は実行名ではないため、制御構文の中でも
+                // posix_prefixで代入を剥がした後の実行名だけを動的かどうか判定する。
+                // `[`・`[[`はtest組込みで、`[`単独はglobとして展開されない。
+                let static_head = compiled(&ASSIGNMENT)?.is_match(&first.text)
+                    || posix_test_builtin(first);
+                if *control
+                    && ((first.dynamic && !static_head)
+                        || compiled(&REDIRECTION)?.is_match(&first.text))
+                {
                     return Ok(self.detected(
                         "dynamic or unsupported POSIX control body cannot be inspected",
                         &first.text,
@@ -652,6 +945,16 @@ impl Inspector {
             return Ok((attached_delete || next_delete)
                 && self.detected("registry deletion command", "reg delete"));
         }
+        // 共通指示の管理者起動だけは、EncodedCommand内のStart-Processでも許可する。
+        // 引数文字列を再びCMD規則で字句解析すると、cmd.exeが実際に解釈する形（引用剥がし・`&`等）との
+        // ずれを検査器が抱えるため、固定形の許可リスト照合に限る（`admin_cmd_start_process`参照）。
+        if strict
+            && self.mode == Some(Mode::PowerShell)
+            && matches!(name.as_str(), "start-process" | "start" | "saps")
+            && admin_cmd_start_process(&w[i + 1..], &self.admin_cli, &self.admin_config)
+        {
+            return Ok(false);
+        }
         if strict
             && matches!(
                 name.as_str(),
@@ -662,6 +965,15 @@ impl Inspector {
                 "dynamic invocation inside EncodedCommand cannot be inspected",
                 &name,
             ));
+        }
+        // 静的な`.ps1`を`-File`で実行するpwshは、非strictの検査と同じくscriptファイル実行として扱う
+        // （ファイル内容はどちらの経路でも検査しない）。`-Command`・EncodedCommand・標準入力（`-File -`）・
+        // 動的なパス・未知の起動オプションは従来どおり入れ子shellとして拒否する。
+        if strict
+            && matches!(name.as_str(), "pwsh" | "powershell")
+            && static_powershell_file(&w[i + 1..])
+        {
+            return Ok(false);
         }
         if strict && wrapper(&name) {
             return Ok(self.detected(
@@ -836,10 +1148,15 @@ impl Inspector {
             name.as_str(),
             "then" | "do" | "else" | "elif" | "if" | "while" | "until" | "!"
         ) {
-            return if words.len() == 1 {
+            // 制御語の後ろも文頭と同じく代入を剥がしてから実行名を調べる（`do n=$(...)`）。
+            let mut rest = 1;
+            while rest < words.len() && assignment.is_match(&words[rest].text) {
+                rest += 1;
+            }
+            return if rest == words.len() {
                 Ok(Some(false))
             } else {
-                self.posix_nested(&words[1..], depth, strict).map(Some)
+                self.posix_nested(&words[rest..], depth, strict).map(Some)
             };
         }
         if matches!(name.as_str(), "for" | "select") {
@@ -857,8 +1174,11 @@ impl Inspector {
             )));
         }
         if matches!(name.as_str(), "fi" | "done" | "esac") {
+            // 終端語の後ろがリダイレクトだけ（`done 2>&1`・`done < list`）なら、構文全体の入出力先の
+            // 指定であってコマンドは実行しない。それ以外の語が続く形は従来どおり検査不能とする。
             return Ok(Some(
                 words.len() > 1
+                    && !posix_redirections_only(&words[1..])?
                     && self.detected(
                         "unsupported POSIX control suffix cannot be inspected",
                         &words[0].text,
@@ -1066,6 +1386,10 @@ impl Inspector {
                 "POSIX prefix inspection depth limit exceeded",
                 &words[0].text,
             ));
+        }
+        // `[`・`[[`はtest組込み（引数の評価だけでコマンドを実行しない）。
+        if posix_test_builtin(&words[0]) {
+            return Ok(false);
         }
         if words[0].dynamic {
             return Ok(self.detected(
@@ -1521,6 +1845,133 @@ fn boundary(out: &mut Vec<Token>) {
     t.boundary = true;
     out.push(t);
 }
+/// POSIX規則で見つけたヒアドキュメント1つ分の情報。本文を読み飛ばせるかの判定に使う。
+struct Heredoc {
+    /// 引用を除いた終端語。
+    delimiter: String,
+    /// 終端語が引用・退避されているか（本文で展開・コマンド置換が起きない）。
+    quoted: bool,
+    /// `<<`を含む文がtokens出力のどこから始まるか。
+    statement_start: usize,
+    /// `<<`より前の状況が読み飛ばし可能か（括弧の入れ子なし、算術・`[[`・逆引用なし）。
+    context_ok: bool,
+}
+/// ヒアドキュメント本文を読み飛ばしてよい場合に、本文の次の文字位置を返す。
+///
+/// 読み飛ばすのは、終端語が引用された本文（展開なしのdata）を、ファイルへ書き出す`cat`か、
+/// 本文をコードとして読むインタプリタ（`python`・`node`。`-c`の本文と同じく検査対象外）が受け取る形だけ。
+/// shellへ渡りうる形（パイプ・入れ子のグループ・同じ行の後続文・`/dev`への出力）は従来どおり本文を文として検査する。
+/// 本文の終わりはbashより早めに判定する（前後の空白を除いて終端語と一致した行）。早く終われば残りを
+/// 文として検査するだけなので安全側に倒れる。
+fn heredoc_skip(
+    s: &[char],
+    body_start: usize,
+    heredocs: &[Heredoc],
+    out: &[Token],
+    boundary_after: bool,
+) -> Result<Option<usize>> {
+    if boundary_after || heredocs.is_empty() {
+        return Ok(None);
+    }
+    for heredoc in heredocs {
+        if !heredoc.quoted
+            || !heredoc.context_ok
+            || heredoc.delimiter.is_empty()
+            || !heredoc_consumer_is_data_sink(&out[heredoc.statement_start.min(out.len())..])?
+        {
+            return Ok(None);
+        }
+    }
+    let mut position = body_start;
+    for heredoc in heredocs {
+        loop {
+            if position >= s.len() {
+                // 終端のないヒアドキュメントはbashでも入力の終わりまでが本文になる。
+                return Ok(Some(s.len()));
+            }
+            let end = s[position..]
+                .iter()
+                .position(|&c| c == '\n')
+                .map_or(s.len(), |offset| position + offset);
+            let line: String = s[position..end].iter().collect();
+            position = (end + 1).min(s.len());
+            if line.trim() == heredoc.delimiter {
+                break;
+            }
+        }
+    }
+    Ok(Some(position))
+}
+/// ヒアドキュメントを受け取る文が、本文をshellへ渡さない形（ファイルへの`cat`・インタプリタ）か。
+fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
+    let assignment = compiled(&ASSIGNMENT)?;
+    let mut command: Vec<&Token> = Vec::new();
+    let mut stdout_to_file = false;
+    let mut k = 0;
+    while k < words.len() {
+        let word = &words[k];
+        let text = word.text.as_str();
+        // 文の終わり（CRLFの`\r`等）。同じ行で後ろに続く文は呼出し側の`boundary_after`で拒否済み。
+        if word.boundary {
+            break;
+        }
+        // `<<`・`<<-`（終端語が直結していれば同じ語、離れていれば次の語が終端語）。
+        if word.quote_start != Some(0) && text.starts_with("<<") {
+            let rest = text[2..].strip_prefix('-').unwrap_or(&text[2..]);
+            k += if rest.is_empty() && !word.quoted { 2 } else { 1 };
+            continue;
+        }
+        if !word.quoted && text.starts_with('<') {
+            return Ok(false);
+        }
+        // 出力リダイレクト（`>`・`>>`・`1>`・`2>`。対象は直結か次の語）。
+        let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if word.quote_start != Some(0) && text[digits..].starts_with('>') {
+            let operator = text[digits..].trim_start_matches('>');
+            let (target, step) = if operator.is_empty() {
+                match words.get(k + 1) {
+                    Some(next) => (next, 2),
+                    None => return Ok(false),
+                }
+            } else {
+                (word, 1)
+            };
+            let target_text = if operator.is_empty() { target.text.as_str() } else { operator };
+            if target.dynamic || target.boundary || target_text.is_empty() {
+                return Ok(false);
+            }
+            if &text[..digits] != "2" {
+                let lower = target_text.to_ascii_lowercase();
+                if lower.starts_with("/dev/") || lower.starts_with("/proc/") {
+                    return Ok(false);
+                }
+                stdout_to_file = true;
+            }
+            k += step;
+            continue;
+        }
+        command.push(word);
+        k += 1;
+    }
+    // 先頭の静的な代入（`PYTHONUTF8=1 python - <<'EOF'`）は実行名ではない。
+    let start = command
+        .iter()
+        .take_while(|w| !w.quoted && !w.dynamic && assignment.is_match(&w.text))
+        .count();
+    let command = &command[start..];
+    let Some(first) = command.first() else {
+        return Ok(false);
+    };
+    if first.quoted || first.dynamic {
+        return Ok(false);
+    }
+    let static_option = |w: &&Token| !w.quoted && !w.dynamic && w.text.starts_with('-');
+    Ok(match leaf(&first.text).as_str() {
+        "cat" => command.len() == 1 && stdout_to_file,
+        "python" | "python3" | "py" | "node" => command[1..].iter().all(static_option),
+        _ => false,
+    })
+}
 fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
     let s: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
@@ -1528,8 +1979,72 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
     let mut quote = '\0';
     let mut previous_equal = false;
     let mut i = 0;
+    // POSIX規則のヒアドキュメント追跡（heredoc_skip参照）。
+    let mut heredocs: Vec<Heredoc> = Vec::new();
+    let mut statement_start = 0usize;
+    let mut group_depth = 0i32;
+    let mut line_start = 0usize;
+    let mut heredoc_boundary_after = false;
     while i < s.len() {
         let mut c = s[i];
+        // 引用外の`<<`（`<<<`を除く）を見つけたら終端語を読み取って記録する。字句解析は通常どおり続ける。
+        if mode == Mode::Posix
+            && quote == '\0'
+            && c == '<'
+            && s.get(i + 1) == Some(&'<')
+            && s.get(i + 2) != Some(&'<')
+            && (i == 0 || s[i - 1] != '<')
+        {
+            let mut j = i + 2;
+            if s.get(j) == Some(&'-') {
+                j += 1;
+            }
+            while j < s.len() && matches!(s[j], ' ' | '\t') {
+                j += 1;
+            }
+            let mut delimiter = String::new();
+            let mut quoted = false;
+            let mut complete = true;
+            while j < s.len() && !s[j].is_whitespace() && !matches!(s[j], ';' | '|' | '&' | '(' | ')' | '<' | '>') {
+                match s[j] {
+                    '\'' | '"' => {
+                        let close = s[j];
+                        quoted = true;
+                        j += 1;
+                        while j < s.len() && s[j] != close {
+                            delimiter.push(s[j]);
+                            j += 1;
+                        }
+                        if j == s.len() {
+                            complete = false;
+                        }
+                        j += 1;
+                    }
+                    '\\' => {
+                        quoted = true;
+                        if let Some(&next) = s.get(j + 1) {
+                            delimiter.push(next);
+                        }
+                        j += 2;
+                    }
+                    other => {
+                        delimiter.push(other);
+                        j += 1;
+                    }
+                }
+            }
+            let before: String = s[line_start..i].iter().collect();
+            heredocs.push(Heredoc {
+                delimiter,
+                quoted: quoted && complete,
+                statement_start,
+                context_ok: group_depth == 0
+                    && !before.contains("((")
+                    && !before.contains("[[")
+                    && !before.contains('`')
+                    && !before.contains("$("),
+            });
+        }
         if strict && mode == Mode::PowerShell {
             if ('\u{2018}'..='\u{201e}').contains(&c) {
                 bail!("EncodedCommand contains unsupported smart quotation marks.");
@@ -1550,7 +2065,14 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             {
                 bail!("EncodedCommand Unicode escapes cannot be inspected.");
             }
-            if quote == '"' && c == '$' && s.get(i + 1) == Some(&'(') {
+            // 二重引用内の`$(...)`は任意のコマンドを実行しうるため原則拒否する。
+            // ただし変数の参照・プロパティ参照・数値添字だけの形（`$($sw.Elapsed.TotalSeconds)`・
+            // `$($r.items[0].Name)`）はコマンドもメソッドも呼ばないため、そのまま文字列として読む。
+            if quote == '"'
+                && c == '$'
+                && s.get(i + 1) == Some(&'(')
+                && !powershell_property_subexpression(&s[i + 2..])
+            {
                 bail!("EncodedCommand expandable string subexpressions cannot be inspected.");
             }
             if quote == '\0' && c == '&' {
@@ -1669,11 +2191,14 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
         {
             i += 1;
             c = s[i];
+            // 行継続でつないだ語も、shellによって語の割れ方が変わりうるため退避ありとして扱う。
+            t.escaped = true;
             if matches!(c, '\r' | '\n') {
                 if c == '\r' && s.get(i + 1) == Some(&'\n') {
                     i += 1;
                 }
             } else {
+                t.bare_chars += 1;
                 append(&mut t, c, &mut previous_equal);
             }
             i += 1;
@@ -1687,6 +2212,8 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             let body = here_string(&s, &mut i, here_quote)?;
             t.text.push_str(&body);
             t.quoted = true;
+            t.quote_segments += 1;
+            t.non_single_quote = true;
             i += 1;
             continue;
         }
@@ -1700,6 +2227,10 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             previous_equal = false;
             quote = c;
             t.quoted = true;
+            t.quote_segments += 1;
+            if c != '\'' {
+                t.non_single_quote = true;
+            }
             i += 1;
             continue;
         }
@@ -1713,8 +2244,33 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
         if c.is_whitespace() || is_boundary {
             flush(&mut t, &mut out);
             previous_equal = false;
+            // 行末で、記録したヒアドキュメントの本文をdataとして読み飛ばせるか判定する。
+            if mode == Mode::Posix && c == '\n' {
+                let skip = heredoc_skip(&s, i + 1, &heredocs, &out, heredoc_boundary_after)?;
+                heredocs.clear();
+                heredoc_boundary_after = false;
+                if let Some(next) = skip {
+                    boundary(&mut out);
+                    statement_start = out.len();
+                    i = next;
+                    line_start = next;
+                    continue;
+                }
+                line_start = i + 1;
+            }
+            if mode == Mode::Posix && is_boundary && !matches!(c, '\r' | '\n') {
+                if !heredocs.is_empty() {
+                    heredoc_boundary_after = true;
+                }
+                match c {
+                    '(' | '{' => group_depth += 1,
+                    ')' | '}' => group_depth -= 1,
+                    _ => {}
+                }
+            }
             if is_boundary {
                 boundary(&mut out);
+                statement_start = out.len();
                 // CMDでは`;`は空白相当の区切りで文の境界ではない。検査のため文は割るが、
                 // 境界が`;`だったことを残し、`cmd`wrapperの引数列が割れた形を呼出し側で拒否できるようにする。
                 if mode == Mode::Cmd
@@ -1729,6 +2285,7 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             if mode == Mode::Cmd && c == ',' {
                 t.commas.push(t.text.len());
             }
+            t.bare_chars += 1;
             append(&mut t, c, &mut previous_equal);
         }
         i += 1;
@@ -1768,21 +2325,49 @@ fn inspect(input: &Value, config: &Path, cli: &Path) -> Result<Value> {
     } else {
         None
     };
-    let mut inspection = Inspector::default();
+    let mut inspection = Inspector {
+        admin_cli: cli.to_string_lossy().into_owned(),
+        admin_config: config.to_string_lossy().into_owned(),
+        ..Inspector::default()
+    };
     if !inspection.contains(command, 0, mode, false)? {
         return Ok(json!({}));
     }
     // 単独EncodedCommandは復号本文をPowerShellとして確定検査しているため、
     // shell不明時の候補注記とEncodedCommandへの変換案内を付けない。
     let standalone_encoded = inspection.standalone_encoded;
+    let deletion = inspection.deletion;
     let mut reason = inspection.detection.unwrap_or_else(|| {
         "Prunlet rejected this command because an invocation could not be safely classified.".into()
     });
+    let executable = cli.to_string_lossy();
+    let config = config.to_string_lossy();
+    // 削除命令を検知していない拒否（構文を静的に検査できない場合）は、削除の手順を長く添えても
+    // 役に立たず、拒否のたびに大量の文脈を消費する。原因と書き換えの方向だけを短く返す。
+    if !deletion {
+        if mode.is_none() && cfg!(windows) && !standalone_encoded {
+            reason.push_str(" Shell metadata is missing or unsupported; this is a candidate interpretation, not a confirmed local deletion.");
+        }
+        // CLIの表記は各OSの完全な案内と同じ引用規則にそろえる。
+        let quote = |s: &str| {
+            if !cfg!(windows) {
+                format!("'{}'", s.replace('\'', "'\\''"))
+            } else if s.chars().any(char::is_whitespace) {
+                format!("\"{s}\"")
+            } else {
+                s.into()
+            }
+        };
+        reason.push_str(&format!(
+            " The hook did not execute the command. This is an inspection limit, not a detected deletion: rewrite the command without that construct (for example, run the logic from a script file). For authorized deletions use the installed Prunlet CLI: {} --config {} delete --paths-file <absolute-json-file>.",
+            quote(&executable),
+            quote(&config)
+        ));
+        return Ok(deny(&reason));
+    }
     if mode.is_none() && cfg!(windows) && !standalone_encoded {
         reason.push_str(" Shell metadata is missing or unsupported; this is a candidate interpretation, not a confirmed local deletion. Quoted search text or remote script data may be interpreted as command syntax. If the host forwards the tool as Bash without shell metadata, setting exec_command.shell alone cannot resolve this ambiguity. For an authorized SSH script sent from PowerShell, encode the entire local PowerShell script as UTF-16LE Base64 and submit the standalone form pwsh -NoProfile -EncodedCommand <base64>. The hook decodes and inspects that script; it does not exempt SSH names or remote deletion targets from inspection. See docs/integration.md for the supported form.");
     }
-    let executable = cli.to_string_lossy();
-    let config = config.to_string_lossy();
     if cfg!(windows) {
         let quote = |s: &str| {
             if s.chars().any(char::is_whitespace) {
@@ -2670,6 +3255,270 @@ mod tests {
             candidate.contains("candidate interpretation"),
             "{candidate}"
         );
+    }
+
+    /// 共通指示の管理者起動（名前付きの静的cmd.exe＋固定形の単一引用引数）だけを許可し、
+    /// 本文の削除・入れ子shell・メタ文字による文の分割・位置引数や既定値による注入は拒否する。
+    #[test]
+    fn encoded_admin_cmd_start_process_accepts_only_the_fixed_form() {
+        if !cfg!(windows) {
+            return;
+        }
+        let encode = |script: &str| {
+            let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            format!("pwsh -NoProfile -EncodedCommand {}", STANDARD.encode(bytes))
+        };
+        // reason()がhookへ渡す配置済みCLI・設定（C:\fixture\…）と同じパスだけが許可される。
+        let cli = r#""C:\fixture\prunlet.exe" --config "C:\fixture\config.json""#;
+        let admin_registry = format!(
+            r#"Start-Process -FilePath cmd.exe -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList '/d /c "{cli} registry-delete --view 64 --recursive -- HKEY_CURRENT_USER\Software\PrunletE2E\x > D:\tmp\out.json 2>&1"'"#
+        );
+        for allowed in [
+            admin_registry.clone(),
+            format!(
+                r#"New-Item -ItemType Directory -Path D:\tmp\x -Force | Out-Null; {admin_registry}"#
+            ),
+            format!(r#"$p = {admin_registry}"#),
+            format!(
+                r#"Start-Process -ArgumentList '/d /c "{cli} delete --paths-file D:\tmp\x\list.json"' -Verb RunAs -PassThru -FilePath cmd"#
+            ),
+            format!(
+                r#"saps -FilePath 'C:\Windows\System32\cmd.exe' -ArgumentList '/d /c "{cli} delete --paths-file D:\tmp\x\list.json"' -Verb RunAs"#
+            ),
+            // CLI・設定パスのASCII大文字小文字の違いは同じ配置として扱う。
+            r#"Start-Process -FilePath cmd.exe -ArgumentList '/d /c ""c:\FIXTURE\Prunlet.exe" --config "C:\fixture\CONFIG.json" delete --paths-file D:\a.json"'"#.to_owned(),
+        ] {
+            assert_eq!(reason(&encode(&allowed), "Bash", None), None, "{allowed}");
+        }
+        let body = |arguments: &str| {
+            format!("Start-Process -FilePath cmd.exe -Verb RunAs -ArgumentList '{arguments}'")
+        };
+        let mut denied = vec![
+            // 本文の削除・入れ子shell・CMDのstart・実行体の差し替え。
+            body(r"/d /c del C:\fixture\file.txt"),
+            body(r"/d /c rd /s /q C:\fixture"),
+            body(r"/d /c reg delete HKCU\Software\X /f"),
+            body(r#"/d /c ""C:\fixture\prunlet.exe" --config "C:\fixture\config.json" delete" & del C:\fixture"#),
+            // 配置済みCLI・設定以外の実行体や設定（同名の任意exeを含む）は昇格させない。
+            body(r#"/d /c ""C:\x\prunlet.exe" --config "C:\fixture\config.json" delete --paths-file C:\a.json""#),
+            body(r#"/d /c ""C:\fixture\prunlet.exe" --config "C:\x\config.json" delete --paths-file C:\a.json""#),
+            body(r#"/d /c ""C:\fixture\..\x\prunlet.exe" --config "C:\fixture\config.json" delete --paths-file C:\a.json""#),
+            // 出力リダイレクト先は.jsonだけ（任意ファイルを管理者権限で切り詰めさせない）。ADS指定も拒否する。
+            body(r#"/d /c ""C:\fixture\prunlet.exe" --config "C:\fixture\config.json" delete --paths-file C:\a.json > C:\Windows\System32\drivers\etc\hosts 2>&1""#),
+            body(r#"/d /c ""C:\fixture\prunlet.exe" --config "C:\fixture\config.json" delete --paths-file C:\a.json > C:\o.json:x.json 2>&1""#),
+            body(r#"/d /c ""C:\fixture\prunlet.exe" --config "C:\fixture\config.json" delete --paths-file C:\a.json > C:\o.json""#),
+            // ASCII以外の大文字小文字畳み込み（ケルビン記号・長いs）で許可文字やパスに一致させない。
+            body("/d /c \"\"C:\\fixture\\prunlet.exe\" --config \"C:\\fixture\\config.json\" delete --paths-file C:\\a.j\u{17f}on\""),
+            body("/d /c \"\"C:\\fixture\\prunlet.exe\" --config \"C:\\fixture\\config.j\u{17f}on\" delete --paths-file C:\\a.json\""),
+            // cmd.exeが実際に解釈する区切り・演算子・引用・展開（検査器との解釈のずれ）。
+            body(r"& /d /c del C:\x"),
+            body(r"| /d /c del C:\x"),
+            body(r"( /d /c del C:\x"),
+            body(r") /d /c del C:\x"),
+            body(r"/d & /c del C:\x"),
+            body("x\n/d /c del C:\\x"),
+            body("/d\n/c del C:\\x"),
+            body(r#"/d /c "reg" delete HKCU\Software\X /f"#),
+            body(r#"/d /c "del" C:\x"#),
+            body(r#"/d /c "C:\Windows\System32\cmd.exe" /c del C:\x"#),
+            body(r#"/d /c "ver" "& del C:\x""#),
+            body(r#"/d /c ""C:\fixture\prunlet.exe" --config "C:\fixture\config.json" delete --paths-file C:\a.json" & del C:\x"#),
+            body(r#"/d /c ""C:\fixture\prunlet.exe" --config "C:\fixture\config.json" delete --paths-file %ComSpec%""#),
+            body(r#"/d /c ""C:\fixture\prunlet.exe" --config "C:\fixture\config.json" delete --paths-file ^C:\a.json""#),
+            body(r#"/d /c ""C:\fixture\prunlet.exe" --config "C:\fixture\config.json" delete --paths-file C:\a.json > C:\o.json 2>&1 & del C:\x""#),
+            // 位置引数・括弧式・scriptblock・既定値による注入・ArgumentListの省略。
+            r"Start-Process cmd.exe ('/d /c del C:\x') -Verb RunAs".to_owned(),
+            r"Start-Process cmd.exe {/d /c del C:\x}".to_owned(),
+            r"$a='/c del C:\x'; Start-Process cmd.exe ($a)".to_owned(),
+            r"Start-Process cmd.exe '/d /c exit 1' -Verb RunAs".to_owned(),
+            r"$PSDefaultParameterValues.Add('Start-Process:ArgumentList','/d /c del C:\x'); Start-Process -FilePath cmd.exe -Verb RunAs".to_owned(),
+            r"Start-Process -FilePath cmd.exe -Verb RunAs".to_owned(),
+            r"Start-Process cmd -Verb RunAs".to_owned(),
+            // 起動先がcmd以外・動的、引数が配列・二重引用・変数・連結・ヒアストリングの形。
+            r"Start-Process -FilePath pwsh -ArgumentList '-NoProfile'".to_owned(),
+            r"Start-Process -FilePath powershell.exe -Verb RunAs".to_owned(),
+            r"Start-Process rm".to_owned(),
+            r"Start-Process -FilePath $exe -ArgumentList '/c dir'".to_owned(),
+            r"Start-Process -FilePath cmd.exe -ArgumentList '/d','/c','del C:\fixture'".to_owned(),
+            r#"Start-Process -FilePath cmd.exe -ArgumentList "/d /c $x""#.to_owned(),
+            r"Start-Process -FilePath cmd.exe -ArgumentList $arguments".to_owned(),
+            r"Start-Process -FilePath cmd.exe -ArgumentList '/d /c'$tail".to_owned(),
+            "Start-Process -FilePath cmd.exe -ArgumentList @'\n/d /c dir\n'@".to_owned(),
+            // 省略形・colon形・未知や重複の引数・退避文字は受理しない。
+            r"Start-Process -File cmd.exe -ArgumentList '/c dir'".to_owned(),
+            r"Start-Process -Args '/c dir' -FilePath cmd.exe".to_owned(),
+            r"Start-Process -FilePath:cmd.exe -ArgumentList '/c dir'".to_owned(),
+            r"Start-Process -FilePath cmd.exe -ArgumentList '/c dir' -Credential $c".to_owned(),
+            r"Start-Process -FilePath cmd.exe -FilePath cmd.exe -ArgumentList '/c dir'".to_owned(),
+            r"Start-Process -FilePath cmd.exe -ArgumentList '/c dir' extra".to_owned(),
+            r"Start-Process -FilePath cmd.exe. -ArgumentList '/c dir'".to_owned(),
+            r"Start-Process -FilePath D:\tmp\cmd.exe -ArgumentList '/c dir'".to_owned(),
+            r"Start-Process -FilePath cmd.`exe -ArgumentList '/c dir'".to_owned(),
+            // 呼出し演算子での名前指定・Invoke-Expressionは従来どおり拒否する。
+            r"& 'Start-Process' rm".to_owned(),
+            r#"Invoke-Expression "cmd /c dir""#.to_owned(),
+        ];
+        // 本文が正規形でも、同じ形の拒否理由が`Start-Process`起点であることを確認するための別名・switch重複。
+        denied.push(format!(
+            r#"Start-Process -FilePath cmd.exe -Wait -Wait -ArgumentList '/d /c "{cli} delete --paths-file D:\a.json"'"#
+        ));
+        for command in &denied {
+            assert!(
+                reason(&encode(command), "Bash", None).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    /// POSIX規則だけで検査した結果（Windowsの候補解釈がPOSIX固有の穴を覆い隠さないようにする）。
+    fn posix_denied(command: &str) -> bool {
+        let result = Inspector::default().contains(command, 0, Some(Mode::Posix), false);
+        result.is_err() || result.unwrap()
+    }
+
+    /// 引用終端のヒアドキュメントは、ファイルへの`cat`・インタプリタが受け取る形に限って本文をdataとして読み、
+    /// shellへ渡りうる形や本文の後ろの削除命令は従来どおり拒否する。
+    #[test]
+    fn quoted_heredoc_bodies_are_data_only_for_file_sinks_and_interpreters() {
+        for allowed in [
+            "cat > /d/tmp/x.js <<'EOF'\nfor (const f of files) { rm(f) }\nrm -rf /tmp/y\nEOF\necho done",
+            "mkdir -p /d/tmp/x && cat > /d/tmp/x/a.py <<'EOF'\nfor f in x:\n    pass\nEOF",
+            "cat <<\"EOF\" > out.txt\nwhile true; do rm -rf /tmp/y; done\nEOF",
+            "cat >> notes.md <<-'EOF'\n\tcase x in *) rm -rf /tmp/y;; esac\n\tEOF",
+            "cat > f <<\\EOF\nrm -rf /tmp/y\nEOF",
+            "cat > f 2>/dev/null <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "python - <<'EOF'\nfor i in range(3):\n    print(i)\nEOF",
+            "PYTHONUTF8=1 python3 -I - <<'EOF'\nimport os\nEOF",
+            "node <<'EOF'\nfor (const x of []) {}\nEOF",
+            "cat > f <<'EOF'\r\nrm -rf /tmp/y\r\nEOF\r\necho ok",
+            // 終端のない本文はbashでも入力の終わりまでがdata。
+            "cat > f <<'EOF'\nrm -rf /tmp/y\n",
+        ] {
+            assert!(!posix_denied(allowed), "{allowed:?}");
+        }
+        for denied in [
+            // 本文の後ろの削除命令。
+            "cat > /d/tmp/x <<'EOF'\nx\nEOF\nrm -rf /tmp/y",
+            "cat > f <<'EOF'\r\nx\r\nEOF\r\nrm -rf /tmp/y",
+            // shellへ渡りうる形（パイプ・同じ行の後続文・グループ・/dev出力・動的な出力先・shell自体）。
+            "cat <<'EOF' | sh\nrm -rf /tmp/y\nEOF",
+            "cat <<'EOF' |\nrm -rf /tmp/y\nEOF",
+            "cat > f <<'EOF' && sh f\nrm -rf /tmp/y\nEOF",
+            "(\ncat > /tmp/f <<'EOF'\nrm -rf /tmp/y\nEOF\n) | sh",
+            "{ cat > /tmp/f <<'EOF'\nrm -rf /tmp/y\nEOF\n} | sh",
+            "cat > /dev/stdout <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "cat > /proc/self/fd/1 <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "cat > \"$out\" <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "cat <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "bash <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "sh -s <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "ssh mac <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "cat > f <<'EOF' x\nrm -rf /tmp/y\nEOF",
+            "python -c 'import sys' <<'EOF' | sh\nrm -rf /tmp/y\nEOF",
+            "python -m pip <<'EOF'\nrm -rf /tmp/y\nEOF",
+            // 展開される本文（終端語が引用されていない）は文として検査する。
+            "cat > f <<EOF\n$(rm -rf /tmp/y)\nEOF",
+            "cat > f <<EOF\nrm -rf /tmp/y\nEOF",
+            // `<<`を算術・`[[`・逆引用・コマンド置換の中で書いた形は読み飛ばさない。
+            "echo $((1<<'X'))\nrm -rf /tmp/y\nX",
+            "[[ a << 'X' ]]\nrm -rf /tmp/y\nX",
+            "x=$(cat > f <<'EOF'\nrm -rf /tmp/y\nEOF\n)",
+            "echo `cat > f <<'EOF'`\nrm -rf /tmp/y\nEOF",
+            // here-string（`<<<`）はヒアドキュメントではない。
+            "cat > f <<<'EOF'\nrm -rf /tmp/y\nEOF",
+        ] {
+            assert!(posix_denied(denied), "{denied:?}");
+        }
+    }
+
+    /// 制御構文の中の代入・`[`・終端語のリダイレクトは実行名ではないため検査不能にしない。削除命令は拒否する。
+    #[test]
+    fn posix_control_flow_assignments_tests_and_redirections_are_inspected() {
+        for allowed in [
+            "for f in a b; do n=$(basename $f); echo $n; done",
+            "for f in *.rs; do if [ -f \"$f\" ]; then echo $f; fi; done 2>&1 | head",
+            "while read f; do echo $f; done < list.txt",
+            "for f in *; do\n  b=$(basename $f)\n  [ -f \"$f\" ] && echo $b\ndone",
+            "if [[ -n \"$x\" ]]; then echo ok; fi >/dev/null",
+            "until [ -s out ]; do sleep 1; done",
+        ] {
+            assert!(!posix_denied(allowed), "{allowed:?}");
+        }
+        for denied in [
+            "for f in a; do rm -rf $f; done",
+            "for f in a; do x=1 rm -rf $f; done",
+            "for f in a; do n=$(rm -rf $f); done",
+            "for f in a; do n=1 $cmd $f; done",
+            "[ -f x ] && rm -rf y",
+            "if [ -f x ]; then rm -rf y; fi",
+            "for f in a; do echo; done rm -rf y",
+            "for f in a; do echo; done > out; rm -rf y",
+        ] {
+            assert!(posix_denied(denied), "{denied:?}");
+        }
+    }
+
+    /// EncodedCommand内の`"$(...)"`は参照だけの形、pwshは静的な`.ps1`の`-File`実行だけを許可する。
+    #[test]
+    fn encoded_property_subexpressions_and_static_pwsh_file_are_allowed() {
+        if !cfg!(windows) {
+            return;
+        }
+        let encode = |script: &str| {
+            let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            format!("pwsh -NoProfile -EncodedCommand {}", STANDARD.encode(bytes))
+        };
+        for allowed in [
+            r#"$sw = [Diagnostics.Stopwatch]::StartNew(); "test sec: $($sw.Elapsed.TotalSeconds)""#,
+            r#""first: $($r.items[0].Name) of $($r.Count)""#,
+            r#""home=$($env:USERPROFILE)""#,
+            r"pwsh -NoProfile -File D:\tmp\x\run.ps1 -Label a",
+            r"& pwsh -NoProfile -NonInteractive -File 'D:\tmp\x y\run.ps1'; 'exit=' + $LASTEXITCODE",
+            r"powershell -NoProfile -ExecutionPolicy Bypass -File C:\tools\setup.ps1",
+        ] {
+            assert_eq!(reason(&encode(allowed), "Bash", None), None, "{allowed}");
+        }
+        for denied in [
+            r#""$(Remove-Item C:\fixture\x)""#,
+            r#""$($f.Delete())""#,
+            r#""$($x.Prop)$(Remove-Item C:\fixture\x)""#,
+            r#""$($x | Remove-Item)""#,
+            r#""$($x.Prop; Remove-Item C:\fixture\x)""#,
+            r#""$($x[$i])""#,
+            r"pwsh -File -",
+            r"pwsh -NoProfile -File $s",
+            r"pwsh -Command Remove-Item C:\fixture\x",
+            r"pwsh -NoProfile -File x.ps1; Remove-Item C:\fixture\x",
+            r"pwsh -f x.ps1",
+            r"pwsh -File x.txt",
+            r"pwsh -ExecutionPolicy $p -File x.ps1",
+            r"pwsh -EncodedCommand AAAA -File x.ps1",
+            r"cmd /c D:\tmp\x.cmd",
+        ] {
+            assert!(reason(&encode(denied), "Bash", None).is_some(), "{denied}");
+        }
+    }
+
+    /// 削除命令の拒否は従来どおりCLIの完全な案内を付け、検査不能による拒否は短い案内だけを返す。
+    #[test]
+    fn inspection_limit_rejections_use_a_short_reason() {
+        let deletion = reason(r"Remove-Item -LiteralPath C:\fixture\x", "exec_command", Some("pwsh"))
+            .expect("deletion must be denied");
+        assert!(deletion.contains("detected token \"Remove-Item\""), "{deletion}");
+        assert!(deletion.contains("delete --paths-file"), "{deletion}");
+        let limit = reason("case x in a) echo;; esac", "exec_command", Some("bash"))
+            .expect("unsupported syntax must be denied");
+        assert!(limit.contains("interpretation="), "{limit}");
+        assert!(limit.contains("inspection limit, not a detected deletion"), "{limit}");
+        assert!(limit.contains("delete --paths-file"), "{limit}");
+        assert!(limit.len() < 700, "{} chars: {limit}", limit.len());
+        if cfg!(windows) {
+            assert!(deletion.len() > limit.len() * 2, "{deletion}");
+            let candidate = reason("case x in a) echo;; esac", "Bash", None)
+                .expect("unsupported syntax must be denied");
+            assert!(candidate.contains("candidate interpretation"), "{candidate}");
+            assert!(candidate.len() < 800, "{} chars: {candidate}", candidate.len());
+        }
     }
 
     #[test]
