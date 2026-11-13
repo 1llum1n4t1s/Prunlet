@@ -3,20 +3,39 @@
 param(
     [Parameter(Mandatory)][string]$PackagePath,
     [Parameter(Mandatory)][string]$SourceRoot,
-    [Parameter(Mandatory)][string]$PublishDirectory,
+    # 今回のビルド出力。省略した場合（CIで添付済みZIPだけを検証する場合）は、実行ファイルを
+    # ビルドと照合できない代わりに、署名・署名者・版・machineをZIPの中身から確認する。
+    [string]$PublishDirectory,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$CommitSha,
     [Parameter(Mandatory)][string]$DefaultBranch,
     [Parameter(Mandatory)][ValidateSet('win-x64', 'win-arm64')][string]$Runtime,
-    [Parameter(Mandatory)][string]$Repository
+    [Parameter(Mandatory)][string]$Repository,
+    # 実行ファイルに有効なAuthenticode署名（署名者・タイムスタンプ付き）を要求する。
+    [switch]$RequireSignature,
+    # PublishDirectoryを省略する場合に必須。実行ファイルの製品版と照合する（例: 1.0.43）。
+    [string]$ExpectedVersion,
+    # PublishDirectoryを省略する場合に必須。実行ファイルを取り出して検査する、未使用の絶対パス。
+    # 呼出し元が用意・清掃する（このスクリプトは削除しない）。
+    [string]$ExtractDirectory
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$fromBuild = [bool]$PublishDirectory
+if (!$fromBuild) {
+    # ビルドとの照合がない場合は、署名と版の確認を省略させない。
+    if (!$RequireSignature) { throw 'Verifying a package without PublishDirectory requires -RequireSignature.' }
+    if ($ExpectedVersion -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw 'ExpectedVersion must be a release version such as 1.2.3.' }
+    if (!$ExtractDirectory -or ![IO.Path]::IsPathFullyQualified($ExtractDirectory) -or (Test-Path -LiteralPath $ExtractDirectory)) { throw 'ExtractDirectory must be an unused absolute path.' }
+}
+if ($RequireSignature) { . (Join-Path $PSScriptRoot 'Signing.Common.ps1') }
+$executables = @('bin/prunlet.exe', 'bin/prunlet-maintenance.exe', 'bin/prunlet-hook.exe')
+
 # アップデーターが受け取るファイルと、今回のビルド・sourceを照合する。
 $inputs = [ordered]@{
-    'bin/prunlet.exe' = (Join-Path $PublishDirectory 'prunlet.exe')
-    'bin/prunlet-maintenance.exe' = (Join-Path $PublishDirectory 'prunlet-maintenance.exe')
-    'bin/prunlet-hook.exe' = (Join-Path $PublishDirectory 'prunlet-hook.exe')
+    'bin/prunlet.exe' = if ($fromBuild) { Join-Path $PublishDirectory 'prunlet.exe' } else { $null }
+    'bin/prunlet-maintenance.exe' = if ($fromBuild) { Join-Path $PublishDirectory 'prunlet-maintenance.exe' } else { $null }
+    'bin/prunlet-hook.exe' = if ($fromBuild) { Join-Path $PublishDirectory 'prunlet-hook.exe' } else { $null }
     'bin/Install-Prunlet.ps1' = (Join-Path $SourceRoot 'scripts\Install-Prunlet.ps1')
     'bin/start-prunlet-mcp.ps1' = (Join-Path $SourceRoot 'integration\start-prunlet-mcp.ps1')
     'bin/configuration-common.ps1' = (Join-Path $SourceRoot 'integration\configuration-common.ps1')
@@ -67,17 +86,46 @@ try {
             if ($item -isnot [Collections.IDictionary] -or $item['sha256'] -cnotmatch '^[0-9A-F]{64}$') {
                 throw "Package metadata is invalid: $name"
             }
-            $source = Get-Item -LiteralPath $inputs[$name]
             $entry = $entries[$name]
-            if ($source.Length -ne $item['bytes'] -or $entry.Length -ne $item['bytes']) {
-                throw "Package size differs: $name"
-            }
-            $sourceHash = (Get-FileHash -LiteralPath $source.FullName -Algorithm SHA256).Hash
+            if ($entry.Length -ne $item['bytes']) { throw "Package size differs: $name" }
             $entryStream = $entry.Open()
             try { $entryHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($entryStream)) }
             finally { $entryStream.Dispose() }
-            if ($sourceHash -cne $item['sha256'] -or $entryHash -cne $item['sha256']) {
-                throw "Package hash differs: $name"
+            if ($entryHash -cne $item['sha256']) { throw "Package hash differs: $name" }
+            if ($inputs[$name]) {
+                # ビルド出力・sourceとの照合。
+                $source = Get-Item -LiteralPath $inputs[$name]
+                if ($source.Length -ne $item['bytes']) { throw "Package size differs: $name" }
+                if ((Get-FileHash -LiteralPath $source.FullName -Algorithm SHA256).Hash -cne $item['sha256']) { throw "Package hash differs: $name" }
+            }
+        }
+        if ($manifest['files']['bin/prunlet.exe']['sha256'] -cne $manifest['files']['bin/prunlet-hook.exe']['sha256']) { throw 'The hook host must match the CLI binary.' }
+        if ($RequireSignature) {
+            if ($fromBuild) {
+                # ビルド出力はZIPとhashが一致済みなので、同じ実体の署名を確認する。
+                foreach ($name in $executables) { $null = Assert-PrunletAuthenticodeSigned $inputs[$name] }
+            } else {
+                # ZIPから取り出した実体で、署名・PEのmachine・製品版を確認する。
+                $null = New-Item -ItemType Directory -Path $ExtractDirectory
+                $expectedMachine = if ($Runtime -eq 'win-x64') { 0x8664 } else { 0xaa64 }
+                foreach ($name in $executables) {
+                    $path = Join-Path $ExtractDirectory ([IO.Path]::GetFileName($name))
+                    $entryStream = $entries[$name].Open()
+                    try {
+                        $file = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                        try { $entryStream.CopyTo($file) } finally { $file.Dispose() }
+                    } finally { $entryStream.Dispose() }
+                    if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -cne $manifest['files'][$name]['sha256']) { throw "Extracted executable differs: $name" }
+                    $bytes = [IO.File]::ReadAllBytes($path)
+                    if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw "Package executable is not a PE file: $name" }
+                    $offset = [BitConverter]::ToUInt32($bytes, 0x3c)
+                    if ($offset -lt 64 -or $offset -gt $bytes.Length - 6 -or [BitConverter]::ToUInt32($bytes, $offset) -ne 0x00004550 -or [BitConverter]::ToUInt16($bytes, $offset + 4) -ne $expectedMachine) {
+                        throw "Package executable does not match ${Runtime}: $name"
+                    }
+                    $version = ([Diagnostics.FileVersionInfo]::GetVersionInfo($path).ProductVersion -split '\+')[0]
+                    if ($version -cne $ExpectedVersion) { throw "Package executable version differs: $name $version" }
+                    $null = Assert-PrunletAuthenticodeSigned $path
+                }
             }
         }
     } finally { $archive.Dispose() }

@@ -3,11 +3,15 @@
 param(
     [Parameter(Mandatory)][string]$PackagePath,
     [Parameter(Mandatory)][string]$SourceRoot,
-    [Parameter(Mandatory)][string]$PublishDirectory,
+    # 省略時は添付済みの署名付きZIPだけを検証する（Verify-ReleasePackage.ps1の同名引数を参照）。
+    [string]$PublishDirectory,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$CommitSha,
     [Parameter(Mandatory)][string]$DefaultBranch,
     [Parameter(Mandatory)][ValidateSet('win-x64', 'win-arm64')][string]$Runtime,
     [string]$Repository = '1llum1n4t1s/Prunlet',
+    [switch]$RequireSignature,
+    [string]$ExpectedVersion,
+    [string]$ExtractDirectory,
     [string]$AccountId = $env:PRUNLET_R2_ACCOUNT_ID,
     [string]$Bucket = $(if ($env:PRUNLET_R2_BUCKET) { $env:PRUNLET_R2_BUCKET } else { 'prunlet-updates' })
 )
@@ -18,9 +22,14 @@ $package = $null; $client = $null
 $phase = 'identity'
 try {
     if ($Repository -cne '1llum1n4t1s/Prunlet' -or ![IO.Path]::IsPathFullyQualified($PackagePath) -or
-        ![IO.Path]::IsPathFullyQualified($SourceRoot) -or ![IO.Path]::IsPathFullyQualified($PublishDirectory)) { Stop-PrunletR2 $phase 'invalid-input' }
+        ![IO.Path]::IsPathFullyQualified($SourceRoot) -or ($PublishDirectory -and ![IO.Path]::IsPathFullyQualified($PublishDirectory))) { Stop-PrunletR2 $phase 'invalid-input' }
     $phase = 'package-verification'
-    $verified = & (Join-Path $PSScriptRoot 'Verify-ReleasePackage.ps1') -PackagePath $PackagePath -SourceRoot $SourceRoot -PublishDirectory $PublishDirectory -CommitSha $CommitSha -DefaultBranch $DefaultBranch -Runtime $Runtime -Repository $Repository
+    $verifyArguments = @{ PackagePath = $PackagePath; SourceRoot = $SourceRoot; CommitSha = $CommitSha; DefaultBranch = $DefaultBranch; Runtime = $Runtime; Repository = $Repository }
+    if ($PublishDirectory) { $verifyArguments['PublishDirectory'] = $PublishDirectory }
+    if ($RequireSignature) { $verifyArguments['RequireSignature'] = $true }
+    if ($ExpectedVersion) { $verifyArguments['ExpectedVersion'] = $ExpectedVersion }
+    if ($ExtractDirectory) { $verifyArguments['ExtractDirectory'] = $ExtractDirectory }
+    $verified = & (Join-Path $PSScriptRoot 'Verify-ReleasePackage.ps1') @verifyArguments
     if ($verified -isnot [string] -or $verified -cnotmatch '^[0-9A-F]{64}$') { Stop-PrunletR2 $phase 'verification-failed' }
     # 検証したZIPを固定し、以後はこの同一streamだけを送信・再照合する。
     $phase = 'package-pin'

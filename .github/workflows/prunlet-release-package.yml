@@ -9,12 +9,15 @@ permissions:
 
 jobs:
   package:
-    # 公開タグから生成した実物だけを、同じreleaseへ添付する。
+    # Windowsの更新ZIPはSimplySignで署名するため、リリース担当者の機械で
+    # scripts/Publish-PrunletWindows.ps1が生成し、公開前のreleaseへ添付する。
+    # このjobは添付済みZIPを公開タグのsourceと署名で検証し、既存のR2へ配置するだけで、
+    # ビルド・releaseへの書込みは行わない。
     if: ${{ github.repository == '1llum1n4t1s/Prunlet' && !github.event.release.prerelease && !github.event.release.draft }}
     runs-on: windows-latest
     timeout-minutes: 30
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -29,10 +32,6 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Prepare Rust targets
-        run: |
-          rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify the released commit
         id: source
         env:
@@ -52,7 +51,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Release commit is not on the default branch.' }
           "commit=$commit" >> $env:GITHUB_OUTPUT
           "branch=$branch" >> $env:GITHUB_OUTPUT
-      - name: Build the released commit
+      - name: Download the signed package attached to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRUNLET_TAG: ${{ github.event.release.tag_name }}
+          PRUNLET_RUNTIME: ${{ matrix.runtime }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $directory = Join-Path $env:RUNNER_TEMP ('prunlet-download-' + $env:PRUNLET_RUNTIME)
+          $name = 'prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip'
+          gh release download $env:PRUNLET_TAG --repo $env:GITHUB_REPOSITORY --pattern $name --dir $directory
+          if ($LASTEXITCODE -ne 0) { throw "Signed package $name is not attached to the release; attach the output of Publish-PrunletWindows.ps1 before publishing." }
+          # GitHubが記録したassetのsize・digestと、取得した実物を照合する。
+          $asset = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:PRUNLET_TAG" --jq ".assets[] | select(.name == `"$name`") | {size, digest}" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or !$asset) { throw 'Release asset metadata is unavailable.' }
+          $package = Join-Path $directory $name
+          if ((Get-Item -LiteralPath $package).Length -ne $asset.size) { throw 'Downloaded package size differs from the release asset.' }
+          if ($asset.digest -and $asset.digest -cne ('sha256:' + (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant())) { throw 'Downloaded package digest differs from the release asset.' }
+      - name: Verify the signed package
+        # R2送信スクリプトは失敗理由を伏せるため、署名・版などの不一致を読めるよう単独で先に検証する。
         env:
           PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
           PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
@@ -60,54 +77,24 @@ jobs:
           PRUNLET_TAG: ${{ github.event.release.tag_name }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $output = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $env:PRUNLET_RUNTIME)
-          $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
-          & ./scripts/Publish-Prunlet.ps1 -OutputDirectory $output -Runtime $env:PRUNLET_RUNTIME | Out-Null
+          $package = Join-Path $env:RUNNER_TEMP ('prunlet-download-' + $env:PRUNLET_RUNTIME + '/prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
+          $extract = Join-Path $env:RUNNER_TEMP ('prunlet-verify-' + $env:PRUNLET_RUNTIME)
           $expectedVersion = $env:PRUNLET_TAG -replace '^v', ''
-          foreach ($name in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
-            $product = Join-Path $output ('publish/' + $name)
-            if (![IO.File]::Exists($product)) { throw "Published product missing: $name" }
-            $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($product).ProductVersion
-            if (($version -split '\+')[0] -cne $expectedVersion) { throw "Published product version differs: $name $version" }
-            $signature = Get-AuthenticodeSignature -LiteralPath $product
-            if ($signature.Status -notin @('NotSigned', 'Valid')) { throw "Published product signature is invalid: $name" }
-          }
-          & ./scripts/Package-PrunletUpdate.ps1 -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory (Join-Path $output 'publish') -OutputPath $package -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME | Out-Null
-      - name: Verify the release package
-        id: verified_package
+          & ./scripts/Verify-ReleasePackage.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME -Repository $env:GITHUB_REPOSITORY -RequireSignature -ExpectedVersion $expectedVersion -ExtractDirectory $extract
+      - name: Verify and publish the signed package to the existing R2 destination
         env:
           PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
           PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
           PRUNLET_RUNTIME: ${{ matrix.runtime }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $output = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $env:PRUNLET_RUNTIME)
-          $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
-          $sha256 = & ./scripts/Verify-ReleasePackage.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory (Join-Path $output 'publish') -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME -Repository $env:GITHUB_REPOSITORY
-          "sha256=$sha256" >> $env:GITHUB_OUTPUT
-      - name: Publish the verified package to the existing R2 destination
-        env:
-          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
-          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
-          PRUNLET_RUNTIME: ${{ matrix.runtime }}
+          PRUNLET_TAG: ${{ github.event.release.tag_name }}
           PRUNLET_R2_ACCOUNT_ID: ${{ secrets.PRUNLET_R2_ACCOUNT_ID }}
           PRUNLET_R2_ACCESS_KEY_ID: ${{ secrets.PRUNLET_R2_ACCESS_KEY_ID }}
           PRUNLET_R2_SECRET_ACCESS_KEY: ${{ secrets.PRUNLET_R2_SECRET_ACCESS_KEY }}
           PRUNLET_R2_BUCKET: ${{ vars.PRUNLET_R2_BUCKET || 'prunlet-updates' }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $output = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $env:PRUNLET_RUNTIME)
-          $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
-          & ./scripts/Publish-PrunletR2.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory (Join-Path $output 'publish') -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME -Repository $env:GITHUB_REPOSITORY
-      - name: Attach the same package to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PRUNLET_TAG: ${{ github.event.release.tag_name }}
-          PRUNLET_RUNTIME: ${{ matrix.runtime }}
-          PRUNLET_EXPECTED_SHA256: ${{ steps.verified_package.outputs.sha256 }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
-          if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -cne $env:PRUNLET_EXPECTED_SHA256) { throw 'Package changed after verification.' }
-          gh release upload $env:PRUNLET_TAG $package --repo $env:GITHUB_REPOSITORY
-          if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed; an existing asset was not overwritten.' }
+          $package = Join-Path $env:RUNNER_TEMP ('prunlet-download-' + $env:PRUNLET_RUNTIME + '/prunlet-update-' + $env:PRUNLET_RUNTIME + '.zip')
+          $extract = Join-Path $env:RUNNER_TEMP ('prunlet-extract-' + $env:PRUNLET_RUNTIME)
+          $expectedVersion = $env:PRUNLET_TAG -replace '^v', ''
+          # ビルド出力がないため、署名・署名者・タイムスタンプ・版・machine・同梱sourceを検証してから送る。
+          & ./scripts/Publish-PrunletR2.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $env:PRUNLET_RUNTIME -Repository $env:GITHUB_REPOSITORY -RequireSignature -ExpectedVersion $expectedVersion -ExtractDirectory $extract

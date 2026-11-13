@@ -3,11 +3,21 @@ param(
     [Parameter(Mandatory)][string]$OutputDirectory,
     [ValidateSet('win-x64', 'win-arm64')][string]$Runtime = 'win-x64',
     [string]$TargetDirectory = $env:PRUNLET_CARGO_TARGET_DIRECTORY,
-    [switch]$IncludeVerificationProbe
+    [switch]$IncludeVerificationProbe,
+    # 配布用にprunlet.exe・prunlet-maintenance.exeへAuthenticode署名する。SimplySignへの
+    # ログインが必要なため、リリース担当者のWindows機（Publish-PrunletWindows.ps1）だけで使う。
+    [switch]$Sign
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 . (Join-Path $PSScriptRoot 'RustBuildInputs.Common.ps1')
+if ($Sign) {
+    . (Join-Path $PSScriptRoot 'Signing.Common.ps1')
+    if ($IncludeVerificationProbe) { throw 'Signed release builds cannot include verification probes.' }
+    # 長いビルドの後で失敗しないよう、署名ツールと証明書を先に確認する。
+    $null = Find-PrunletSignTool
+    $null = Get-PrunletSigningCertificate
+}
 if (-not [IO.Path]::IsPathFullyQualified($OutputDirectory)) { throw 'OutputDirectory must be absolute.' }
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $targetRoot = if ($TargetDirectory) {
@@ -95,6 +105,15 @@ foreach ($name in @('prunlet.exe', 'prunlet-maintenance.exe')) {
 $exe = Join-Path $publish 'prunlet.exe'
 $maintenanceExe = Join-Path $publish 'prunlet-maintenance.exe'
 $hookExe = Join-Path $publish 'prunlet-hook.exe'
+$signing = $null
+if ($Sign) {
+    # hookの複製より前に署名する。署名ごとにタイムスタンプが変わるため、hookを別に
+    # 署名するとCLIとhookのhashが一致しなくなる（更新ZIPは同一hashを要求する）。
+    $unsigned = [ordered]@{}
+    foreach ($product in @($exe, $maintenanceExe)) { $unsigned[[IO.Path]::GetFileName($product)] = (Get-FileHash -LiteralPath $product -Algorithm SHA256).Hash.ToLowerInvariant() }
+    $signing = Invoke-PrunletAuthenticodeSign @($exe, $maintenanceExe)
+    $signing['unsignedSha256'] = $unsigned
+}
 # hook は CLI と同一実体の複製で、入口名から動作を限定する。
 Copy-Item -LiteralPath $exe -Destination $hookExe
 $probe = $null
@@ -119,11 +138,18 @@ $environmentAfter = @(Get-PrunletCargoEnvironmentInputs $repoRoot)
 if ($before.fingerprint -cne $after.fingerprint -or (ConvertTo-Json -InputObject $environmentBefore -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $environmentAfter -Depth 5 -Compress)) { throw 'Rust source or Cargo environment configuration changed during build.' }
 $products = [ordered]@{}
 foreach ($product in @($exe, $maintenanceExe, $hookExe)) { $products[[IO.Path]::GetFileName($product)] = (Get-FileHash -LiteralPath $product -Algorithm SHA256).Hash.ToLowerInvariant() }
+if ($Sign) {
+    # 複製後のhookも署名済みCLIと同一で、署名が有効なことを確認する。
+    if ($products['prunlet-hook.exe'] -cne $products['prunlet.exe']) { throw 'Signed hook differs from the signed CLI.' }
+    $null = Assert-PrunletAuthenticodeSigned $hookExe
+}
 $record = [ordered]@{
     schema = 1; sourceCommit = $commit; runtime = $Runtime; version = $version
     sourceFingerprint = $before.fingerprint; sourceFingerprintAlgorithm = 'sha256-relative-path-tab-content-sha256-v1'; sources = $before.sources
     build = [ordered]@{ toolchain = $toolchain; target = $target; targetDirectory = $targetRoot; profile = 'release'; sourceCommit = $commit; cargoEnvironmentInputs = $environmentBefore }
     product = [ordered]@{ relativePath = 'publish/prunlet.exe'; sha256 = $products['prunlet.exe'] }; products = $products; probe = $probe; verificationTools = $verificationTools
 }
+# 署名時だけ、署名者と署名前のhashを記録する。productsは署名後の配布物のhash。
+if ($signing) { $record['signing'] = $signing }
 [IO.File]::WriteAllText($manifestPath, ($record | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
 [ordered]@{ executable = $exe; maintenanceExecutable = $maintenanceExe; hookExecutable = $hookExe; runtime = $Runtime; sha256 = $products['prunlet.exe'].ToUpperInvariant(); maintenanceSha256 = $products['prunlet-maintenance.exe'].ToUpperInvariant(); hookSha256 = $products['prunlet-hook.exe'].ToUpperInvariant(); bytes = (Get-Item -LiteralPath $exe).Length; manifestPath = $manifestPath } | ConvertTo-Json

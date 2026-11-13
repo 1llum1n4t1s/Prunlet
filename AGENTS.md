@@ -81,7 +81,7 @@ x64・ARM64ともにGitHub ActionsのGitHub提供ランナー（x64は`ubuntu-la
 
 ## 導入と文書
 
-Prunletの `vava` で新しいリリースを公開するときは、Apple Silicon版のビルド・署名・公証・ZIP生成を `ssh mac` の実機で行う。[Apple Silicon版の公開手順](docs/distribution.md#apple-silicon版の公開手順)に従い、検証済みZIPを同じGitHub Releaseに添付してから公開する。Mac向けにGitHub Actionsを起動したり、GitHubホストのrunnerへ切り替えたりしない。Windows版は既存の配布workflowを使う。再開時は完了済みの工程と実物を照合して再利用する。
+Prunletの `vava` で新しいリリースを公開するときは、Apple Silicon版のビルド・署名・公証・ZIP生成を `ssh mac` の実機で行う。[Apple Silicon版の公開手順](docs/distribution.md#apple-silicon版の公開手順)に従い、検証済みZIPを同じGitHub Releaseに添付してから公開する。Mac向けにGitHub Actionsを起動したり、GitHubホストのrunnerへ切り替えたりしない。Windows版は、`vava`の共通SimplySign自動接続（`Connect-SimplySign.ps1`）を署名の直前に実行してから、このWindows機で`scripts/Publish-PrunletWindows.ps1`を実行し、署名付きの検証済みZIPを同じ下書きへ添付してから公開する。公開後はrelease workflowが同じZIPを検証してR2へ配置するので、その結果を確認する。手順は[Windowsの公開の順序](docs/distribution.md#公開の順序)に従う。署名をGitHub Actionsへ移したり、未署名ZIPを添付したりしない。証明書が見えることだけを鍵が使える証拠にせず、自動接続が失敗した場合だけ、必要な本人操作を案内する。再開時は完了済みの工程と実物を照合して再利用する。
 
 Linuxのリリースビルドは、上記のGitHub提供ランナーで`bash scripts/Publish-PrunletLinux.sh <新規の絶対出力先> <40桁SHA> <linux-x64|linux-arm64>`を各CPU向けに実行する。[Linux版の公開手順](docs/distribution.md#linux版の公開手順)に従い、検証済みtar.gzとチェックサムを同じGitHub Releaseへ添付する。
 
@@ -91,6 +91,6 @@ Dependabotと依存検証のworkflowを変更する場合は、[依存更新の�
 
 Windowsのlatest導入の検証は`scripts/Install-Prunlet.ps1`の[導入契約](DESIGN.md#導入と検証の境界)に従い、開発クローンやローカルビルドで代用しない。[容量上限の一度だけの移行](DESIGN.md#容量上限の一度だけの移行)、既存設定とACLの保持、再更新時の冪等性、ロック・登録失敗時の原本保全と復旧も確認する。
 
-WindowsのMCP起動時自動更新は手動導入とは別の経路である。[更新の設計](DESIGN.md#起動時自動更新)に従い、更新状態・製品排他・配布検証・容量検査を迂回しない。Windowsの配布物は`scripts/Package-PrunletUpdate.ps1`で生成し、公開タグから生成するrelease workflowとの形式の一致を維持する。Windowsの公開ZIPは`scripts/Verify-ReleasePackage.ps1 -PackagePath <ZIP絶対パス> -SourceRoot <ソース絶対パス> -PublishDirectory <publish絶対パス> -CommitSha <40桁SHA> -DefaultBranch <既定ブランチ> -Runtime <win-x64|win-arm64> -Repository <owner/repo>`で生成元と照合し、返されたZIP全体のSHA-256がアップロード直前にも一致することを確認する。
+WindowsのMCP起動時自動更新は手動導入とは別の経路である。[更新の設計](DESIGN.md#起動時自動更新)に従い、更新状態・製品排他・配布検証・容量検査を迂回しない。Windowsの配布物は`scripts/Publish-PrunletWindows.ps1`が`scripts/Package-PrunletUpdate.ps1`で生成し、release workflowの検証と形式の一致を維持する。Windowsの公開ZIPは`scripts/Verify-ReleasePackage.ps1 -PackagePath <ZIP絶対パス> -SourceRoot <ソース絶対パス> -PublishDirectory <publish絶対パス> -CommitSha <40桁SHA> -DefaultBranch <既定ブランチ> -Runtime <win-x64|win-arm64> -Repository <owner/repo> -RequireSignature`で生成元・署名と照合し、返されたZIP全体のSHA-256がアップロード直前にも一致することを確認する。署名・ZIP生成・R2配置を変更した場合は、実際に署名したZIPで、ビルド出力ありの検証と、workflowと同じビルド出力なし（`-ExpectedVersion`・`-ExtractDirectory`）の検証の両方を確認する。
 
 コードコメントは日本語。[README](README.md)は利用者向け、[DESIGN.md](DESIGN.md)は現在の設計、連携と検証の詳細は`docs/`、エージェントの作業規約は本ファイルに置き、同じ説明を複製せず参照する。

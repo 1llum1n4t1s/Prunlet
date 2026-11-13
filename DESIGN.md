@@ -181,13 +181,13 @@ stageは再帰削除せず、完了した世代の正規製品とmetadataをhash
 
 切替前のidleで候補実行・移行・登録確定・未解決の書込みやrotationがない未適用stageも、旧owner・source-info・stateの公開ZIP hash/長さ・ZIP manifest・全12製品・3つのready slotが一致し、未知の項目・ADS・リンクがない場合に限りcacheとして再利用する。旧commit・owner/source-info hash・3製品と9補助製品のhashを任意stateの`cacheBaseline`へ先に固定してからownerを切り替え、中断時は同じbaselineで再開する。これはstage主streamの更新だけに用い、previousへの退避と製品rotationは現在のinstalled来歴を基準にする。認定できないstageは変更せず保持する。
 
-配布元は公開済みGitHub Releaseとする。`.github/workflows/prunlet-release-package.yml`が公開タグからwin-x64・win-arm64をビルドし、`scripts/Package-PrunletUpdate.ps1`でZIPを作成する。公開前に`Verify-ReleasePackage.ps1`がentryの過不足・重複、metadataの取得元・commit・runtime等、および全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合する。検証済みZIP全体のSHA-256をアップロード直前にも再確認し、同じreleaseへ添付する。既存assetは上書きしない。
+配布元は公開済みGitHub Releaseとする。実行ファイルはSimplySign（Certum）でAuthenticode署名し、タイムスタンプを付ける。署名はGitHub Actionsで行えないため、リリース担当者のWindows機で`scripts/Publish-PrunletWindows.ps1`がwin-x64・win-arm64を`Publish-Prunlet.ps1 -Sign`でビルド・署名し、`scripts/Package-PrunletUpdate.ps1`でZIPを作成する。CLIを署名してからhookへ複製し、両者の同一hashを保つ。公開前に`Verify-ReleasePackage.ps1 -RequireSignature`がentryの過不足・重複、metadataの取得元・commit・runtime等、全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合し、各実行ファイルの署名・署名者・タイムスタンプを確認する。検証済みZIP全体のSHA-256を添付直前にも再確認し、公開前のreleaseへ添付する。既存assetは上書きしない。署名処理は`scripts/Signing.Common.ps1`に集約する。
 
 取得側はタグが既定ブランチ上のcommitを指すことと、パッケージ内のcommit・runtime・製品hashを検証する。通常の起動時更新では、照会済みタグと実行体のruntimeからGitHubの公開ZIP URLを組み立て、REST API枠を使わずにZIPを取得する。タグを渡さない旧launcherからの要求ではasset IDによるAPI取得を維持する。どちらの取得経路でも、APIが返したサイズとSHA-256で転送内容を照合する。ソースとビルドの対応は発行者への信頼に依存する。Actionsの期限付きartifactを更新の必須条件としない。
 
 更新用cacheはレジストリ復元領域とは別に合計2 GiBを上限とする。公開ZIP・stage・製品slot・固定candidate/previous・保全した異常世代・各ディレクトリのADS・更新管理ファイルを容量に含め、確保前と完了後に検査する。slotはcache専用で、実行・移動・削除しない。正規hash・長さ・単一linkを同じ排他handleで確認し、通常streamだけをin-place更新する。候補へはそのhandleの通常streamだけをCreateNewコピーする。ADSや不明な部分書込みは保持し、予算不足を自動削除で回避しない。
 
-既存のWindowsクライアント向けにも、同一ZIPをR2へ配置してからGitHub Releaseへ添付する。固定配信先・資格情報・順序は[配布手順](docs/distribution.md)を参照する。
+既存のWindowsクライアント向けにも、同一ZIPをR2へ配置する。release公開後に`.github/workflows/prunlet-release-package.yml`が添付済みZIPを取得し、ビルド出力の代わりに公開タグのsource・metadata・署名・署名者・タイムスタンプ・版・PE machineを検証してからR2へ送る。workflowはビルドもreleaseへの書込みも行わない。固定配信先・資格情報・順序は[配布手順](docs/distribution.md)を参照する。
 
 ### macOSの起動時自動更新
 
