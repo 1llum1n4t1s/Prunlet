@@ -7,7 +7,7 @@ resolver = "3"
 name = "prunlet"
 version = "1.0.42"
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 publish = false
 authors = ["Kagayoi"]
 license = "MIT"
@@ -27,9 +27,7 @@ path = "src/rust/bin/maintenance.rs"
 anyhow = "1"
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
-fs2 = "0.4"
 hex = "0.4"
-libc = "0.2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -49,13 +47,17 @@ native-tls = "0.2"
 tokio = { version = "1", features = ["net", "rt", "time", "io-util", "sync"] }
 tokio-native-tls = "0.3"
 url = "2.5.8"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Console", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_RestartManager", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_Networking_WinHttp", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_RestartManager", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# fs2・libcはmacOS/Linuxの実装だけが使う。platform/mod.rsのcfgと揃え、Windowsのビルドグラフへ入れない。
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+fs2 = "0.4"
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

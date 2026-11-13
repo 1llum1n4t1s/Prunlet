@@ -10,7 +10,6 @@ use std::{
         atomic::{AtomicU32, Ordering},
     },
 };
-use windows::core::GUID;
 use windows_sys::Win32::{
     Foundation::*,
     Security::*,
@@ -21,6 +20,33 @@ use windows_sys::Win32::{
 const BIG: i32 = 0x80270037u32 as i32;
 const UNAVAILABLE: i32 = 0x80270036u32 as i32;
 const ABORT: i32 = 0x80004004u32 as i32;
+
+/// COMのIID/CLSIDとして渡すGUID。Win32の`GUID`と同じ`repr(C)`レイアウトを持つ。
+/// `windows`クレートはこの型のためだけに依存していたため、自前定義で依存グラフを縮める。
+/// `windows_sys::core::GUID`は`PartialEq`を持たないので、`sink_query`のIID比較用にderiveする。
+// Win32 APIの型名に合わせ、宣言側の`*const GUID`をそのまま読めるようにする。
+#[allow(clippy::upper_case_acronyms)]
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GUID {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+impl GUID {
+    /// `windows::core::GUID::from_u128`と同じ並び（上位32bit→data1、次の16bit×2→data2/3、下位64bit→data4をbig-endian）。
+    const fn from_u128(uuid: u128) -> Self {
+        Self {
+            data1: (uuid >> 96) as u32,
+            data2: (uuid >> 80 & 0xffff) as u16,
+            data3: (uuid >> 64 & 0xffff) as u16,
+            data4: (uuid as u64).to_be_bytes(),
+        }
+    }
+}
+
 const SHELL: GUID = GUID::from_u128(0x43826d1e_e718_42ee_bc55_a1e261c37bfe);
 const BIN: GUID = GUID::from_u128(0xb7534046_3ecb_4c18_be4e_64cd4cb7d6ac);
 const HANDLER: GUID = GUID::from_u128(0xd5e346a1_f753_4932_b403_4574800e2498);
@@ -573,6 +599,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 自前GUIDがWin32のGUIDと同じレイアウト・値になることを確認する。
+    /// ずれるとShell COMへ誤ったIID/CLSIDを渡し、Recycleが失敗する。
+    #[test]
+    fn local_guid_matches_win32_layout_and_values() {
+        assert_eq!(size_of::<GUID>(), size_of::<windows_sys::core::GUID>());
+        assert_eq!(align_of::<GUID>(), align_of::<windows_sys::core::GUID>());
+        for value in [
+            0x43826d1e_e718_42ee_bc55_a1e261c37bfe_u128,
+            0xb7534046_3ecb_4c18_be4e_64cd4cb7d6ac,
+            0xd5e346a1_f753_4932_b403_4574800e2498,
+            0x00adb003_bde9_45c6_8e29_d09f9353e108,
+            0xd594d0d8_8da7_457b_b3b4_ce5dbaac0b88,
+            0x00000000_0000_0000_c000_000000000046,
+        ] {
+            let local = GUID::from_u128(value);
+            let win32 = windows_sys::core::GUID::from_u128(value);
+            assert_eq!(
+                (local.data1, local.data2, local.data3, local.data4),
+                (win32.data1, win32.data2, win32.data3, win32.data4)
+            );
+        }
+        // IUnknownの既知表現で並びを固定する。
+        assert_eq!(UNKNOWN.data4, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+        assert!(SINK != UNKNOWN);
+    }
     #[test]
     fn file_progress_prevents_permanent_fallback() {
         let state = Arc::new(Mutex::new(State::default()));
