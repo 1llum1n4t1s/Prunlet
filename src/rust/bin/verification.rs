@@ -1,6 +1,4 @@
 //! libtest専用の検証入口。製品binaryにはコンパイルせず、固定された外部入力だけを使う。
-#[path = "../migration/store.rs"]
-mod fixture_store;
 
 use crate::{
     config::Config,
@@ -440,7 +438,7 @@ fn owned_markers() -> Result<()> {
         "Fixed fixture configuration changed"
     );
     let config = Config::load(Path::new(&request.config_path))?;
-    let result = fixture_store::verification_owned_markers(
+    let result = crate::migration::verification_owned_markers(
         &config,
         &request.action,
         &metadata,

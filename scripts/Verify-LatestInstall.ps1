@@ -1424,11 +1424,13 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         Assert-True ((Invoke-UpdateOnly $root $noCodex) -eq 0 -and (Get-InstalledCommit $root) -ceq $newCommit -and (Get-UpdatePhase $root) -ceq 'idle') 'Update did not resume after the task was restored.'
     }
     Test-Case 'Installer from main skips the update task when the release package predates it' {
-        # mainの新しいインストーラーで、更新タスク未対応の配布物（HEADの補助ファイル）を導入する場合。
+        # mainの新しいインストーラーで、更新タスク未対応の配布物を導入する場合。
+        # 補助ファイルは更新タスク導入前の最終リリースタグから固定で取る（HEADは導入後に対応済みとなり旧版を表せない）。
+        $legacyRevision = 'v1.0.42'
         $legacySource = New-FixtureSource (Join-Path $fixtureRoot 'source-without-update-task')
         foreach ($relative in @('integration/maintenance-task.ps1', 'integration/start-prunlet-mcp.ps1')) {
-            $text = & git -C $repoRoot show ('HEAD:' + $relative)
-            Assert-True ($LASTEXITCODE -eq 0) "Committed $relative could not be read."
+            $text = & git -C $repoRoot show ($legacyRevision + ':' + $relative)
+            Assert-True ($LASTEXITCODE -eq 0) "Committed $relative could not be read from tag $legacyRevision (fetch tags if missing)."
             [IO.File]::WriteAllText((Join-Path $legacySource $relative.Replace('/', '\')), (($text -join "`r`n") + "`r`n"), [Text.UTF8Encoding]::new($false))
         }
         Assert-True (![IO.File]::ReadAllText((Join-Path $legacySource 'integration\maintenance-task.ps1')).Contains('Get-PrunletUpdateTaskState')) 'Legacy fixture already supports the update task.'

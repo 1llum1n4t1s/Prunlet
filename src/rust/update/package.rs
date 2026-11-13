@@ -306,6 +306,19 @@ mod tests {
     use std::io::{Cursor, Write};
     use zip::{ZipWriter, write::SimpleFileOptions};
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// 配布ZIPの製品表（実行体3つ＋補助ファイル）と、更新状態が保持する補助ファイル表の一致を固定する。
+    /// 2表は別モジュールに定義されているため、片方だけ増減すると補助ファイルのhash照合が配布物とずれる。
+    #[test]
+    fn auxiliary_names_match_packaged_products() {
+        let packaged: Vec<&str> = PRODUCT_NAMES[3..]
+            .iter()
+            .map(|name| name.strip_prefix("bin/").expect("product under bin/"))
+            .collect();
+        assert_eq!(packaged, crate::update::state::AUXILIARY_NAMES);
+        assert!(PRODUCT_NAMES[..3].iter().all(|name| name.ends_with(".exe")));
+    }
+
     fn package(machine: u16) -> Vec<u8> {
         let mut executable = vec![0u8; 70];
         executable[..2].copy_from_slice(b"MZ");

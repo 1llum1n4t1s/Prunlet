@@ -109,7 +109,7 @@ GitHub応答（最新release・タグ・既定ブランチとの比較・asset�
 
 定期整理はTask Scheduler境界を隔離して、毎日03:00と現在のユーザーのログオンの両トリガー、有効状態、`StartWhenAvailable`、電池使用時の実行許可、既存タスク設定の保持をXMLで検証します。PCの電源断・スリープ・ログオフを伴う取り逃し回復の実動作は、この検証の対象外です。
 
-更新タスクは同じ隔離境界で、conhost経由の非表示起動・`-UpdateOnly`の引数・保守タスクとずらした時刻とログオン遅延、所有済みタスクの引数だけの移行と利用者設定の保持、他者のタスクの保護、明示解除を確認します。`start-prunlet-mcp.ps1 -UpdateOnly`は、検証済みZIPを取得完了の位置へ置いてHTTP取得だけを代替し、Codex未登録の配置で次releaseへ実際に切り替えること（MCPを起動しない・最新なら変更しない）、保守exeの使用中は延期して解放後に再開すること、更新タスクの実行先が編集されていれば更新状態をidleのまま延期すること、更新タスクの登録失敗で両タスクと製品を戻すこと、Codex登録ありで登録が編集されていれば切り替えずに延期することを確認します。mainのインストーラーが更新タスク未対応の配布物（コミット済みの補助ファイル）を導入する場合に、タスクを登録しないことも確認します。実Task Schedulerからの非表示起動とPATH上のpwshの解決は、隔離fixtureではなく一時タスクで別に確認します。
+更新タスクは同じ隔離境界で、conhost経由の非表示起動・`-UpdateOnly`の引数・保守タスクとずらした時刻とログオン遅延、所有済みタスクの引数だけの移行と利用者設定の保持、他者のタスクの保護、明示解除を確認します。`start-prunlet-mcp.ps1 -UpdateOnly`は、検証済みZIPを取得完了の位置へ置いてHTTP取得だけを代替し、Codex未登録の配置で次releaseへ実際に切り替えること（MCPを起動しない・最新なら変更しない）、保守exeの使用中は延期して解放後に再開すること、更新タスクの実行先が編集されていれば更新状態をidleのまま延期すること、更新タスクの登録失敗で両タスクと製品を戻すこと、Codex登録ありで登録が編集されていれば切り替えずに延期することを確認します。mainのインストーラーが更新タスク未対応の配布物（更新タスク導入前の最終リリースタグ`v1.0.42`の補助ファイル）を導入する場合に、タスクを登録しないことも確認します。実Task Schedulerからの非表示起動とPATH上のpwshの解決は、隔離fixtureではなく一時タスクで別に確認します。
 
 非表示起動は`scripts/Verify-MaintenanceTask.ps1 -ExecutablePath <今回のCLI exe> -BuildManifestPath <同じビルドのmanifest> -ExpectedBuildManifestSha256 <manifestのSHA-256> -OutputDirectory <新しい外部作業領域> -ReportPath <外部JSONレポート>`で、実Task Schedulerと保守専用exeを検証します。同じpublishフォルダーに`prunlet-maintenance.exe`が必要です。CLIのconsole subsystemと保守exeのGUI subsystem、旧タスクからの設定を保つ移行、保守以外のコマンドの拒否、期限切れ整理・保持対象の復元、失敗終了コード、所有者検証を確認します。`-PauseForWindowInspection`は旧・新タスクを専用lockで待機させ、別途ウィンドウを観測するための指定です。配置後も同じ登録タスクを手動起動して表示と終了コードを確認し、実際のWindows再起動と区別します。
 

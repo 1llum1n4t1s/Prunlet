@@ -200,6 +200,7 @@ function Get-ManagedInstallationSnapshot([string]$Root) {
         if ($expected -notmatch '^[0-9a-fA-F]{64}$' -or !(Test-Path -LiteralPath $path -PathType Leaf) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $expected) { throw 'Managed installation product hash mismatch.' }
         $hashes[$entry[0]] = $expected.ToUpperInvariant()
     }
+    # この関数は検証スクリプトがASTから単体で読み込んで呼ぶため、スクリプト変数に依存せず表を直接持つ。
     foreach ($name in @('Install-Prunlet.ps1','start-prunlet-mcp.ps1','configuration-common.ps1','maintenance-task.ps1','uninstall-maintenance.ps1','install-codex.ps1','uninstall-codex.ps1','install-agent-instructions.ps1','PRUNLET.md')) {
         $relative = 'bin\'+$name
         $path = Assert-PlainPath (Join-Path $full $relative) 'Managed auxiliary product'
@@ -413,7 +414,8 @@ $updateBackup = Assert-ExternalPath (Join-Path $UpdateBackupRoot $runId) 'Update
 if ((Test-InTree $updateBackup $InstallDirectory) -or (Test-InTree $InstallDirectory $updateBackup) -or (Test-InTree $updateBackup $WorkDirectory) -or (Test-InTree $WorkDirectory $updateBackup)) { throw 'Update backup must be separate from install and work directories.' }
 if ((Test-InTree $updateBackup $effectiveBackup) -or (Test-InTree $effectiveBackup $updateBackup)) { throw 'Update backup must be separate from recovery data.' }
 if ($RegisterCodex -and $SettingsBackupDirectory) { $SettingsBackupDirectory = Assert-ExternalPath $SettingsBackupDirectory 'SettingsBackupDirectory' }
-$products = @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\prunlet-hook.exe', 'bin\Install-Prunlet.ps1', 'bin\start-prunlet-mcp.ps1', 'bin\configuration-common.ps1', 'bin\maintenance-task.ps1', 'bin\uninstall-maintenance.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
+# 12製品は$script:PackageExecutables・$script:PackageAuxiliaryから組み立て、表の重複を持たない。
+$products = @(@($script:PackageExecutables + $script:PackageAuxiliary | ForEach-Object { 'bin\' + $_ }) + 'source-info.json')
 $retiredProducts = @('bin\codex-pretooluse.ps1')
 $previousGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
 # 非管理モードでも、前回binと登録済みガイドが改行差だけなら登録実物のhashをPreviousに使う（管理モードと同じ判定）。

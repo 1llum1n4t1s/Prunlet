@@ -409,8 +409,9 @@ pub fn decode<T: DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T> {
         Ok(())
     }
     limits(&raw, 0)?;
-    let parsed: T =
-        serde_json::from_value(raw.clone()).context("Invalid registry metadata JSON")?;
+    // `raw`は後段のshape照合でも使うため、所有権を渡さず`&Value`をDeserializerとして読む。
+    // 以前の`from_value(raw.clone())`は最大128 MiBのsnapshotでもValue木全体を毎回複製していた。
+    let parsed: T = T::deserialize(&raw).context("Invalid registry metadata JSON")?;
     // Optionだけでは必須null項目の欠落を受理するため、C#同様に再構成したfield集合を再帰照合する。
     fn shape(actual: &Value, canonical: &Value) -> Result<()> {
         match canonical {

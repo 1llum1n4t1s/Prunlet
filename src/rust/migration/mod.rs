@@ -7,7 +7,7 @@ use serde_json::Value;
 #[cfg(windows)]
 mod windows;
 #[cfg(all(test, windows))]
-pub(crate) use windows::verification_set_checkpoint;
+pub(crate) use windows::{verification_owned_markers, verification_set_checkpoint};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

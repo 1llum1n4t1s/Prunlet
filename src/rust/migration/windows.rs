@@ -16,6 +16,10 @@ use std::{
 };
 #[path = "store.rs"]
 mod store;
+// libtestの検証入口（bin/verification.rs）へ所有markerモデルを渡す。
+// 以前は検証入口が同じstore.rsを`#[path]`で再ロードしており、二重コンパイル・テスト重複実行・dead code警告を生んでいた。
+#[cfg(test)]
+pub(crate) use store::verification_owned_markers;
 
 const GATE: &str = ".legacy-file-discard-in-progress";
 const REGISTRY: &str = ".registry-records-v1";

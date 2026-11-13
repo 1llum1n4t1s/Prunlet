@@ -532,11 +532,6 @@ fn parse_registry_delete(args: &[String]) -> Result<Value> {
 }
 
 fn command_failed(command: &str, value: &Value) -> bool {
-    if command == "mcp-cache-maintain" {
-        return (value.get("dryRun") != Some(&Value::Bool(true))
-            && value.get("cleanupBlocked") == Some(&Value::Bool(true)))
-            || has_errors(value);
-    }
     // 更新の途中phaseはlauncherが次段を実行するための正常応答。
     if command == "__apply-startup-update" {
         return matches!(
@@ -650,26 +645,6 @@ mod tests {
         assert!(
             HELP.contains("migrate [--dry-run | --apply [--if-needed | --retry-legacy-discard]]")
         );
-    }
-
-    #[test]
-    fn mcp_cleanup_blocked_is_non_success_even_when_items_are_retained() {
-        assert!(command_failed(
-            "mcp-cache-maintain",
-            &json!({"dryRun":false,"cleanupBlocked":true,"items":[{"status":"retained"}]})
-        ));
-        assert!(!command_failed(
-            "mcp-cache-maintain",
-            &json!({"dryRun":false,"cleanupBlocked":false,"status":"acknowledged","items":[]})
-        ));
-        assert!(!command_failed(
-            "mcp-cache-maintain",
-            &json!({"dryRun":true,"cleanupBlocked":true,"items":[{"status":"retained"}]})
-        ));
-        assert!(command_failed(
-            "mcp-cache-maintain",
-            &json!({"dryRun":true,"cleanupBlocked":true,"items":[{"status":"failed"}]})
-        ));
     }
 
     #[test]
