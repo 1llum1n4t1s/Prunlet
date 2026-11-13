@@ -27,7 +27,7 @@ Prunletは、AIエージェントに許可されたファイル・フォルダ�
 
 CMD規則では`#`をコメントとして扱わず、後続のコマンド区切り以降も検査する。静的な`IF`は`/i`・`not`、`exist`・`defined`・`errorlevel`・`cmdextversion`、`==`と`EQU/NEQ/LSS/LEQ/GTR/GEQ`の条件直後のコマンドを検査する。条件の真偽は評価せず、比較値や`echo`の引数を削除コマンドとは扱わない。wrapper本文の再構成では、引用内の`==`と引用外の比較演算子、空の引用文字列を区別して保つ。`cmd`のswitchは先頭`/`の重複（Git Bashの`//c`等）と大文字小文字を正規化し、`/C`・`/K`・`/R`、連結形、switchに直結した本文を本文として再検査する。本文より前の未知switchは検査不能として拒否する。括弧なしで`do`・`else`の直後に続くコマンドも`IF`と同様に検査する。静的wrapperの入れ子が深さ上限を超えた場合は、shell規則によらず拒否する。
 
-削除と無関係な定型構文は、検査不能として一律に拒否せず、データと確定できる範囲だけを読み飛ばす。POSIX規則では、終端語を引用したヒアドキュメントの本文のうち、受け取る文が静的なパスへ書き出す`cat`、またはoptionだけを付けたインタプリタ起動の場合に限り、本文をdataとして扱う。パイプ・同じ行の後続文・入れ子の展開・shell起動・終端語を引用しない本文は、従来どおり文として検査する。PowerShellのEncodedCommandでは、変数・プロパティ参照・数値添字だけの`"$(...)"`と、静的な`.ps1`を`-File`で実行するpwshだけを通す。検知していない拒否は、原因と書き換え方だけを短く返す。
+削除と無関係な定型構文は、検査不能として一律に拒否せず、データと確定できる範囲だけを読み飛ばす。POSIX規則では、終端語を引用したヒアドキュメントの本文のうち、受け取る文が静的なパスへ書き出す`cat`、またはoptionだけを付けたインタプリタ起動の場合に限り、本文をdataとして扱う。パイプ・同じ行の後続文・入れ子の展開・shell起動・終端語を引用しない本文は、従来どおり文として検査する。PowerShellのEncodedCommandでは、変数・プロパティ参照・数値添字だけの`"$(...)"`と、静的な`.ps1`を`-File`で実行するpwshだけを通す。コマンド位置の`.`はdot-sourcingとして拒否するが、同じ行で直前のコマンドへ引数として渡す単独の`.`（`rg x .`・`git grep x -- .`）は、文境界・キーワード直後・動的な語の後を除いて通す。検知していない拒否は、原因と書き換え方だけを短く返す。
 
 PowerShellの`Start-Process`は原則拒否し、共通指示が定める管理者CMD起動の固定形だけを許可リストで照合して通す。起動先は静的な`cmd.exe`、引数は配置済みCLI・同じ設定・限定文字の引数・`.json`出力先に全体一致する単一の文字列とし、CMDの演算子・引用・展開を持ち込めない形にして、引数文字列のCMD再解析による解釈差を避ける。これは起動制御だけの例外であり、実削除は起動先CMD内の配置済みCLIが行う。固定形の詳細は[連携手順](docs/integration.md#sandboxとゴミ箱へのアクセス)に集約する。
 
@@ -49,7 +49,7 @@ Shellが削除元を8.3短縮名で返した場合、非reparseの対象だけ�
 
 Shellがゴミ箱への移動を成功と返した場合は、返却項目だけを一時的に開き、保持した元実体のFile IDと照合する。識別できない場合や不一致は`ambiguous`とし、記録やゴミ箱全体の走査は行わない。この照合は事後の検出であり、Shell直前の名前差し替えによって別実体がゴミ箱へ移ること自体は防げない。
 
-`files::recordless`の同期削除結果は、`dryRun`・`items`・`warnings`を持つ。項目は`path`・`kind`・`status`・任意の`error`だけであり、状態は`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`である。`permanently_deleted`は対象の元名をゴミ箱へ移さず削除したことを示し、別ハードリンクやバックアップの消去は保証しない。dry-runは予約名の通常ファイルをwould_permanently_deleteで示し、それ以外はWindowsの最終判定を予測できないことを警告する。`failed`・`ambiguous`はCLIの非ゼロ終了とMCPの`isError`へ反映する。結果不明時は同じ削除を再送せず、元対象とWindowsのゴミ箱を確認する。
+`files::recordless`の同期削除結果は、`dryRun`・`items`・`warnings`を持つ。項目は`path`・`kind`・`status`・任意の`error`だけであり、状態は`recycled`・`permanently_deleted`・`would_recycle`・`would_permanently_delete`・`already_absent`・`failed`・`ambiguous`である。`permanently_deleted`は対象の元名をゴミ箱へ移さず削除したことを示し、別ハードリンクやバックアップの消去は保証しない。dry-runは予約名の通常ファイルをwould_permanently_deleteで示し、それ以外はWindowsの最終判定を予測できないことを警告する。事前検査で失敗した項目の`kind`は、リンク先を辿らず開き直して種別を判定できた場合だけ実際の種別（`directory`など）にし、判定できない場合は既定の`file`のままにする。`failed`・`ambiguous`はCLIの非ゼロ終了とMCPの`isError`へ反映する。結果不明時は同じ削除を再送せず、元対象とWindowsのゴミ箱を確認する。
 
 復元と保持期間の管理はWindowsのゴミ箱で行う。Windowsが完全削除した実体をPrunletが復元できるとは扱わない。ハードリンクの別名は実体を共有し、生存する外部別名からの書込みがゴミ箱内にも反映される。通常属性・ADS・case-sensitiveな名前とACLはWindowsが移す同じオブジェクトの状態であり、Prunletが保存時点の不変コピーやACL再適用を提供するものではない。
 
