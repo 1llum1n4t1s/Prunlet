@@ -1972,6 +1972,51 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
         _ => false,
     })
 }
+/// PowerShell strict検査で、`s[i]`の単独の`.`がdot-sourcingではなく、前のコマンドへ渡す
+/// 引数（カレントディレクトリ）かを判定する。`rg -n x .`・`Get-ChildItem -Path .`・
+/// `git grep x -- .`のような形を拒否しないために使う。
+///
+/// dot-sourcingはコマンド位置（文頭・`;`・`|`・`&`・`{`・`(`・`=`の直後や、
+/// パイプラインを取るキーワードの直後）でだけ働く。そこで、同じ行で直前に
+/// 空白以外の文字があり、それが通常の語の末尾として使われる文字で、かつ直前の語が
+/// 文境界やキーワードでない場合だけ引数とみなす。`.(`は動的なdot-sourcingになりうるため、
+/// 後続が空白の場合に限る。判定できない形は従来どおり拒否側に倒す。
+fn powershell_dot_argument(s: &[char], i: usize, out: &[Token]) -> bool {
+    if s.get(i + 1).is_none_or(|c| !c.is_whitespace()) {
+        return false;
+    }
+    // 改行・行継続は文の区切りを曖昧にするので、同じ行の空白とタブだけを読み飛ばす。
+    let mut j = i;
+    while j > 0 && matches!(s[j - 1], ' ' | '\t') {
+        j -= 1;
+    }
+    if j == 0 || j == i {
+        return false;
+    }
+    let previous = s[j - 1];
+    if !(previous.is_alphanumeric()
+        || matches!(previous, '\'' | '"' | '-' | '_' | '.' | '/' | '\\' | ':' | '*'))
+    {
+        return false;
+    }
+    let Some(last) = out.last() else {
+        return false;
+    };
+    if last.boundary || last.dynamic || last.subexpression {
+        return false;
+    }
+    // パイプラインや文を後ろに取るキーワードの直後はコマンド位置になる。
+    const KEYWORDS: &[&str] = &[
+        "return", "throw", "exit", "in", "else", "elseif", "if", "do", "try", "catch",
+        "finally", "begin", "process", "end", "param", "trap", "switch", "while", "until",
+        "foreach", "for", "data", "dynamicparam", "filter", "function", "break", "continue",
+        "class", "enum", "using", "workflow", "parallel", "sequence", "inlinescript",
+    ];
+    if !last.quoted && KEYWORDS.iter().any(|k| last.text.eq_ignore_ascii_case(k)) {
+        return false;
+    }
+    true
+}
 fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
     let s: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
@@ -2138,6 +2183,7 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
                 && c == '.'
                 && t.text.is_empty()
                 && s.get(i + 1).is_some_and(|c| c.is_whitespace() || *c == '(')
+                && !powershell_dot_argument(&s, i, &out)
             {
                 bail!("EncodedCommand dot-sourcing cannot be inspected.");
             }
@@ -3494,6 +3540,45 @@ mod tests {
             r"pwsh -ExecutionPolicy $p -File x.ps1",
             r"pwsh -EncodedCommand AAAA -File x.ps1",
             r"cmd /c D:\tmp\x.cmd",
+        ] {
+            assert!(reason(&encode(denied), "Bash", None).is_some(), "{denied}");
+        }
+    }
+
+    /// EncodedCommand内で引数として渡す単独の`.`（カレントディレクトリ）はdot-sourcingとみなさず、
+    /// コマンド位置の`.`（文頭・区切りやキーワードの直後）は従来どおり拒否する。
+    #[test]
+    fn encoded_dot_argument_is_not_dot_sourcing() {
+        if !cfg!(windows) {
+            return;
+        }
+        let encode = |script: &str| {
+            let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            format!("pwsh -NoProfile -EncodedCommand {}", STANDARD.encode(bytes))
+        };
+        for allowed in [
+            r#"rg -n "net8" -g "*.csproj" . ; dotnet build -c Release"#,
+            r"Get-ChildItem -Recurse -Force -Filter config.toml -Path . -Depth 3",
+            r#"git grep -n "x" -- . ':!RELEASE_NOTES.md' | Select-Object -First 3"#,
+            r"dotnet new console -n EtlSplit -o . --force 2>&1 | Select-Object -Last 1",
+            r"git add . 2>&1",
+            "Set-Location D:\\x\nrg -n \"catalog\" . ; 'done'",
+            r"rg -n 'x' .",
+        ] {
+            assert_eq!(reason(&encode(allowed), "Bash", None), None, "{allowed}");
+        }
+        for denied in [
+            r". ./build/DevelopmentOutput.ps1; Get-X",
+            r". 'D:\tmp\x\inventory.ps1'",
+            r"Get-Item x; . ./a.ps1",
+            r"Get-Item x | . ./a.ps1",
+            r"if ($a) { . ./a.ps1 }",
+            r"$x = . ./a.ps1",
+            r"return . ./a.ps1",
+            "Get-Item x\n. ./a.ps1",
+            "Get-Item x `\n. ./a.ps1",
+            r"Get-Item x .('./a.ps1')",
+            r"Get-Item . ; Remove-Item C:\fixture\x",
         ] {
             assert!(reason(&encode(denied), "Bash", None).is_some(), "{denied}");
         }

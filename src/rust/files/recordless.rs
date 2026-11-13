@@ -650,6 +650,14 @@ fn preflight(
                 prepared.push(None);
             }
             Err(error) => {
+                // 既定値の"file"のままだと、非空フォルダーの拒否などでフォルダーを"file"と報告してしまう。
+                // 読取属性だけでリンク先を辿らずに開き直し、実体の種別を判定できた場合だけ反映する。
+                // 判定できない場合（対象が開けない・未対応のreparse）は従来どおり"file"を返す。
+                if let Ok(Some(entry)) = inspect(path)
+                    && let Ok(observed) = kind(entry.initial_identity())
+                {
+                    result.items[index].kind = observed.into();
+                }
                 result.items[index].error = Some(diagnose_with(path, &error, !dry_run));
                 prepared.push(None);
             }
@@ -2220,6 +2228,36 @@ mod tests {
         let mut added = vec![];
         capture_tree(&target, true, &mut added, usize::MAX, None)?;
         assert!(snapshot.matches_tree(&added).is_err());
+        Ok(())
+    }
+    /// 事前検査で失敗した項目も、開ける実体なら`kind`に実際の種別を返す。
+    /// 以前は非空フォルダーの`--recursive`なし指定が既定値の"file"のまま報告されていた。
+    #[test]
+    fn preflight_failure_reports_the_observed_kind() -> Result<()> {
+        let root = fixture("failed-kind")?;
+        let directory = root.join("nonempty");
+        std::fs::create_dir(&directory)?;
+        std::fs::write(directory.join("child.txt"), b"x")?;
+        // 保護対象の判定で中央metadataの実体を固定するため、事前に作っておく。
+        std::fs::create_dir(root.join("metadata"))?;
+        let config = Config {
+            path: root.join("config.json"),
+            data: crate::config::ConfigData {
+                backup_directory: root.join("metadata").to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        };
+        let result = delete(&config, std::slice::from_ref(&directory), true, false, None, None)?;
+        let item = &result.items[0];
+        assert_eq!(item.status, "failed");
+        assert_eq!(item.kind, "directory");
+        assert!(
+            item.error
+                .as_deref()
+                .is_some_and(|e| e.contains("Nonempty directories require explicit recursive deletion")),
+            "{item:?}"
+        );
+        assert!(directory.join("child.txt").exists());
         Ok(())
     }
     fn fixture(label: &str) -> Result<PathBuf> {
