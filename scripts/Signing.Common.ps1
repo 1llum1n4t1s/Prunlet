@@ -1,45 +1,32 @@
 #requires -Version 7.0
 # Windows配布物のAuthenticode署名と、その検証を一か所にまとめる。
 #
-# 署名はCertumのクラウド署名（SimplySign）を使う。SimplySign Desktopへのログインと
-# スマートフォンのトークンが必要なため、GitHub Actionsでは署名できない。署名は
-# リリース担当者のWindows機で`Publish-PrunletWindows.ps1`から行い、CIは署名済みZIPの
-# 検証だけを行う。
+# 署名はSigilune（https://github.com/1llum1n4t1s/Sigilune）で、Certum SimplySignの
+# クラウド鍵を使う。SimplySign Desktopは不要で、GitHub Actionsではrelease workflowが
+# 承認付きEnvironment `release`のSecrets（SIGILUNE_EMAIL・SIGILUNE_TOTP_URI）を
+# 署名stepだけへ渡して実行する。手元ではSigiluneの登録（sigilune setup）を使う。
 #
-# 署名者の確認では、Windowsが証明書チェーンを`Valid`と判定することに加えて、
-# 署名者の共通名とタイムスタンプの存在も必須にする。タイムスタンプがないと、証明書の
-# 有効期限が切れた時点で既存の配布物まで`Valid`でなくなり、公開済みクライアントが
-# 受け付けない（NotSigned/Valid以外を拒否する）状態になるため。
+# Sigilune自身も署名後に検証するが、Prunletの配布条件として、Windowsの判定が`Valid`、
+# 署名者の共通名、タイムスタンプの存在をここでも独立に確認する。タイムスタンプがないと
+# 証明書の有効期限後に既存の配布物まで`Valid`でなくなるため。
 
 # 署名者の共通名。証明書の年次更新でthumbprintが変わっても同じ値で照合できる。
 $script:PrunletSignerCommonName = 'Open Source Developer Yuichiro Shinozaki'
-# RFC 3161タイムスタンプ。証明書の発行元（Certum）のサーバーを使う。
-$script:PrunletTimestampUrl = 'http://time.certum.pl'
 
-function Find-PrunletSignTool {
-    # Windows SDKはビルドにも必須なので、同じSDKのsigntoolを使う。PATHには依存しない。
-    $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
-    if (!(Test-Path -LiteralPath $kits -PathType Container)) { throw 'Windows SDK is required to sign Prunlet (Windows Kits\10\bin was not found).' }
-    $hostArch = if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::Arm64) { 'arm64' } else { 'x64' }
-    $candidates = @(Get-ChildItem -LiteralPath $kits -Directory |
-        Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-        Sort-Object { [version]$_.Name } -Descending |
-        ForEach-Object { Join-Path $_.FullName "$hostArch\signtool.exe" } |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
-    if (!$candidates.Count) { throw "signtool.exe for $hostArch was not found in the Windows SDK." }
-    return $candidates[0]
-}
-
-function Get-PrunletSigningCertificate {
-    # SimplySign Desktopが接続済みなら、クラウド上の証明書がCurrentUser\Myに見える。
-    $now = Get-Date
-    $certs = @(Get-ChildItem Cert:\CurrentUser\My | Where-Object {
-        $_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -ceq $script:PrunletSignerCommonName -and
-        $_.HasPrivateKey -and $_.NotBefore -le $now -and $_.NotAfter -gt $now
-    })
-    if (!$certs.Count) { throw "Signing certificate (CN=$script:PrunletSignerCommonName) was not found. Start SimplySign Desktop and log in with the token." }
-    # 更新直後は新旧が並ぶことがあるため、期限が最も遅いものを使う。thumbprintで指定して曖昧さを避ける。
-    return ($certs | Sort-Object NotAfter -Descending | Select-Object -First 1)
+function Find-PrunletSigilune {
+    # 明示指定（絶対パス）を優先し、なければPATH上のsigilune.exeを使う。
+    # PRUNLET_SIGILUNEのほか、他の配布スクリプトと共通のSIGILUNE_EXEも受け付ける。
+    foreach ($explicit in @($env:PRUNLET_SIGILUNE, $env:SIGILUNE_EXE)) {
+        if (!$explicit) { continue }
+        if (![IO.Path]::IsPathFullyQualified($explicit) -or !(Test-Path -LiteralPath $explicit -PathType Leaf)) { throw 'PRUNLET_SIGILUNE / SIGILUNE_EXE must be the absolute path of sigilune.exe.' }
+        return $explicit
+    }
+    $command = Get-Command sigilune.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+    # 手元の既定配置（PATHへ追加しない導入）。CIはSigiluneのactionがPATHへ追加する。
+    $local = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.local\Sigilune\bin\sigilune.exe'
+    if (Test-Path -LiteralPath $local -PathType Leaf) { return $local }
+    throw 'Sigilune (sigilune.exe) is required to sign Prunlet. Install it or set PRUNLET_SIGILUNE.'
 }
 
 function Assert-PrunletAuthenticodeSigned([string]$Path) {
@@ -55,20 +42,61 @@ function Assert-PrunletAuthenticodeSigned([string]$Path) {
     return $signature
 }
 
-function Invoke-PrunletAuthenticodeSign([string[]]$Paths) {
-    # 1回のsigntool呼出しでまとめて署名し、SimplySignのトークン確認を最小限にする。
-    if (!$Paths.Count) { throw 'No files to sign.' }
-    foreach ($path in $Paths) {
-        if (![IO.Path]::IsPathFullyQualified($path) -or !(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Signing input must be an existing absolute file: $path" }
-        # 二重署名を避け、ビルド直後の未署名ファイルだけを受け付ける。
-        if ((Get-AuthenticodeSignature -LiteralPath $path).Status -ne [Management.Automation.SignatureStatus]::NotSigned) { throw "Signing input is already signed or has an invalid signature: $path" }
+function Invoke-PrunletBuildSigning([string[]]$BuildDirectories) {
+    # Publish-Prunlet.ps1の出力（<build>\publish と <build>\build-manifest.json）へ署名する。
+    # 全runtimeを同じjob・同じSigiluneセッションで署名し、ログイン（TOTP）は最初の1回だけにする。
+    if (!$BuildDirectories.Count) { throw 'No build directories to sign.' }
+    $builds = [Collections.Generic.List[object]]::new()
+    $targets = [Collections.Generic.List[string]]::new()
+    foreach ($directory in $BuildDirectories) {
+        if (![IO.Path]::IsPathFullyQualified($directory)) { throw "Build directory must be absolute: $directory" }
+        $root = [IO.Path]::GetFullPath($directory)
+        $publish = Join-Path $root 'publish'
+        $manifestPath = Join-Path $root 'build-manifest.json'
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -AsHashtable
+        if ($manifest['probe'] -or $manifest['verificationTools']) { throw "Verification builds cannot be signed for release: $root" }
+        if ($manifest.Contains('signing')) { throw "Build is already signed: $root" }
+        $exe = Join-Path $publish 'prunlet.exe'
+        $maintenanceExe = Join-Path $publish 'prunlet-maintenance.exe'
+        $hookExe = Join-Path $publish 'prunlet-hook.exe'
+        $unsigned = [ordered]@{}
+        foreach ($product in @($exe, $maintenanceExe, $hookExe)) {
+            $item = Get-Item -LiteralPath $product -Force
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Signing input cannot be a link: $product" }
+            $hash = (Get-FileHash -LiteralPath $product -Algorithm SHA256).Hash.ToLowerInvariant()
+            # ビルド記録と一致する未署名の出力だけを受け付ける。
+            if ($hash -cne $manifest['products'][$item.Name]) { throw "Build output differs from its manifest: $product" }
+            if ((Get-AuthenticodeSignature -LiteralPath $product).Status -ne [Management.Automation.SignatureStatus]::NotSigned) { throw "Signing input is already signed or has an invalid signature: $product" }
+            $unsigned[$item.Name] = $hash
+        }
+        $builds.Add([ordered]@{ manifestPath = $manifestPath; manifest = $manifest; exe = $exe; maintenanceExe = $maintenanceExe; hookExe = $hookExe; unsigned = $unsigned })
+        # hookはCLIの複製なので署名しない。署名ごとにタイムスタンプが変わるため、
+        # 署名済みCLIを複製し直して両者の同一hashを保つ（更新ZIPが要求する）。
+        $targets.Add($exe); $targets.Add($maintenanceExe)
     }
-    $signTool = Find-PrunletSignTool
-    $cert = Get-PrunletSigningCertificate
-    $arguments = @('sign', '/sha1', $cert.Thumbprint, '/fd', 'SHA256', '/tr', $script:PrunletTimestampUrl, '/td', 'SHA256') + $Paths
-    # signtoolの出力は戻り値へ混ぜず、診断用に表示だけする（呼出し元はJSONを出力するため）。
-    & $signTool @arguments 2>&1 | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE. Connect SimplySign Desktop (vava Connect-SimplySign.ps1) and retry with a new output directory." }
-    foreach ($path in $Paths) { $null = Assert-PrunletAuthenticodeSigned $path }
-    return [ordered]@{ signer = $script:PrunletSignerCommonName; thumbprint = $cert.Thumbprint; timestampUrl = $script:PrunletTimestampUrl }
+    $sigilune = Find-PrunletSigilune
+    # 1ファイルずつ署名する。2026-11-13にv1.0.0公開前のSigiluneで確かめたところ、1回の呼出しで
+    # 複数ファイルを渡すと、3回中1回はsigntoolがアクセス違反で異常終了し、1回はdlibがtokioの
+    # panic（EnterGuardの解放順序違反）を出した。1ファイルずつの呼出しでは問題が出なかった。
+    # セッションはプロセス間で共有されるため、呼出しを分けてもログインは増えない。
+    # 失敗時は自動再試行せず、残りの署名もしない（署名済み分は呼出し元が出力ごと破棄する）。
+    foreach ($target in $targets) {
+        # Sigiluneの出力は戻り値へ混ぜず、診断用に表示だけする（呼出し元はJSONを出力するため）。
+        & $sigilune sign $target 2>&1 | ForEach-Object { Write-Host $_ }
+        if ($LASTEXITCODE -ne 0) { throw "sigilune sign failed with exit code $LASTEXITCODE for $target." }
+    }
+    foreach ($build in $builds) {
+        Copy-Item -LiteralPath $build.exe -Destination $build.hookExe -Force
+        $products = [ordered]@{}
+        foreach ($product in @($build.exe, $build.maintenanceExe, $build.hookExe)) {
+            $null = Assert-PrunletAuthenticodeSigned $product
+            $products[[IO.Path]::GetFileName($product)] = (Get-FileHash -LiteralPath $product -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        if ($products['prunlet-hook.exe'] -cne $products['prunlet.exe']) { throw 'Signed hook differs from the signed CLI.' }
+        # productsは署名後の配布物のhashへ更新し、署名前のhashと署名者を記録として残す。
+        $build.manifest['products'] = $products
+        $build.manifest['product']['sha256'] = $products['prunlet.exe']
+        $build.manifest['signing'] = [ordered]@{ tool = 'sigilune'; signer = $script:PrunletSignerCommonName; unsignedSha256 = $build.unsigned }
+        [IO.File]::WriteAllText($build.manifestPath, ($build.manifest | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+    }
 }

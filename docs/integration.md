@@ -4,7 +4,7 @@ PrunletはWindows向けCLIとstdio MCPを同じexeで提供します。Codexの`
 
 ## 準備
 
-通常は[READMEのlatestインストール手順](../README.md#インストールと更新)を使います。GitHubの既定ブランチ最新HEADからソースを取得し、exe・連携スクリプト・共通指示を`%USERPROFILE%\.local\Prunlet\bin`へ配置します。`-RegisterCodex`で下記の共通登録も実行できます。ローカルクローン内のファイルを実行元に登録しません。
+通常は[READMEのlatestインストール手順](../README.md#インストールと更新)を使います。GitHubの最新releaseから署名済みの更新ZIPを取得・照合し、exe・連携スクリプト・共通指示を`%USERPROFILE%\.local\Prunlet\bin`へ配置します。`-RegisterCodex`で下記の共通登録も実行できます。ローカルクローン内のファイルを実行元に登録しません。
 
 登録後のMCP起動時には配置済みの起動スクリプトがlatestを確認します。旧MCP・保守プロセスの使用中は切替を延期し、フック用exeは切替中も独立して動作します。更新状態・候補の所有と互換性を確認できない場合は保全し、自動再送や旧版への無条件な巻戻しを行いません。レジストリの移行が必要な更新では新しいexeで既存の明示移行を完了させ、復元記録を維持します。最初の導入・既存の旧フック定義からの移行にはCodexでのフック信頼が必要です。
 
@@ -30,7 +30,7 @@ RTKの共通指示と同様、エージェントのツール選択を案内す�
 
 既存の管理済み配置がGitの祖先配下にある場合だけ、導入スクリプトの`-UpdateManagedInstallation`を明示できる。既存設定・配置情報・実行ファイルと補助ファイルのhash一致、リンクのない既存ディレクトリ、Gitの追跡対象がないことを確認する。Gitの除外対象でない場合は、実効CodexHomeの正規管理blockにあるCLI登録と配置先が一致することも必要である。復元先は既存設定の値を保持し、配置外の復元先には通常の導入ガードを適用する。
 
-作業先・更新バックアップ・ソース・Codex内部へのガードは維持する。配置前と移行前にパス・設定・hashを再確認し、`-ExpectedCommitSha <40桁SHA>`を渡した場合は取得した既定branchのHEADとも照合する。共通guideの再登録では、検証済み配置のguideとUTF-8本文が一致するLF/CRLFの差だけを認識し、編集済み本文は拒否する。旧更新stageはこのモードで清掃しない。これらは非原子的な整合確認であり、ディレクトリ実体を固定する機構ではない。
+作業先・更新バックアップ・ソース・Codex内部へのガードは維持する。配置前と移行前にパス・設定・hashを再確認し、`-ExpectedCommitSha <40桁SHA>`を渡した場合は取得した最新releaseのcommitとも照合する。共通guideの再登録では、検証済み配置のguideとUTF-8本文が一致するLF/CRLFの差だけを認識し、編集済み本文は拒否する。旧更新stageはこのモードで清掃しない。これらは非原子的な整合確認であり、ディレクトリ実体を固定する機構ではない。
 
 通常はインストーラーが設定を作成します。手動の初期化は[README](../README.md#初期設定)を参照してください。`backupDirectory`は保護された共通metadata基点で、レジストリ記録を`.registry-records-v1/<operationId>`へ保存します。新しいファイル・フォルダー削除は操作記録やsnapshotを作りません。
 
@@ -224,7 +224,7 @@ native scopeのmachine・SID・32/64 viewを復元記録とsnapshotへ結び付�
 
 ## 解除と復元
 
-自動整理のWindowsタスクはCodex連携とは独立しています。次のCodex登録解除でも維持されます。タスクだけを解除する場合は、配置済み`uninstall-maintenance.ps1`へ同じexe・設定を渡します。解除後も実削除時の自動整理は行われますが、使っていない間の期限切れ整理は行われません。
+自動整理のWindowsタスクはCodex連携とは独立しています。次のCodex登録解除でも維持されます。タスクだけを解除する場合は、配置済み`uninstall-maintenance.ps1`へ同じexe・設定を渡します。解除後も実削除時の自動整理は行われますが、使っていない間の期限切れ整理は行われません。同じ解除で更新タスク（`Prunlet-Update-*`）も外れるため、以後はCodexのMCP起動時か手動導入でだけ更新されます。
 
 ```powershell
 & (Join-Path $bin 'uninstall-maintenance.ps1') -ExecutablePath $exe -ConfigPath $config

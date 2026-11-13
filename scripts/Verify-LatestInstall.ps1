@@ -30,13 +30,8 @@ foreach ($path in @($OutputDirectory, $ReportPath)) {
     if (Test-Path -LiteralPath $full) { throw 'Verification destinations must be new.' }
 }
 New-Item -ItemType Directory -Path $OutputDirectory, (Split-Path -Parent $ReportPath) -Force | Out-Null
-$previousCargoTargetDirectory = $env:PRUNLET_CARGO_TARGET_DIRECTORY
-try {
-# 各導入は実際にCargoを呼び、依存だけを同じ外部targetへ共有する。
-$env:PRUNLET_CARGO_TARGET_DIRECTORY = Join-Path $OutputDirectory 'cargo-target'
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
 . (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')
-. (Join-Path $PSScriptRoot 'RustBuildInputs.Common.ps1')
 . (Join-Path $PSScriptRoot 'FixtureBridge.Common.ps1')
 . (Join-Path $PSScriptRoot 'FileFixtures.Common.ps1')
 $binding = @{ ExecutablePath = $ExecutablePath }
@@ -56,7 +51,8 @@ function Set-FixtureVolumeMap([string]$ConfigPath) {
     [IO.File]::WriteAllText($ConfigPath, ($settings | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
 }
 # 実ホストのタスクは一切登録せず、Task Scheduler境界だけをメモリー上で代替する。
-$global:PrunletMaintenanceFixture = @{ tasks = @{}; failAfterWrite = $false }
+# failAfterWriteNameは、その接頭辞のタスクを書いた直後だけ失敗させる（保守→更新の順で登録するため）。
+$global:PrunletMaintenanceFixture = @{ tasks = @{}; failAfterWrite = $false; failAfterWriteName = $null }
 function Get-ScheduledTask {
     [CmdletBinding()] param([string]$TaskPath)
     if ($TaskPath -cne '\') { throw 'Unexpected maintenance task folder.' }
@@ -75,6 +71,10 @@ function Register-ScheduledTask {
     if ($global:PrunletMaintenanceFixture.failAfterWrite) {
         $global:PrunletMaintenanceFixture.failAfterWrite = $false
         throw 'Fixture maintenance registration failure.'
+    }
+    if ($global:PrunletMaintenanceFixture.failAfterWriteName -and $TaskName.StartsWith($global:PrunletMaintenanceFixture.failAfterWriteName, [StringComparison]::Ordinal)) {
+        $global:PrunletMaintenanceFixture.failAfterWriteName = $null
+        throw 'Fixture update task registration failure.'
     }
 }
 function Unregister-ScheduledTask {
@@ -101,7 +101,7 @@ $isolatedCodex = Join-Path $OutputDirectory 'isolated-codex'
 $settingsBackup = Join-Path $OutputDirectory 'settings-backup'
 
 # 起こり得る失敗を列挙してから実システムの検証を組み立てる。
-$failureConditions = @('退役で旧file復元領域や操作記録を作る', '退役が元設定や他の設定を変更する', 'Windowsゴミ箱の退役項目のID/hash不一致', '通常更新で旧領域を再走査する', '復元領域の移行開始後に旧exeへ戻す', '部分保全を移行完了と偽る', 'fixtureが本番専用領域へ書き込む', '未追跡Rustソースがfixture archiveから欠落する', 'フォルダー未登録の初回導入が拒否される', '旧rootsが削除範囲へ再適用される', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '公開HEADに必要ソース欠落', 'ZIP traversal/重複/リンク', 'ビルド失敗', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '旧roots内外の作業場所と復元先の検証', '指示登録オプションの組合せ不備', '指示marker重複・不完全・利用者編集', 'guide既存未所有・利用者編集', '指示登録途中での書込み失敗')
+$failureConditions = @('退役で旧file復元領域や操作記録を作る', '退役が元設定や他の設定を変更する', 'Windowsゴミ箱の退役項目のID/hash不一致', '通常更新で旧領域を再走査する', '復元領域の移行開始後に旧exeへ戻す', '部分保全を移行完了と偽る', 'fixtureが本番専用領域へ書き込む', 'フォルダー未登録の初回導入が拒否される', '旧rootsが削除範囲へ再適用される', '無効repository', '外部保存先違反またはリンク', 'ネットワーク取得失敗', '最新releaseに更新ZIPがない', 'release commitが既定ブランチ外', '取得ZIPとassetのdigest/size不一致', 'ZIP traversal/重複/リンク/欠落/余分なentry', 'package.jsonのcommit・runtime・hash不一致', '未署名・署名者違い・タイムスタンプなしの実行ファイル', 'Codex未登録のPCで更新が永久に延期される', '更新だけの起動がMCPを起動する', '使用中の製品を更新が置き換える', 'Codex登録ありで更新が登録保護を素通りする', '更新タスクが利用者設定・他者のタスクを書き換える', '更新タスク未対応の配布物へ実行できないタスクを登録する', '製品ファイル更新失敗', '登録時既存設定の拒否', 'Codex登録の2ファイル間での書込み失敗', '旧roots内外の作業場所と復元先の検証', '指示登録オプションの組合せ不備', '指示marker重複・不完全・利用者編集', 'guide既存未所有・利用者編集', '指示登録途中での書込み失敗')
 Test-Case 'Agent instructions require explicit Codex registration' {
     Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -RegisterAgentInstructions } 'requires explicit -RegisterCodex'
 }
@@ -151,62 +151,124 @@ Test-Case 'Explicit GitHub CLI authentication rejects invalid JSON without raw o
     Assert-True ($null -ne $caught -and $caught.ToString() -ceq 'GitHub CLI returned invalid JSON.') 'Invalid JSON was accepted or raw output escaped into the error.'
 }
 if ($CheckPublicHead) {
-    Test-Case 'Public default branch is queried without clone fallback' {
+    Test-Case 'Public latest release installs only its verified signed package' {
+        # 実GitHubの最新releaseを使う。署名済み更新ZIPがあれば導入し、未署名・未添付なら何も書かずに止まることを確認する。
         $publicInstall = Join-Path $OutputDirectory 'public-install'
         try {
             & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $publicInstall -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'public-work') -UseGitHubCliAuthentication:$UseGitHubCliAuthentication | Out-Null
             $publicInfo = Get-Content -LiteralPath (Join-Path $publicInstall 'source-info.json') -Raw | ConvertFrom-Json
-            Assert-True ($publicInfo.commitSha -match '^[0-9a-f]{40}$') 'Public installation has no provenance.'
+            Assert-True ($publicInfo.commitSha -match '^[0-9a-f]{40}$' -and $publicInfo.downloadUrl -match '^https://api\.github\.com/repos/[^/]+/[^/]+/releases/assets/[0-9]+$') 'Public installation has no release provenance.'
+            foreach ($name in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
+                Assert-True ((Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath (Join-Path $publicInstall ('bin\' + $name))).Status -eq 'Valid') "Public installation placed an unsigned executable: $name"
+            }
         } catch {
-            Assert-True ($_.ToString() -match 'Latest source is not installable; required file missing') "Public lookup failed unexpectedly: $_"
-            Assert-True (!(Test-Path -LiteralPath $publicInstall)) 'Incomplete public source mutated installation.'
+            Assert-True ($_.ToString() -match 'has no unique prunlet-update-|not signed by the Prunlet publisher') "Public lookup failed unexpectedly: $_"
+            Assert-True (!(Test-Path -LiteralPath $publicInstall)) 'Refused public release mutated installation.'
         }
     }
 }
 
-# 本番URLは固定のまま、親スコープのHTTPコマンドだけを置換する。
-# CLI/build/配置/登録/ロールバックは実処理を実行する。
+# 本番URLは固定のまま、親スコープのHTTPコマンドと署名照合だけを置換する。
+# 取得・ZIP検証・展開・配置・登録・ロールバックは実処理を実行する。
+# 配布物は公開workflowと同じPackage-PrunletUpdate.ps1で、今回のビルド出力と作業ツリーの補助ファイルから作る。
 $fixtureRoot = Join-Path $OutputDirectory 'fixture'
-$source = Join-Path $fixtureRoot 'Prunlet-fixture'
-New-Item -ItemType Directory -Path $source, (Join-Path $source 'scripts') | Out-Null
-Copy-Item -LiteralPath (Join-Path $repoRoot 'src'), (Join-Path $repoRoot 'integration') -Destination $source -Recurse
-Copy-Item -LiteralPath (Join-Path $repoRoot 'tools') -Destination $source -Recurse
-Copy-Item -LiteralPath (Join-Path $repoRoot '.cargo') -Destination $source -Recurse
-Copy-Item -LiteralPath (Join-Path $repoRoot 'Cargo.toml'), (Join-Path $repoRoot 'Cargo.lock'), (Join-Path $repoRoot 'rust-toolchain.toml'), (Join-Path $repoRoot 'build.rs') -Destination $source
-Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Join-Path $repoRoot 'scripts\RustBuildInputs.Common.ps1'), (Join-Path $repoRoot 'scripts\Install-Prunlet.ps1') -Destination (Join-Path $source 'scripts')
-$fixtureGuideSha256 = (Get-FileHash -LiteralPath (Join-Path $source 'integration\PRUNLET.md') -Algorithm SHA256).Hash
+$fixtureSource = Join-Path $fixtureRoot 'source'
+$fixturePublish = Split-Path -Parent ([IO.Path]::GetFullPath($ExecutablePath))
+$fixturePackages = Join-Path $fixtureRoot 'packages'
+function New-FixtureSource([string]$Path) {
+    # 梱包に必要な補助ファイル（integration\*とscripts\Install-Prunlet.ps1）だけを複製する。
+    New-Item -ItemType Directory -Path (Join-Path $Path 'scripts') | Out-Null
+    Microsoft.PowerShell.Management\Copy-Item -LiteralPath (Join-Path $repoRoot 'integration') -Destination $Path -Recurse
+    Microsoft.PowerShell.Management\Copy-Item -LiteralPath $installer -Destination (Join-Path $Path 'scripts')
+    return $Path
+}
+New-Item -ItemType Directory -Path $fixtureRoot, $fixturePackages | Out-Null
+$null = New-FixtureSource $fixtureSource
+$fixtureGuideSha256 = (Get-FileHash -LiteralPath (Join-Path $fixtureSource 'integration\PRUNLET.md') -Algorithm SHA256).Hash
 Assert-True ($fixtureGuideSha256 -ceq (Get-FileHash -LiteralPath (Join-Path $repoRoot 'integration\PRUNLET.md') -Algorithm SHA256).Hash) 'Fixture guide differs from the current working tree.'
-# 実行した検証・導入・ビルド・連携元のhashを、製品本文とは別にレポートへ固定する。
-$verificationInputFiles = @(@($PSCommandPath, $installer, (Join-Path $repoRoot 'scripts\Publish-Prunlet.ps1'), (Join-Path $repoRoot 'scripts\RustBuildInputs.Common.ps1'), (Join-Path $PSScriptRoot 'Verification-Common.ps1'), (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')) + $recordlessHelpers + @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'integration') -File | ForEach-Object FullName) | Sort-Object -Unique | ForEach-Object {
+# 実行した検証・導入・梱包・連携元のhashを、製品本文とは別にレポートへ固定する。
+$verificationInputFiles = @(@($PSCommandPath, $installer, (Join-Path $repoRoot 'scripts\Package-PrunletUpdate.ps1'), (Join-Path $PSScriptRoot 'Verification-Common.ps1'), (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')) + $recordlessHelpers + @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'integration') -File | ForEach-Object FullName) | Sort-Object -Unique | ForEach-Object {
     @{ path = [IO.Path]::GetRelativePath($repoRoot, $_); sha256 = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash }
 })
-$fixtureSourceFiles = @(Get-PrunletRustInputNames $repoRoot | ForEach-Object {
-    $relative = $_
-    $hash = (Get-FileHash -LiteralPath (Join-Path $repoRoot $relative) -Algorithm SHA256).Hash
-    Assert-True ((Get-FileHash -LiteralPath (Join-Path $source $relative) -Algorithm SHA256).Hash -ceq $hash) "Fixture source differs: $relative"
-    @{ path = $relative; sha256 = $hash }
+$fixtureProducts = @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe' | ForEach-Object {
+    @{ name = $_; sha256 = (Get-FileHash -LiteralPath (Join-Path $fixturePublish $_) -Algorithm SHA256).Hash }
 })
-Assert-True (@($fixtureSourceFiles | Where-Object path -eq 'src/rust/main.rs').Count -eq 1) 'Fixture archive omitted the Rust entry point.'
-$zipPath = Join-Path $OutputDirectory 'fixture.zip'
-[IO.Compression.ZipFile]::CreateFromDirectory($fixtureRoot, $zipPath)
-$global:PrunletLatestFixture = @{ sha = ('a' * 40); zip = $zipPath; requests = [Collections.Generic.List[string]]::new(); failDownload = $false; failCopy = $false }
+$fixtureTag = 'v9.9.9'
+$fixtureAssetName = 'prunlet-update-win-x64.zip'
+$global:PrunletLatestFixture = @{
+    sha = ('a' * 40); source = $fixtureSource; publish = $fixturePublish; packages = @{}; zipOverride = $null
+    assetMode = 'normal'; compareStatus = 'ahead'; digestOverride = $null; signature = 'valid'
+    requests = [Collections.Generic.List[string]]::new(); signatureChecks = [Collections.Generic.List[string]]::new()
+    failDownload = $false; failCopy = $false
+}
+function New-FixturePackage([string]$Sha, [string]$Source, [string]$Runtime = 'win-x64', [string]$Publish = $fixturePublish) {
+    # 同じcommit・補助ファイル・ビルド出力の組は1回だけ梱包する（commitはcaller-assertedで、releaseのcommitと照合される）。
+    $key = $Source + '|' + $Sha + '|' + $Runtime + '|' + $Publish
+    if (!$global:PrunletLatestFixture.packages.ContainsKey($key)) {
+        $output = Join-Path $fixturePackages ('package-' + $global:PrunletLatestFixture.packages.Count + '.zip')
+        & (Join-Path $repoRoot 'scripts\Package-PrunletUpdate.ps1') -SourceRoot $Source -PublishDirectory $Publish -OutputPath $output -CommitSha $Sha -DefaultBranch 'fixture/main' -Runtime $Runtime | Out-Null
+        $global:PrunletLatestFixture.packages[$key] = $output
+    }
+    return $global:PrunletLatestFixture.packages[$key]
+}
+function Get-FixturePackage {
+    if ($global:PrunletLatestFixture.zipOverride) { return $global:PrunletLatestFixture.zipOverride }
+    return New-FixturePackage $global:PrunletLatestFixture.sha $global:PrunletLatestFixture.source 'win-x64' $global:PrunletLatestFixture.publish
+}
+function New-ModifiedFixturePackage([string]$Name, [scriptblock]$Change) {
+    # 正規の梱包を複製し、ZIPの一部だけを壊した配布物を作る（digest・sizeは壊した後の実物で公開する）。
+    $output = Join-Path $fixturePackages ($Name + '.zip')
+    Microsoft.PowerShell.Management\Copy-Item -LiteralPath (New-FixturePackage ('a' * 40) $fixtureSource) -Destination $output
+    $zip = [IO.Compression.ZipFile]::Open($output, [IO.Compression.ZipArchiveMode]::Update)
+    try { & $Change $zip } finally { $zip.Dispose() }
+    return $output
+}
 function Invoke-RestMethod {
     param($Uri, $Headers, $TimeoutSec)
     [void]$global:PrunletLatestFixture.requests.Add([string]$Uri)
     Assert-True ($Headers['User-Agent'] -eq 'Prunlet-Latest-Installer' -and $TimeoutSec -gt 0) 'Missing network bounds.'
+    $fixture = $global:PrunletLatestFixture
     switch -Exact ([string]$Uri) {
-        'https://api.github.com/repos/1llum1n4t1s/Prunlet' { return @{ default_branch = 'fixture/main' } }
-        'https://api.github.com/repos/1llum1n4t1s/Prunlet/commits/fixture%2Fmain' { return @{ sha = $global:PrunletLatestFixture.sha } }
-        default { throw "Unexpected metadata URL: $Uri" }
+        'https://api.github.com/repos/1llum1n4t1s/Prunlet' { return [pscustomobject]@{ default_branch = 'fixture/main' } }
+        'https://api.github.com/repos/1llum1n4t1s/Prunlet/releases/latest' {
+            $assets = @()
+            if ($fixture.assetMode -ne 'missing') {
+                $package = Get-FixturePackage
+                $digest = if ($fixture.digestOverride) { $fixture.digestOverride } else { 'sha256:' + (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant() }
+                $assets = @([pscustomobject]@{ id = 4242; name = $fixtureAssetName; state = 'uploaded'; digest = $digest; size = (Get-Item -LiteralPath $package).Length })
+            }
+            return [pscustomobject]@{ tag_name = $fixtureTag; draft = $false; prerelease = $false; assets = $assets }
+        }
+        ('https://api.github.com/repos/1llum1n4t1s/Prunlet/git/ref/tags/' + $fixtureTag) { return [pscustomobject]@{ object = [pscustomobject]@{ type = 'commit'; sha = $fixture.sha } } }
+        ('https://api.github.com/repos/1llum1n4t1s/Prunlet/compare/' + $fixture.sha + '...fixture%2Fmain?per_page=1') { return [pscustomobject]@{ status = $fixture.compareStatus } }
+        default {
+            # 起動時更新は、導入済みcommitから最新releaseへの前進も確認する。
+            if ([string]$Uri -cmatch '\Ahttps://api\.github\.com/repos/1llum1n4t1s/Prunlet/compare/[0-9a-fA-F]{40}\.\.\.([0-9a-f]{40})\?per_page=1\z' -and $Matches[1] -ceq $fixture.sha) { return [pscustomobject]@{ status = $fixture.compareStatus } }
+            throw "Unexpected metadata URL: $Uri"
+        }
     }
 }
 function Invoke-WebRequest {
     param($Uri, $Headers, $OutFile, $TimeoutSec)
     [void]$global:PrunletLatestFixture.requests.Add([string]$Uri)
-    Assert-True ([string]$Uri -eq ('https://codeload.github.com/1llum1n4t1s/Prunlet/zip/' + $global:PrunletLatestFixture.sha)) 'Download did not pin this resolved HEAD.'
+    Assert-True ([string]$Uri -ceq ('https://github.com/1llum1n4t1s/Prunlet/releases/download/' + $fixtureTag + '/' + $fixtureAssetName)) 'Download did not pin the latest release asset.'
     if ($global:PrunletLatestFixture.failDownload) { throw 'Fixture network failure.' }
-    Microsoft.PowerShell.Management\Copy-Item -LiteralPath $global:PrunletLatestFixture.zip -Destination $OutFile
+    Microsoft.PowerShell.Management\Copy-Item -LiteralPath (Get-FixturePackage) -Destination $OutFile
 }
+function Get-AuthenticodeSignature {
+    # fixtureのビルドは検証用で署名できないため、署名照合の結果だけを置換する。
+    # 'real'では実際のWindows判定（未署名ならNotSigned）をそのまま返す。
+    [CmdletBinding()] param([string]$LiteralPath)
+    [void]$global:PrunletLatestFixture.signatureChecks.Add($LiteralPath)
+    $mode = $global:PrunletLatestFixture.signature
+    if ($mode -eq 'real') { return Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $LiteralPath }
+    $signerName = if ($mode -eq 'wrongSigner') { 'Fixture Other Publisher' } else { 'Open Source Developer Yuichiro Shinozaki' }
+    $certificate = [pscustomobject]@{ SimpleName = $signerName }
+    $certificate | Add-Member -MemberType ScriptMethod -Name GetNameInfo -Value { param($Type, $ForIssuer) return $this.SimpleName }
+    $timestamp = if ($mode -eq 'noTimestamp') { $null } else { $certificate }
+    return [pscustomobject]@{ Status = [Management.Automation.SignatureStatus]::Valid; SignatureType = [Management.Automation.SignatureType]::Authenticode; SignerCertificate = $certificate; TimeStamperCertificate = $timestamp }
+}
+$baseFixturePackage = New-FixturePackage ('a' * 40) $fixtureSource
 function Copy-Item {
     [CmdletBinding()]
     param([string[]]$LiteralPath, [string]$Destination, [switch]$Force, [switch]$Recurse)
@@ -291,41 +353,75 @@ try {
         finally { $global:PrunletLatestFixture.failDownload = $false }
         Assert-True (!(Test-Path -LiteralPath $install)) 'Download failure created install files.'
     }
-    Test-Case 'ZIP traversal is rejected before mutation' {
-        $badZip = Join-Path $OutputDirectory 'unsafe.zip'
-        $z = [IO.Compression.ZipFile]::Open($badZip, [IO.Compression.ZipArchiveMode]::Create)
-        try { [void]$z.CreateEntry('root/../escaped.txt') } finally { $z.Dispose() }
-        $global:PrunletLatestFixture.zip = $badZip
-        try { Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'unsafe-work') } 'Unsafe archive path' }
-        finally { $global:PrunletLatestFixture.zip = $zipPath }
-        Assert-True (!(Test-Path -LiteralPath $install)) 'Unsafe ZIP created install files.'
+    # 配布物の拒否はすべて初回導入先が作られないこと（製品・設定・タスクを書かないこと）で判定する。
+    function Assert-RefusedInstall([string]$Name, [string]$Pattern) {
+        Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory ($Name + '-work')) } $Pattern
+        Assert-True (!(Test-Path -LiteralPath $install)) "Refused package created install files: $Name"
     }
-    Test-Case 'ZIP duplicate paths and symbolic links are rejected' {
-        foreach ($kind in @('duplicate', 'link')) {
-            $badZip = Join-Path $OutputDirectory "$kind.zip"
-            $z = [IO.Compression.ZipFile]::Open($badZip, [IO.Compression.ZipArchiveMode]::Create)
-            try {
-                $entry = $z.CreateEntry('root/file.txt')
-                if ($kind -eq 'duplicate') { [void]$z.CreateEntry('root/FILE.txt') }
-                else { $entry.ExternalAttributes = [int](-1577058304) }
-            } finally { $z.Dispose() }
-            $global:PrunletLatestFixture.zip = $badZip
-            try { Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory "$kind-work") } 'Duplicate archive path|Archive links or special files' }
-            finally { $global:PrunletLatestFixture.zip = $zipPath }
+    Test-Case 'Latest release without its update package stops before download' {
+        $downloadsBefore = @($global:PrunletLatestFixture.requests | Where-Object { $_ -like 'https://github.com/*' }).Count
+        $global:PrunletLatestFixture.assetMode = 'missing'
+        try { Assert-RefusedInstall 'missing-asset' 'has no unique prunlet-update-win-x64\.zip yet' }
+        finally { $global:PrunletLatestFixture.assetMode = 'normal' }
+        Assert-True (@($global:PrunletLatestFixture.requests | Where-Object { $_ -like 'https://github.com/*' }).Count -eq $downloadsBefore) 'Missing asset still downloaded a package.'
+    }
+    Test-Case 'Release commit outside the default branch is refused' {
+        $global:PrunletLatestFixture.compareStatus = 'diverged'
+        try { Assert-RefusedInstall 'diverged-release' 'not on the default branch' }
+        finally { $global:PrunletLatestFixture.compareStatus = 'ahead' }
+    }
+    Test-Case 'Downloaded package must match the published digest' {
+        $global:PrunletLatestFixture.digestOverride = 'sha256:' + ('0' * 64)
+        try { Assert-RefusedInstall 'digest-mismatch' 'differs from the published release asset' }
+        finally { $global:PrunletLatestFixture.digestOverride = $null }
+    }
+    Test-Case 'Package metadata must name the release commit and runtime' {
+        foreach ($variant in @(@{ name = 'other-commit'; zip = (New-FixturePackage ('f' * 40) $fixtureSource) }, @{ name = 'other-runtime'; zip = $null })) {
+            if ($variant.name -eq 'other-runtime') {
+                # PEのmachineを照合する前にmetadataで止まることを確かめるため、runtimeだけを書き換える。
+                $variant.zip = New-ModifiedFixturePackage 'other-runtime' {
+                    param($zip)
+                    $entry = $zip.GetEntry('package.json')
+                    $reader = [IO.StreamReader]::new($entry.Open()); try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
+                    $entry.Delete()
+                    $writer = [IO.StreamWriter]::new($zip.CreateEntry('package.json').Open(), [Text.UTF8Encoding]::new($false)); try { $writer.Write($text.Replace('"runtime":"win-x64"', '"runtime":"win-arm64"')) } finally { $writer.Dispose() }
+                }
+            }
+            $global:PrunletLatestFixture.zipOverride = $variant.zip
+            try { Assert-RefusedInstall $variant.name 'Package metadata does not match the published release' }
+            finally { $global:PrunletLatestFixture.zipOverride = $null }
         }
-        Assert-True (!(Test-Path -LiteralPath $install)) 'Invalid ZIP created install files.'
     }
-    Test-Case 'Publish failure preserves initial boundary' {
-        $publishScript = Join-Path $source 'scripts\Publish-Prunlet.ps1'
-        $originalPublish = [IO.File]::ReadAllText($publishScript)
-        $brokenZip = Join-Path $OutputDirectory 'broken-build.zip'
-        try {
-            Set-Content -LiteralPath $publishScript -Value "param([string]`$OutputDirectory, [string]`$Runtime)`nthrow 'Fixture publish failure.'" -Encoding utf8NoBOM
-            [IO.Compression.ZipFile]::CreateFromDirectory($fixtureRoot, $brokenZip)
-            $global:PrunletLatestFixture.zip = $brokenZip
-            Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -AllowedRoot $allowed -WorkDirectory (Join-Path $OutputDirectory 'broken-work') } 'Fixture publish failure'
-        } finally { [IO.File]::WriteAllText($publishScript, $originalPublish); $global:PrunletLatestFixture.zip = $zipPath }
-        Assert-True (!(Test-Path -LiteralPath $install)) 'Build failure created install files.'
+    Test-Case 'Package traversal, duplicate, link, missing, extra and altered entries are rejected before mutation' {
+        $variants = [ordered]@{
+            'traversal' = @({ param($zip) [void]$zip.CreateEntry('bin/../escaped.txt') }, 'Unexpected or duplicate package entry')
+            'extra' = @({ param($zip) $writer = [IO.StreamWriter]::new($zip.CreateEntry('bin/extra.ps1').Open()); try { $writer.Write('extra') } finally { $writer.Dispose() } }, 'Unexpected or duplicate package entry')
+            'duplicate' = @({ param($zip) $writer = [IO.StreamWriter]::new($zip.CreateEntry('bin/PRUNLET.md').Open()); try { $writer.Write('duplicate') } finally { $writer.Dispose() } }, 'Unexpected or duplicate package entry')
+            'link' = @({ param($zip) $zip.GetEntry('bin/PRUNLET.md').ExternalAttributes = [int](-1577058304) }, 'links, directories, or special files')
+            'missing' = @({ param($zip) $zip.GetEntry('bin/PRUNLET.md').Delete() }, 'missing required entries')
+            'altered' = @({
+                param($zip)
+                $entry = $zip.GetEntry('bin/PRUNLET.md')
+                $reader = [IO.StreamReader]::new($entry.Open()); try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
+                $entry.Delete()
+                # 長さを保ったまま内容だけを変え、metadataのhash照合で止まることを確かめる。
+                $writer = [IO.StreamWriter]::new($zip.CreateEntry('bin/PRUNLET.md').Open(), [Text.UTF8Encoding]::new($false)); try { $writer.Write('X' + $text.Substring(1)) } finally { $writer.Dispose() }
+            }, 'Package content differs from its metadata')
+        }
+        foreach ($name in $variants.Keys) {
+            $global:PrunletLatestFixture.zipOverride = New-ModifiedFixturePackage ('bad-' + $name) $variants[$name][0]
+            try { Assert-RefusedInstall ('bad-' + $name) $variants[$name][1] }
+            finally { $global:PrunletLatestFixture.zipOverride = $null }
+        }
+    }
+    Test-Case 'Unsigned, foreign-signed and untimestamped executables are never placed' {
+        # realは実際のWindows判定を使い、検証用ビルド（未署名）がNotSignedで拒否されることを確かめる。
+        foreach ($mode in @('real', 'wrongSigner', 'noTimestamp')) {
+            $global:PrunletLatestFixture.signature = $mode
+            try { Assert-RefusedInstall ('signature-' + $mode) 'not signed by the Prunlet publisher' }
+            finally { $global:PrunletLatestFixture.signature = 'valid' }
+        }
+        Assert-True (!@($global:PrunletMaintenanceFixture.tasks.Values | Where-Object { $_.Contains($install) }).Count) 'Refused signature registered a maintenance task.'
     }
     Test-Case 'Maintenance registration failure rolls back new task and product files' {
         $failedInstall = Join-Path $OutputDirectory 'schedule-failure-install'
@@ -348,15 +444,33 @@ try {
         } finally { $global:PrunletMaintenanceFixture.tasks.Remove($state.name) }
     }
     Test-Case 'Latest fixture installs without target registration and protects recovery storage' {
+        $global:PrunletLatestFixture.signatureChecks.Clear()
         $firstInstallResult = & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $install -RegisterCodex -CodexHome $isolatedCodex -SettingsBackupDirectory $settingsBackup -WorkDirectory (Join-Path $OutputDirectory 'first-work') | ConvertFrom-Json -AsHashtable
         Assert-True ($firstInstallResult.status -ceq 'installed' -and $firstInstallResult.recoveryMigration.registryReady -and $firstInstallResult.recoveryMigration.complete) 'Fresh installation did not prepare registry-only recovery storage.'
         $info = Get-Content -LiteralPath (Join-Path $install 'source-info.json') -Raw | ConvertFrom-Json
         Assert-True ($info.commitSha -eq ('a' * 40)) 'Initial provenance mismatch.'
+        # 起動時更新（coordinator.rs）が読む10項目と同じ構成で、取得したreleaseのassetとZIPを指すこと。
+        $infoFields = @($info.PSObject.Properties.Name)
+        Assert-True ($infoFields.Count -eq 10 -and !(Compare-Object $infoFields @('repository', 'defaultBranch', 'commitSha', 'downloadUrl', 'archiveSha256', 'executableSha256', 'maintenanceExecutableSha256', 'hookExecutableSha256', 'auxiliarySha256', 'runtime'))) "Provenance fields differ from startup update: $($infoFields -join ',')"
+        Assert-True ($info.downloadUrl -ceq 'https://api.github.com/repos/1llum1n4t1s/Prunlet/releases/assets/4242' -and $info.archiveSha256 -ceq (Get-FileHash -LiteralPath $baseFixturePackage -Algorithm SHA256).Hash -and $info.defaultBranch -ceq 'fixture/main' -and $info.runtime -ceq 'win-x64') 'Provenance does not identify the installed release package.'
+        Assert-True (@($info.auxiliarySha256.PSObject.Properties).Count -eq 9) 'Auxiliary provenance is incomplete.'
+        foreach ($name in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
+            Assert-True ((Get-FileHash -LiteralPath (Join-Path $install ('bin\' + $name))).Hash -ceq ($fixtureProducts | Where-Object name -eq $name).sha256) "Installed executable is not the packaged build: $name"
+            Assert-True (@($global:PrunletLatestFixture.signatureChecks | Where-Object { [IO.Path]::GetFileName($_) -ceq $name -and !$_.StartsWith($install, [StringComparison]::OrdinalIgnoreCase) }).Count -ge 1) "Signature was not checked before placement: $name"
+        }
         Assert-True ($info.executableSha256 -eq (Get-FileHash -LiteralPath (Join-Path $install 'bin\prunlet.exe')).Hash) 'Executable provenance hash mismatch.'
         $toml = Get-Content -LiteralPath (Join-Path $isolatedCodex 'config.toml') -Raw
         $hooks = Get-Content -LiteralPath (Join-Path $isolatedCodex 'hooks.json') -Raw
         Assert-True (!$toml.Contains($repoRoot) -and !$hooks.Contains($repoRoot) -and !$toml.Contains($fixtureRoot) -and !$hooks.Contains($fixtureRoot)) 'Registration references checkout source.'
         Assert-True ($toml.Contains('bin\\prunlet.exe')) 'Registration does not use installed bin.'
+        # MCPに頼らない更新タスク: 非表示のconhost経由でpwshの-UpdateOnlyを起動し、保守タスクと時刻をずらす。
+        Assert-True ($firstInstallResult.updateTaskRegistered -and $global:PrunletMaintenanceFixture.tasks.ContainsKey($firstInstallResult.updateTaskName)) 'Installation did not register the update task.'
+        $updateXml = [xml]$global:PrunletMaintenanceFixture.tasks[$firstInstallResult.updateTaskName]
+        $expectedArguments = '--headless pwsh -NoProfile -NonInteractive -File "' + (Join-Path $install 'bin\start-prunlet-mcp.ps1') + '" -UpdateOnly -ExecutablePath "' + (Join-Path $install 'bin\prunlet.exe') + '" -ConfigPath "' + (Join-Path $install 'config.json') + '" -CodexHome "' + $isolatedCodex + '"'
+        Assert-True ($updateXml.Task.Actions.Exec.Command -ieq (Join-Path ([Environment]::GetFolderPath('System')) 'conhost.exe') -and $updateXml.Task.Actions.Exec.Arguments -ceq $expectedArguments) "Update task action differs: $($updateXml.Task.Actions.Exec.Arguments)"
+        Assert-True ($updateXml.Task.Principals.Principal.RunLevel -ceq 'LeastPrivilege' -and $updateXml.Task.Settings.Hidden -ceq 'true' -and $updateXml.Task.Settings.MultipleInstancesPolicy -ceq 'IgnoreNew' -and $updateXml.Task.Settings.StartWhenAvailable -ceq 'true') 'Update task is elevated, visible, overlapping, or skips missed runs.'
+        $updateBoundary = [Xml.XmlConvert]::ToDateTime($updateXml.Task.Triggers.CalendarTrigger.StartBoundary, [Xml.XmlDateTimeSerializationMode]::Unspecified)
+        Assert-True ($updateBoundary.TimeOfDay -eq [TimeSpan]::FromMinutes(750) -and $updateXml.Task.Triggers.LogonTrigger.Delay -ceq 'PT10M') 'Update task runs together with maintenance.'
         Assert-True (!(Test-Path -LiteralPath (Join-Path $OutputDirectory 'first-work'))) 'Successful work was not cleaned.'
         Assert-True (!(Test-Path -LiteralPath (Join-Path $isolatedCodex 'AGENTS.md')) -and !(Test-Path -LiteralPath (Join-Path $isolatedCodex 'PRUNLET.md'))) 'Without the flag agent instructions were written.'
         $installedExe = Join-Path $install 'bin\prunlet.exe'
@@ -841,14 +955,10 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-idempotent-work') | Out-Null
         Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $instructionAgents).Hash -and $guideHash -eq (Get-FileHash -LiteralPath $instructionGuide).Hash) 'Idempotent instruction registration rewrote contents.'
     }
-    $updatedZip = Join-Path $OutputDirectory 'updated-guide-fixture.zip'
-    $fixtureGuide = Join-Path $source 'integration\PRUNLET.md'
-    [byte[]]$originalGuideBytes = [IO.File]::ReadAllBytes($fixtureGuide)
-    try {
-        [IO.File]::AppendAllText($fixtureGuide, "`nFixture guide update.`n", [Text.UTF8Encoding]::new($false))
-        [IO.Compression.ZipFile]::CreateFromDirectory($fixtureRoot, $updatedZip)
-    } finally { [IO.File]::WriteAllBytes($fixtureGuide, $originalGuideBytes) }
-    $global:PrunletLatestFixture.zip = $updatedZip
+    # guideだけを変えた補助ファイルの組を別sourceとして用意し、同じビルド出力で梱包する。
+    $updatedSource = New-FixtureSource (Join-Path $fixtureRoot 'source-updated-guide')
+    [IO.File]::AppendAllText((Join-Path $updatedSource 'integration\PRUNLET.md'), "`nFixture guide update.`n", [Text.UTF8Encoding]::new($false))
+    $global:PrunletLatestFixture.source = $updatedSource
     $global:PrunletLatestFixture.sha = 'd' * 40
     Test-Case 'Owned guide updates from its previous installed hash' {
         $agentHash = (Get-FileHash -LiteralPath $instructionAgents).Hash
@@ -856,11 +966,8 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         Assert-True ([IO.File]::ReadAllText($instructionGuide).Contains('Fixture guide update.')) 'Owned guide did not update.'
         Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $instructionAgents).Hash) 'Guide update changed existing AGENTS.'
     }
-    $lineEndingZip = Join-Path $OutputDirectory 'line-ending-guide-fixture.zip'
-    try {
-        [IO.File]::AppendAllText($fixtureGuide, "`nFixture guide update.`nLine-ending fixture update.`n", [Text.UTF8Encoding]::new($false))
-        [IO.Compression.ZipFile]::CreateFromDirectory($fixtureRoot, $lineEndingZip)
-    } finally { [IO.File]::WriteAllBytes($fixtureGuide, $originalGuideBytes) }
+    $lineEndingSource = New-FixtureSource (Join-Path $fixtureRoot 'source-line-ending-guide')
+    [IO.File]::AppendAllText((Join-Path $lineEndingSource 'integration\PRUNLET.md'), "`nFixture guide update.`nLine-ending fixture update.`n", [Text.UTF8Encoding]::new($false))
     Test-Case 'Non-managed update accepts a registered guide that differs from the previous bin only by line endings' {
         $installedGuide = Join-Path $instructionInstall 'bin\PRUNLET.md'
         $installedText = [IO.File]::ReadAllText($installedGuide)
@@ -872,7 +979,7 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         Assert-True ((Get-FileHash -LiteralPath $instructionGuide).Hash -cne (Get-FileHash -LiteralPath $installedGuide).Hash) 'Line-ending fixture equals the installed guide bytes.'
         $agentHash = (Get-FileHash -LiteralPath $instructionAgents).Hash
         # このケースだけ別fixtureを使い、後続ケースの入力は従来のupdated fixtureへ戻す。
-        $global:PrunletLatestFixture.zip = $lineEndingZip
+        $global:PrunletLatestFixture.source = $lineEndingSource
         $global:PrunletLatestFixture.sha = 'e' * 40
         try {
             & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-line-ending-work') | Out-Null
@@ -881,7 +988,7 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
             Assert-True ($agentHash -eq (Get-FileHash -LiteralPath $instructionAgents).Hash) 'Line-ending guide update changed existing AGENTS.'
         } finally {
             # 後続ケースが前提とする「updated fixtureのbinと同じ登録ガイド」へ戻す（登録実物は所有判定を通る状態）。
-            $global:PrunletLatestFixture.zip = $updatedZip
+            $global:PrunletLatestFixture.source = $updatedSource
             $global:PrunletLatestFixture.sha = 'd' * 40
             & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $instructionInstall -RegisterCodex -RegisterAgentInstructions -CodexHome $instructionCodex -SettingsBackupDirectory $instructionBackup -WorkDirectory (Join-Path $OutputDirectory 'instruction-line-ending-restore-work') | Out-Null
         }
@@ -1031,7 +1138,7 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
             Assert-True ($originalHash -eq (Get-FileHash -LiteralPath $agentPath).Hash) 'Fenced document registration/removal did not restore original bytes.'
         }
     }
-    $global:PrunletLatestFixture.zip = $zipPath
+    $global:PrunletLatestFixture.source = $fixtureSource
     $managedRepository = Join-Path $OutputDirectory 'managed-git'
     $managedRoot = Join-Path $managedRepository 'runtimé'
     $managedRecovery = Join-Path $managedRoot 'recovery'
@@ -1175,16 +1282,174 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         Expect-Failure { & $installer -UpdateManagedInstallation -ExpectedCommitSha ('0'*40) -InstallDirectory $managedRoot -WorkDirectory (Join-Path $OutputDirectory 'managed-sha-refused') -UpdateBackupRoot $fixtureUpdateBackupRoot } 'ExpectedCommitSha'
         Assert-True ((Get-FileHash -LiteralPath (Join-Path $managedRoot 'source-info.json')).Hash -ceq $before) 'Commit mismatch changed installed provenance.'
     }
+    # ---- MCPに頼らない更新（start-prunlet-mcp.ps1 -UpdateOnly）と更新タスク ----
+    # 旧版は実行可能なままhashだけを変えた製品（末尾にoverlay）で導入し、今回のビルドを新releaseとして切り替える。
+    $oldPublish = Join-Path $fixtureRoot 'old-publish'
+    New-Item -ItemType Directory -Path $oldPublish | Out-Null
+    foreach ($leaf in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
+        $copy = Join-Path $oldPublish $leaf
+        [IO.File]::Copy((Join-Path $fixturePublish $leaf), $copy)
+        $stream = [IO.File]::Open($copy, [IO.FileMode]::Append, [IO.FileAccess]::Write)
+        try { $stream.Write([Text.Encoding]::UTF8.GetBytes('Prunlet update-only previous release fixture')) } finally { $stream.Dispose() }
+    }
+    $oldCommit = '1' * 40
+    $newCommit = '2' * 40
+    function Install-PreviousRelease([string]$Name, [string]$CodexHome, [switch]$RegisterCodex) {
+        $global:PrunletLatestFixture.sha = $oldCommit
+        $global:PrunletLatestFixture.source = $fixtureSource
+        $global:PrunletLatestFixture.publish = $oldPublish
+        $root = Join-Path $OutputDirectory $Name
+        $parameters = @{ UpdateBackupRoot = $fixtureUpdateBackupRoot; InstallDirectory = $root; WorkDirectory = (Join-Path $OutputDirectory ($Name + '-work')); CodexHome = $CodexHome }
+        if ($RegisterCodex) { $parameters.RegisterCodex = $true; $parameters.SettingsBackupDirectory = $settingsBackup }
+        $result = & $installer @parameters | ConvertFrom-Json -AsHashtable
+        Assert-True ($result.status -ceq 'installed' -and $result.commitSha -ceq $oldCommit) "Previous release fixture was not installed: $Name"
+        Set-FixtureVolumeMap (Join-Path $root 'config.json')
+        return $root
+    }
+    function Publish-NextRelease([string]$Root) {
+        # 新releaseを公開し、HTTP取得だけを「検証済みZIPを取得完了の位置へ置く」ことで代替する（Rustの取得は既存hashを再利用する）。
+        $global:PrunletLatestFixture.sha = $newCommit
+        $global:PrunletLatestFixture.publish = $fixturePublish
+        $package = Get-FixturePackage
+        $begin = & (Join-Path $Root 'bin\prunlet.exe') --config (Join-Path $Root 'config.json') __begin-published-update $newCommit $oldCommit
+        Assert-True ($LASTEXITCODE -eq 0) "Update stage could not be prepared: $begin"
+        $state = [IO.File]::ReadAllText((Join-Path $Root '.prunlet-update-state.json')) | ConvertFrom-Json -AsHashtable
+        [IO.File]::Copy($package, (Join-Path (Join-Path $Root '.prunlet-update-stage') $state.packageName))
+        return $package
+    }
+    function Invoke-UpdateOnly([string]$Root, [string]$CodexHome) {
+        & (Join-Path $Root 'bin\start-prunlet-mcp.ps1') -UpdateOnly -ExecutablePath (Join-Path $Root 'bin\prunlet.exe') -ConfigPath (Join-Path $Root 'config.json') -CodexHome $CodexHome
+        return $LASTEXITCODE
+    }
+    function Get-InstalledCommit([string]$Root) { return ([IO.File]::ReadAllText((Join-Path $Root 'source-info.json')) | ConvertFrom-Json).commitSha }
+    function Get-UpdatePhase([string]$Root) { return ([IO.File]::ReadAllText((Join-Path $Root '.prunlet-update-state.json')) | ConvertFrom-Json).phase }
+    Test-Case 'Update-only launcher switches a Codex-less installation to the next release without starting MCP' {
+        # ryzenx3dの状況: Codexの登録がなく、MCPが起動されないPC。
+        $noCodex = Join-Path $OutputDirectory 'update-only-no-codex'
+        $root = Install-PreviousRelease 'update-only-install' $noCodex
+        Assert-True (!(Test-Path -LiteralPath $noCodex)) 'Codex-less installation created a Codex home.'
+        $package = Publish-NextRelease $root
+        $exitCode = Invoke-UpdateOnly $root $noCodex
+        Assert-True ($exitCode -eq 0) "Update-only launcher failed: $exitCode"
+        Assert-True ((Get-InstalledCommit $root) -ceq $newCommit -and (Get-UpdatePhase $root) -ceq 'idle') 'Update-only launcher did not switch to the next release.'
+        foreach ($name in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
+            Assert-True ((Get-FileHash -LiteralPath (Join-Path $root ('bin\' + $name))).Hash -ceq ($fixtureProducts | Where-Object name -eq $name).sha256) "Update-only switch left a previous product: $name"
+        }
+        Assert-True (!(Test-Path -LiteralPath $noCodex)) 'Update-only launcher created a Codex home.'
+        # 最新を確認できた2回目は何も変えずに正常終了する。
+        $before = (Get-FileHash -LiteralPath (Join-Path $root 'source-info.json')).Hash
+        Assert-True ((Invoke-UpdateOnly $root $noCodex) -eq 0 -and (Get-FileHash -LiteralPath (Join-Path $root 'source-info.json')).Hash -ceq $before) 'Current update-only check changed the installation.'
+    }
+    Test-Case 'Update-only launcher defers when the maintenance executable is in use' {
+        $noCodex = Join-Path $OutputDirectory 'update-busy-no-codex'
+        $root = Install-PreviousRelease 'update-busy-install' $noCodex
+        $null = Publish-NextRelease $root
+        # 書込みを共有しない読取りで保持すると、起動時更新の使用中判定が働く。
+        $hold = [IO.File]::Open((Join-Path $root 'bin\prunlet-maintenance.exe'), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try { Assert-True ((Invoke-UpdateOnly $root $noCodex) -eq 0) 'Busy deferral did not exit normally.' }
+        finally { $hold.Dispose() }
+        Assert-True ((Get-InstalledCommit $root) -ceq $oldCommit) 'Update-only launcher replaced products that were in use.'
+        Assert-True ((Invoke-UpdateOnly $root $noCodex) -eq 0 -and (Get-InstalledCommit $root) -ceq $newCommit) 'Deferred update did not resume after the product was released.'
+    }
+    Test-Case 'Update-only launcher keeps Codex registration protection when Codex is registered' {
+        $codex = Join-Path $OutputDirectory 'update-registered-codex'
+        $root = Install-PreviousRelease 'update-registered-install' $codex -RegisterCodex
+        $null = Publish-NextRelease $root
+        # 利用者がPrunletのMCP blockを編集した状態。登録の見直しが必要なので、製品を切り替えずに延期する。
+        $tomlPath = Join-Path $codex 'config.toml'
+        $edited = [IO.File]::ReadAllText($tomlPath).Replace('startup_timeout_sec = 600', 'startup_timeout_sec = 601')
+        Assert-True ($edited -cne [IO.File]::ReadAllText($tomlPath)) 'Registration edit fixture did not change config.toml.'
+        [IO.File]::WriteAllText($tomlPath, $edited, [Text.UTF8Encoding]::new($false))
+        $tomlHash = (Get-FileHash -LiteralPath $tomlPath).Hash
+        Assert-True ((Invoke-UpdateOnly $root $codex) -eq 0) 'Registration deferral did not exit normally.'
+        Assert-True ((Get-InstalledCommit $root) -ceq $oldCommit -and (Get-UpdatePhase $root) -ceq 'idle') 'Update-only launcher bypassed changed Codex registration.'
+        Assert-True ((Get-FileHash -LiteralPath $tomlPath).Hash -ceq $tomlHash) 'Update-only launcher rewrote the edited Codex registration.'
+    }
+    Test-Case 'Update task is migrated only while owned and removed by explicit schedule uninstall' {
+        . (Join-Path $repoRoot 'integration\maintenance-task.ps1')
+        $root = Join-Path $OutputDirectory 'update-only-install'
+        $exe = Join-Path $root 'bin\prunlet.exe'
+        $config = Join-Path $root 'config.json'
+        $noCodex = Join-Path $OutputDirectory 'update-only-no-codex'
+        $state = Get-PrunletUpdateTaskState $exe $config $noCodex
+        Assert-True ([bool]$state.previousXml) 'Installed update task is missing.'
+        # 利用者が無効化した所有タスクは、CodexHomeを変えた再登録でも引数だけを移行し、無効化を保持する。
+        $disabled = $state.previousXml.Replace('<Enabled>true</Enabled><ScheduleByDay>', '<Enabled>false</Enabled><ScheduleByDay>')
+        Assert-True ($disabled -cne $state.previousXml) 'Disabled update task fixture did not change the XML.'
+        $global:PrunletMaintenanceFixture.tasks[$state.name] = $disabled
+        $moved = Get-PrunletUpdateTaskState $exe $config (Join-Path $OutputDirectory 'moved-codex')
+        Register-PrunletUpdateTask $moved
+        $migrated = [xml]$global:PrunletMaintenanceFixture.tasks[$state.name]
+        Assert-True ($migrated.Task.Actions.Exec.Arguments -ceq $moved.arguments -and $migrated.Task.Triggers.CalendarTrigger.Enabled -ceq 'false') 'Update task migration changed user settings or kept the old launcher arguments.'
+        Restore-PrunletUpdateTask $moved
+        Assert-True ($global:PrunletMaintenanceFixture.tasks[$state.name] -ceq $disabled) 'Update task rollback did not restore the previous XML.'
+        $foreign = $disabled.Replace($state.marker, 'Foreign update task')
+        $global:PrunletMaintenanceFixture.tasks[$state.name] = $foreign
+        Expect-Failure { Get-PrunletUpdateTaskState $exe $config $noCodex } 'not owned'
+        Expect-Failure { Unregister-PrunletUpdateTask $exe $config $noCodex } 'not owned'
+        Assert-True ($global:PrunletMaintenanceFixture.tasks[$state.name] -ceq $foreign) 'Foreign update task was modified.'
+        $global:PrunletMaintenanceFixture.tasks[$state.name] = $disabled
+        $maintenanceName = (Get-PrunletMaintenanceState $exe $config).name
+        $removed = & (Join-Path $root 'bin\uninstall-maintenance.ps1') -ExecutablePath $exe -ConfigPath $config | ConvertFrom-Json
+        Assert-True ($removed.updateTaskName -ceq $state.name -and !$global:PrunletMaintenanceFixture.tasks.ContainsKey($state.name) -and !$global:PrunletMaintenanceFixture.tasks.ContainsKey($maintenanceName)) 'Schedule uninstall retained the update or maintenance task.'
+    }
+    Test-Case 'Update task registration failure rolls back both tasks and product files' {
+        $failedRoot = Join-Path $OutputDirectory 'update-task-failure-install'
+        $beforeTasks = @($global:PrunletMaintenanceFixture.tasks.Keys)
+        $global:PrunletLatestFixture.sha = $newCommit
+        $global:PrunletLatestFixture.source = $fixtureSource
+        $global:PrunletLatestFixture.publish = $fixturePublish
+        $global:PrunletMaintenanceFixture.failAfterWriteName = 'Prunlet-Update-'
+        try { Expect-Failure { & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $failedRoot -WorkDirectory (Join-Path $OutputDirectory 'update-task-failure-work') -CodexHome (Join-Path $OutputDirectory 'update-task-failure-codex') } 'Fixture update task registration failure' }
+        finally { $global:PrunletMaintenanceFixture.failAfterWriteName = $null }
+        Assert-True (!@($global:PrunletMaintenanceFixture.tasks.Keys | Where-Object { $beforeTasks -cnotcontains $_ }).Count) 'Failed update task registration left a scheduled task.'
+        Assert-True (!(Test-Path -LiteralPath $failedRoot)) 'Failed update task registration left product files.'
+    }
+    Test-Case 'Edited update task defers the switch while the update state is still idle' {
+        $noCodex = Join-Path $OutputDirectory 'update-edited-no-codex'
+        $root = Install-PreviousRelease 'update-edited-install' $noCodex
+        $null = Publish-NextRelease $root
+        . (Join-Path $repoRoot 'integration\maintenance-task.ps1')
+        $state = Get-PrunletUpdateTaskState (Join-Path $root 'bin\prunlet.exe') (Join-Path $root 'config.json') $noCodex
+        $original = $state.previousXml
+        # 利用者が実行先を差し替えたタスク。切替後に所有確認で止まると更新状態がidleへ戻らないため、切替前に延期する。
+        $edited = $original.Replace([Security.SecurityElement]::Escape($state.command), 'C:\Users\Public\other.exe')
+        Assert-True ($edited -cne $original) 'Edited update task fixture did not change the command.'
+        $global:PrunletMaintenanceFixture.tasks[$state.name] = $edited
+        try {
+            Assert-True ((Invoke-UpdateOnly $root $noCodex) -eq 0) 'Edited task deferral did not exit normally.'
+            Assert-True ((Get-InstalledCommit $root) -ceq $oldCommit -and (Get-UpdatePhase $root) -ceq 'idle') 'Edited update task stranded or bypassed the switch.'
+            Assert-True ($global:PrunletMaintenanceFixture.tasks[$state.name] -ceq $edited) 'Update rewrote an edited update task.'
+        } finally { $global:PrunletMaintenanceFixture.tasks[$state.name] = $original }
+        Assert-True ((Invoke-UpdateOnly $root $noCodex) -eq 0 -and (Get-InstalledCommit $root) -ceq $newCommit -and (Get-UpdatePhase $root) -ceq 'idle') 'Update did not resume after the task was restored.'
+    }
+    Test-Case 'Installer from main skips the update task when the release package predates it' {
+        # mainの新しいインストーラーで、更新タスク未対応の配布物（HEADの補助ファイル）を導入する場合。
+        $legacySource = New-FixtureSource (Join-Path $fixtureRoot 'source-without-update-task')
+        foreach ($relative in @('integration/maintenance-task.ps1', 'integration/start-prunlet-mcp.ps1')) {
+            $text = & git -C $repoRoot show ('HEAD:' + $relative)
+            Assert-True ($LASTEXITCODE -eq 0) "Committed $relative could not be read."
+            [IO.File]::WriteAllText((Join-Path $legacySource $relative.Replace('/', '\')), (($text -join "`r`n") + "`r`n"), [Text.UTF8Encoding]::new($false))
+        }
+        Assert-True (![IO.File]::ReadAllText((Join-Path $legacySource 'integration\maintenance-task.ps1')).Contains('Get-PrunletUpdateTaskState')) 'Legacy fixture already supports the update task.'
+        $global:PrunletLatestFixture.sha = 'f' * 40
+        $global:PrunletLatestFixture.source = $legacySource
+        $global:PrunletLatestFixture.publish = $fixturePublish
+        $legacyRoot = Join-Path $OutputDirectory 'legacy-package-install'
+        $before = @($global:PrunletMaintenanceFixture.tasks.Keys)
+        $result = & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $legacyRoot -WorkDirectory (Join-Path $OutputDirectory 'legacy-package-work') -CodexHome (Join-Path $OutputDirectory 'legacy-package-codex') | ConvertFrom-Json -AsHashtable
+        Assert-True ($result.status -ceq 'installed' -and !$result.updateTaskRegistered -and !$result.updateTaskName) 'Installer registered an update task the packaged launcher cannot run.'
+        $added = @($global:PrunletMaintenanceFixture.tasks.Keys | Where-Object { $before -cnotcontains $_ })
+        Assert-True ($added.Count -eq 1 -and $added[0] -like 'Prunlet-Maintenance-*') "Legacy package registered unexpected tasks: $($added -join ',')"
+    }
 } finally {
-    Remove-Item Function:\Invoke-RestMethod, Function:\Invoke-WebRequest, Function:\Copy-Item
+    Remove-Item Function:\Invoke-RestMethod, Function:\Invoke-WebRequest, Function:\Copy-Item, Function:\Get-AuthenticodeSignature
+    $fixturePackageHashes = @($global:PrunletLatestFixture.packages.GetEnumerator() | Sort-Object Value | ForEach-Object { @{ key = $_.Key.Replace($fixtureRoot, '<fixture>'); sha256 = (Get-FileHash -LiteralPath $_.Value -Algorithm SHA256).Hash } })
     Remove-Variable PrunletLatestFixture -Scope Global
     Remove-Item Function:\Get-ScheduledTask, Function:\Export-ScheduledTask, Function:\Register-ScheduledTask, Function:\Unregister-ScheduledTask
     Remove-Variable PrunletMaintenanceFixture -Scope Global
     # junctionと更新バックアップも隔離出力内に残し、結果確認後にPrunletで一括清掃する。
-    [ordered]@{ fileFixtureRun = $fileFixtureRun; verifiedUtc = [DateTimeOffset]::UtcNow.ToString('o'); fixtureSource = 'current working tree including untracked Rust files'; fixtureSourceFiles = $fixtureSourceFiles; verificationInputFiles = $verificationInputFiles; fixtureArchiveSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash; fixtureGuideSha256 = $fixtureGuideSha256; publicHeadChecked = [bool]$CheckPublicHead; publicHeadAuthentication = $(if ($UseGitHubCliAuthentication) { 'github-cli' } else { 'unauthenticated' }); failureConditions = $failureConditions; results = @($results.ToArray()); passed = !@($results | Where-Object { !$_.passed }).Count; retention = 'Keep this report as reproducible installer verification evidence; delete when superseded.'; reproduce = 'Run scripts/Verify-LatestInstall.ps1 with new external OutputDirectory and ReportPath.' } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ReportPath -Encoding utf8NoBOM
+    [ordered]@{ fileFixtureRun = $fileFixtureRun; verifiedUtc = [DateTimeOffset]::UtcNow.ToString('o'); fixtureSource = 'update packages built by Package-PrunletUpdate.ps1 from the given build output and current working tree auxiliary files; Authenticode results are substituted except the real-signature refusal case'; fixtureProducts = $fixtureProducts; fixturePackages = $fixturePackageHashes; verificationInputFiles = $verificationInputFiles; fixtureArchiveSha256 = (Get-FileHash -LiteralPath $baseFixturePackage -Algorithm SHA256).Hash; fixtureGuideSha256 = $fixtureGuideSha256; publicHeadChecked = [bool]$CheckPublicHead; publicHeadAuthentication = $(if ($UseGitHubCliAuthentication) { 'github-cli' } else { 'unauthenticated' }); failureConditions = $failureConditions; results = @($results.ToArray()); passed = !@($results | Where-Object { !$_.passed }).Count; retention = 'Keep this report as reproducible installer verification evidence; delete when superseded.'; reproduce = 'Run scripts/Verify-LatestInstall.ps1 with new external OutputDirectory and ReportPath.' } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ReportPath -Encoding utf8NoBOM
 }
 Get-Content -LiteralPath $ReportPath -Raw
 if (@($results | Where-Object { !$_.passed }).Count) { throw 'Latest installer verification failed; read the JSON report.' }
-} finally {
-    $env:PRUNLET_CARGO_TARGET_DIRECTORY = $previousCargoTargetDirectory
-}

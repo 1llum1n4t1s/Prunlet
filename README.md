@@ -40,12 +40,12 @@ CPUに合う`prunlet-linux-x64.tar.gz`または`prunlet-linux-arm64.tar.gz`と�
 
 ### Windows
 
-Windows x64・ARM64に対応します。下のインストーラーは[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の既定ブランチの最新コミットからビルドするため、PowerShell 7、Rustup・Cargo、対象アーキテクチャのMSVCビルドツールとWindows SDKが必要です。ビルドに使うRustの版は[`rust-toolchain.toml`](rust-toolchain.toml)の`channel`で固定されています。Rustターゲットがなければ、`rustup target add --toolchain <channelの値> <ターゲット名>`で追加してください。
+Windows x64・ARM64に対応します。下のインストーラーは[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の最新リリースから、署名済みのビルド済み配布物（`prunlet-update-<runtime>.zip`）を取得して配置します。必要なのはPowerShell 7だけで、Rust・MSVCビルドツール・Windows SDKは不要です。
 
-| ビルド先 | Rustターゲット | インストーラーの指定 |
-| --- | --- | --- |
-| Windows x64 | `x86_64-pc-windows-msvc` | `-Runtime win-x64`（既定） |
-| Windows ARM64 | `aarch64-pc-windows-msvc` | `-Runtime win-arm64` |
+| 導入先 | インストーラーの指定 |
+| --- | --- |
+| Windows x64 | `-Runtime win-x64`（既定） |
+| Windows ARM64 | `-Runtime win-arm64` |
 
 Windows ARM64では、下の実行コマンドに`-Runtime`を明示してください。x64エミュレーションを選ぶ場合は`-Runtime win-x64`を指定します。
 
@@ -59,11 +59,11 @@ pwsh -NoProfile -File $installer -RegisterCodex -RegisterAgentInstructions
 
 GitHub APIの未認証枠が上限に達した場合は、上の`pwsh`コマンドに`-UseGitHubCliAuthentication`を追加すると、既存のログイン済みGitHub CLIを利用できます。ghの自動導入・ログインは行いません。この指定は手動インストーラー用です。
 
-インストーラーはGitHub APIから既定ブランチと最新コミットを取得し、そのコミットのアーカイブを取得してビルドします。導入処理中は取得したSHAでソースを揃えますが、次回の導入・更新は再び最新HEADを解決します。取得失敗やリモートの実装不足では停止し、ローカルクローンへ切り替えません。
+インストーラーはGitHub APIから最新の安定版リリースを取得し、そのタグが既定ブランチ上のコミットを指すこと、対象runtimeの配布物が1つだけ添付されていることを確認します。取得したZIPは、GitHubが返したサイズ・SHA-256、同梱物の一覧と各hash、リリースのコミット・runtime、実行ファイルのAuthenticode署名（署名者・タイムスタンプ付きのValid）を照合してから配置します。照合は起動時自動更新と同じ条件です。リリース直後で配布物の署名・添付がまだ終わっていない場合や、照合に失敗した場合は何も書き込まずに停止します。ソースのビルドやローカルクローンへの切替えは行いません。
 
-既定の配置先は`%USERPROFILE%\.local\Prunlet`です。`bin\prunlet.exe`と登録用スクリプト・共通指示を配置し、`source-info.json`に取得元・ブランチ・コミットを記録します。`-RegisterCodex`を指定すると共通MCPとネイティブexeのフックも登録します。
+既定の配置先は`%USERPROFILE%\.local\Prunlet`です。`bin\prunlet.exe`と登録用スクリプト・共通指示を配置し、`source-info.json`に取得元・ブランチ・コミット・配布物のhashを起動時自動更新と同じ形式で記録します。`-RegisterCodex`を指定すると共通MCPとネイティブexeのフックも登録します。
 
-自動更新では、CodexがPrunlet MCPを起動する際にGitHub Releaseのビルド済みバイナリを確認し、旧MCPや保守プロセスが終了しているときに切り替えます。自動更新ではソースの再ビルドは不要です。製品exeの実行に.NETランタイムやVCランタイムの追加導入は不要です。使用中なら終了させず、次のMCP起動時に再確認します。GitHub APIの未認証の通常リクエスト枠を使い切った場合は、設定済みのGitHub CLI（`gh`）の認証を使って自動で照会を続けます。通信や取得に失敗した場合は、更新前の状態が安全に保たれていれば現在の版を使います。
+自動更新では、CodexがPrunlet MCPを起動する際と、インストーラーが登録する更新タスク（毎日12:30とログオン10分後、窓なし）でGitHub Releaseのビルド済みバイナリを確認し、旧MCPや保守プロセスが終了しているときに切り替えます。更新タスクがあるため、Codexを使わないPCでも最新版へ追従します。自動更新ではソースの再ビルドは不要です。製品exeの実行に.NETランタイムやVCランタイムの追加導入は不要です。使用中なら終了させず、次のMCP起動時に再確認します。GitHub APIの未認証の通常リクエスト枠を使い切った場合は、設定済みのGitHub CLI（`gh`）の認証を使って自動で照会を続けます。通信や取得に失敗した場合は、更新前の状態が安全に保たれていれば現在の版を使います。
 
 自動更新はGitHub Releaseの発行者を信頼し、取得した配布物の一致を検査します。検証の仕組みと信頼範囲は[起動時自動更新の設計](DESIGN.md#起動時自動更新)を参照してください。
 
@@ -79,7 +79,7 @@ GitHub APIの未認証枠が上限に達した場合は、上の`pwsh`コマン�
 
 既存の管理済み配置がGitリポジトリ配下にあり、通常の保存先検査で更新が止まる場合は、再取得したインストーラーに`-UpdateManagedInstallation -InstallDirectory <既存配置の絶対パス>`を追加できます。既存設定・配置情報・製品hashの一致を確認し、Git追跡対象がなく、Gitで除外されているか現在の共通CLI登録と一致する配置を更新します。確認できない配置は保全して停止します。条件の詳細は[連携手順](docs/integration.md#手動の設定準備)を参照してください。
 
-事前に確認した最新HEADとの一致を要求する場合は、`-ExpectedCommitSha <40桁SHA>`を追加できます。取得した既定ブランチのHEADが異なれば、導入前に停止します。
+事前に確認したリリースとの一致を要求する場合は、`-ExpectedCommitSha <40桁SHA>`を追加できます。最新リリースのコミットが異なれば、導入前に停止します。
 
 取得したbootstrapファイルは一時物です。導入結果を確認して、そのbootstrap専用ディレクトリだけを清掃してください。アプリの配置先と復元用データは清掃対象に含めません。
 

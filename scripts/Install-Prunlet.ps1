@@ -249,45 +249,131 @@ function Assert-ManagedRecoveryBinding($Snapshot,[string]$ExpectedConfigHash = $
     $recovery = if (Test-InTree $recoveryPath $Snapshot.root) { Assert-ManagedExistingPath $recoveryPath -RegisteredInstallation:$registered } else { Assert-ExternalPath $recoveryPath 'Configured backupDirectory' }
     if (!$recovery.Equals($Snapshot.recovery,[StringComparison]::OrdinalIgnoreCase)) { throw 'Managed recovery configuration changed; migration was not started.' }
 }
-function Expand-CheckedArchive([string]$Archive, [string]$Destination) {
+# 公開済み最新releaseを解決する。起動時更新（start-prunlet-mcp.ps1のGet-LatestReleaseInfo）と
+# 同じ条件で、安定版・タグが既定ブランチ上のcommitを指すこと・runtimeの更新ZIPが一意で
+# digestとsizeを持つことを確認する。GitHub Releaseの発行者を信頼する点も同じ。
+function Get-LatestPrunletRelease {
+    $metadata = Get-PrunletGitHubApiResponse "repos/$Repository"
+    $branch = [string]$metadata.default_branch
+    if (!$branch -or $branch -cnotmatch '^[A-Za-z0-9._/-]+$' -or $branch.Contains('..') -or $branch.StartsWith('/') -or $branch.EndsWith('/')) { throw 'GitHub did not return a valid default branch.' }
+    $release = Get-PrunletGitHubApiResponse "repos/$Repository/releases/latest"
+    $tag = [string]$release.tag_name
+    if (!$tag -or $release.draft -or $release.prerelease) { throw 'GitHub did not return a published stable release.' }
+    if ($tag -cnotmatch '\Av?[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?\z') { throw 'Published release tag is invalid.' }
+    $target = (Get-PrunletGitHubApiResponse "repos/$Repository/git/ref/tags/$tag").object
+    for ($depth = 0; $depth -lt 8; $depth++) {
+        $sha = [string]$target.sha
+        if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw 'Release tag has an invalid object SHA.' }
+        if ($target.type -ceq 'commit') {
+            $comparison = Get-PrunletGitHubApiResponse ("repos/$Repository/compare/$sha..." + [Uri]::EscapeDataString($branch) + '?per_page=1')
+            if ($comparison.status -cnotin @('ahead', 'identical')) { throw 'Release commit is not on the default branch.' }
+            $name = 'prunlet-update-' + $Runtime + '.zip'
+            $assets = @($release.assets | Where-Object { $_.name -ceq $name -and $_.state -ceq 'uploaded' })
+            # 公開直後は配布workflowの承認・完了前でassetがまだない。何も書き込まずに止める。
+            if ($assets.Count -ne 1) { throw "The latest release $tag has no unique $name yet; retry after its release workflow finishes. Nothing was installed." }
+            $asset = $assets[0]
+            if ([string]$asset.digest -cnotmatch '^sha256:[0-9a-f]{64}$' -or [long]$asset.size -le 0 -or [long]$asset.size -gt 536870912) { throw 'Published package digest or size is invalid.' }
+            if ([long]$asset.id -le 0) { throw 'Published package identity is invalid.' }
+            return [ordered]@{ branch = $branch; tag = $tag; commit = $sha; assetName = $name; assetId = [long]$asset.id; assetBytes = [long]$asset.size; assetSha256 = ([string]$asset.digest).Substring(7).ToUpperInvariant() }
+        }
+        if ($target.type -cne 'tag') { throw 'Release tag does not identify a commit.' }
+        $target = (Get-PrunletGitHubApiResponse "repos/$Repository/git/tags/$sha").object
+    }
+    throw 'Release tag nesting exceeds the supported depth.'
+}
+
+# 配布ZIPに含まれる12製品。配置先（bin\…）とZIP内の名前（bin/…）は1対1で対応する。
+$script:PackageExecutables = @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')
+$script:PackageAuxiliary = @('Install-Prunlet.ps1', 'start-prunlet-mcp.ps1', 'configuration-common.ps1', 'maintenance-task.ps1', 'uninstall-maintenance.ps1', 'install-codex.ps1', 'uninstall-codex.ps1', 'install-agent-instructions.ps1', 'PRUNLET.md')
+# 配布物の署名者。Signing.Common.ps1と同じ値で、インストーラー単体でも照合できるよう直接持つ。
+$script:PackageSignerCommonName = 'Open Source Developer Yuichiro Shinozaki'
+
+# 取得したZIPを、何も実行する前に検証してから展開する。
+# 検証範囲: 固定のentry集合・リンクなし・サイズ上限、package.json（製品・schema・取得元・既定ブランチ・
+# releaseのcommit・runtime・12製品のhash/長さ）、展開後の実体hash、CLIとhookの同一性、PEのmachine、
+# 実行ファイルのAuthenticode（Valid・署名者・タイムスタンプ）。
+function Expand-VerifiedPackage([string]$Archive, [string]$Destination, $Release) {
     $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
     try {
-        $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        $roots = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        [long]$total = 0
+        $expected = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        [void]$expected.Add('package.json')
+        foreach ($name in @($script:PackageExecutables + $script:PackageAuxiliary)) { [void]$expected.Add('bin/' + $name) }
+        $entries = [Collections.Generic.Dictionary[string, IO.Compression.ZipArchiveEntry]]::new([StringComparer]::Ordinal)
+        $caseFolded = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($entry in $zip.Entries) {
             $name = $entry.FullName
-            $segments = $name.TrimEnd('/').Split('/')
-            if (!$name -or $name.Contains('\') -or $name.StartsWith('/') -or $segments.Count -lt 1) { throw "Unsafe archive path: $name" }
-            foreach ($segment in $segments) {
-                if (!$segment -or $segment -in @('.', '..') -or $segment -match '[:\x00-\x1f<>"|?*]' -or $segment.EndsWith('.') -or $segment.EndsWith(' ') -or $segment -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') { throw "Unsafe archive path: $name" }
-            }
-            if (!$names.Add($name.TrimEnd('/'))) { throw "Duplicate archive path: $name" }
+            if (!$expected.Contains($name) -or !$caseFolded.Add($name)) { throw "Unexpected or duplicate package entry: $name" }
             $mode = ($entry.ExternalAttributes -shr 16) -band 0xf000
-            if ($mode -notin @(0, 0x8000, 0x4000) -or ($entry.ExternalAttributes -band 0x400)) { throw "Archive links or special files are forbidden: $name" }
-            [void]$roots.Add($segments[0])
-            $total += $entry.Length
-            if ($total -gt 256MB -or $zip.Entries.Count -gt 20000) { throw 'Source archive exceeds installation limits.' }
-            $target = [IO.Path]::GetFullPath((Join-Path $Destination $name.Replace('/', [IO.Path]::DirectorySeparatorChar)))
-            if (!(Test-InTree $target $Destination)) { throw "Archive path escapes source directory: $name" }
+            if ($mode -notin @(0, 0x8000) -or ($entry.ExternalAttributes -band 0x410)) { throw "Package links, directories, or special files are forbidden: $name" }
+            $limit = if ($name.EndsWith('.exe', [StringComparison]::Ordinal)) { 256MB } elseif ($name -ceq 'package.json') { 64KB } else { 4MB }
+            if ($entry.Length -lt 1 -or $entry.Length -gt $limit) { throw "Package entry size is invalid: $name" }
+            $entries.Add($name, $entry)
         }
-        if ($roots.Count -ne 1) { throw 'Source archive must contain exactly one top-level directory.' }
-        # 全エントリを検査してから展開し、GitHubの単一ルートを使う。
-        [IO.Compression.ZipFile]::ExtractToDirectory($Archive, $Destination)
-        $rootName = @($roots)[0]
-        $root = Join-Path $Destination $rootName
-        if (!(Test-Path -LiteralPath $root -PathType Container)) { throw 'Source archive root is not a directory.' }
-        foreach ($required in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'build.rs', 'src\rust\main.rs', 'tools\prunlet-fixtures\Cargo.toml', 'tools\prunlet-fixtures\src\lib.rs', 'tools\prunlet-support\Cargo.toml', 'tools\prunlet-support\src\main.rs', 'scripts\Install-Prunlet.ps1', 'scripts\Publish-Prunlet.ps1', 'scripts\RustBuildInputs.Common.ps1', 'integration\start-prunlet-mcp.ps1', 'integration\configuration-common.ps1', 'integration\maintenance-task.ps1', 'integration\uninstall-maintenance.ps1', 'integration\install-codex.ps1', 'integration\uninstall-codex.ps1', 'integration\install-agent-instructions.ps1', 'integration\PRUNLET.md')) {
-            if (!(Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Latest source is not installable; required file missing: $required. Publish the source to the repository default branch first." }
+        if ($entries.Count -ne $expected.Count) { throw 'Release package is missing required entries.' }
+        $reader = [IO.StreamReader]::new($entries['package.json'].Open(), [Text.UTF8Encoding]::new($false, $true))
+        try { $manifest = $reader.ReadToEnd() | ConvertFrom-Json -AsHashtable -ErrorAction Stop } finally { $reader.Dispose() }
+        if ($manifest -isnot [Collections.IDictionary] -or $manifest['product'] -cne 'Prunlet' -or $manifest['schema'] -ne 1 -or
+            $manifest['repository'] -cne $Repository -or $manifest['defaultBranch'] -cne $Release.branch -or
+            [string]$manifest['commitSha'] -cne $Release.commit -or $manifest['runtime'] -cne $Runtime -or
+            $manifest['files'] -isnot [Collections.IDictionary] -or $manifest['files'].Count -ne ($expected.Count - 1)) {
+            throw 'Package metadata does not match the published release.'
         }
-        return $root
+        New-Item -ItemType Directory -Path (Join-Path $Destination 'bin') | Out-Null
+        $hashes = [ordered]@{}
+        foreach ($name in @($script:PackageExecutables + $script:PackageAuxiliary)) {
+            $key = 'bin/' + $name
+            if (@($manifest['files'].Keys) -cnotcontains $key) { throw "Package metadata is missing: $key" }
+            $item = $manifest['files'][$key]
+            if ($item -isnot [Collections.IDictionary] -or [string]$item['sha256'] -cnotmatch '^[0-9A-F]{64}$' -or [long]$item['bytes'] -ne $entries[$key].Length) { throw "Package metadata is invalid: $key" }
+            $path = Join-Path $Destination ('bin\' + $name)
+            $source = $entries[$key].Open()
+            try {
+                $file = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                try { $source.CopyTo($file) } finally { $file.Dispose() }
+            } finally { $source.Dispose() }
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            if ($hash -cne [string]$item['sha256'] -or (Get-Item -LiteralPath $path).Length -ne [long]$item['bytes']) { throw "Package content differs from its metadata: $key" }
+            $hashes[$name] = $hash
+        }
+        if ($hashes['prunlet.exe'] -cne $hashes['prunlet-hook.exe']) { throw 'The hook host must match the CLI binary.' }
+        $machine = if ($Runtime -eq 'win-x64') { 0x8664 } else { 0xaa64 }
+        foreach ($name in $script:PackageExecutables) {
+            $path = Join-Path $Destination ('bin\' + $name)
+            $bytes = [IO.File]::ReadAllBytes($path)
+            if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw "Package executable is not a PE file: $name" }
+            $offset = [BitConverter]::ToUInt32($bytes, 0x3c)
+            if ($offset -lt 64 -or $offset -gt $bytes.Length - 6 -or [BitConverter]::ToUInt32($bytes, [int]$offset) -ne 0x00004550 -or [BitConverter]::ToUInt16($bytes, [int]$offset + 4) -ne $machine) { throw "Package executable does not match ${Runtime}: $name" }
+            # 未署名・署名者違い・タイムスタンプなしの実行ファイルは配置も実行もしない。
+            $signature = Get-AuthenticodeSignature -LiteralPath $path
+            $signer = if ($signature.SignerCertificate) { $signature.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) } else { '' }
+            if ($signature.Status -ne 'Valid' -or $signer -cne $script:PackageSignerCommonName -or !$signature.TimeStamperCertificate) { throw "Package executable is not signed by the Prunlet publisher (status $($signature.Status)): $name" }
+        }
+        return $hashes
     } finally { $zip.Dispose() }
 }
 
 
 
+# 配布物の補助ファイルが更新タスクに対応しているかを、実物の構文木で判定する。
+# maintenance-task.ps1が登録・復元の関数を定義し、start-prunlet-mcp.ps1が-UpdateOnlyを受け付ける場合だけ真。
+function Test-PackageSupportsUpdateTask([string]$PackageBin) {
+    $definitions = @{}
+    foreach ($name in @('maintenance-task.ps1', 'start-prunlet-mcp.ps1')) {
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PackageBin $name), [ref]$tokens, [ref]$errors)
+        if ($errors.Count) { return $false }
+        $definitions[$name] = $ast
+    }
+    $functions = @($definitions['maintenance-task.ps1'].FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $false) | ForEach-Object Name)
+    foreach ($required in @('Get-PrunletUpdateTaskState', 'Register-PrunletUpdateTask', 'Restore-PrunletUpdateTask')) {
+        if ($functions -cnotcontains $required) { return $false }
+    }
+    $launcherParameters = $definitions['start-prunlet-mcp.ps1'].ParamBlock
+    return [bool]($launcherParameters -and @($launcherParameters.Parameters | Where-Object { $_.Name.VariablePath.UserPath -ceq 'UpdateOnly' }).Count)
+}
+
 if (!$IsWindows) { throw 'Prunlet installation requires Windows and PowerShell 7.' }
-if ($PrepareStartupUpdate) { throw 'Source-build startup preparation is no longer supported. Use the registered MCP startup entry to verify and prepare a published release package.' }
+if ($PrepareStartupUpdate) { throw 'Startup preparation is not part of manual installation. Use the registered MCP startup entry to verify and prepare a published release package.' }
 if ($RegisterAgentInstructions -and !$RegisterCodex) { throw 'RegisterAgentInstructions requires explicit -RegisterCodex.' }
 if ($Repository -cnotmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$') { throw 'Repository must be a GitHub owner/repository name.' }
 $nativeArchitecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
@@ -327,7 +413,6 @@ $updateBackup = Assert-ExternalPath (Join-Path $UpdateBackupRoot $runId) 'Update
 if ((Test-InTree $updateBackup $InstallDirectory) -or (Test-InTree $InstallDirectory $updateBackup) -or (Test-InTree $updateBackup $WorkDirectory) -or (Test-InTree $WorkDirectory $updateBackup)) { throw 'Update backup must be separate from install and work directories.' }
 if ((Test-InTree $updateBackup $effectiveBackup) -or (Test-InTree $effectiveBackup $updateBackup)) { throw 'Update backup must be separate from recovery data.' }
 if ($RegisterCodex -and $SettingsBackupDirectory) { $SettingsBackupDirectory = Assert-ExternalPath $SettingsBackupDirectory 'SettingsBackupDirectory' }
-if (!(Get-Command cargo.exe -ErrorAction SilentlyContinue) -and !(Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe') -PathType Leaf)) { throw 'Rust and Cargo are required to build latest source.' }
 $products = @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\prunlet-hook.exe', 'bin\Install-Prunlet.ps1', 'bin\start-prunlet-mcp.ps1', 'bin\configuration-common.ps1', 'bin\maintenance-task.ps1', 'bin\uninstall-maintenance.ps1', 'bin\install-codex.ps1', 'bin\uninstall-codex.ps1', 'bin\install-agent-instructions.ps1', 'bin\PRUNLET.md', 'source-info.json')
 $retiredProducts = @('bin\codex-pretooluse.ps1')
 $previousGuidePath = Join-Path $InstallDirectory 'bin\PRUNLET.md'
@@ -354,6 +439,8 @@ $profileSnapshot = [Collections.Generic.List[object]]::new()
 $registrationStarted = $false
 $maintenanceState = $null
 $maintenanceStarted = $false
+$updateTaskState = $null
+$updateTaskStarted = $false
 $retiredProductPaths = [Collections.Generic.List[string]]::new()
 $storageMigrationStarted = $false
 $storageMigration = $null
@@ -364,42 +451,38 @@ try {
     try { $mutexAcquired = $installationMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $mutexAcquired = $true }
     if (!$mutexAcquired) { throw 'Another Prunlet installation is already running for this directory.' }
     if ($managedInstallation) { Assert-ManagedInstallationSnapshot $managedInstallation }
-    $metadata = Get-PrunletGitHubApiResponse "repos/$Repository"
-    $branch = [string]$metadata.default_branch
-    if (!$branch) { throw 'GitHub did not return a default branch.' }
-    $head = Get-PrunletGitHubApiResponse ("repos/$Repository/commits/" + [Uri]::EscapeDataString($branch))
-    $sha = [string]$head.sha
-    if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw 'GitHub did not return a valid commit SHA.' }
-    if ($ExpectedCommitSha -and $sha -ine $ExpectedCommitSha) { throw 'The latest source commit differs from ExpectedCommitSha; nothing was installed.' }
-
+    # 既定ブランチのHEADではなく、署名済みの更新ZIPを持つ公開済み最新releaseを導入する。
+    # ソースのビルドをしないため、Rust・MSVC・Windows SDKは不要。
+    $release = Get-LatestPrunletRelease
+    $branch = $release.branch
+    $sha = $release.commit
+    if ($ExpectedCommitSha -and $sha -ine $ExpectedCommitSha) { throw 'The latest release commit differs from ExpectedCommitSha; nothing was installed.' }
 
     New-Item -ItemType Directory -Path $WorkDirectory | Out-Null
     $createdWork = $true
-    $downloadUrl = "https://codeload.github.com/$Repository/zip/$sha"
-    $archive = Join-Path $WorkDirectory 'source.zip'
-    Invoke-WebRequest -Uri $downloadUrl -Headers @{ 'User-Agent' = 'Prunlet-Latest-Installer' } -OutFile $archive -TimeoutSec 120 | Out-Null
+    # ZIP本体はREST APIの枠を使わない公開URLから取得し、APIが返したsizeとdigestで照合する（起動時更新と同じ）。
+    $archive = Join-Path $WorkDirectory $release.assetName
+    Invoke-WebRequest -Uri ("https://github.com/$Repository/releases/download/" + [Uri]::EscapeDataString($release.tag) + '/' + $release.assetName) -Headers @{ 'User-Agent' = 'Prunlet-Latest-Installer' } -OutFile $archive -TimeoutSec 300 | Out-Null
     $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
-    $sourceRoot = Expand-CheckedArchive $archive (Join-Path $WorkDirectory 'source')
+    if ((Get-Item -LiteralPath $archive).Length -ne $release.assetBytes -or $archiveHash -cne $release.assetSha256) { throw 'Downloaded package differs from the published release asset; nothing was installed.' }
+    $packageRoot = Join-Path $WorkDirectory 'package'
+    $packageHashes = Expand-VerifiedPackage $archive $packageRoot $release
+    $packageBin = Join-Path $packageRoot 'bin'
+    # 起動時更新と同じ形の取得元情報にする（downloadUrlはreleaseのasset API、archiveSha256はZIP全体）。
+    $downloadUrl = "https://api.github.com/repos/$Repository/releases/assets/$($release.assetId)"
     if ($RegisterAgentInstructions) {
-        $instructionParameters = @{ SourceGuidePath = (Join-Path $sourceRoot 'integration\PRUNLET.md'); CodexHome = $CodexHome; BackupDirectory = $(if ($SettingsBackupDirectory) { $SettingsBackupDirectory } else { $updateBackup }); PreviousGuideSha256 = $previousGuideSha256; ExecutablePath = (Join-Path $InstallDirectory 'bin\prunlet.exe'); ConfigPath = $configPath }
-        & (Join-Path $sourceRoot 'integration\install-agent-instructions.ps1') @instructionParameters -ValidateOnly | Out-Null
+        $instructionParameters = @{ SourceGuidePath = (Join-Path $packageBin 'PRUNLET.md'); CodexHome = $CodexHome; BackupDirectory = $(if ($SettingsBackupDirectory) { $SettingsBackupDirectory } else { $updateBackup }); PreviousGuideSha256 = $previousGuideSha256; ExecutablePath = (Join-Path $InstallDirectory 'bin\prunlet.exe'); ConfigPath = $configPath }
+        & (Join-Path $packageBin 'install-agent-instructions.ps1') @instructionParameters -ValidateOnly | Out-Null
     }
     # 所有していない既存タスクは製品ファイルを書き換える前に拒否する。
-    . (Join-Path $sourceRoot 'integration\maintenance-task.ps1')
+    . (Join-Path $packageBin 'maintenance-task.ps1')
     $maintenanceState = Get-PrunletMaintenanceState (Join-Path $InstallDirectory 'bin\prunlet.exe') $configPath
-    $buildRoot = Join-Path $WorkDirectory 'build'
-    # GitHub archive は .git を含まないため、解決済み HEAD をビルドへ明示する。
-    $oldSourceCommit = $env:PRUNLET_SOURCE_COMMIT
-    try {
-        $env:PRUNLET_SOURCE_COMMIT = $sha
-        & (Join-Path $sourceRoot 'scripts\Publish-Prunlet.ps1') -OutputDirectory $buildRoot -Runtime $Runtime | Out-Null
-    } finally { $env:PRUNLET_SOURCE_COMMIT = $oldSourceCommit }
-    $exe = Join-Path $buildRoot 'publish\prunlet.exe'
-    if (!(Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Build did not produce prunlet.exe.' }
-    $maintenanceExe = Join-Path $buildRoot 'publish\prunlet-maintenance.exe'
-    if (!(Test-Path -LiteralPath $maintenanceExe -PathType Leaf)) { throw 'Build did not produce prunlet-maintenance.exe.' }
-    $hookExe = Join-Path $buildRoot 'publish\prunlet-hook.exe'
-    if (!(Test-Path -LiteralPath $hookExe -PathType Leaf)) { throw 'Build did not produce prunlet-hook.exe.' }
+    # 更新タスクは、導入する配布物の補助ファイルが対応している場合だけ登録する。このインストーラーは
+    # mainから取得されるため、最新releaseより新しいことがある。呼び出し元の関数ではなく配布物の実物で判定する。
+    $updateTaskState = if (Test-PackageSupportsUpdateTask $packageBin) { Get-PrunletUpdateTaskState (Join-Path $InstallDirectory 'bin\prunlet.exe') $configPath $CodexHome } else { $null }
+    $exe = Join-Path $packageBin 'prunlet.exe'
+    $maintenanceExe = Join-Path $packageBin 'prunlet-maintenance.exe'
+    $hookExe = Join-Path $packageBin 'prunlet-hook.exe'
     # 初期設定も外部作業場所で検証する。既存設定の移行は配置後に行う。
     $newConfig = Join-Path $WorkDirectory 'config.json'
     if (!$existingConfig) {
@@ -414,11 +497,9 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Prunlet rejected the existing configuration; it was preserved.' }
     }
     $auxiliaryHashes = [ordered]@{}
-    foreach ($relative in $products | Where-Object { $_ -notin @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\prunlet-hook.exe', 'source-info.json') }) {
-        $source = if ($relative -eq 'bin\Install-Prunlet.ps1') { Join-Path $sourceRoot 'scripts\Install-Prunlet.ps1' } else { Join-Path $sourceRoot ('integration\' + [IO.Path]::GetFileName($relative)) }
-        $auxiliaryHashes[$relative] = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
-    }
-    $provenance = [ordered]@{ repository = $Repository; defaultBranch = $branch; commitSha = $sha; downloadUrl = $downloadUrl; archiveSha256 = $archiveHash; executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; maintenanceExecutableSha256 = (Get-FileHash -LiteralPath $maintenanceExe -Algorithm SHA256).Hash; hookExecutableSha256 = (Get-FileHash -LiteralPath $hookExe -Algorithm SHA256).Hash; auxiliarySha256 = $auxiliaryHashes; installedUtc = [DateTimeOffset]::UtcNow.ToString('o'); runtime = $Runtime }
+    foreach ($name in $script:PackageAuxiliary) { $auxiliaryHashes['bin\' + $name] = $packageHashes[$name] }
+    # 起動時更新（coordinator.rsのsource_info）が書く10項目と同じ構成にし、次回以降の自動更新が引き継げるようにする。
+    $provenance = [ordered]@{ repository = $Repository; defaultBranch = $branch; commitSha = $sha.ToLowerInvariant(); downloadUrl = $downloadUrl; archiveSha256 = $archiveHash.ToUpperInvariant(); executableSha256 = $packageHashes['prunlet.exe']; maintenanceExecutableSha256 = $packageHashes['prunlet-maintenance.exe']; hookExecutableSha256 = $packageHashes['prunlet-hook.exe']; auxiliarySha256 = $auxiliaryHashes; runtime = $Runtime }
     $provenance | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $WorkDirectory 'source-info.json') -Encoding utf8NoBOM
 
     if ($managedInstallation) { Assert-ManagedInstallationSnapshot $managedInstallation }
@@ -439,7 +520,7 @@ try {
     }
     if ($managedInstallation) { Assert-ManagedInstallationSnapshot $managedInstallation } else { New-TrackedDirectory (Join-Path $InstallDirectory 'bin') }
     foreach ($relative in $products) {
-        $inputPath = if ($relative -in @('bin\prunlet.exe', 'bin\prunlet-maintenance.exe', 'bin\prunlet-hook.exe')) { Join-Path (Join-Path $buildRoot 'publish') ([IO.Path]::GetFileName($relative)) } elseif ($relative -eq 'source-info.json') { Join-Path $WorkDirectory $relative } elseif ($relative -eq 'bin\Install-Prunlet.ps1') { Join-Path $sourceRoot 'scripts\Install-Prunlet.ps1' } else { Join-Path $sourceRoot ('integration\' + [IO.Path]::GetFileName($relative)) }
+        $inputPath = if ($relative -eq 'source-info.json') { Join-Path $WorkDirectory $relative } else { Join-Path $packageBin ([IO.Path]::GetFileName($relative)) }
         $target = Join-Path $InstallDirectory $relative
         [void]$changed.Add($relative)
         Copy-Item -LiteralPath $inputPath -Destination $target -Force
@@ -526,6 +607,13 @@ try {
     [ordered]@{ purpose = 'Restore the owned maintenance task if this installation fails.'; installDirectory = $InstallDirectory; taskName = $maintenanceState.name; taskPath = '\'; existed = [bool]$maintenanceState.previousXml; previousXml = $(if ($maintenanceState.previousXml) { 'maintenance-task.xml' } else { $null }); restore = 'First verify current task ownership using maintenance-task.ps1; restore previous XML if existed, otherwise unregister only the owned task.' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $updateBackup 'maintenance-task-backup-info.json') -Encoding utf8NoBOM
     $maintenanceStarted = $true
     Register-PrunletMaintenanceTask $maintenanceState
+    if ($updateTaskState) {
+        # CodexがMCPを起動しないPCでも最新releaseへ追従させる更新タスク（start-prunlet-mcp.ps1 -UpdateOnly）。
+        if ($updateTaskState.previousXml) { [IO.File]::WriteAllText((Join-Path $updateBackup 'update-task.xml'), $updateTaskState.previousXml, [Text.Encoding]::Unicode) }
+        [ordered]@{ purpose = 'Restore the owned update task if this installation fails.'; installDirectory = $InstallDirectory; taskName = $updateTaskState.name; taskPath = '\'; existed = [bool]$updateTaskState.previousXml; previousXml = $(if ($updateTaskState.previousXml) { 'update-task.xml' } else { $null }); restore = 'First verify current task ownership using maintenance-task.ps1; restore previous XML if existed, otherwise unregister only the owned task.' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $updateBackup 'update-task-backup-info.json') -Encoding utf8NoBOM
+        $updateTaskStarted = $true
+        Register-PrunletUpdateTask $updateTaskState
+    }
     # 廃止したバックエンドも記録なしのCore経路でWindowsのゴミ箱へ渡す。
     foreach ($relative in $retiredProducts) {
         $target = Assert-PlainPath (Join-Path $InstallDirectory $relative) 'Retired product path'
@@ -552,7 +640,7 @@ try {
         throw 'Recovery storage migration is incomplete. Installed products were retained; resume with the installed CLI migrate --apply.'
     }
     if (!$storageMigration.complete) { Write-Warning 'Some legacy file recovery data was retained. Review the migration result before retrying migrate --apply; normal maintenance does not scan it.' }
-    [ordered]@{ status = 'installed'; installDirectory = $InstallDirectory; configPath = $configPath; repository = $Repository; defaultBranch = $branch; commitSha = $sha; sourceInfoPath = (Join-Path $InstallDirectory 'source-info.json'); updateBackupDirectory = $updateBackup; maintenanceTaskName = $maintenanceState.name; retiredProductPaths = @($retiredProductPaths.ToArray()); recoveryMigration = $storageMigration; codexRegistered = [bool]$RegisterCodex; agentInstructionsRegistered = [bool]$RegisterAgentInstructions; requiresHookTrust = [bool]$RegisterCodex } | ConvertTo-Json -Depth 12
+    [ordered]@{ status = 'installed'; installDirectory = $InstallDirectory; configPath = $configPath; repository = $Repository; defaultBranch = $branch; releaseTag = $release.tag; commitSha = $sha; sourceInfoPath = (Join-Path $InstallDirectory 'source-info.json'); updateBackupDirectory = $updateBackup; maintenanceTaskName = $maintenanceState.name; updateTaskName = $(if ($updateTaskState) { $updateTaskState.name } else { $null }); updateTaskRegistered = [bool]$updateTaskState; retiredProductPaths = @($retiredProductPaths.ToArray()); recoveryMigration = $storageMigration; codexRegistered = [bool]$RegisterCodex; agentInstructionsRegistered = [bool]$RegisterAgentInstructions; requiresHookTrust = [bool]$RegisterCodex } | ConvertTo-Json -Depth 12
 } catch {
     $originalError = $_
     if ($storageMigrationStarted) {
@@ -572,6 +660,9 @@ try {
                 } finally { $guard.Dispose() }
             } finally { if (Test-Path -LiteralPath $rollbackConfig -PathType Leaf) { Remove-Item -LiteralPath $rollbackConfig } }
         } catch { $rollbackErrors.Add("Capacity configuration: $_") }
+    }
+    if ($updateTaskStarted) {
+        try { Restore-PrunletUpdateTask $updateTaskState } catch { $rollbackErrors.Add("Update task: $_") }
     }
     if ($maintenanceStarted) {
         try { Restore-PrunletMaintenanceTask $maintenanceState } catch { $rollbackErrors.Add("Maintenance task: $_") }

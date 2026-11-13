@@ -1,7 +1,10 @@
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$ConfigPath,
-    [Parameter(Mandatory)][string]$CodexHome
+    [Parameter(Mandatory)][string]$CodexHome,
+    # 更新タスク（maintenance-task.ps1のRegister-PrunletUpdateTask）からの起動。MCPは起動せず、
+    # 起動時更新と同じ確認・切替だけを行って終わる。Codexを使わないPCでも最新版へ追従させるため。
+    [switch]$UpdateOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,6 +67,31 @@ function Test-StageCleanupReady([hashtable]$State) {
         if (!$State.ContainsKey($name) -or $State[$name] -cne 'done') { return $false }
     }
     return $true
+}
+
+function Test-CodexRegistrationPresent([string]$Codex) {
+    # 起動ごとにCodexHomeの実物から判定する（タスク引数のスイッチにすると、後でCodexへ登録したとき保護を素通りする）。
+    # Prunletの痕跡（所有block・hook handler・共通指示）が一つでもあれば、部分的でも従来の登録保護を通す。
+    # MCPとしての起動はCodexから呼ばれているので、常に登録ありとして扱う。
+    if (!$UpdateOnly) { return $true }
+    if (!(Test-Path -LiteralPath $Codex)) { return $false }
+    $markers = @{
+        'config.toml' = @('# BEGIN PRUNLET MCP', '# BEGIN PRUNLET HOOK-FEATURE')
+        'hooks.json' = @('prunlet-hook.exe', 'Prunlet')
+        'AGENTS.md' = @('BEGIN PRUNLET AGENT-INSTRUCTIONS')
+        'PRUNLET.md' = @('')
+    }
+    foreach ($name in $markers.Keys) {
+        $path = Join-Path $Codex $name
+        if (!(Test-Path -LiteralPath $path)) { continue }
+        $item = Get-Item -LiteralPath $path -Force
+        # 通常ファイルでない登録先は判定できないため、登録ありとして従来の保護（停止）へ回す。
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $true }
+        if ($name -ceq 'PRUNLET.md') { return $true }
+        $text = [IO.File]::ReadAllText($path)
+        foreach ($marker in $markers[$name]) { if ($text.Contains($marker, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    }
+    return $false
 }
 
 function Test-ProductsIdle([string]$Executable) {
@@ -277,6 +305,8 @@ function Open-RegistrationGuards([string]$Executable, [string]$Config, [string]$
         if (!$ownsGlobal) { throw 'Another Prunlet installation is running.' }
         try { $ownsLocal = $local.WaitOne(0) } catch [Threading.AbandonedMutexException] { $ownsLocal = $true }
         if (!$ownsLocal) { throw 'Another Prunlet installation is running.' }
+        # Codexへ登録していないPC（更新タスクだけで追従する）には、守るべき登録がない。
+        if (!(Test-CodexRegistrationPresent $Codex)) { return ,$guards }
         foreach ($name in @('hooks.json', 'config.toml', 'AGENTS.md', 'PRUNLET.md')) {
             $path = Join-Path $Codex $name
             if ($name -in @('AGENTS.md', 'PRUNLET.md') -and !(Test-Path -LiteralPath $path)) { continue }
@@ -317,22 +347,24 @@ function Invoke-Integration([string]$Candidate, [string]$Stage, [string]$Config,
         try { $ownsLocal = $local.WaitOne(0) } catch [Threading.AbandonedMutexException] { $ownsLocal = $true }
         if (!$ownsLocal) { throw 'Another Prunlet installation is running.' }
         $guards = Open-RegistrationGuards $Executable $Config $Codex $Stage
-        $oldInfo = [IO.File]::ReadAllText((Join-Path $Stage 'previous-source-info.json')) | ConvertFrom-Json -AsHashtable
-        $oldGuideHash = [string]$oldInfo.auxiliarySha256['bin\PRUNLET.md']
-        $agent = @{
-            SourceGuidePath = (Join-Path $Stage 'integration\PRUNLET.md')
-            PreviousGuideSha256 = $oldGuideHash
-            ExecutablePath = $Executable
-            ConfigPath = $Config
-            CodexHome = $Codex
-            BackupDirectory = $backup
-            StartupUpdate = $true
-        }
-        $agentHelper = Join-Path $bin 'install-agent-instructions.ps1'
-        $agentState = & $agentHelper @agent -ValidateOnly
-        if (!$agentState.ContainsKey('instructionsPresent') -or !$agentState.ContainsKey('agentChanged') -or !$agentState.ContainsKey('guideChanged')) { throw 'Agent instruction validation is incompatible.' }
-        if ($agentState.instructionsPresent -and ($agentState.agentChanged -or $agentState.guideChanged)) {
-            throw 'Agent instructions require an update; concurrent edits must be preserved.'
+        if (Test-CodexRegistrationPresent $Codex) {
+            $oldInfo = [IO.File]::ReadAllText((Join-Path $Stage 'previous-source-info.json')) | ConvertFrom-Json -AsHashtable
+            $oldGuideHash = [string]$oldInfo.auxiliarySha256['bin\PRUNLET.md']
+            $agent = @{
+                SourceGuidePath = (Join-Path $Stage 'integration\PRUNLET.md')
+                PreviousGuideSha256 = $oldGuideHash
+                ExecutablePath = $Executable
+                ConfigPath = $Config
+                CodexHome = $Codex
+                BackupDirectory = $backup
+                StartupUpdate = $true
+            }
+            $agentHelper = Join-Path $bin 'install-agent-instructions.ps1'
+            $agentState = & $agentHelper @agent -ValidateOnly
+            if (!$agentState.ContainsKey('instructionsPresent') -or !$agentState.ContainsKey('agentChanged') -or !$agentState.ContainsKey('guideChanged')) { throw 'Agent instruction validation is incompatible.' }
+            if ($agentState.instructionsPresent -and ($agentState.agentChanged -or $agentState.guideChanged)) {
+                throw 'Agent instructions require an update; concurrent edits must be preserved.'
+            }
         }
         # 所有タスクの設定を維持し、更新途中でも元のXMLを確認できるようにする。
         . (Join-Path $bin 'maintenance-task.ps1')
@@ -348,6 +380,23 @@ function Invoke-Integration([string]$Candidate, [string]$Stage, [string]$Config,
                 finally { $output.Dispose() }
             }
             Register-PrunletMaintenanceTask $maintenance
+        }
+        # 更新タスクは導入時だけ作る。自動更新では所有済みの既存タスクの実行先だけを移行し、新規には作らない。
+        # 更新後のmaintenance-task.ps1が関数を持たない（旧版へ戻した配布物）場合は触れない。
+        if (Get-Command Get-PrunletUpdateTaskState -CommandType Function -ErrorAction SilentlyContinue) {
+            $updateTask = Get-PrunletUpdateTaskState $Executable $Config $Codex
+            if ($updateTask.previousXml) {
+                $updateBackup = Join-Path $backup 'update-task.xml'
+                if (!(Test-Path -LiteralPath $updateBackup)) {
+                    $xmlBytes = [Text.Encoding]::Unicode.GetBytes($updateTask.previousXml)
+                    $budget = & $Candidate --config $Config __check-startup-budget ($xmlBytes.Length + [Text.Encoding]::Unicode.GetPreamble().Length)
+                    if ($LASTEXITCODE -ne 0 -or ($budget | ConvertFrom-Json -AsHashtable).status -cne 'available') { throw 'Update task backup would exceed the update storage budget.' }
+                    $output = [IO.File]::Open($updateBackup, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                    try { $output.Write([Text.Encoding]::Unicode.GetPreamble()); $output.Write($xmlBytes); $output.Flush($true) }
+                    finally { $output.Dispose() }
+                }
+                Register-PrunletUpdateTask $updateTask
+            }
         }
         # coordinatorが同じmutexを取得できるよう、登録の確定後に解放する。
         $local.ReleaseMutex(); $ownsLocal = $false
@@ -374,6 +423,15 @@ function Invoke-UpdateCoordinator([string]$Stage, [string]$Config, [string]$Code
     try {
         $state = Read-StartupState (Join-Path $root '.prunlet-update-state.json')
         if ($state.phase -ceq 'idle' -and (!$state.ContainsKey('candidateCliSha256') -or !$state.candidateCliSha256)) {
+            # 切替後の連携（Invoke-Integration）で更新タスクの所有確認に失敗すると、更新状態がidleへ戻らず
+            # 以後の起動もCLIも止まる。候補の判定でidleのうちに確認し、他者・編集済みのタスクなら切り替えずに延期する。
+            $candidateTasks = Join-Path $Stage 'integration\maintenance-task.ps1'
+            & {
+                . $candidateTasks
+                if (Get-Command Get-PrunletUpdateTaskState -CommandType Function -ErrorAction SilentlyContinue) { $null = Get-PrunletUpdateTaskState $Executable $Config $Codex }
+            }
+        }
+        if ($state.phase -ceq 'idle' -and (!$state.ContainsKey('candidateCliSha256') -or !$state.candidateCliSha256) -and (Test-CodexRegistrationPresent $Codex)) {
             # 候補の登録仕様が変更を要する場合は、製品を切り替える前に延期する。
             $candidateHelper = Join-Path $Stage 'integration\install-codex.ps1'
             $validationBackup = Join-Path ([IO.Path]::GetTempPath()) 'Prunlet-Registration-Validation'
@@ -409,7 +467,8 @@ function Invoke-UpdateCoordinator([string]$Stage, [string]$Config, [string]$Code
 }
 
 try {
-    Start-PrunletMcpJob
+    # 更新だけの起動ではMCPの子を持たないため、jobへ入れない（呼出し元プロセスを巻き込まない）。
+    if (!$UpdateOnly) { Start-PrunletMcpJob }
     foreach ($path in @($ExecutablePath, $ConfigPath, $CodexHome)) {
         if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Prunlet MCP paths must be absolute.' }
     }
@@ -479,10 +538,17 @@ try {
             $mutex.Dispose()
         }
     }
+    if ($UpdateOnly) {
+        # 最新・延期・通信不能は正常終了とし、次の起動（タスク・MCP）で再確認する。
+        # 更新状態をidleへ戻せなかった場合だけ上のthrowで非0になる。
+        if (!$managed) { throw 'Update-only startup requires the managed installation layout.' }
+        exit 0
+    }
     $env:PRUNLET_MCP_LAUNCHER_JOB = $script:PrunletMcpJobName
     & $ExecutablePath --config $ConfigPath mcp
     exit $LASTEXITCODE
 } catch {
-    [Console]::Error.WriteLine('Prunlet MCP could not start safely: ' + $_.Exception.Message)
+    $purpose = if ($UpdateOnly) { 'Prunlet update check could not finish safely: ' } else { 'Prunlet MCP could not start safely: ' }
+    [Console]::Error.WriteLine($purpose + $_.Exception.Message)
     exit 1
 }

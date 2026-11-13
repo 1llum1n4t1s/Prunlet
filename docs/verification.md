@@ -101,7 +101,7 @@ New-Item -ItemType Directory -Path (Split-Path -Parent $latestReport) -Force | O
 pwsh -NoProfile -File .\scripts\Verify-LatestInstall.ps1 -ExecutablePath $exe -OutputDirectory $latestRun -ReportPath $latestReport -CheckPublicHead
 ```
 
-GitHub応答を検証用アーカイブへ差し替え、実際のインストーラー・Cargoビルド・配置・Codex登録を通すE2Eです。最新HEADの再解決、同一SHAからの導入、クローンに依存しない登録、旧設定の容量を一度だけ1 GiBへ移すこと、新規設定の移行印、移行後の明示容量と他設定・レジストリ復元データの保持、大小文字を変えた印・容量、設定だけ残る再導入、未知設定の拒否、設定ロック時の保全、制限DACLの保存と登録失敗時の設定バイト列・SDDL復旧、ZIPの不正経路・重複・リンク、取得とビルドの失敗、製品更新の失敗時の復元を検証します。Codex設定がロックされて登録が途中で失敗した場合の復旧と、旧`allowedRoots`内外にある作業場所での導入も確認します。実ユーザーの配置先・Codex設定は使いません。設定検証が`validate-config`で走査・変更せず、全登録・旧backend退役後に明示移行することを確認します。移行開始後の失敗は旧binaryへrollbackせず新exe・設定・登録を保全し、同じCLIで再開できることを確認します。
+GitHub応答（最新release・タグ・既定ブランチとの比較・asset）を、今回のビルド出力と作業ツリーの補助ファイルから`Package-PrunletUpdate.ps1`で作った更新ZIPへ差し替え、実際のインストーラーの取得・照合・展開・配置・Codex登録を通すE2Eです。検証用ビルドは署名できないため、Authenticodeの判定結果だけを置換します。未署名の拒否は置換せず実際のWindows判定で確認し、署名者違い・タイムスタンプなしは置換した判定で確認します。assetの未添付、既定ブランチ外のcommit、digest不一致、`package.json`のcommit・runtime不一致、ZIPの不正経路・重複・リンク・欠落・余分なentry・内容改変を、導入先へ書き込む前に拒否することも確認します。`source-info.json`が起動時更新と同じ10項目で、取得したassetとZIPを指すことを照合します。releaseの再解決、同一SHAからの導入、クローンに依存しない登録、旧設定の容量を一度だけ1 GiBへ移すこと、新規設定の移行印、移行後の明示容量と他設定・レジストリ復元データの保持、大小文字を変えた印・容量、設定だけ残る再導入、未知設定の拒否、設定ロック時の保全、制限DACLの保存と登録失敗時の設定バイト列・SDDL復旧、取得の失敗、製品更新の失敗時の復元を検証します。Codex設定がロックされて登録が途中で失敗した場合の復旧と、旧`allowedRoots`内外にある作業場所での導入も確認します。実ユーザーの配置先・Codex設定は使いません。設定検証が`validate-config`で走査・変更せず、全登録・旧backend退役後に明示移行することを確認します。移行開始後の失敗は旧binaryへrollbackせず新exe・設定・登録を保全し、同じCLIで再開できることを確認します。
 
 起動時更新では、旧MCPが応答中の延期と終了後の切替、独立hookの応答、標準入出力とEOF、複数起動の排他、取得失敗時の旧版利用、切替・登録・移行途中からの再開を確認します。 配布と同じZIPから複数回更新し、補助製品の変更・据置・再変更、旧slotの実体再利用、schema 5記録の不変更を確認します。容量検査はファイルとディレクトリのADS、stateの一時出力を含め、上限拒否時に元データを変えないことを確認します。改変した登録・不正state・互換性を確認できない候補は保持して停止し、不明な清掃を自動再送しないことを確認します。隔離fixtureでの成功と、公開後の実ホストでの読み込み・hook信頼は区別します。
 
@@ -109,9 +109,11 @@ GitHub応答を検証用アーカイブへ差し替え、実際のインスト�
 
 定期整理はTask Scheduler境界を隔離して、毎日03:00と現在のユーザーのログオンの両トリガー、有効状態、`StartWhenAvailable`、電池使用時の実行許可、既存タスク設定の保持をXMLで検証します。PCの電源断・スリープ・ログオフを伴う取り逃し回復の実動作は、この検証の対象外です。
 
+更新タスクは同じ隔離境界で、conhost経由の非表示起動・`-UpdateOnly`の引数・保守タスクとずらした時刻とログオン遅延、所有済みタスクの引数だけの移行と利用者設定の保持、他者のタスクの保護、明示解除を確認します。`start-prunlet-mcp.ps1 -UpdateOnly`は、検証済みZIPを取得完了の位置へ置いてHTTP取得だけを代替し、Codex未登録の配置で次releaseへ実際に切り替えること（MCPを起動しない・最新なら変更しない）、保守exeの使用中は延期して解放後に再開すること、更新タスクの実行先が編集されていれば更新状態をidleのまま延期すること、更新タスクの登録失敗で両タスクと製品を戻すこと、Codex登録ありで登録が編集されていれば切り替えずに延期することを確認します。mainのインストーラーが更新タスク未対応の配布物（コミット済みの補助ファイル）を導入する場合に、タスクを登録しないことも確認します。実Task Schedulerからの非表示起動とPATH上のpwshの解決は、隔離fixtureではなく一時タスクで別に確認します。
+
 非表示起動は`scripts/Verify-MaintenanceTask.ps1 -ExecutablePath <今回のCLI exe> -BuildManifestPath <同じビルドのmanifest> -ExpectedBuildManifestSha256 <manifestのSHA-256> -OutputDirectory <新しい外部作業領域> -ReportPath <外部JSONレポート>`で、実Task Schedulerと保守専用exeを検証します。同じpublishフォルダーに`prunlet-maintenance.exe`が必要です。CLIのconsole subsystemと保守exeのGUI subsystem、旧タスクからの設定を保つ移行、保守以外のコマンドの拒否、期限切れ整理・保持対象の復元、失敗終了コード、所有者検証を確認します。`-PauseForWindowInspection`は旧・新タスクを専用lockで待機させ、別途ウィンドウを観測するための指定です。配置後も同じ登録タスクを手動起動して表示と終了コードを確認し、実際のWindows再起動と区別します。
 
-`-CheckPublicHead`では実際のGitHubも参照します。リモートに必要な実装がまだない場合は、配置先を変更せず停止することを確認します。検証用アーカイブでの成功を、実GitHubからの導入成功として扱いません。公開後は実GitHubから導入し、`source-info.json`のリポジトリ・ブランチ・コミット、配置済みexeと登録先を照合してください。
+`-CheckPublicHead`では実際のGitHubの最新releaseも参照します。署名済み更新ZIPが添付されていれば導入して署名と取得元を確認し、未署名・未添付なら配置先を変更せず停止することを確認します。検証用ZIPでの成功を、実GitHubからの導入成功として扱いません。公開後は実GitHubから導入し、`source-info.json`のリポジトリ・ブランチ・コミット・asset、配置済みexeの署名と登録先を照合してください。
 
 共通指示の登録では、明示オプションなしの不変更、既存AGENTSの保持、配置済みexe・設定のbinding、既知の旧MCP優先ブロックとguideハッシュに一致する移行、冪等な登録と解除、利用者編集の保護、登録途中の失敗時の復旧を隔離したCodex homeで確認します。旧配置済みPowerShell backendの退役では、製品バックアップとCoreによるWindowsゴミ箱への削除を照合します。実ユーザーの共通AGENTS本文はこのE2Eで変更しません。実登録後は、専用guide・管理マーカー・bindingの保存内容、新しいチャットでの読込、最初からCMD CLIが選ばれた実動作を分けて確認してください。
 

@@ -65,7 +65,7 @@ Windowsでは通常の同期削除とは別に、CLIの`delete-queue`・`delete-
 
 同じexeのジョブ専用一時workerとユーザー限定IPCを使い、ジョブ・実体照合情報・結果をメモリーだけに保持する。SID・Windows sessionごとのnamed Mutexで完了保持中を含め最大8 workerに制限する。1要求1〜256パス・親を含む照合情報4096項目・IPC入力1 MiBを上限とする。対象・親・再帰対象の子を削除前に固定して事前probeのWin32 32/33だけを1秒間隔で期限なく待ち、実体や再帰範囲の変更を検出したら中止する。全対象が削除可能になってから既存Coreの削除経路を一度だけ呼び、削除開始後は再送しない。取消は開始判定と同じlockで`pending`の間だけ受理する。
 
-状態は`pending`・`running`・`completed`・`failed`・`ambiguous`・`cancelled`・`unavailable`。最終結果は1時間保持し、`expiresUtc`で期限を返す。照会不能・worker終了・期限切れは`unavailable`として結果不明を示す。受付済みなら呼出元のstdio切断後も継続し、workerが初期ACKを返せなければ削除を開始しない。登録MCPでは通常の子をlauncher終了時に停止し、明示キューworkerは受付前にlauncherのWindows jobからの離脱を照合する。 起動時更新の直後に旧launcherの終了時強制終了jobから新しいexeを起動した場合、キューを受け付ける前に再接続を案内する。
+状態は`pending`・`running`・`completed`・`failed`・`ambiguous`・`cancelled`・`unavailable`。最終結果は1時間保持し、`expiresUtc`で期限を返す。照会不能・worker終了・期限切れは`unavailable`として結果不明を示す。受付済みなら呼出元のstdio切断後も継続し、workerが初期ACKを返せなければ削除を開始しない。登録MCPでは通常の子をlauncher終了時に停止し、明示キューworkerは受付前にlauncherのWindows jobからの離脱を照合する。Microsoft Store版（MSIX）のPowerShellが起動した子は親のjobを継承しないため、MCPは起動直後に名前で渡されたlauncherのjobがKILL_ON_JOB_CLOSEを持つことを確かめて自分を入れ、開いたhandleはすぐ閉じる（持ち続けるとlauncher終了でjobが閉じない）。入れない場合も起動は続け、キューの受付だけを所属確認で拒否する。 起動時更新の直後に旧launcherの終了時強制終了jobから新しいexeを起動した場合、キューを受け付ける前に再接続を案内する。
 
 待機ジョブIDは復元用操作IDではなく、manifest・snapshot・恒久キュー・操作履歴を作らない。OSやworkerの消失時は結果不明として扱い、再起動後に同じ削除を再開しない。既存の同期削除・保護領域・ゴミ箱移動と永久削除の条件は維持する。
 
@@ -161,11 +161,11 @@ latest導入時に`capacityDefaultMigrationVersion`が欠落または1未満の�
 
 ## 導入と検証の境界
 
-Windowsの利用者向け導入はGitHubの既定ブランチ最新HEADを解決し、取得元・ブランチ・commitを`source-info.json`へ記録する。開発クローン・ローカルビルドをlatest導入の代用にしない。設定の検証には`validate-config`を使い、設定読込とservice構築だけで走査・変更しない。共通指示の生成元は`integration/PRUNLET.md`で、配置済み共通指示の更新とソース変更は別の結果として扱う。
+Windowsの利用者向け導入はソースをビルドせず、公開済み最新releaseの署名済み更新ZIP（`prunlet-update-<runtime>.zip`）を配置する。releaseの解決と取得は起動時自動更新と同じ条件（安定版・タグのcommitが既定ブランチ上・runtimeのassetが一意でdigestとsizeを持つ・公開URLから取得してdigestとsizeを照合）で行う。展開前に固定のentry集合・リンクなし・サイズ上限、`package.json`の取得元・既定ブランチ・release commit・runtime・各hash/長さを照合し、展開後に実体hash・CLIとhookの同一性・PEのmachine・Authenticode（Valid・署名者・タイムスタンプ）を確認する。いずれかが不一致、またはassetが未添付なら配置先・設定・タスク・登録へ書き込む前に止まる。`source-info.json`は起動時更新と同じ10項目（`downloadUrl`はreleaseのasset API、`archiveSha256`はZIP全体）で記録し、次回以降の自動更新が引き継ぐ。開発クローン・ローカルビルドをlatest導入の代用にしない。設定の検証には`validate-config`を使い、設定読込とservice構築だけで走査・変更しない。共通指示の生成元は`integration/PRUNLET.md`で、配置済み共通指示の更新とソース変更は別の結果として扱う。
 
-インストーラーの`-UseGitHubCliAuthentication`は、APIの未認証枠を使えない場合などに、既存のGitHub CLIへAPI取得を委ねる明示選択である。既定ブランチ・commit解決の契約は変えず、`gh api --hostname github.com --method GET`を直接起動する。トークンを抽出せず、対話とデバッグ出力を抑止し、認証関連のstderrを記録へ転載しない。ghの導入・ログイン・cloneへの切替は行わず、失敗時は停止する。
+インストーラーの`-UseGitHubCliAuthentication`は、APIの未認証枠を使えない場合などに、既存のGitHub CLIへAPI取得を委ねる明示選択である。release解決の契約は変えず、`gh api --hostname github.com --method GET`を直接起動する。トークンを抽出せず、対話とデバッグ出力を抑止し、認証関連のstderrを記録へ転載しない。ghの導入・ログイン・cloneへの切替は行わず、失敗時は停止する。
 
-手動導入の`-UpdateManagedInstallation`は、Gitの祖先配下にある既存の管理済み配置を更新するための限定的なパス検査例外である。既存設定・取得元情報と全製品hashを照合し、Git追跡対象を含まず、Git除外または実効CodexHomeの正規CLI登録で所有を確認できる配置だけを扱う。作業先・更新バックアップ・ソース・Codex内部へのガードを維持し、既存の復元先を保持する。配置と移行の直前にも再確認するが、ディレクトリ実体の原子的固定は提供しない。登録guideは検証済み本文との改行差だけを許容し、旧更新stageは保全する。`-ExpectedCommitSha`は取得した既定ブランチの最新HEADとの一致を要求し、不一致なら導入を止める。詳細な条件は[連携手順](docs/integration.md#手動の設定準備)を参照する。
+手動導入の`-UpdateManagedInstallation`は、Gitの祖先配下にある既存の管理済み配置を更新するための限定的なパス検査例外である。既存設定・取得元情報と全製品hashを照合し、Git追跡対象を含まず、Git除外または実効CodexHomeの正規CLI登録で所有を確認できる配置だけを扱う。作業先・更新バックアップ・ソース・Codex内部へのガードを維持し、既存の復元先を保持する。配置と移行の直前にも再確認するが、ディレクトリ実体の原子的固定は提供しない。登録guideは検証済み本文との改行差だけを許容し、旧更新stageは保全する。`-ExpectedCommitSha`は取得した最新releaseのcommitとの一致を要求し、不一致なら導入を止める。詳細な条件は[連携手順](docs/integration.md#手動の設定準備)を参照する。
 
 ### 起動時自動更新
 
@@ -175,19 +175,21 @@ Windowsの起動時照会は未認証で始める。HTTP 403で`X-RateLimit-Rema
 
 MCP起動時に公開済みlatestを確認し、既存版の子孫で更新protocolと保管形式が互換の候補だけを準備する。既存の製品・登録の所有とhashを確認し、旧CLI/MCPと保守exeを同時にwrite排他できなければ変更せず延期する。hookは独立exeとして継続し、旧プロセスを終了させない。固定の更新状態は製品切替・登録・移行の再開と更新cacheの所有確認・再利用に限り、ファイル操作履歴には使わない。途中状態では通常CLI/MCPと保守を止め、候補からレジストリ移行を再開する。移行開始後は旧exeへrollbackせず、registryが利用可能になってからsource-infoとidleを確定する。書込みや置換が不明なときは保全して自動再送せず、確定したregistryの利用とは分離する。
 
+CodexがMCPを起動しないPC（Claude Codeだけを使うPCなど）でも追従させるため、インストーラーは更新タスク（`Prunlet-Update-<識別子>`）を登録する。タスクは`conhost.exe --headless`から`pwsh -NoProfile -NonInteractive -File bin\start-prunlet-mcp.ps1 -UpdateOnly`を窓なしで起動し、MCPを起動せずに上と同じ照会・延期・切替だけを行う。最新・延期・通信不能は正常終了とし、更新状態をidleへ戻せない場合だけ非0で終わる（conhostは終了コードを中継しないため、タスクの結果欄では区別できない）。`Global\Prunlet-Startup-`のmutexでMCP起動時の更新と直列化する。保守タスク（03:00・ログオン直後）と重なると製品exeの使用中判定で毎回延期するため、毎日12:30とログオン10分後に実行する。pwshはCodexのMCP登録と同じくPATHから解決し、所有判定は所有印・利用者・conhostのExecで行う。Codex登録の保護は起動ごとにCodexHomeの実物から判定する。Prunletの所有block・hook・共通指示が一つでもあれば従来どおり登録の変更を要する候補を延期し、痕跡がない場合だけ登録の照合を省く（タスク引数の切替にはしない）。自動更新では所有済みの既存タスクの引数だけを移行して新規には作らない。切替後の連携で所有確認に失敗すると更新状態がidleへ戻らないため、候補の判定時（idleのうち）に候補の`maintenance-task.ps1`で更新タスクの所有を確認し、他者・編集済みなら切り替えずに延期する（保守タスクは従来どおり連携時の確認だけで、idle前の確認との間の編集は同じ非原子的な扱い）。インストーラーは配布物の補助ファイルが対応する場合だけ登録する。明示的な定期実行の解除（`uninstall-maintenance.ps1`）は保守タスクと更新タスクの両方を外す。
+
 登録の検証では、登録済み`PRUNLET.md`のバイト列が候補と異なる場合に、両方を厳密なUTF-8として読み、CRLFをLFにそろえて本文を照合する。一致すれば既存ファイルのバイト列を保持したまま進める。登録への書込みが必要な候補は保留する。この同一性判定は登録済みガイドの読取り検証に限り、配布物のSHA-256照合は元のバイト列で行う。
 
 stageは再帰削除せず、完了した世代の正規製品とmetadataをhashと実体で照合して主streamだけを再利用する。正常な次回更新を、stageが存在するだけで止めない。未知の項目は残して容量へ含め、未確定の切替・移行は先に同じ候補で再開する。
 
 切替前のidleで候補実行・移行・登録確定・未解決の書込みやrotationがない未適用stageも、旧owner・source-info・stateの公開ZIP hash/長さ・ZIP manifest・全12製品・3つのready slotが一致し、未知の項目・ADS・リンクがない場合に限りcacheとして再利用する。旧commit・owner/source-info hash・3製品と9補助製品のhashを任意stateの`cacheBaseline`へ先に固定してからownerを切り替え、中断時は同じbaselineで再開する。これはstage主streamの更新だけに用い、previousへの退避と製品rotationは現在のinstalled来歴を基準にする。認定できないstageは変更せず保持する。
 
-配布元は公開済みGitHub Releaseとする。実行ファイルはSimplySign（Certum）でAuthenticode署名し、タイムスタンプを付ける。署名はGitHub Actionsで行えないため、リリース担当者のWindows機で`scripts/Publish-PrunletWindows.ps1`がwin-x64・win-arm64を`Publish-Prunlet.ps1 -Sign`でビルド・署名し、`scripts/Package-PrunletUpdate.ps1`でZIPを作成する。CLIを署名してからhookへ複製し、両者の同一hashを保つ。公開前に`Verify-ReleasePackage.ps1 -RequireSignature`がentryの過不足・重複、metadataの取得元・commit・runtime等、全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合し、各実行ファイルの署名・署名者・タイムスタンプを確認する。検証済みZIP全体のSHA-256を添付直前にも再確認し、公開前のreleaseへ添付する。既存assetは上書きしない。署名処理は`scripts/Signing.Common.ps1`に集約する。
+配布元は公開済みGitHub Releaseとする。`.github/workflows/prunlet-release-package.yml`が公開タグからwin-x64・win-arm64を1つのjobでビルドし、Sigilune（Certum SimplySignのクラウド鍵）で`scripts/Sign-PrunletBuild.ps1`が両runtimeの実行ファイルをまとめて署名してから、`scripts/Package-PrunletUpdate.ps1`でZIPを作成する。署名用Secretsは承認付きEnvironment `release`に置き、署名stepだけへ渡す。CLIを署名してからhookへ複製し、両者の同一hashを保つ。公開前に`Verify-ReleasePackage.ps1 -RequireSignature`がentryの過不足・重複、metadataの取得元・commit・runtime等、全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合し、各実行ファイルの署名・署名者・タイムスタンプを確認する。検証済みZIP全体のSHA-256をアップロード直前にも再確認し、同じreleaseへ添付する。既存assetは上書きしない。署名処理は`scripts/Signing.Common.ps1`に集約する。
 
 取得側はタグが既定ブランチ上のcommitを指すことと、パッケージ内のcommit・runtime・製品hashを検証する。通常の起動時更新では、照会済みタグと実行体のruntimeからGitHubの公開ZIP URLを組み立て、REST API枠を使わずにZIPを取得する。タグを渡さない旧launcherからの要求ではasset IDによるAPI取得を維持する。どちらの取得経路でも、APIが返したサイズとSHA-256で転送内容を照合する。ソースとビルドの対応は発行者への信頼に依存する。Actionsの期限付きartifactを更新の必須条件としない。
 
 更新用cacheはレジストリ復元領域とは別に合計2 GiBを上限とする。公開ZIP・stage・製品slot・固定candidate/previous・保全した異常世代・各ディレクトリのADS・更新管理ファイルを容量に含め、確保前と完了後に検査する。slotはcache専用で、実行・移動・削除しない。正規hash・長さ・単一linkを同じ排他handleで確認し、通常streamだけをin-place更新する。候補へはそのhandleの通常streamだけをCreateNewコピーする。ADSや不明な部分書込みは保持し、予算不足を自動削除で回避しない。
 
-既存のWindowsクライアント向けにも、同一ZIPをR2へ配置する。release公開後に`.github/workflows/prunlet-release-package.yml`が添付済みZIPを取得し、ビルド出力の代わりに公開タグのsource・metadata・署名・署名者・タイムスタンプ・版・PE machineを検証してからR2へ送る。workflowはビルドもreleaseへの書込みも行わない。固定配信先・資格情報・順序は[配布手順](docs/distribution.md)を参照する。
+既存のWindowsクライアント向けにも、同一ZIPをR2へ配置してからGitHub Releaseへ添付する。固定配信先・資格情報・順序は[配布手順](docs/distribution.md)を参照する。
 
 ### macOSの起動時自動更新
 

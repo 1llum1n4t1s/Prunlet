@@ -17,12 +17,12 @@ use windows_sys::Win32::{
     System::{
         IO::CancelSynchronousIo,
         JobObjects::{
-            IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            AssignProcessToJobObject, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
             OpenJobObjectW, QueryInformationJobObject,
         },
         Pipes::*,
-        SystemServices::JOB_OBJECT_QUERY,
+        SystemServices::{JOB_OBJECT_ASSIGN_PROCESS, JOB_OBJECT_QUERY},
         Threading::*,
     },
 };
@@ -90,7 +90,8 @@ fn belongs_to_job(process: HANDLE, job: &OwnedHandle) -> Result<bool> {
     Ok(member != 0)
 }
 
-fn mcp_launcher_job() -> Result<Option<OwnedHandle>> {
+/// launcherが環境変数で渡したjob名を検証し、UTF-16へ変換する。名前がなければNone。
+fn launcher_job_name() -> Result<Option<Vec<u16>>> {
     let Some(name) = std::env::var_os(MCP_LAUNCHER_JOB) else {
         return Ok(None);
     };
@@ -101,7 +102,68 @@ fn mcp_launcher_job() -> Result<Option<OwnedHandle>> {
     if !valid {
         bail!("Invalid Prunlet MCP launcher job name; deletion was not started");
     }
-    let name = wide(&name)?;
+    Ok(Some(wide(&name)?))
+}
+
+fn kill_on_close(job: &OwnedHandle) -> Result<bool> {
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    if unsafe {
+        QueryInformationJobObject(
+            job.raw(),
+            JobObjectExtendedLimitInformation,
+            (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0)
+}
+
+/// MCPの起動直後に、launcherのjobへ自分を入れる。
+///
+/// launcher（start-prunlet-mcp.ps1）は自分をKILL_ON_JOB_CLOSEのjobへ入れてからMCPを起動し、子が同じjobを
+/// 継承することで「launcherが終わればMCPも止まる」を保証している。ところがMicrosoft Store版（MSIX）の
+/// PowerShellが起動した子は、パッケージアプリの子プロセス生成の扱いにより親のjobを継承しない
+/// （BREAKAWAY_OKの有無に関係なく外れることを実測した）。そのままでは寿命の保証がなく、待機キューの
+/// 受付（mcp_launcher_job）が拒否される。
+///
+/// ここでは名前で開いたjobがKILL_ON_JOB_CLOSEを持つことを確かめてから自分を入れ、開いたhandleはすぐ閉じる。
+/// MCPがhandleを持ち続けると、launcherの終了後もjobが閉じず、終了時の停止が働かなくなるため。
+/// 入れなかった場合も起動は続ける（通常の削除は使える）。キューの受付は従来どおり所属確認で拒否される。
+pub fn join_mcp_launcher_job() -> Result<()> {
+    let Some(name) = launcher_job_name()? else {
+        return Ok(());
+    };
+    let job = unsafe {
+        OwnedHandle::from_raw(OpenJobObjectW(
+            JOB_OBJECT_QUERY | JOB_OBJECT_ASSIGN_PROCESS,
+            0,
+            name.as_ptr(),
+        ))?
+    };
+    if belongs_to_job(unsafe { GetCurrentProcess() }, &job)? {
+        return Ok(());
+    }
+    if !kill_on_close(&job)? {
+        bail!("Prunlet MCP launcher job does not stop its processes on close; it was not joined");
+    }
+    if unsafe { AssignProcessToJobObject(job.raw(), GetCurrentProcess()) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if !belongs_to_job(unsafe { GetCurrentProcess() }, &job)? {
+        bail!("Prunlet MCP could not confirm its launcher job membership");
+    }
+    drop(job);
+    Ok(())
+}
+
+fn mcp_launcher_job() -> Result<Option<OwnedHandle>> {
+    let Some(name) = launcher_job_name()? else {
+        return Ok(None);
+    };
     let job = unsafe { OwnedHandle::from_raw(OpenJobObjectW(JOB_OBJECT_QUERY, 0, name.as_ptr()))? };
     if !belongs_to_job(unsafe { GetCurrentProcess() }, &job)? {
         bail!("Current process is outside its Prunlet MCP launcher job; deletion was not started");

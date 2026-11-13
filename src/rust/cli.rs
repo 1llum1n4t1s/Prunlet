@@ -211,6 +211,12 @@ fn run_inner(args: &[String]) -> Result<i32> {
     });
     if command == "mcp" {
         ensure!(tail.is_empty(), "MCP accepts no arguments.");
+        // Store版PowerShellのlauncherから起動された場合でも、launcherのjobへ入って寿命を揃える。
+        // 入れなくてもMCPは起動する（待機キューの受付だけが所属確認で拒否される）。
+        #[cfg(windows)]
+        if let Err(error) = crate::platform::windows::process::join_mcp_launcher_job() {
+            eprintln!("Prunlet MCP did not join its launcher job: {error}");
+        }
         crate::protocol::mcp::run(runtime)?;
         return Ok(0);
     }
