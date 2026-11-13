@@ -7,7 +7,7 @@ param(
     [string[]]$AllowedRoot,
     [string]$BackupDirectory,
     [string]$WorkDirectory,
-    [string]$UpdateBackupRoot = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Codex\TaskArtifacts\Prunlet'),
+    [string]$UpdateBackupRoot = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Prunlet\Backups'),
     [ValidateSet('win-x64', 'win-arm64')][string]$Runtime = 'win-x64',
     [switch]$RegisterCodex,
     [switch]$RegisterAgentInstructions,
@@ -107,6 +107,26 @@ function New-TrackedDirectory([string]$Path) {
         New-Item -ItemType Directory -Path $directory | Out-Null
         $createdDirectories.Add(@{ path = $directory; createdUtcTicks = (Get-Item -LiteralPath $directory).CreationTimeUtc.Ticks })
     }
+}
+# CodexHomeにPrunletの登録（所有block・hook handler・共通指示）が残っているか。起動スクリプトの
+# Test-CodexRegistrationPresentと同じ目印で判定する。通常ファイルでない登録先は判定できないため登録ありとする。
+function Test-CodexHomeHasPrunlet([string]$Codex) {
+    if (!$Codex -or !(Test-Path -LiteralPath $Codex -PathType Container)) { return $false }
+    $markers = @{
+        'config.toml' = @('# BEGIN PRUNLET MCP', '# BEGIN PRUNLET HOOK-FEATURE')
+        'hooks.json' = @('prunlet-hook.exe', 'Prunlet')
+        'AGENTS.md' = @('BEGIN PRUNLET AGENT-INSTRUCTIONS')
+    }
+    if (Test-Path -LiteralPath (Join-Path $Codex 'PRUNLET.md')) { return $true }
+    foreach ($name in $markers.Keys) {
+        $path = Join-Path $Codex $name
+        if (!(Test-Path -LiteralPath $path)) { continue }
+        $item = Get-Item -LiteralPath $path -Force
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $true }
+        $text = [IO.File]::ReadAllText($path)
+        foreach ($marker in $markers[$name]) { if ($text.Contains($marker, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    }
+    return $false
 }
 function Test-RegisteredManagedInstallation([string]$Root) {
     $effectiveHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
@@ -389,7 +409,7 @@ $managedInstallation = if ($UpdateManagedInstallation) { Get-ManagedInstallation
 $InstallDirectory = if ($managedInstallation) { $managedInstallation.root } else { Assert-ExternalPath $InstallDirectory 'InstallDirectory' }
 
 if (!$WorkDirectory) {
-    $WorkDirectory = Join-Path ([IO.Path]::GetTempPath()) "Codex\Prunlet\$runId"
+    $WorkDirectory = Join-Path ([IO.Path]::GetTempPath()) "Prunlet\$runId"
 }
 $WorkDirectory = Assert-ExternalPath $WorkDirectory 'WorkDirectory'
 if ((Test-InTree $WorkDirectory $InstallDirectory) -or (Test-InTree $InstallDirectory $WorkDirectory)) {
@@ -481,7 +501,14 @@ try {
     $maintenanceState = Get-PrunletMaintenanceState (Join-Path $InstallDirectory 'bin\prunlet.exe') $configPath
     # 更新タスクは、導入する配布物の補助ファイルが対応している場合だけ登録する。このインストーラーは
     # mainから取得されるため、最新releaseより新しいことがある。呼び出し元の関数ではなく配布物の実物で判定する。
-    $updateTaskState = if (Test-PackageSupportsUpdateTask $packageBin) { Get-PrunletUpdateTaskState (Join-Path $InstallDirectory 'bin\prunlet.exe') $configPath $CodexHome } else { $null }
+    # 更新タスクへCodexHomeを渡すのは、今回Codexへ登録する場合と、CodexHomeにPrunletの登録が残っている場合だけ。
+    # Codexを使わない導入ではタスク引数から外し、更新のたびに~/.codexを参照・保護しないようにする。
+    # mainのインストーラーは最新releaseより新しいことがある。配布物のmaintenance-task.ps1が
+    # CodexHome省略に対応していない（PreserveCodexHomeを持たない）旧版なら、従来どおりCodexHomeを渡す。
+    $taskFunction = Get-Command Get-PrunletUpdateTaskState -CommandType Function -ErrorAction SilentlyContinue
+    $optionalCodexHome = $taskFunction -and $taskFunction.Parameters.ContainsKey('PreserveCodexHome')
+    $taskCodexHome = if (!$optionalCodexHome -or $RegisterCodex -or $RegisterAgentInstructions -or (Test-CodexHomeHasPrunlet $CodexHome)) { $CodexHome } else { '' }
+    $updateTaskState = if (Test-PackageSupportsUpdateTask $packageBin) { Get-PrunletUpdateTaskState (Join-Path $InstallDirectory 'bin\prunlet.exe') $configPath $taskCodexHome } else { $null }
     $exe = Join-Path $packageBin 'prunlet.exe'
     $maintenanceExe = Join-Path $packageBin 'prunlet-maintenance.exe'
     $hookExe = Join-Path $packageBin 'prunlet-hook.exe'

@@ -1,7 +1,9 @@
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$ConfigPath,
-    [Parameter(Mandatory)][string]$CodexHome,
+    # 任意。隔離したCodexHomeへ登録した導入だけが明示する。省略時は実効のCodexHome（CODEX_HOME、
+    # なければ%USERPROFILE%\.codex）を読取り専用で調べ、Prunletの登録が残っている場合だけ保護・更新する。
+    [string]$CodexHome = '',
     # 更新タスク（maintenance-task.ps1のRegister-PrunletUpdateTask）からの起動。MCPは起動せず、
     # 起動時更新と同じ確認・切替だけを行って終わる。Codexを使わないPCでも最新版へ追従させるため。
     [switch]$UpdateOnly
@@ -72,9 +74,10 @@ function Test-StageCleanupReady([hashtable]$State) {
 function Test-CodexRegistrationPresent([string]$Codex) {
     # 起動ごとにCodexHomeの実物から判定する（タスク引数のスイッチにすると、後でCodexへ登録したとき保護を素通りする）。
     # Prunletの痕跡（所有block・hook handler・共通指示）が一つでもあれば、部分的でも従来の登録保護を通す。
-    # MCPとしての起動はCodexから呼ばれているので、常に登録ありとして扱う。
-    if (!$UpdateOnly) { return $true }
-    if (!(Test-Path -LiteralPath $Codex)) { return $false }
+    # MCP起動・更新タスクのどちらでも実物の目印で判定する。PrunletはCodexに依存しない単独のアプリで、
+    # Toolportなど他のMCPホストからも起動されるため、「MCP起動ならCodex登録あり」とはみなさない。
+    # 判定は読取りだけで、登録がなければ~/.codexへは触れない。
+    if (!$Codex -or !(Test-Path -LiteralPath $Codex)) { return $false }
     $markers = @{
         'config.toml' = @('# BEGIN PRUNLET MCP', '# BEGIN PRUNLET HOOK-FEATURE')
         'hooks.json' = @('prunlet-hook.exe', 'Prunlet')
@@ -92,6 +95,14 @@ function Test-CodexRegistrationPresent([string]$Codex) {
         foreach ($marker in $markers[$name]) { if ($text.Contains($marker, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
     }
     return $false
+}
+
+# 起動時更新で更新タスクを移行するときは、既存タスクの-CodexHomeを引き継ぐ（起動元のMCPホストで変えない）。
+# 読み込んだmaintenance-task.ps1が旧版で引数を持たない場合は、従来どおり何も付けない。
+function Get-UpdateTaskPreserveSwitch {
+    $command = Get-Command Get-PrunletUpdateTaskState -CommandType Function -ErrorAction SilentlyContinue
+    if ($command -and $command.Parameters.ContainsKey('PreserveCodexHome')) { return @{ PreserveCodexHome = $true } }
+    return @{}
 }
 
 function Test-ProductsIdle([string]$Executable) {
@@ -384,7 +395,8 @@ function Invoke-Integration([string]$Candidate, [string]$Stage, [string]$Config,
         # 更新タスクは導入時だけ作る。自動更新では所有済みの既存タスクの実行先だけを移行し、新規には作らない。
         # 更新後のmaintenance-task.ps1が関数を持たない（旧版へ戻した配布物）場合は触れない。
         if (Get-Command Get-PrunletUpdateTaskState -CommandType Function -ErrorAction SilentlyContinue) {
-            $updateTask = Get-PrunletUpdateTaskState $Executable $Config $Codex
+            $preserve = Get-UpdateTaskPreserveSwitch
+            $updateTask = Get-PrunletUpdateTaskState $Executable $Config $Codex @preserve
             if ($updateTask.previousXml) {
                 $updateBackup = Join-Path $backup 'update-task.xml'
                 if (!(Test-Path -LiteralPath $updateBackup)) {
@@ -428,7 +440,7 @@ function Invoke-UpdateCoordinator([string]$Stage, [string]$Config, [string]$Code
             $candidateTasks = Join-Path $Stage 'integration\maintenance-task.ps1'
             & {
                 . $candidateTasks
-                if (Get-Command Get-PrunletUpdateTaskState -CommandType Function -ErrorAction SilentlyContinue) { $null = Get-PrunletUpdateTaskState $Executable $Config $Codex }
+                if (Get-Command Get-PrunletUpdateTaskState -CommandType Function -ErrorAction SilentlyContinue) { $preserve = Get-UpdateTaskPreserveSwitch; $null = Get-PrunletUpdateTaskState $Executable $Config $Codex @preserve }
             }
         }
         if ($state.phase -ceq 'idle' -and (!$state.ContainsKey('candidateCliSha256') -or !$state.candidateCliSha256) -and (Test-CodexRegistrationPresent $Codex)) {
@@ -469,11 +481,13 @@ function Invoke-UpdateCoordinator([string]$Stage, [string]$Config, [string]$Code
 try {
     # 更新だけの起動ではMCPの子を持たないため、jobへ入れない（呼出し元プロセスを巻き込まない）。
     if (!$UpdateOnly) { Start-PrunletMcpJob }
-    foreach ($path in @($ExecutablePath, $ConfigPath, $CodexHome)) {
+    foreach ($path in @($ExecutablePath, $ConfigPath) + @($CodexHome | Where-Object { $_ })) {
         if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Prunlet MCP paths must be absolute.' }
     }
     $ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath)
     $ConfigPath = [IO.Path]::GetFullPath($ConfigPath)
+    # 省略時は実効のCodexHomeを判定対象にする（登録の有無は実物の目印で決まり、なければ何もしない）。
+    if (!$CodexHome) { $CodexHome = if ($env:CODEX_HOME -and [IO.Path]::IsPathFullyQualified($env:CODEX_HOME)) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' } }
     $CodexHome = [IO.Path]::GetFullPath($CodexHome)
     $bin = [IO.Path]::GetDirectoryName($ExecutablePath)
     $root = [IO.Path]::GetDirectoryName($bin)

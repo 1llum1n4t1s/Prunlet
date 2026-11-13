@@ -2,7 +2,7 @@
 
 Prunletは、`blocked by policy`による清掃の停止を減らすために、AIエージェントのファイル・フォルダー削除を専用CLI・MCPへ集約するWindows・Apple Silicon Mac・Linux用ツールです。許可された削除を最初からPrunletへ任せる使い方に揃えます。
 
-通常はファイル・フォルダーをOSのゴミ箱へ移します。Prunletはファイルの操作記録・操作ID・復元用snapshotを保存せず、ゴミ箱からの復元と保持はOSに任せます。Codexフックは直接削除を検査・拒否し、CLI手順を案内します。提供元はKagayoiです。
+通常はファイル・フォルダーをOSのゴミ箱へ移します。Prunletはファイルの操作記録・操作ID・復元用snapshotを保存せず、ゴミ箱からの復元と保持はOSに任せます。特定のAIツールに付属せず、単独のアプリとして導入します。各AIツールへはMCP・CLI・フックを任意に登録でき、フックは直接削除を検査・拒否してCLI手順を案内します。提供元はKagayoiです。
 
 ファイルと空フォルダーを扱い、`--recursive`を明示するとフォルダー全体を削除できます。リンク先は辿りません。ハードリンクはゴミ箱への移動後も生存する別名と内容を共有します。条件付きの永久削除と[レジストリの削除・復元](#レジストリの削除復元)はWindows専用です。
 
@@ -10,11 +10,11 @@ Prunletは、`blocked by policy`による清掃の停止を減らすために、
 
 AIが生成した`Remove-Item`や`rm`などの削除コマンドで清掃が止まりやすい環境では、許可された削除を最初からPrunlet CLIへ任せます。Apple Silicon MacとLinuxのCodexでは、導入時に配置したCLIと設定を使います。[macOSの導入手順](docs/macos.md)・[Linuxの導入手順](docs/linux.md)
 
-WindowsのCodexでは、次の順序で利用します。
+Windowsでは、次の順序で利用します。
 
-1. 下の[インストールと更新](#インストールと更新)のコマンドを、`-RegisterCodex -RegisterAgentInstructions`付きで実行します。CLI・MCP・フックと、Prunlet CLIを最初から使う共通指示を登録します。
-2. Codexで`/hooks`を開いてPrunletフックを信頼し、Codexを再起動して登録内容を読み込みます。
-3. 通常どおり作業や清掃を依頼します。共通指示は、配置済みCLIと設定の絶対パスを使い、CMD（`shell: cmd.exe`、`login: false`）からPrunletを直接呼び出すようCodexへ指示します。各リポジトリへ同じ指示を追加する必要はありません。
+1. 下の[インストールと更新](#インストールと更新)のコマンドで、Prunletを単独のアプリとして導入します。AIツールの設定ファイルには触れません。
+2. 使うAIツール（MCPホスト）へ、[MCPホストへの登録](#mcpホストへの登録)の起動コマンドを登録します。CLIを直接呼ぶ場合は、配置済みCLIと設定の絶対パスをAIツールの指示へ書きます。Codexへまとめて登録する場合は[Codexへの登録（任意）](#codexへの登録任意)を使います。
+3. 通常どおり作業や清掃を依頼します。CLIは、配置済みCLIと設定の絶対パスを使い、CMD（`shell: cmd.exe`、`login: false`）から直接呼び出します。各リポジトリへ同じ指示を追加する必要はありません。
 
 清掃を明示して依頼する場合は、たとえば次のように伝えます。
 
@@ -50,24 +50,39 @@ Windows x64・ARM64に対応します。下のインストーラーは[GitHubリ
 Windows ARM64では、下の実行コマンドに`-Runtime`を明示してください。x64エミュレーションを選ぶ場合は`-Runtime win-x64`を指定します。
 
 ```powershell
-$installerDirectory = Join-Path ([IO.Path]::GetTempPath()) ('Codex\Prunlet\bootstrap-' + [guid]::NewGuid().ToString('N'))
+$installerDirectory = Join-Path ([IO.Path]::GetTempPath()) ('Prunlet\bootstrap-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $installerDirectory | Out-Null
 $installer = Join-Path $installerDirectory 'Install-Prunlet.ps1'
 Invoke-WebRequest 'https://raw.githubusercontent.com/1llum1n4t1s/Prunlet/main/scripts/Install-Prunlet.ps1' -OutFile $installer
-pwsh -NoProfile -File $installer -RegisterCodex -RegisterAgentInstructions
+pwsh -NoProfile -File $installer
 ```
 
 GitHub APIの未認証枠が上限に達した場合は、上の`pwsh`コマンドに`-UseGitHubCliAuthentication`を追加すると、既存のログイン済みGitHub CLIを利用できます。ghの自動導入・ログインは行いません。この指定は手動インストーラー用です。
 
 インストーラーはGitHub APIから最新の安定版リリースを取得し、そのタグが既定ブランチ上のコミットを指すこと、対象runtimeの配布物が1つだけ添付されていることを確認します。取得したZIPは、GitHubが返したサイズ・SHA-256、同梱物の一覧と各hash、リリースのコミット・runtime、実行ファイルのAuthenticode署名（署名者・タイムスタンプ付きのValid）を照合してから配置します。照合は起動時自動更新と同じ条件です。リリース直後で配布物の署名・添付がまだ終わっていない場合や、照合に失敗した場合は何も書き込まずに停止します。ソースのビルドやローカルクローンへの切替えは行いません。
 
-既定の配置先は`%USERPROFILE%\.local\Prunlet`です。`bin\prunlet.exe`と登録用スクリプト・共通指示を配置し、`source-info.json`に取得元・ブランチ・コミット・配布物のhashを起動時自動更新と同じ形式で記録します。`-RegisterCodex`を指定すると共通MCPとネイティブexeのフックも登録します。
+既定の配置先は`%USERPROFILE%\.local\Prunlet`です。`bin\prunlet.exe`と登録用スクリプト・共通指示を配置し、`source-info.json`に取得元・ブランチ・コミット・配布物のhashを起動時自動更新と同じ形式で記録します。既定ではCodexなどAIツールの設定ファイル・フォルダーへ書き込まず、保守タスクと更新タスクだけを登録します。
 
-自動更新では、CodexがPrunlet MCPを起動する際と、インストーラーが登録する更新タスク（毎日12:30とログオン10分後、窓なし）でGitHub Releaseのビルド済みバイナリを確認し、旧MCPや保守プロセスが終了しているときに切り替えます。更新タスクがあるため、Codexを使わないPCでも最新版へ追従します。自動更新ではソースの再ビルドは不要です。製品exeの実行に.NETランタイムやVCランタイムの追加導入は不要です。使用中なら終了させず、次のMCP起動時に再確認します。GitHub APIの未認証の通常リクエスト枠を使い切った場合は、設定済みのGitHub CLI（`gh`）の認証を使って自動で照会を続けます。通信や取得に失敗した場合は、更新前の状態が安全に保たれていれば現在の版を使います。
+自動更新では、MCPホストがPrunlet MCPを起動する際と、インストーラーが登録する更新タスク（毎日12:30とログオン10分後、窓なし）でGitHub Releaseのビルド済みバイナリを確認し、旧MCPや保守プロセスが終了しているときに切り替えます。更新タスクがあるため、MCPを登録していないPCでも最新版へ追従します。自動更新ではソースの再ビルドは不要です。製品exeの実行に.NETランタイムやVCランタイムの追加導入は不要です。使用中なら終了させず、次のMCP起動時に再確認します。GitHub APIの未認証の通常リクエスト枠を使い切った場合は、設定済みのGitHub CLI（`gh`）の認証を使って自動で照会を続けます。通信や取得に失敗した場合は、更新前の状態が安全に保たれていれば現在の版を使います。
 
 自動更新はGitHub Releaseの発行者を信頼し、取得した配布物の一致を検査します。検証の仕組みと信頼範囲は[起動時自動更新の設計](DESIGN.md#起動時自動更新)を参照してください。
 
 更新データは専用の2 GiB枠で管理します。確認済みの領域を再利用し、未知のデータや中断した出力は保全します。容量不足時は更新を延期し、レジストリの復元データは整理対象にしません。
+
+#### MCPホストへの登録
+
+ToolportやClaude CodeなどのMCPホストには、配置済みの起動スクリプトをstdioサーバーとして登録します。PowerShell 7は`pwsh`（Microsoft Store版は`%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`）を指定し、AIツールに同梱されたPowerShellの絶対パスは使いません。
+
+```text
+command: pwsh
+args:    -NoProfile -NonInteractive -File %USERPROFILE%\.local\Prunlet\bin\start-prunlet-mcp.ps1 -ExecutablePath %USERPROFILE%\.local\Prunlet\bin\prunlet.exe -ConfigPath %USERPROFILE%\.local\Prunlet\config.json
+```
+
+`%USERPROFILE%`は実際の絶対パスへ置き換えます。`-CodexHome`は不要です。起動スクリプトは、Codexに以前の登録が残っている場合だけ、その登録を読み取り専用で確認して保護します。
+
+#### Codexへの登録（任意）
+
+Codexへまとめて登録する場合だけ、上のインストーラーに`-RegisterCodex -RegisterAgentInstructions`を追加します。CodexのMCP・ネイティブexeのフックと、Prunlet CLIを最初から使う共通指示を、CodexHome（`CODEX_HOME`、未指定なら`%USERPROFILE%\.codex`）へ登録します。
 
 `-RegisterCodex`を指定した導入・更新後は、Codexで`/hooks`を開いてPrunletフックの定義を確認し、信頼してください。インストーラーは信頼設定を変更せず、結果の`requiresHookTrust`でこの操作が必要なことを通知します。Codexを再起動し、MCP・共通指示・フックの読込みを確認してください。登録と解除の詳細は[連携手順](docs/integration.md#登録)を参照してください。
 
@@ -75,7 +90,7 @@ GitHub APIの未認証枠が上限に達した場合は、上の`pwsh`コマン�
 
 自動更新では、共通指示を含む登録内容が変更不要な候補だけを切り替えます。登録済みの`PRUNLET.md`と候補の違いがCRLFとLFの改行形式だけなら、既存のファイルをそのまま使います。登録の上書きが必要な場合や、利用者による登録の変更を検出した場合は、更新を保留します。手動でインストーラーを使う更新では、共通指示を登録済みなら同じ`-RegisterAgentInstructions`を指定してください。詳細は[エージェント共通指示](docs/integration.md#エージェント共通指示)を参照してください。
 
-自動更新の仕組みを持たない旧版からの初回更新や手動更新では、最新版のインストーラーを再取得して実行します。既存の`config.json`は保持容量の一度だけの移行を除いて保持します。旧復元データは[明示移行](#旧ファイル復元データの移行)で扱います。削除対象フォルダーの事前登録は不要です。旧`-AllowedRoot`は互換引数として受理しますが、削除範囲を制限しません。配置先は`-InstallDirectory`で変更できます。利用者のクローンパスをCodex設定へ登録することはありません。
+自動更新の仕組みを持たない旧版からの初回更新や手動更新では、最新版のインストーラーを再取得して実行します。既存の`config.json`は保持容量の一度だけの移行を除いて保持します。旧復元データは[明示移行](#旧ファイル復元データの移行)で扱います。削除対象フォルダーの事前登録は不要です。旧`-AllowedRoot`は互換引数として受理しますが、削除範囲を制限しません。配置先は`-InstallDirectory`で変更できます。利用者のクローンパスをAIツールの設定へ登録することはありません。
 
 既存の管理済み配置がGitリポジトリ配下にあり、通常の保存先検査で更新が止まる場合は、再取得したインストーラーに`-UpdateManagedInstallation -InstallDirectory <既存配置の絶対パス>`を追加できます。既存設定・配置情報・製品hashの一致を確認し、Git追跡対象がなく、Gitで除外されているか現在の共通CLI登録と一致する配置を更新します。確認できない配置は保全して停止します。条件の詳細は[連携手順](docs/integration.md#手動の設定準備)を参照してください。
 
@@ -83,7 +98,7 @@ GitHub APIの未認証枠が上限に達した場合は、上の`pwsh`コマン�
 
 取得したbootstrapファイルは一時物です。導入結果を確認して、そのbootstrap専用ディレクトリだけを清掃してください。アプリの配置先と復元用データは清掃対象に含めません。
 
-更新前の製品や登録前のCodex設定のバックアップがある場合、導入結果の`updateBackupDirectory`に保存先が表示されます。既定は`%LOCALAPPDATA%\Codex\TaskArtifacts\Prunlet\install-<ID>`です。動作とCodex登録を確認し、復旧が不要になってから、その導入分のバックアップだけを清掃してください。連携スクリプトの設定バックアップは[連携手順](docs/integration.md)を参照してください。
+更新前の製品や登録前のCodex設定のバックアップがある場合、導入結果の`updateBackupDirectory`に保存先が表示されます。既定は`%LOCALAPPDATA%\Prunlet\Backups\install-<ID>`です。動作と登録内容を確認し、復旧が不要になってから、その導入分のバックアップだけを清掃してください。連携スクリプトの設定バックアップは[連携手順](docs/integration.md)を参照してください。
 
 MSIX環境でAppDataが別の実体へ転送される場合は、`-UpdateBackupRoot <実体の絶対パス>`で更新バックアップの親を明示できます。その下へ導入ごとの`install-<ID>`を作ります。導入ごとの保存先がリポジトリ、Codex home、配置先、作業場所、復元データと重なる場合は拒否します。旧PowerShellフックが残っている場合、インストーラーはPrunletでWindowsのゴミ箱へ移し、結果を同じ更新バックアップの`retired-products.json`に保存します。
 

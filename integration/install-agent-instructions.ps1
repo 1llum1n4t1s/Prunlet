@@ -3,7 +3,7 @@
 param(
     [string]$SourceGuidePath = (Join-Path $PSScriptRoot 'PRUNLET.md'),
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
-    [string]$BackupDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\agent-instructions-' + [Guid]::NewGuid().ToString('N'))),
+    [string]$BackupDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Prunlet\Backups\agent-instructions-' + [Guid]::NewGuid().ToString('N'))),
     [string]$PreviousGuideSha256,
     [string]$ExecutablePath = (Join-Path $PSScriptRoot 'prunlet.exe'),
     [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config.json'),

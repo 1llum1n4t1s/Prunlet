@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory)][string]$ConfigPath,
     [string]$HookPath,
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
-    [string]$BackupDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\integration-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))),
+    [string]$BackupDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Prunlet\Backups\integration-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))),
     [switch]$ValidateOnly,
     [switch]$StartupUpdate
 )

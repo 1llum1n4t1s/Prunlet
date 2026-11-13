@@ -99,13 +99,17 @@ function Unregister-PrunletMaintenanceTask([string]$ExecutablePath, [string]$Con
 # pwshはCodexのMCP登録と同じくPATHから解決し、PowerShellの更新で絶対パスが変わっても所有判定を崩さない。
 # 保守タスク（03:00・ログオン直後）と同時に走ると、更新側が製品exeの使用中を検出して毎回延期するため、
 # 時刻とログオン後の遅延をずらす。
-function Get-PrunletUpdateTaskState([string]$ExecutablePath, [string]$ConfigPath, [string]$CodexHome) {
-    foreach ($path in @($ExecutablePath, $ConfigPath, $CodexHome)) {
+function Get-PrunletUpdateTaskState([string]$ExecutablePath, [string]$ConfigPath, [string]$CodexHome, [switch]$PreserveCodexHome) {
+    # CodexHomeは任意。空ならCodexへ登録していない導入として、タスク引数に-CodexHomeを付けない。
+    # 起動スクリプト側はCodexHomeがなければCodex登録の保護・更新を行わない。
+    # PreserveCodexHomeは起動時更新用。どのMCPホストから起動されたかでタスクの-CodexHomeが付いたり
+    # 外れたりしないよう、既存タスクの値をそのまま引き継ぐ（導入時はインストーラーが明示的に決める）。
+    foreach ($path in @($ExecutablePath, $ConfigPath) + @($CodexHome | Where-Object { $_ })) {
         if (![IO.Path]::IsPathFullyQualified($path) -or $path.Contains('"') -or $path.Contains("`r") -or $path.Contains("`n")) { throw 'Update task paths must be absolute paths without quotes or line breaks.' }
     }
     $ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath)
     $ConfigPath = [IO.Path]::GetFullPath($ConfigPath)
-    $CodexHome = [IO.Path]::GetFullPath($CodexHome).TrimEnd('\')
+    $CodexHome = if ($CodexHome) { [IO.Path]::GetFullPath($CodexHome).TrimEnd('\') } else { '' }
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     # 保守タスクと同じ識別（利用者・CLI・設定）から、別の名前と所有印を作る。CodexHomeは引数側だけに置き、
     # 再導入でCodexHomeを変えても同じタスクとして実行先を移行できるようにする。
@@ -113,13 +117,22 @@ function Get-PrunletUpdateTaskState([string]$ExecutablePath, [string]$ConfigPath
     $key = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($identity)))
     $launcher = Join-Path ([IO.Path]::GetDirectoryName($ExecutablePath)) 'start-prunlet-mcp.ps1'
     $command = Join-Path ([Environment]::GetFolderPath('System')) 'conhost.exe'
-    $arguments = '--headless pwsh -NoProfile -NonInteractive -File "' + $launcher + '" -UpdateOnly -ExecutablePath "' + $ExecutablePath + '" -ConfigPath "' + $ConfigPath + '" -CodexHome "' + $CodexHome + '"'
+    $arguments = '--headless pwsh -NoProfile -NonInteractive -File "' + $launcher + '" -UpdateOnly -ExecutablePath "' + $ExecutablePath + '" -ConfigPath "' + $ConfigPath + '"' + $(if ($CodexHome) { ' -CodexHome "' + $CodexHome + '"' } else { '' })
     $state = [ordered]@{ name = ('Prunlet-Update-' + $key.Substring(0, 24)); sid = $sid; executable = $ExecutablePath; config = $ConfigPath; codexHome = $CodexHome; launcher = $launcher; command = $command; arguments = $arguments; marker = ('Prunlet managed update v1:' + $key); previousXml = $null; attempted = $false }
     $task = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop | Where-Object { $_.TaskName.Equals($state.name, [StringComparison]::OrdinalIgnoreCase) })
     if ($task.Count -gt 1) { throw 'Update task identity is ambiguous.' }
     if ($task.Count) {
         $state.previousXml = Export-ScheduledTask -TaskPath '\' -TaskName $state.name -ErrorAction Stop
         Assert-PrunletUpdateTaskOwned $state $state.previousXml
+        if ($PreserveCodexHome) {
+            $namespace = [Xml.XmlNamespaceManager]::new(([xml]$state.previousXml).NameTable)
+            $namespace.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+            $previousArguments = ([xml]$state.previousXml).SelectSingleNode('/t:Task/t:Actions/t:Exec/t:Arguments', $namespace)
+            $match = if ($previousArguments) { [regex]::Match($previousArguments.InnerText, ' -CodexHome "([^"\r\n]+)"') } else { $null }
+            $kept = if ($match -and $match.Success -and [IO.Path]::IsPathFullyQualified($match.Groups[1].Value)) { [IO.Path]::GetFullPath($match.Groups[1].Value).TrimEnd('\') } else { '' }
+            $state.codexHome = $kept
+            $state.arguments = '--headless pwsh -NoProfile -NonInteractive -File "' + $launcher + '" -UpdateOnly -ExecutablePath "' + $ExecutablePath + '" -ConfigPath "' + $ConfigPath + '"' + $(if ($kept) { ' -CodexHome "' + $kept + '"' } else { '' })
+        }
     }
     return $state
 }

@@ -20,7 +20,7 @@ PrunletはWindows向けCLIとstdio MCPを同じexeで提供します。Codexの`
 
 ```powershell
 $bin = Join-Path $env:USERPROFILE '.local\Prunlet\bin'
-$instructionBackup = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\instructions-' + [guid]::NewGuid().ToString('N'))
+$instructionBackup = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Prunlet\Backups\instructions-' + [guid]::NewGuid().ToString('N'))
 & (Join-Path $bin 'install-agent-instructions.ps1') -SourceGuidePath (Join-Path $bin 'PRUNLET.md') -ExecutablePath (Join-Path $bin 'prunlet.exe') -ConfigPath (Join-Path $env:USERPROFILE '.local\Prunlet\config.json') -BackupDirectory $instructionBackup
 ```
 
@@ -90,7 +90,7 @@ MCPは5ツールを維持し、既存の`delete_files`に`action: "enqueue"`で�
 
 ```powershell
 $bin = Join-Path $env:USERPROFILE '.local\Prunlet\bin'
-$rollback = Join-Path $env:LOCALAPPDATA 'Codex\TaskArtifacts\Prunlet\integration-backup'
+$rollback = Join-Path $env:LOCALAPPDATA 'Prunlet\Backups\integration-backup'
 & (Join-Path $bin 'install-codex.ps1') `
   -ExecutablePath (Join-Path $bin 'prunlet.exe') `
   -ConfigPath (Join-Path $env:USERPROFILE '.local\Prunlet\config.json') `

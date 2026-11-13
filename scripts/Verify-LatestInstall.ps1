@@ -1321,6 +1321,16 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         & (Join-Path $Root 'bin\start-prunlet-mcp.ps1') -UpdateOnly -ExecutablePath (Join-Path $Root 'bin\prunlet.exe') -ConfigPath (Join-Path $Root 'config.json') -CodexHome $CodexHome
         return $LASTEXITCODE
     }
+    # -CodexHomeを渡さない起動（単独アプリとしてのMCPホスト・更新タスク）。実効のCodexHomeは
+    # 実PCの~/.codexを読まないよう、検証用の絶対パスをCODEX_HOMEで指定する。
+    function Invoke-UpdateOnlyWithoutCodexHome([string]$Root, [string]$EffectiveCodexHome) {
+        $previous = $env:CODEX_HOME
+        $env:CODEX_HOME = $EffectiveCodexHome
+        try {
+            & (Join-Path $Root 'bin\start-prunlet-mcp.ps1') -UpdateOnly -ExecutablePath (Join-Path $Root 'bin\prunlet.exe') -ConfigPath (Join-Path $Root 'config.json')
+            return $LASTEXITCODE
+        } finally { $env:CODEX_HOME = $previous }
+    }
     function Get-InstalledCommit([string]$Root) { return ([IO.File]::ReadAllText((Join-Path $Root 'source-info.json')) | ConvertFrom-Json).commitSha }
     function Get-UpdatePhase([string]$Root) { return ([IO.File]::ReadAllText((Join-Path $Root '.prunlet-update-state.json')) | ConvertFrom-Json).phase }
     Test-Case 'Update-only launcher switches a Codex-less installation to the next release without starting MCP' {
@@ -1364,6 +1374,42 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         Assert-True ((Invoke-UpdateOnly $root $codex) -eq 0) 'Registration deferral did not exit normally.'
         Assert-True ((Get-InstalledCommit $root) -ceq $oldCommit -and (Get-UpdatePhase $root) -ceq 'idle') 'Update-only launcher bypassed changed Codex registration.'
         Assert-True ((Get-FileHash -LiteralPath $tomlPath).Hash -ceq $tomlHash) 'Update-only launcher rewrote the edited Codex registration.'
+    }
+    Test-Case 'Standalone installation omits CodexHome from the update task and updates without it' {
+        # 単独のアプリとしての導入: Codexへ登録せず、CodexHomeにもPrunletの登録がない。
+        $absentCodex = Join-Path $OutputDirectory 'standalone-absent-codex'
+        $root = Install-PreviousRelease 'standalone-install' $absentCodex
+        Assert-True (!(Test-Path -LiteralPath $absentCodex)) 'Standalone installation created a Codex home.'
+        . (Join-Path $root 'bin\maintenance-task.ps1')
+        $taskState = Get-PrunletUpdateTaskState (Join-Path $root 'bin\prunlet.exe') (Join-Path $root 'config.json') ''
+        Assert-True ([bool]$taskState.previousXml) 'Standalone installation did not register the update task.'
+        $arguments = ([xml]$taskState.previousXml).Task.Actions.Exec.Arguments
+        Assert-True (!$arguments.Contains('-CodexHome')) "Standalone update task still passes CodexHome: $arguments"
+        $null = Publish-NextRelease $root
+        Assert-True ((Invoke-UpdateOnlyWithoutCodexHome $root $absentCodex) -eq 0) 'Update-only launcher without CodexHome failed.'
+        Assert-True ((Get-InstalledCommit $root) -ceq $newCommit -and (Get-UpdatePhase $root) -ceq 'idle') 'Update-only launcher without CodexHome did not switch to the next release.'
+        Assert-True (!(Test-Path -LiteralPath $absentCodex)) 'Update-only launcher without CodexHome created a Codex home.'
+        # 起動時更新での移行は、既存タスクの-CodexHomeなしを引き継ぐ。
+        $after = ([xml]$global:PrunletMaintenanceFixture.tasks[$taskState.name]).Task.Actions.Exec.Arguments
+        Assert-True (!$after.Contains('-CodexHome')) "Startup update added CodexHome to the standalone task: $after"
+        $preserved = Get-PrunletUpdateTaskState (Join-Path $root 'bin\prunlet.exe') (Join-Path $root 'config.json') (Join-Path $OutputDirectory 'other-codex') -PreserveCodexHome
+        Assert-True (!$preserved.arguments.Contains('-CodexHome') -and !$preserved.codexHome) 'PreserveCodexHome did not keep the absent CodexHome.'
+    }
+    Test-Case 'Launcher without CodexHome still protects a Codex registration in the effective CodexHome' {
+        $codex = Join-Path $OutputDirectory 'effective-registered-codex'
+        $root = Install-PreviousRelease 'effective-registered-install' $codex -RegisterCodex
+        $null = Publish-NextRelease $root
+        $tomlPath = Join-Path $codex 'config.toml'
+        $edited = [IO.File]::ReadAllText($tomlPath).Replace('startup_timeout_sec = 600', 'startup_timeout_sec = 601')
+        Assert-True ($edited -cne [IO.File]::ReadAllText($tomlPath)) 'Registration edit fixture did not change config.toml.'
+        [IO.File]::WriteAllText($tomlPath, $edited, [Text.UTF8Encoding]::new($false))
+        $tomlHash = (Get-FileHash -LiteralPath $tomlPath).Hash
+        Assert-True ((Invoke-UpdateOnlyWithoutCodexHome $root $codex) -eq 0) 'Registration deferral without CodexHome did not exit normally.'
+        Assert-True ((Get-InstalledCommit $root) -ceq $oldCommit -and (Get-UpdatePhase $root) -ceq 'idle') 'Launcher without CodexHome bypassed the effective Codex registration.'
+        Assert-True ((Get-FileHash -LiteralPath $tomlPath).Hash -ceq $tomlHash) 'Launcher without CodexHome rewrote the edited Codex registration.'
+        . (Join-Path $root 'bin\maintenance-task.ps1')
+        $taskState = Get-PrunletUpdateTaskState (Join-Path $root 'bin\prunlet.exe') (Join-Path $root 'config.json') $codex
+        Assert-True (([xml]$taskState.previousXml).Task.Actions.Exec.Arguments.Contains('-CodexHome "' + $codex + '"')) 'Codex-registered installation did not keep CodexHome in the update task.'
     }
     Test-Case 'Update task is migrated only while owned and removed by explicit schedule uninstall' {
         . (Join-Path $repoRoot 'integration\maintenance-task.ps1')

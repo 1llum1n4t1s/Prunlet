@@ -2,7 +2,7 @@ param(
     [string]$ExecutablePath = (Join-Path $PSScriptRoot 'prunlet.exe'),
     [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config.json'),
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
-    [string]$BackupDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Codex\TaskArtifacts\Prunlet\integration-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')))
+    [string]$BackupDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Prunlet\Backups\integration-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')))
 )
 . (Join-Path $PSScriptRoot 'configuration-common.ps1')
 $CodexHome = Resolve-Absolute $CodexHome 'CodexHome'
