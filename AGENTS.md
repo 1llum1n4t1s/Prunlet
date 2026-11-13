@@ -75,15 +75,15 @@ Apple Silicon実機で`aarch64-apple-darwin`をビルドし、`CARGO_TARGET_DIR`
 
 ### Linux
 
-x64・ARM64ともに`ssh mac`先のLima `linux-validation`でビルドする。各CPUの通常配布実行体で`bun scripts/Verify-LinuxFiles.ts <実行体> <新規の外部出力先>`を実行する。ARM64ゲストでx64を検証する場合のQEMU・動的ローダーの引数と、隔離した`XDG_DATA_HOME`での検証範囲は[Linuxの検証](docs/verification.md#linuxの検証)に従う。
+x64・ARM64ともにGitHub ActionsのGitHub提供ランナー（x64は`ubuntu-latest`、ARM64は`ubuntu-24.04-arm`）でビルドする。各CPUの通常配布実行体で`bun scripts/Verify-LinuxFiles.ts <実行体> <新規の外部出力先>`を実行する。ARM64環境でx64を検証する場合のQEMU・動的ローダーの引数と、隔離した`XDG_DATA_HOME`での検証範囲は[Linuxの検証](docs/verification.md#linuxの検証)に従う。
 
-起動時更新の変更では、各CPUに対応するLinuxゲストで`bun scripts/Verify-UnixStartupUpdate.ts`を実行し、通常MCP起動で連続更新・延期・中断・拒否を確認する。GitHub応答の置換は`prunlet_linux_update_tests`を指定したデバッグビルドに限定し、候補は公開用と同じtar.gz形式を使う。
+起動時更新の変更では、各CPUに対応するLinuxランナーで`bun scripts/Verify-UnixStartupUpdate.ts`を実行し、通常MCP起動で連続更新・延期・中断・拒否を確認する。GitHub応答の置換は`prunlet_linux_update_tests`を指定したデバッグビルドに限定し、候補は公開用と同じtar.gz形式を使う。
 
 ## 導入と文書
 
 Prunletの `vava` で新しいリリースを公開するときは、Apple Silicon版のビルド・署名・公証・ZIP生成を `ssh mac` の実機で行う。[Apple Silicon版の公開手順](docs/distribution.md#apple-silicon版の公開手順)に従い、検証済みZIPを同じGitHub Releaseに添付してから公開する。Mac向けにGitHub Actionsを起動したり、GitHubホストのrunnerへ切り替えたりしない。Windows版は既存の配布workflowを使う。再開時は完了済みの工程と実物を照合して再利用する。
 
-Linuxのリリースビルドは、上記のLimaゲストで`bash scripts/Publish-PrunletLinux.sh <新規の絶対出力先> <40桁SHA> <linux-x64|linux-arm64>`を各CPU向けに実行する。[Linux版の公開手順](docs/distribution.md#linux版の公開手順)に従い、検証済みtar.gzとチェックサムを同じGitHub Releaseへ添付する。Linux向けのGitHub Actionsは起動しない。
+Linuxのリリースビルドは、上記のGitHub提供ランナーで`bash scripts/Publish-PrunletLinux.sh <新規の絶対出力先> <40桁SHA> <linux-x64|linux-arm64>`を各CPU向けに実行する。[Linux版の公開手順](docs/distribution.md#linux版の公開手順)に従い、検証済みtar.gzとチェックサムを同じGitHub Releaseへ添付する。
 
 Dependabotと依存検証のworkflowを変更する場合は、[依存更新の境界](DESIGN.md#依存更新の境界)にある検証条件と読取り権限の境界を維持する。依存検証CIの成功は、変更内容に応じた上記の追加E2Eを代替しない。
 

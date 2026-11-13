@@ -30,9 +30,9 @@ R2の既存配信処理に含まれる内容照合が成功した後だけ、ZIP
 
 ## Linux版の公開手順
 
-`ssh mac` でApple Silicon実機に接続し、Limaの `linux-validation` に固定済みリリースSHAのクリーンなチェックアウトと新規の外部出力先を用意する。ゲストのUbuntu ARM64上で、`rust-toolchain.toml` が指定するRustと `aarch64-unknown-linux-gnu`・`x86_64-unknown-linux-gnu` を使う。x64のクロスリンクには `x86_64-linux-gnu-gcc` と対象のglibc開発環境を使う。
+GitHub ActionsのGitHub提供ランナー（x64は `ubuntu-latest`、ARM64は `ubuntu-24.04-arm`）に、固定済みリリースSHAのクリーンなチェックアウトと新規の外部出力先を用意する。各ランナーで、`rust-toolchain.toml` が指定するRustと対象CPUの `x86_64-unknown-linux-gnu`・`aarch64-unknown-linux-gnu` を使う。ARM64上でx64をクロスビルドする場合は、`x86_64-linux-gnu-gcc` と対象のglibc開発環境を使う。
 
-ゲスト内で `bash scripts/Publish-PrunletLinux.sh <新規の絶対出力先> <40桁SHA> linux-arm64` と、別出力先への `linux-x64` を実行する。生成するtar.gzには `prunlet` と、版・コミット・対象・実行体サイズ・SHA-256を記録した `manifest.json` を収録する。スクリプトがELFのアーキテクチャと梱包内容を照合し、配布実物のチェックサムを `.tar.gz.sha256` へ保存する。 `--preview` で生成したファイルは公開対象外とする。
+ARM64のランナーで `bash scripts/Publish-PrunletLinux.sh <新規の絶対出力先> <40桁SHA> linux-arm64` を、x64のランナーで別出力先への `linux-x64` を実行する。生成するtar.gzには `prunlet` と、版・コミット・対象・実行体サイズ・SHA-256を記録した `manifest.json` を収録する。スクリプトがELFのアーキテクチャと梱包内容を照合し、配布実物のチェックサムを `.tar.gz.sha256` へ保存する。 `--preview` で生成したファイルは公開対象外とする。
 
 転送後にチェックサムを再照合し、Mac版と同じGitHub Release下書きへ各アーカイブとチェックサムを添付する。GitHubが返したasset名・サイズ・SHA-256を確認してから公開する。
 

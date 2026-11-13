@@ -149,7 +149,7 @@ macOSの通常ビルドで `Verify-MacRecordlessFiles.py` を実行し、Trash�
 起動時更新は、上記のデバッグcfgで作成した別バージョン・別コミットのA/B/Cを同じDeveloper IDで署名・公証する。Aの実行ファイルとB/Cの公開形式ZIPを `bun scripts/Verify-MacStartupUpdate.ts <新規の外部ディレクトリ> <Aのexe> <BのZIP> <CのZIP>` に渡す。GitHub応答だけをローカルに置換し、署名・ZIP・stdio・排他・置換は製品の経路で確認する。配布用ビルドにはこの応答置換を含めない。
 ## Linuxの検証
 
-`ssh mac` 先のLima `linux-validation` で両アーキテクチャをビルドする。配布tar.gzをそれぞれ外部へ展開し、ARM64は `bun scripts/Verify-LinuxFiles.ts <prunletの絶対パス> <新規の外部出力先>` を実行する。ARM64ゲストでx64を検証する場合は、末尾に次を追加する。
+GitHub ActionsのGitHub提供ランナー（x64は `ubuntu-latest`、ARM64は `ubuntu-24.04-arm`）で両アーキテクチャをビルドする。配布tar.gzをそれぞれ外部へ展開し、各CPUのランナーで `bun scripts/Verify-LinuxFiles.ts <prunletの絶対パス> <新規の外部出力先>` を実行する。ARM64環境でx64を検証する場合は、末尾に次を追加する。
 
 ```text
 <検証済みqemu-x86_64の絶対パス> /usr/x86_64-linux-gnu/lib/ld-linux-x86-64.so.2 --library-path /usr/x86_64-linux-gnu/lib
@@ -157,4 +157,4 @@ macOSの通常ビルドで `Verify-MacRecordlessFiles.py` を実行し、Trash�
 
 動的ローダーを直接指定し、`-L` でルートディレクトリの解決をsysrootへ変えない。専用の `XDG_DATA_HOME` で、元名・Trash内のinode・復元後の内容を照合する。CLIとstdio MCPの終了コード、フックの拒否、別マウント・リンク・設定の保全も確認する。
 
-起動時自動更新は、各CPUでバージョンとコミットが異なる3世代を、`RUSTFLAGS='--cfg prunlet_linux_update_tests'` を指定したデバッグビルドとして用意する。CPUをエミュレーションするゲスト向けのfixtureは `CARGO_PROFILE_DEV_OPT_LEVEL=2` を指定する。後の2世代は公開物と同じustar形式のtar.gzにする。 `bun scripts/Verify-UnixStartupUpdate.ts <新規の外部出力先> <初期実行体> <2世代目のtar.gz> <3世代目のtar.gz>` をCPUが一致するLinuxゲストで実行する。これはGitHub応答だけを隔離fixtureに置き換え、通常MCPのstdio・実行体の交換と引継ぎ・設定と復元領域の保全を確認する。x64のビルドも `linux-validation` で行い、実行体の再起動を含む更新の検証はx64 Linuxゲストへ検証実物を転送して行える。
+起動時自動更新は、各CPUでバージョンとコミットが異なる3世代を、`RUSTFLAGS='--cfg prunlet_linux_update_tests'` を指定したデバッグビルドとして用意する。CPUをエミュレーションする環境向けのfixtureは `CARGO_PROFILE_DEV_OPT_LEVEL=2` を指定する。後の2世代は公開物と同じustar形式のtar.gzにする。 `bun scripts/Verify-UnixStartupUpdate.ts <新規の外部出力先> <初期実行体> <2世代目のtar.gz> <3世代目のtar.gz>` をCPUが一致するLinuxランナーで実行する。これはGitHub応答だけを隔離fixtureに置き換え、通常MCPのstdio・実行体の交換と引継ぎ・設定と復元領域の保全を確認する。x64のビルドと、実行体の再起動を含む更新の検証は `ubuntu-latest` で行う。
