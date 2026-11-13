@@ -5,7 +5,7 @@ resolver = "3"
 
 [package]
 name = "prunlet"
-version = "1.0.43"
+version = "1.0.44"
 edition = "2024"
 rust-version = "1.100.0"
 publish = false
