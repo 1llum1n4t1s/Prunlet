@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "prunlet"
-version = "1.0.42"
+version = "1.0.43"
 dependencies = [
  "anyhow",
  "base64",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "prunlet-fixtures"
-version = "1.0.42"
+version = "1.0.43"
 dependencies = [
  "anyhow",
  "base64",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "prunlet-support"
-version = "1.0.42"
+version = "1.0.43"
 dependencies = [
  "anyhow",
  "chrono",
