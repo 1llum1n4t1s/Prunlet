@@ -1475,7 +1475,12 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         $legacyRevision = 'v1.0.42'
         $legacySource = New-FixtureSource (Join-Path $fixtureRoot 'source-without-update-task')
         foreach ($relative in @('integration/maintenance-task.ps1', 'integration/start-prunlet-mcp.ps1')) {
-            $text = & git -C $repoRoot show ($legacyRevision + ':' + $relative)
+            # gitの出力はUTF-8。コンソールの文字コード（日本語環境のShift_JISなど）で読むと日本語コメントが
+            # 化けて旧版スクリプトが構文エラーになるため、この読取りの間だけUTF-8で受け取る。
+            $previousEncoding = [Console]::OutputEncoding
+            [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+            try { $text = & git -C $repoRoot show ($legacyRevision + ':' + $relative) }
+            finally { [Console]::OutputEncoding = $previousEncoding }
             Assert-True ($LASTEXITCODE -eq 0) "Committed $relative could not be read from tag $legacyRevision (fetch tags if missing)."
             [IO.File]::WriteAllText((Join-Path $legacySource $relative.Replace('/', '\')), (($text -join "`r`n") + "`r`n"), [Text.UTF8Encoding]::new($false))
         }
