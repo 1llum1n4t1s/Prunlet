@@ -299,11 +299,7 @@ fn scan_directory_names(handle: HANDLE, mut visit: impl FnMut(String)) -> Result
                 if length == 0 || length % 2 != 0 || length > buffer.len() - offset - 68 {
                     bail!("Invalid fixed-directory name length");
                 }
-                let text: Vec<u16> = buffer[offset + 68..offset + 68 + length]
-                    .chunks_exact(2)
-                    .map(|x| u16::from_le_bytes([x[0], x[1]]))
-                    .collect();
-                let name = String::from_utf16(&text)?;
+                let name = utf16le_to_string(&buffer[offset + 68..offset + 68 + length])?;
                 if name != "." && name != ".." {
                     if name.contains(['\\', '/', ':', '\0']) {
                         bail!("Invalid fixed-directory name");
@@ -320,6 +316,15 @@ fn scan_directory_names(handle: HANDLE, mut visit: impl FnMut(String)) -> Result
             }
         }
     }
+}
+/// UTF-16LEのバイト列を文字列へ復号する。不正なサロゲートは`FromUtf16Error`のまま返す。
+fn utf16le_to_string(bytes: &[u8]) -> Result<String, std::string::FromUtf16Error> {
+    String::from_utf16(
+        &bytes
+            .chunks_exact(2)
+            .map(|x| u16::from_le_bytes([x[0], x[1]]))
+            .collect::<Vec<_>>(),
+    )
 }
 pub fn directory_names(handle: HANDLE) -> Result<Vec<String>> {
     let mut names = Vec::new();
@@ -348,20 +353,11 @@ pub struct DirectoryEntry {
     pub last_write_time: i64,
     pub change_time: i64,
 }
-pub fn directory_entries(handle: HANDLE) -> Result<Vec<DirectoryEntry>> {
-    directory_entries_bounded(handle, usize::MAX)
-}
-pub fn directory_names_bounded(handle: HANDLE, maximum: usize) -> Result<Vec<String>> {
-    Ok(directory_entries_bounded(handle, maximum)?
-        .into_iter()
-        .map(|entry| entry.name)
-        .collect())
-}
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "HANDLEはOSが検証するopaque値であり、呼出元メモリを参照しない"
 )]
-pub fn directory_entries_bounded(handle: HANDLE, maximum: usize) -> Result<Vec<DirectoryEntry>> {
+pub fn directory_entries(handle: HANDLE) -> Result<Vec<DirectoryEntry>> {
     let mut result = vec![];
     let mut first = true;
     let mut buffer = vec![0u8; 65536];
@@ -399,17 +395,8 @@ pub fn directory_entries_bounded(handle: HANDLE, maximum: usize) -> Result<Vec<D
             if n == 0 || n % 2 != 0 || n > b.len() - 88 {
                 bail!("Invalid directory identity name");
             }
-            let name = String::from_utf16(
-                &b[88..88 + n]
-                    .chunks_exact(2)
-                    .map(|x| u16::from_le_bytes([x[0], x[1]]))
-                    .collect::<Vec<_>>(),
-            )?;
+            let name = utf16le_to_string(&b[88..88 + n])?;
             if name != "." && name != ".." {
-                anyhow::ensure!(
-                    result.len() < maximum,
-                    "Directory enumeration exceeds the reserved-tree entry limit"
-                );
                 if name.contains(['\\', '/', ':', '\0']) {
                     bail!("Invalid directory identity component");
                 }
@@ -575,9 +562,6 @@ pub fn ready_local_drives() -> Result<Vec<PathBuf>> {
     }
     Ok(result)
 }
-pub fn local_ready_drives() -> Result<Vec<PathBuf>> {
-    ready_local_drives()
-}
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "HANDLEはOSが検証するopaque値であり、呼出元メモリを参照しない"
@@ -636,14 +620,11 @@ pub fn named_stream_bytes(handle: HANDLE) -> Result<u64> {
                 .ok_or_else(|| anyhow::anyhow!("Stream size overflow"))
         })
 }
-pub fn named_streams(handle: HANDLE) -> Result<Vec<NamedStream>> {
-    named_streams_bounded(handle, usize::MAX)
-}
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "HANDLEはOSが検証するopaque値であり、呼出元メモリを参照しない"
 )]
-pub fn named_streams_bounded(handle: HANDLE, maximum: usize) -> Result<Vec<NamedStream>> {
+pub fn named_streams(handle: HANDLE) -> Result<Vec<NamedStream>> {
     let mut size = 1024usize;
     loop {
         let mut buffer = vec![0u8; size];
@@ -678,17 +659,8 @@ pub fn named_streams_bounded(handle: HANDLE, maximum: usize) -> Result<Vec<Named
             if length % 2 != 0 || length > size - offset - 24 || bytes < 0 {
                 bail!("Invalid stream information record");
             }
-            let name = String::from_utf16(
-                &buffer[offset + 24..offset + 24 + length]
-                    .chunks_exact(2)
-                    .map(|x| u16::from_le_bytes([x[0], x[1]]))
-                    .collect::<Vec<_>>(),
-            )?;
+            let name = utf16le_to_string(&buffer[offset + 24..offset + 24 + length])?;
             if name != "::$DATA" {
-                anyhow::ensure!(
-                    streams.len() < maximum,
-                    "Named-stream enumeration exceeds the reserved-tree stream-guard limit"
-                );
                 let name = name
                     .strip_prefix(':')
                     .and_then(|x| x.strip_suffix(":$DATA"))

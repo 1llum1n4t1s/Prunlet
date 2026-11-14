@@ -896,16 +896,6 @@ pub fn dispatch(op: &str, args: &Value) -> Result<Value> {
                 Ok(found.into_iter().next().unwrap())
             })
         }
-        "file.bin.find_tracked" => {
-            let saved = field(args, "pidl")?.to_owned();
-            in_sta(move || {
-                let b = bin()?;
-                match find(&b, &saved)? {
-                    Some(item) => Ok(json!(physical(item.0)?)),
-                    None => Ok(Value::Null),
-                }
-            })
-        }
         "file.bin.restore_owned" => {
             let args = args.clone();
             in_sta(move || restore_owned(&args))

@@ -1,10 +1,12 @@
-param([Parameter(Mandatory)][string]$ExecutablePath,[Parameter(Mandatory)][string]$RustProbePath,[Parameter(Mandatory)][string]$BuildManifestPath,[Parameter(Mandatory)][string]$ExpectedBuildManifestSha256,[Parameter(Mandatory)][string]$ConfigPath,[Parameter(Mandatory)][string]$FixtureRoot,[Parameter(Mandatory)][string]$OutputDirectory)
+param([Parameter(Mandatory)][string]$ExecutablePath,[Parameter(Mandatory)][string]$RustProbePath,[Parameter(Mandatory)][string]$BuildManifestPath,[Parameter(Mandatory)][string]$ExpectedBuildManifestSha256,[Parameter(Mandatory)][string]$ConfigPath,[Parameter(Mandatory)][string]$FixtureRoot,[Parameter(Mandatory)][string]$OutputDirectory,
+ # 実行するCoreプローブのケース。並列の独立root検証と、リサイクル済みハードリンクの独立性検証で共有する。
+ [Parameter(Mandatory)][ValidateSet('file-independent-roots','file-recycled-alias-independent')][string]$Case)
 $ErrorActionPreference='Stop'
 # runnerが固定した同一source証拠をprobe実行直前にも照合する。
 $binding=Assert-RustFileProbeBinding
 $script:Config=$ConfigPath
 $resultPath=Join-Path $OutputDirectory ('independence-probe-'+[guid]::NewGuid().ToString('N')+'.json')
-$request=@{case='file-recycled-alias-independent';fixtureRoot=$FixtureRoot;configSha256=(Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash;resultPath=$resultPath}
+$request=@{case=$Case;fixtureRoot=$FixtureRoot;configSha256=(Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash;resultPath=$resultPath}
 $info=New-RustProbeStartInfo $RustProbePath 'files_contract' $request $OutputDirectory
 $process=[Diagnostics.Process]::Start($info)
 try{

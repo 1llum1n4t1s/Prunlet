@@ -90,10 +90,6 @@ function Find-FileFixtureBinNew {
     param([Parameter(Mandatory)][string]$ExpectedId,[Parameter(Mandatory)][AllowEmptyCollection()][string[]]$PriorPidls)
     Invoke-PrunletFixture -Operation 'file.bin.find_new' -Arguments @{expectedId=$ExpectedId;priorPidls=@($PriorPidls)}
 }
-function Find-FileFixtureBinTracked {
-    param([Parameter(Mandatory)][string]$Pidl)
-    Invoke-PrunletFixture -Operation 'file.bin.find_tracked' -Arguments @{pidl=$Pidl}
-}
 function Restore-FileFixtureOwned {
     param([Parameter(Mandatory)][string]$Pidl,[Parameter(Mandatory)][string]$PhysicalPath,[Parameter(Mandatory)][string]$ExpectedId,[Parameter(Mandatory)][string]$OriginalPath,[Parameter(Mandatory)][string]$Scope)
     Invoke-PrunletFixture -Operation 'file.bin.restore_owned' -Arguments @{pidl=$Pidl;physicalPath=$PhysicalPath;expectedId=$ExpectedId;originalPath=$OriginalPath;scope=$Scope}
@@ -145,17 +141,6 @@ class PrunletFileFixtureAccessLease : System.IDisposable {
 function New-FileFixtureAccessLease {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Scope,[switch]$WritableAcl,[string]$ExpectedId,[string]$ExpectedSecurityBase64)
     [PrunletFileFixtureAccessLease]::new($Path,$Scope,[bool]$WritableAcl,$ExpectedId,$ExpectedSecurityBase64)
-}
-function Set-FileFixtureDenyRead {
-    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Scope)
-    $lease = New-FileFixtureAccessLease -Path $Path -Scope $Scope -WritableAcl
-    try { $lease.DenyRead(); return $lease }
-    catch {
-        $setupError = $_
-        try { $lease.Dispose() }
-        catch { throw "Fixture deny setup failed ($($setupError.Exception.Message)); lease release is $($lease.ReleaseState), lease ID $($lease.LastLeaseId): $($_.Exception.Message). Do not resend." }
-        throw $setupError
-    }
 }
 
 class PrunletFileFixtureHold : System.IDisposable {

@@ -25,11 +25,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
     a.to_string_lossy()
         .eq_ignore_ascii_case(&b.to_string_lossy())
 }
-fn missing(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|e| matches!(e.raw_os_error(), Some(2 | 3)))
-}
+use super::missing;
 
 pub fn location(
     config: &Config,
@@ -212,7 +208,7 @@ pub fn inspect(
             Err(e) => unavailable(key.clone(), e),
         }
     }
-    match native::local_ready_drives() {
+    match native::ready_local_drives() {
         Ok(paths) => {
             for path in paths {
                 drives.insert(path.to_string_lossy().to_uppercase());

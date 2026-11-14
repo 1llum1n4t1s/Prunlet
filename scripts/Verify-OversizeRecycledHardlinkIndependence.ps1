@@ -17,7 +17,7 @@ $buildBinding=Assert-RustFileProbeBinding
 $null=Initialize-PrunletFixtureBinding -ExecutablePath $ExecutablePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256
 $script:fixtureRun=New-VerificationFixtureRun -FixtureRoot $FixtureRoot -ForbiddenRoots @($repo,(Join-Path $env:USERPROFILE '.codex'),$OutputDirectory) -NamePrefix 'independence'
 $exeHash=(Get-FileHash -LiteralPath $ExecutablePath).Hash
-$hostScript=Join-Path $PSScriptRoot 'recordless-e2e/OversizeRecycledHardlinkHost.ps1';$common=Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1';. $common
+$hostScript=Join-Path $PSScriptRoot 'recordless-e2e/OversizeIndependenceHost.ps1';$common=Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1';. $common
 $helperFiles=@('FileFixtures.Common.ps1','FixtureBridge.Common.ps1')|ForEach-Object {Join-Path $PSScriptRoot $_}
 $sources=@(@($PSCommandPath,$hostScript,$common,(Join-Path $PSScriptRoot 'SparseFixtures.Common.ps1'),(Join-Path $PSScriptRoot 'FileFixtures.Common.ps1'))+$helperFiles|ForEach-Object {@{path=$_;sha256=(Get-FileHash -LiteralPath $_).Hash}})
 $sources+=@(Get-RustFileProbeSourceHashes)
@@ -42,7 +42,7 @@ try {
  Assert-R ($proof.Length-eq$length-and$proof.NumberOfLinks-eq1-and$proof.AllocationSize-le1MB-and$proof.CompressedSize-le1MB) 'Invalid sparse fixture'
  $sparsePrior=[string[]]@((Find-FileFixtureBinIdentity -ExpectedId ($proof.Id))|ForEach-Object Pidl)
  $state.huge=@{path=$root;before=$rootBefore;prior=$rootPrior;childBefore=$childBefore;childPrior=$childPrior;sparsePath=$sparse;sparse=$proof;sparsePrefix=[Convert]::ToBase64String($prefix);sparsePrior=$sparsePrior}
- $observed=& $hostScript -ExecutablePath $ExecutablePath -RustProbePath $RustProbePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256 -ConfigPath $scope.config -FixtureRoot $scope.files -OutputDirectory $OutputDirectory;$state.checkpoint=$observed
+ $observed=& $hostScript -ExecutablePath $ExecutablePath -RustProbePath $RustProbePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256 -ConfigPath $scope.config -FixtureRoot $scope.files -OutputDirectory $OutputDirectory -Case 'file-recycled-alias-independent';$state.checkpoint=$observed
  Assert-R ($observed.sizeRefusals-eq1-and$observed.aliasWriteOpen-and$observed.aliasIdentityMatched) 'Alias write-open failed during pinned unrelated child'
  Assert-R (@($observed.result['items']).Count-eq2) 'Core batch failed or returned wrong item count'
  Assert-R ($observed.result['items'][0]['path']-ceq$small-and$observed.result['items'][0]['status']-ceq'recycled'-and![IO.File]::Exists($small)) 'Small file was not recycled'
@@ -64,4 +64,4 @@ finally {
  $report=@{suite='oversize-recycled-hardlink-independence';executable=$ExecutablePath;executableSha256=$exeHash;rustProbePath=$RustProbePath;sameSourceBuild=$buildBinding;fixtureRun=$script:fixtureRun;scope='Actual Shell and same-source cfg(test) Core; CLI/MCP E2E separate';sources=$sources;result=$state;commands=@($script:commands);retained=$OutputDirectory;passed=[int]$state.passed;failed=[int](!$state.passed)}
  try{$bytes=$utf8.GetBytes((ConvertTo-Json -InputObject $report -Depth 100));$stream=[IO.FileStream]::new($ReportPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None);try{$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}finally{$stream.Dispose()}}finally{$env:TEMP=$oldTemp;$env:TMP=$oldTmp}
 }
-if(!$state.passed){throw 'Mixed oversize verification failed; inspect report and retain uncertain fixtures'}
+if(!$state.passed){throw 'Recycled hardlink independence verification failed; inspect report and retain uncertain fixtures'}

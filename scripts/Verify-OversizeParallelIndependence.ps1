@@ -18,7 +18,7 @@ $buildBinding=Assert-RustFileProbeBinding
 $null=Initialize-PrunletFixtureBinding -ExecutablePath $ExecutablePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256
 $script:fixtureRun=New-VerificationFixtureRun -FixtureRoot $FixtureRoot -ForbiddenRoots @($repo,(Join-Path $env:USERPROFILE '.codex'),$OutputDirectory) -NamePrefix 'independence'
 $exeHash=(Get-FileHash -LiteralPath $ExecutablePath).Hash
-$hostScript=Join-Path $PSScriptRoot 'recordless-e2e/OversizeParallelIndependenceHost.ps1'
+$hostScript=Join-Path $PSScriptRoot 'recordless-e2e/OversizeIndependenceHost.ps1'
 $common=Join-Path $PSScriptRoot 'recordless-e2e/Common.ps1';. $common
 $helperFiles=@('FileFixtures.Common.ps1','FixtureBridge.Common.ps1')|ForEach-Object {Join-Path $PSScriptRoot $_}
 $sources=@(@($PSCommandPath,$hostScript,$common,(Join-Path $PSScriptRoot 'SparseFixtures.Common.ps1'),(Join-Path $PSScriptRoot 'FileFixtures.Common.ps1'))+$helperFiles|ForEach-Object {@{path=$_;sha256=(Get-FileHash -LiteralPath $_).Hash}})
@@ -48,7 +48,7 @@ try {
   $roots.Add($root);$witnesses.Add(@{path=$witness;before=$witnessBefore;prior=$witnessPrior});$state.roots+=@(@{path=$root;before=$rootBefore;sparse=$proof});$state.witnesses+=@(@{path=$witness;before=$witnessBefore;prior=$witnessPrior})
  }
  $state.members=@($members)
- $observed=& $hostScript -ExecutablePath $ExecutablePath -RustProbePath $RustProbePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256 -ConfigPath $scope.config -FixtureRoot $scope.files -OutputDirectory $OutputDirectory;$state.checkpoint=$observed
+ $observed=& $hostScript -ExecutablePath $ExecutablePath -RustProbePath $RustProbePath -BuildManifestPath $BuildManifestPath -ExpectedBuildManifestSha256 $ExpectedBuildManifestSha256 -ConfigPath $scope.config -FixtureRoot $scope.files -OutputDirectory $OutputDirectory -Case 'file-independent-roots';$state.checkpoint=$observed
  Assert-R ($observed.sizeRefusals-eq2-and$observed.parallelShellReady-and$observed.firstPinned-and$observed.secondPinnedWhileFirstHeld-and$observed.firstReleased) 'Independent pin rendezvous failed'
  Assert-R (@($observed.result['items']).Count-eq2) 'Core deletion failed or returned wrong item count'
  for($i=0;$i-lt2;$i++) {Assert-R ($observed.result['items'][$i]['path']-ceq$roots[$i]-and$observed.result['items'][$i]['status']-ceq'permanently_deleted'-and![IO.Directory]::Exists($roots[$i])) 'Unexpected root deletion result'}

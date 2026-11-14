@@ -244,16 +244,28 @@ fn verify_gate(path: &Path, raw: windows_sys::Win32::Foundation::HANDLE) -> Resu
     );
     Ok(())
 }
-fn remove_gate(path: &Path) -> Result<()> {
-    let fixed = security::open_lifecycle_delete(path)?;
-    verify_gate(path, fixed.raw())?;
-    security::delete_fixed(fixed.raw(), false)?;
-    drop(fixed);
+/// 開いたgate handleの実体を照合して削除し、handle解放後に名前の消失を確認する。
+/// `handle`は`raw`の所有者で、削除設定の直後（名前確認の前）に必ず閉じる。
+fn delete_gate_handle<H>(
+    path: &Path,
+    handle: H,
+    raw: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<()> {
+    verify_gate(path, raw)?;
+    // POSIX削除を先に試し、外部の共有handleが残っていても名前をすぐ解放する（非対応FSだけ従来設定）。
+    // 従来設定のままだと名前がdelete-pendingで残り、直後の名前確認がアクセス拒否になる。
+    security::delete_permanent_fixed(raw, false, false)?;
+    drop(handle);
     ensure!(
         inspect(path)?.is_none(),
         "Legacy discard gate still exists after deletion."
     );
     Ok(())
+}
+fn remove_gate(path: &Path) -> Result<()> {
+    let fixed = security::open_lifecycle_delete(path)?;
+    let raw = fixed.raw();
+    delete_gate_handle(path, fixed, raw)
 }
 
 pub fn migrate(
@@ -478,20 +490,8 @@ pub fn migrate(
     }
     if !uncertain {
         if let Some(lease) = gate_lease.take() {
-            let remove = (|| -> Result<()> {
-                verify_gate(&gate, lease.raw())?;
-                security::delete_fixed(lease.raw(), false)?;
-                Ok(())
-            })();
-            drop(lease);
-            let remove = remove.and_then(|_| {
-                ensure!(
-                    inspect(&gate)?.is_none(),
-                    "Legacy discard gate still exists after deletion."
-                );
-                Ok(())
-            });
-            if let Err(error) = remove {
+            let raw = lease.raw();
+            if let Err(error) = delete_gate_handle(&gate, lease, raw) {
                 result.complete = false;
                 result.warnings.push(format!("Legacy discard succeeded but its uncertainty gate removal could not be confirmed: {error}"));
             }
@@ -578,5 +578,20 @@ mod tests {
         // Shell投入後はregistry signalの有無に関わらず結果不明として扱う。
         assert_eq!(failure_status(true, false, true), "ambiguous");
         assert_eq!(failure_status(true, true, true), "ambiguous");
+    }
+
+    /// 外部の共有handleがgateを開いたままでも、POSIX削除で名前が即座に解放され、
+    /// 直後の名前確認がdelete-pendingのアクセス拒否（Win32 5）にならないことを確かめる。
+    #[test]
+    fn gate_removal_releases_the_name_while_an_external_handle_remains_open() {
+        let directory = fixture_directory("gate-external-handle");
+        let gate = directory.join(GATE);
+        let lease = security::create_private_file(&gate).unwrap();
+        let raw = lease.raw();
+        verify_gate(&gate, raw).unwrap();
+        let external = PinnedFile::open(&gate, 0x80, SHARE_ALL).unwrap();
+        delete_gate_handle(&gate, lease, raw).unwrap();
+        assert!(inspect(&gate).unwrap().is_none());
+        drop(external);
     }
 }

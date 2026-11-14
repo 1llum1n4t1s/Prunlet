@@ -61,37 +61,46 @@ try {
             }
             $paths = if ($mode -eq 'pending-child') { @($tree) } elseif ($mode -eq 'acl-preflight') { @($sibling, $target) } else { @($target) }
             $script:observed.settingBeforeDeletion=Assert-CurrentImmediateSettingA
+            # pending-*は外部プロセスが共有削除許可付きhandleを保持する状況。POSIX削除により、保持中でも
+            # 元名が消えて成功する。acl-preflightだけが削除前のアクセス拒否で失敗する。
+            $expectSuccess = $mode -ne 'acl-preflight'
             if ($transport -eq 'cli') {
                 $response = Delete-R $s $paths -Recursive; $script:observed.response = $response
-                Assert-R ($response.exitCode -ne 0) 'Expected deletion failure was successful'
-                $text = if ($mode -eq 'acl-preflight') { $response.json.error } else { $response.json.items[0].error }
+                if ($expectSuccess) { Assert-R ($response.exitCode -eq 0) 'Deletion while an external shared handle was held did not succeed' }
+                else { Assert-R ($response.exitCode -ne 0) 'Expected deletion failure was successful' }
+                $text = if ($mode -eq 'acl-preflight') { $response.json.error } else { [string]$response.json.items[0].error }
                 $body = $response.json
             } else {
                 $session = Open-McpR $s; Init-McpR $session
                 $response = Rpc-R $session @{ jsonrpc = '2.0'; id = 2; method = 'tools/call'; params = @{ name = 'delete_files'; arguments = @{ paths = @($paths); recursive = $true } } }
                 $script:observed.response = $response
-                Assert-R ($response.result.isError -and $response.result.content.Count -eq 1) 'MCP non-success was not preserved'
+                if ($expectSuccess) { Assert-R (!$response.result.isError -and $response.result.content.Count -eq 1) 'MCP deletion while an external shared handle was held did not succeed' }
+                else { Assert-R ($response.result.isError -and $response.result.content.Count -eq 1) 'MCP non-success was not preserved' }
                 $wire = $response.result.content[0].text
-                if ($mode -eq 'acl-preflight') { $text = $wire; $body = $null } else { $body = $wire | ConvertFrom-Json -AsHashtable -Depth 30; $text = $body.items[0].error }
+                if ($mode -eq 'acl-preflight') { $text = $wire; $body = $null } else { $body = $wire | ConvertFrom-Json -AsHashtable -Depth 30; $text = [string]$body.items[0].error }
                 Close-McpR $session; $session = $null
             }
             $after = $holder.State(); $script:observed.after = $after
             Assert-R ($after.id -ceq $heldBefore.id) 'The observed fixed identity changed'
-            Assert-R ($text.Contains('native error 5') -and $text.Contains('error 5 alone does not identify the cause')) 'Native access denial or qualified explanation missing'
+            if (!$expectSuccess) { Assert-R ($text.Contains('native error 5') -and $text.Contains('error 5 alone does not identify the cause')) 'Native access denial or qualified explanation missing' }
             if ($mode -eq 'acl-preflight') {
                 Assert-R (!$after.deletePending -and $text.Contains('original targets were retained') -and !$text.Contains('Windows accepted a deletion request')) 'Preflight denial was misreported as accepted deletion'
                 $holder.Dispose(); $holder = $null; $parentHolder.Dispose(); $parentHolder = $null
                 $script:observed.restored = Assert-SnapshotR $target $before
             } else {
-                Assert-WireR @{ json = $body } $paths @('ambiguous')
-                Assert-R ($after.deletePending -and $after.security -ceq $heldBefore.security) 'Pending deletion was not observed with unchanged security'
-                Assert-R ($text.Contains('Windows accepted a deletion request for the previously fixed object') -and $text.Contains('after Prunlet closed its deletion handle') -and $text.Contains($target)) 'Post-disposition stage or entry name missing'
-                $script:observed.attributesOpenError = (Get-FileFixtureOpenError -Path $target -Access 0x80)
-                $script:observed.securityOpenError = (Get-FileFixtureOpenError -Path $target -Access 0x20000)
-                Assert-R ($script:observed.attributesOpenError -eq 5 -and $script:observed.securityOpenError -eq 5) 'Pending deletion did not reproduce native access denial'
+                Assert-WireR @{ json = $body } $paths @('permanently_deleted')
+                Assert-R ([string]::IsNullOrEmpty($text)) 'Successful deletion carried an error'
+                Assert-R ($after.security -ceq $heldBefore.security) 'Security changed while the external handle was held'
+                # 外部handleの保持中に、元名が既に名前空間から外れていること（従来はWin32 5で残っていた）。
+                $script:observed.whileHeldOpenError = (Get-FileFixtureOpenError -Path $target -Access 0x80)
+                Assert-R ($script:observed.whileHeldOpenError -in @(2, 3)) 'The original name remained while the external handle was held'
+                if ($mode -eq 'pending-child') {
+                    $script:observed.treeWhileHeldOpenError = (Get-FileFixtureOpenError -Path $tree -Access 0x80)
+                    Assert-R ($script:observed.treeWhileHeldOpenError -in @(2, 3)) 'The recursive root remained while a child handle was held'
+                }
                 $holder.Dispose(); $holder = $null
                 $absent = (Get-FileFixtureOpenError -Path $target -Access 0x80); $script:observed.afterReleaseOpenError = $absent
-                Assert-R ($absent -in @(2, 3)) 'The pending name did not disappear after its holder was released'
+                Assert-R ($absent -in @(2, 3)) 'The deleted name reappeared after its holder was released'
             }
             $script:observed.siblingAfter = Assert-SnapshotR $sibling $siblingBefore
             No-FileRecordsR $s

@@ -1,5 +1,5 @@
 //! Windows Shellによる記録なしの削除。実装は同一のネイティブCoreに集約する。
-use super::{OwnedHandle, path, security, wide};
+use super::{path, security, wide};
 use anyhow::{Result, bail};
 use std::{
     ffi::c_void,
@@ -536,41 +536,12 @@ where
     V: FnOnce(&Path) -> Result<()> + Send,
 {
     let source = path::absolute(source)?;
-    let token = unsafe {
-        let mut raw = null_mut();
-        if OpenThreadToken(
-            GetCurrentThread(),
-            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
-            1,
-            &mut raw,
-        ) == 0
-        {
-            let error = GetLastError();
-            if error != ERROR_NO_TOKEN {
-                return Err(std::io::Error::from_raw_os_error(error as i32).into());
-            }
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut raw) == 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-        let original = OwnedHandle::from_raw(raw)?;
-        let mut copy = null_mut();
-        if DuplicateTokenEx(
-            original.raw(),
-            TOKEN_QUERY | TOKEN_IMPERSONATE,
-            null(),
-            SecurityImpersonation,
-            TokenImpersonation,
-            &mut copy,
-        ) == 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        OwnedHandle::from_raw(copy)?
-    };
+    // 取得手順（スレッドtoken→process token→Impersonation複製）は`EffectiveToken`と共通。
+    // 復帰は下のSTA内`Impersonation`ガードのRevertToSelfで行うため、`run`は使わない。
+    let token = super::EffectiveToken::capture()?;
     std::thread::scope(|scope| {
         super::process::spawn_scoped(scope,"file-shell-sta",move||unsafe{
-  if SetThreadToken(null(),token.raw())==0{return Err(std::io::Error::last_os_error().into());}
+  if SetThreadToken(null(),token.0.raw())==0{return Err(std::io::Error::last_os_error().into());}
   struct Impersonation;impl Drop for Impersonation{fn drop(&mut self){unsafe{RevertToSelf();}}}let _impersonation=Impersonation;
   ok(CoInitializeEx(null(),2),"Cannot initialize Shell STA")?;struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}let _apartment=Apartment;
   let name=wide(source.as_os_str())?;let mut raw=null_mut();let code=SHCreateItemFromParsingName(name.as_ptr(),null_mut(),&SHELL,&mut raw);let item=com(code,raw,"Cannot resolve Shell source")?;

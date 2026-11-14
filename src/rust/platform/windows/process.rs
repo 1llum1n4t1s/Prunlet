@@ -30,19 +30,11 @@ use windows_sys::Win32::{
 const MCP_LAUNCHER_JOB: &str = "PRUNLET_MCP_LAUNCHER_JOB";
 
 pub struct WorkerProcess {
-    process: OwnedHandle,
+    /// 子プロセスのhandleを保持して寿命を保つ（直接は読まない）。
+    _process: OwnedHandle,
     pub id: u32,
     pub input: Option<std::fs::File>,
     pub output: std::fs::File,
-}
-impl WorkerProcess {
-    pub fn has_exited(&self) -> Result<bool> {
-        match unsafe { WaitForSingleObject(self.process.raw(), 0) } {
-            WAIT_OBJECT_0 => Ok(true),
-            WAIT_TIMEOUT => Ok(false),
-            _ => Err(std::io::Error::last_os_error().into()),
-        }
-    }
 }
 fn anonymous_pipe() -> Result<(OwnedHandle, OwnedHandle)> {
     unsafe {
@@ -332,7 +324,7 @@ pub fn spawn_worker(executable: &Path, args: &[String]) -> Result<WorkerProcess>
             );
         }
         Ok(WorkerProcess {
-            process,
+            _process: process,
             id: info.dwProcessId,
             input: Some(std::fs::File::from_raw_handle(parent_input.into_raw())),
             output: std::fs::File::from_raw_handle(parent_output.into_raw()),

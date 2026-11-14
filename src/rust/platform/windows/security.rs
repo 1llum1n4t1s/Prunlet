@@ -297,10 +297,6 @@ pub fn create_private_file(path: &Path) -> Result<OwnedHandle> {
 pub fn create_private_directory(path: &Path) -> Result<OwnedHandle> {
     create_private(path, true)
 }
-/// 子を公開するまでディレクトリ自身への書込み・リンク化・renameを他handleへ許さない。
-pub fn create_private_fixed_directory(path: &Path) -> Result<OwnedHandle> {
-    create_private_shared(path, true, FILE_SHARE_READ)
-}
 fn create_private(path: &Path, directory: bool) -> Result<OwnedHandle> {
     create_private_shared(path, directory, if directory { 3 } else { 1 })
 }
@@ -426,27 +422,50 @@ pub fn delete_fixed(handle: HANDLE, ignore_readonly: bool) -> Result<()> {
         Ok(())
     }
 }
+/// 固定した実体へ永久削除を設定する。
+///
+/// 常にPOSIX削除（`FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS`）を先に要求する。
+/// 従来の削除設定では、ウイルス対策・検索インデクサー・ディレクトリ監視（Claude Codeの`.claude`監視等）が
+/// `FILE_SHARE_DELETE`付きのhandleを開いている間、元名がdelete-pendingとして残る。この状態では
+/// 削除handle解放後の名前確認がWin32 5で失敗して`ambiguous`となり、再帰削除では親フォルダーが空にならず
+/// 途中で停止していた。POSIX削除ではPrunletの削除handleを閉じた時点で元名が名前空間から外れるため、
+/// 外部の共有handleが残っていても名前の消失を確認できる。
+///
+/// `posix_required`はハードリンクguardの経路で使う。guardは削除保留中の別名の変化を検査するため、
+/// POSIX削除を必須とし、非対応なら従来どおりエラーで止める。それ以外の経路では、POSIX削除に非対応の
+/// ファイルシステム（FAT・exFAT等）が設定自体を拒否した場合だけ、従来の削除設定を同じhandleへ要求する。
+/// 拒否された要求は削除を設定していないため、従来設定は結果不明な削除の再送には当たらない。
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "HANDLEはOSが検証するopaque値であり、呼出元メモリを参照しない"
 )]
-pub fn delete_permanent_fixed(handle: HANDLE, ignore_readonly: bool, posix: bool) -> Result<()> {
-    if !posix {
-        return delete_fixed(handle, ignore_readonly);
-    }
-    unsafe {
-        let flags = 3u32 | if ignore_readonly { 0x10 } else { 0 };
-        if SetFileInformationByHandle(
+pub fn delete_permanent_fixed(
+    handle: HANDLE,
+    ignore_readonly: bool,
+    posix_required: bool,
+) -> Result<()> {
+    // FILE_DISPOSITION_DELETE(0x1) | FILE_DISPOSITION_POSIX_SEMANTICS(0x2)
+    // | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE(0x10)
+    let flags = 3u32 | if ignore_readonly { 0x10 } else { 0 };
+    let accepted = unsafe {
+        SetFileInformationByHandle(
             handle,
             FileDispositionInfoEx,
             (&flags as *const u32).cast(),
             4,
-        ) == 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
+        ) != 0
+    };
+    if accepted {
+        return Ok(());
     }
+    let error = std::io::Error::last_os_error();
+    // ERROR_INVALID_FUNCTION(1)・ERROR_NOT_SUPPORTED(50)・ERROR_INVALID_PARAMETER(87)は、
+    // FileDispositionInfoExまたはPOSIX semanticsを解釈できないファイルシステムが返す。
+    let unsupported = matches!(error.raw_os_error(), Some(1 | 50 | 87));
+    if posix_required || !unsupported {
+        return Err(error.into());
+    }
+    delete_fixed(handle, ignore_readonly)
 }
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,

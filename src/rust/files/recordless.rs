@@ -119,6 +119,42 @@ pub fn normalize_paths(config: &Config, args: &Value) -> Result<Vec<PathBuf>> {
     }
     Ok(result)
 }
+/// 互換設定`volumeRecoveryDirectories`の値が、現在存在しないドライブ上かを返す。
+/// 取り外したドライブの設定が残っていても、無関係なボリューム上の削除まで止めないための判定で、
+/// 値のドライブrootを開こうとして「ドライブ・パスなし」（Win32 2/3）を確認できた場合だけ真にする。
+/// 値が不正な形・ドライブ未準備（21）・アクセス拒否などの確認できない失敗は偽のままにし、
+/// 従来どおり検証失敗（fail-closed）として扱う。存在するドライブ上の値は偽で、必ず検証される。
+fn recovery_volume_absent(value: &str) -> bool {
+    let Ok(absolute) = path::absolute(Path::new(value)) else {
+        return false;
+    };
+    let text = absolute.to_string_lossy();
+    // `absolute`は`X:\`形のドライブ絶対パスだけを返す。先頭3文字がドライブroot。
+    let Some(drive_root) = text.get(..3) else {
+        return false;
+    };
+    match path::resolve(Path::new(drive_root), false, false) {
+        Ok(_) => false,
+        Err(error) => error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| matches!(e.raw_os_error(), Some(2 | 3))),
+    }
+}
+/// 検証から除外された、存在しないドライブ上の互換復元ディレクトリ設定を警告文にして返す。
+/// 削除要求ごとに1回だけ結果へ添える。保護対象の判定（`protected_roots`）と同じ判定を使う。
+fn absent_recovery_warnings(config: &Config) -> Vec<String> {
+    config
+        .data
+        .volume_recovery_directories
+        .values()
+        .filter(|value| recovery_volume_absent(value))
+        .map(|value| {
+            format!(
+                "Configured recovery directory was not evaluated because its drive is not present: {value}"
+            )
+        })
+        .collect()
+}
 fn protected_roots(config: &Config, target: &Path) -> Result<Vec<PathBuf>> {
     let mut roots = vec![path::resolve(
         Path::new(&config.data.backup_directory),
@@ -142,6 +178,11 @@ fn protected_roots(config: &Config, target: &Path) -> Result<Vec<PathBuf>> {
         )?);
     }
     for (key, value) in &config.data.volume_recovery_directories {
+        // 値のドライブ自体が存在しない設定は、その上に今回の対象は存在し得ない。評価から除外する
+        // （警告は`absent_recovery_warnings`）。値が存在するボリューム上にある設定は、キーが別でも検証する。
+        if recovery_volume_absent(value) {
+            continue;
+        }
         let expected = path::absolute(Path::new(key))?;
         for suffix in ["", ".restore"] {
             let root = path::resolve(Path::new(&format!("{value}{suffix}")), true, false).map_err(
@@ -374,47 +415,42 @@ pub fn delete_checked(
             }),
     }
 }
-fn verify_snapshots(snapshots: Option<&Mutex<Vec<Snapshot>>>) -> Result<()> {
-    if let Some(snapshots) = snapshots {
-        for snapshot in snapshots
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Queue snapshot unavailable"))?
-            .iter()
-        {
-            snapshot.verify()?;
-        }
-    }
-    Ok(())
-}
-fn verify_target_snapshot(snapshots: Option<&Mutex<Vec<Snapshot>>>, target: &Path) -> Result<()> {
-    if let Some(snapshots) = snapshots {
-        for snapshot in snapshots
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Queue snapshot unavailable"))?
-            .iter()
-        {
-            if snapshot.root() == target {
-                snapshot.verify()?;
-            }
-        }
-    }
-    Ok(())
-}
-fn release_snapshot_tree(snapshots: Option<&Mutex<Vec<Snapshot>>>, target: &Path) -> Result<()> {
+/// キュー受付時のsnapshotへ`action`を順に適用する共通走査。
+///
+/// `snapshots`が無ければ何もしない。ロックは1呼出しにつき1回で、guardは走査の間だけ保持する。
+/// `target`があればrootが一致するsnapshotだけを対象にし、無ければ全snapshotへ適用する。
+/// `action`が最初に返したErrで即座に打ち切る。
+fn with_snapshots(
+    snapshots: Option<&Mutex<Vec<Snapshot>>>,
+    target: Option<&Path>,
+    mut action: impl FnMut(&mut Snapshot) -> Result<()>,
+) -> Result<()> {
     if let Some(snapshots) = snapshots {
         for snapshot in snapshots
             .lock()
             .map_err(|_| anyhow::anyhow!("Queue snapshot unavailable"))?
             .iter_mut()
         {
-            if snapshot.root() == target {
-                for entry in &mut snapshot.entries {
-                    entry.original.take();
-                }
+            if target.is_none_or(|target| snapshot.root() == target) {
+                action(snapshot)?;
             }
         }
     }
     Ok(())
+}
+fn verify_snapshots(snapshots: Option<&Mutex<Vec<Snapshot>>>) -> Result<()> {
+    with_snapshots(snapshots, None, |snapshot| snapshot.verify())
+}
+fn verify_target_snapshot(snapshots: Option<&Mutex<Vec<Snapshot>>>, target: &Path) -> Result<()> {
+    with_snapshots(snapshots, Some(target), |snapshot| snapshot.verify())
+}
+fn release_snapshot_tree(snapshots: Option<&Mutex<Vec<Snapshot>>>, target: &Path) -> Result<()> {
+    with_snapshots(snapshots, Some(target), |snapshot| {
+        for entry in &mut snapshot.entries {
+            entry.original.take();
+        }
+        Ok(())
+    })
 }
 /// キュー受付時に固定した子孫の照合用handleを、Shell投入の直前にだけ閉じる。
 ///
@@ -427,18 +463,10 @@ fn release_snapshot_children(
     snapshots: Option<&Mutex<Vec<Snapshot>>>,
     target: &Path,
 ) -> Result<()> {
-    if let Some(snapshots) = snapshots {
-        for snapshot in snapshots
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Queue snapshot unavailable"))?
-            .iter_mut()
-        {
-            if snapshot.root() == target {
-                snapshot.release_children();
-            }
-        }
-    }
-    Ok(())
+    with_snapshots(snapshots, Some(target), |snapshot| {
+        snapshot.release_children();
+        Ok(())
+    })
 }
 /// 永久削除で新たに捕捉した木を、キュー受付時の基準と突き合わせる。
 ///
@@ -450,18 +478,7 @@ fn verify_snapshot_baseline(
     target: &Path,
     tree: &[TreeEntry],
 ) -> Result<()> {
-    if let Some(snapshots) = snapshots {
-        for snapshot in snapshots
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Queue snapshot unavailable"))?
-            .iter()
-        {
-            if snapshot.root() == target {
-                snapshot.matches_tree(tree)?;
-            }
-        }
-    }
-    Ok(())
+    with_snapshots(snapshots, Some(target), |snapshot| snapshot.matches_tree(tree))
 }
 fn attempt_recycle(
     entry: &mut Prepared,
@@ -626,7 +643,7 @@ fn preflight(
                 error: None,
             })
             .collect(),
-        warnings: vec![],
+        warnings: absent_recovery_warnings(config),
     };
     let mut prepared = vec![];
     let mut hardlinks = false;
@@ -828,7 +845,6 @@ fn submit(
                                 stream_handles: vec![],
                                 unprotected_root: None,
                                 recycled: true,
-                                stream_limit: None,
                             });
                     } else {
                         entry.original.take();
@@ -1040,7 +1056,6 @@ struct HardlinkGuard {
     stream_handles: Vec<native::OwnedHandle>,
     unprotected_root: Option<PathBuf>,
     recycled: bool,
-    stream_limit: Option<usize>,
 }
 fn access_denied(error: &anyhow::Error) -> bool {
     error.chain().any(|e| {
@@ -1070,12 +1085,8 @@ fn open_hardlink_guard(path: &Path) -> Result<Option<PinnedFile>> {
 fn retain_hardlink_streams(
     path: &Path,
     base: &PinnedFile,
-    maximum: Option<usize>,
 ) -> Result<(Vec<native::NamedStream>, Vec<native::OwnedHandle>)> {
-    let names = match maximum {
-        Some(limit) => native::named_streams_bounded(base.raw(), limit)?,
-        None => native::named_streams(base.raw())?,
-    };
+    let names = native::named_streams(base.raw())?;
     let expected = base.identity()?;
     let mut handles = vec![];
     for stream in &names {
@@ -1092,10 +1103,7 @@ fn retain_hardlink_streams(
         }
         handles.push(handle);
     }
-    let current = match maximum {
-        Some(_) => native::named_streams_bounded(base.raw(), names.len())?,
-        None => native::named_streams(base.raw())?,
-    };
+    let current = native::named_streams(base.raw())?;
     if current != names {
         bail!("Alternate hardlink stream list changed while being retained");
     }
@@ -1112,22 +1120,10 @@ impl HardlinkGuard {
             return Ok(true);
         }
         Ok(self.streams.as_ref().is_some_and(|names| {
-            match self.stream_limit {
-                Some(limit) => native::named_streams_bounded(self.base.raw(), limit),
-                None => native::named_streams(self.base.raw()),
-            }
-            .is_ok_and(|actual| actual == *names)
+            native::named_streams(self.base.raw()).is_ok_and(|actual| actual == *names)
         }))
     }
     fn capture(path: &Path, identity: &FileIdentity, root: &Path) -> Result<Self> {
-        Self::capture_with_stream_budget(path, identity, root, None)
-    }
-    fn capture_with_stream_budget(
-        path: &Path,
-        identity: &FileIdentity,
-        root: &Path,
-        budget: Option<&mut usize>,
-    ) -> Result<Self> {
         let protected = open_hardlink_guard(path)?;
         let unprotected = protected.is_none();
         let base = match protected {
@@ -1135,28 +1131,14 @@ impl HardlinkGuard {
             None => PinnedFile::open(path, FILE_READ_ATTRIBUTES, 7)?,
         };
         verify_handle(&base, path, identity)?;
-        let bounded = budget.is_some();
-        let retained = if let Some(budget) = budget {
-            anyhow::ensure!(
-                !unprotected,
-                "Reserved-tree hardlinks require retained stream write guards"
-            );
-            let retained = retain_hardlink_streams(path, &base, Some(*budget))?;
-            *budget -= retained.1.len();
-            Some(retained)
-        } else if unprotected {
+        let retained = if unprotected {
             None
         } else {
-            retain_hardlink_streams(path, &base, None).ok()
+            retain_hardlink_streams(path, &base).ok()
         };
         let (streams, stream_handles, unprotected_root) = match retained {
             Some((names, handles)) => (Some(names), handles, None),
             None => (None, vec![], Some(root.to_owned())),
-        };
-        let stream_limit = if bounded {
-            streams.as_ref().map(Vec::len)
-        } else {
-            None
         };
         Ok(Self {
             base,
@@ -1164,7 +1146,6 @@ impl HardlinkGuard {
             stream_handles,
             unprotected_root,
             recycled: false,
-            stream_limit,
         })
     }
     fn upgrade_recycled(
@@ -1189,7 +1170,7 @@ impl HardlinkGuard {
                 if candidate.identity()?.change_time != expected.change_time {
                     bail!("Recycled hardlink changed while its write guard was acquired");
                 }
-                match retain_hardlink_streams(path, &candidate, None) {
+                match retain_hardlink_streams(path, &candidate) {
                     Ok((names, handles)) => {
                         self.base = candidate;
                         self.streams = Some(names);
@@ -1266,7 +1247,6 @@ fn prepare_tree_hardlinks(
     tree: &[TreeEntry],
     root: &Path,
     states: &PermanentState,
-    mut stream_budget: Option<&mut usize>,
 ) -> Result<()> {
     for entry in tree {
         if entry.identity.links > 1
@@ -1284,15 +1264,11 @@ fn prepare_tree_hardlinks(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Shared file state unavailable"))?;
             if state.guard.is_none() {
-                state.guard = Some(match stream_budget.as_deref_mut() {
-                    Some(budget) => HardlinkGuard::capture_with_stream_budget(
-                        &entry.path,
-                        &entry.identity,
-                        root,
-                        Some(budget),
-                    )?,
-                    None => HardlinkGuard::capture(&entry.path, &entry.identity, root)?,
-                });
+                state.guard = Some(HardlinkGuard::capture(
+                    &entry.path,
+                    &entry.identity,
+                    root,
+                )?);
             }
             if !state.guard.as_ref().unwrap().can_continue(root) {
                 bail!(
@@ -1340,7 +1316,7 @@ fn permanent_delete(
     // 捕捉後に親を別実体へ差し替えられても、子のhardlink IDだけでは通さない。
     // 全directoryの名前を先に固定し、各directory自身の削除直前まで保持する。
     let mut directory_pins = pin_tree_directories(&tree)?;
-    prepare_tree_hardlinks(&tree, &root.path, states, None)?;
+    prepare_tree_hardlinks(&tree, &root.path, states)?;
     for index in (0..tree.len()).rev() {
         let entry = &mut tree[index];
         let failure_path = entry.path.clone();
@@ -1799,6 +1775,28 @@ pub(super) fn verification_independence(
 mod tests {
     use super::*;
 
+    /// `FILE_CHECKPOINT`を解除するRAIIガード。dropで必ず外し、他testへcallbackを残さない。
+    struct FileCheckpointReset;
+    impl Drop for FileCheckpointReset {
+        fn drop(&mut self) {
+            FILE_CHECKPOINT.lock().unwrap().take();
+        }
+    }
+    /// 子検証用の`PERMANENT_AFTER_CAPTURE`を解除するRAIIガード（callback内で設定するtest用）。
+    struct AfterCaptureReset;
+    impl Drop for AfterCaptureReset {
+        fn drop(&mut self) {
+            PERMANENT_AFTER_CAPTURE.lock().unwrap().take();
+        }
+    }
+    /// checkpoint callbackを設置し、dropで解除するガードを返す（`process::test_faults`と同じ形）。
+    fn install_file_checkpoint(
+        callback: impl Fn(&str, &Path) -> Result<()> + Send + Sync + 'static,
+    ) -> FileCheckpointReset {
+        *FILE_CHECKPOINT.lock().unwrap() = Some(Arc::new(callback));
+        FileCheckpointReset
+    }
+
     // 既存fixtureのCore境界だけを実行し、実Shell報告と名前・IDを確認する。
     pub(super) fn independence_contract(
         case: &str,
@@ -1813,7 +1811,9 @@ mod tests {
             },
             time::Duration,
         };
-        let _serial = PERMANENT_TEST_SERIAL.lock().unwrap();
+        let _serial = PERMANENT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _fixture = path::pin_directories(fixture)?;
         let is_parallel = case == "file-independent-roots";
         anyhow::ensure!(
@@ -1829,11 +1829,7 @@ mod tests {
             ]
         };
         let first_child = paths[0].join("small.txt");
-        let second_child = if is_parallel {
-            paths[1].join("small.txt")
-        } else {
-            paths[1].join("small.txt")
-        };
+        let second_child = paths[1].join("small.txt");
         let id = |path: &Path| -> Result<FileIdentity> {
             Ok(PinnedFile::open(path, FILE_READ_ATTRIBUTES, 7)?.identity()?)
         };
@@ -1885,7 +1881,7 @@ mod tests {
         let second = second_child.clone();
         let alias = alias_path.clone();
         let baseline = alias_id.clone();
-        *FILE_CHECKPOINT.lock().unwrap() = Some(Arc::new(move |phase, current| {
+        let reset = install_file_checkpoint(move |phase, current| {
             if is_parallel && phase == "before-shell" && targets.iter().any(|p| p == current) {
                 let mut ready = shell_gate_cb
                     .0
@@ -1974,14 +1970,7 @@ mod tests {
                 drop(writer);
             }
             Ok(())
-        }));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                FILE_CHECKPOINT.lock().unwrap().take();
-            }
-        }
-        let reset = Reset;
+        });
         let result = delete(config, &paths, false, true, None, None)?;
         drop(reset);
         let observed = *gate
@@ -2260,6 +2249,27 @@ mod tests {
         assert!(directory.join("child.txt").exists());
         Ok(())
     }
+    /// 削除要求の受理後に元名が残っている場合は、到達段階と確認できなかったentryを診断へ含める。
+    /// POSIX削除の常用で外部handle保持中のdelete-pendingはE2Eから消えたため、この診断の文言とentry名は
+    /// Coreの単体テストで固定する（名前が無ければ成功する）。
+    #[test]
+    fn permanent_absence_check_reports_stage_and_entry_when_name_remains() -> Result<()> {
+        let root = fixture("absence-check")?;
+        let present = root.join("still-present.txt");
+        std::fs::write(&present, b"x")?;
+        let error = verify_permanent_absence(&present).expect_err("残っている名前は確認失敗になる");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("Windows accepted a deletion request for the previously fixed object")
+                && text.contains("after Prunlet closed its deletion handle")
+                && text.contains(&present.display().to_string())
+                && text.contains("The source name is still present"),
+            "{text}"
+        );
+        std::fs::remove_file(&present)?;
+        verify_permanent_absence(&present)?;
+        Ok(())
+    }
     fn fixture(label: &str) -> Result<PathBuf> {
         // TEMPはドライブ文字を問わず、リポジトリとCodex homeの外にある通常のドライブ絶対パスだけを使う。
         let temp = path::external_test_temp()?;
@@ -2272,6 +2282,70 @@ mod tests {
         );
         Ok(root)
     }
+    /// 存在しないドライブ文字を返す。判定は本番と同じ`recovery_volume_absent`を使う。
+    fn absent_drive_letter() -> char {
+        ('D'..='Z')
+            .rev()
+            .find(|letter| recovery_volume_absent(&format!(r"{letter}:\Prunlet-Absent")))
+            .expect("this host has no absent drive letter")
+    }
+
+    /// 取り外したドライブの互換復元設定が残っていても、無関係なボリューム上の削除は止めない。
+    /// 一方で、値が存在するボリューム上にありキーが別ボリュームを指す設定は従来どおり拒否する。
+    #[test]
+    fn absent_drive_recovery_setting_does_not_block_unrelated_targets() -> Result<()> {
+        let root = fixture("absent-recovery-drive")?;
+        let target = root.join("target.txt");
+        std::fs::write(&target, b"unrelated target")?;
+        let metadata = root.join("metadata");
+        std::fs::create_dir(&metadata)?;
+        let letter = absent_drive_letter();
+        let mount = path::absolute(&native::volume_mount_root(&root)?)?;
+        let make = |entries: &[(String, String)]| Config {
+            path: root.join("config.json"),
+            data: crate::config::ConfigData {
+                backup_directory: metadata.to_string_lossy().into(),
+                volume_recovery_directories: entries.iter().cloned().collect(),
+                ..Default::default()
+            },
+        };
+        // 存在しないドライブだけの設定: 評価から除外され、保護対象の一覧にも入らず、警告が出る。
+        let absent = make(&[(format!(r"{letter}:\"), format!(r"{letter}:\Recovery"))]);
+        let roots = protected_roots(&absent, &target)?;
+        assert!(
+            roots
+                .iter()
+                .all(|r| !r.to_string_lossy().starts_with(&format!("{letter}:"))),
+            "{roots:?}"
+        );
+        assert_eq!(absent_recovery_warnings(&absent).len(), 1);
+        check_target(&absent, &target, false)?;
+        // キーは存在するボリューム、値だけ存在しないドライブ: 値の保護は不要で除外される。
+        let value_only = make(&[(
+            mount.to_string_lossy().into_owned(),
+            format!(r"{letter}:\Recovery"),
+        )]);
+        protected_roots(&value_only, &target)?;
+        // 存在するボリューム上の値でキーが別ボリューム: 従来どおり検証失敗（保護を弱めない）。
+        let mismatch = make(&[(
+            format!(r"{letter}:\"),
+            root.join("recovery").to_string_lossy().into_owned(),
+        )]);
+        let error = protected_roots(&mismatch, &target).unwrap_err().to_string();
+        assert!(
+            error.contains("must remain on its configured volume")
+                || error.contains("could not be validated"),
+            "{error}"
+        );
+        assert!(absent_recovery_warnings(&mismatch).is_empty());
+        // 値が不正な形（ドライブ絶対パスでない）は不在とみなさず、従来どおり検証失敗にする。
+        assert!(!recovery_volume_absent("relative\\path"));
+        assert!(!recovery_volume_absent(r"\\server\share\x"));
+        let malformed = make(&[(mount.to_string_lossy().into_owned(), "relative".into())]);
+        assert!(protected_roots(&malformed, &target).is_err());
+        Ok(())
+    }
+
     /// ネイティブRecycle検証の根。`PRUNLET_NATIVE_RECYCLE_ROOT`があればそれを使い、
     /// 未指定ならTEMP配下（外部検証パスのみ許可）に一意のfixtureを作る。
     /// 開発者固有の固定パスへは依存しない。どのvolumeで検証するかは指定したパス（TEMP）のvolumeで決まる。
@@ -2281,13 +2355,32 @@ mod tests {
             None => fixture(label),
         }
     }
+    /// ゴミ箱が有効なvolume上の一意なfixtureを作る。`native_recycle_root`の根は再実行で衝突しないよう
+    /// 一意のサブディレクトリを切り、volumeが即時削除設定なら明示的に失敗させる（検証側の不整合を隠さない）。
+    fn recyclable_fixture(label: &str) -> Result<PathBuf> {
+        let root = native_recycle_root(label)?;
+        std::fs::create_dir_all(&root)?;
+        let _parents = path::pin_directories(&root)?;
+        let data = root.join(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&data)?;
+        eprintln!("Retained native fixture for Prunlet cleanup: {}", data.display());
+        if ImmediateDeleteSetting::capture(&data).is_some() {
+            bail!(
+                "This test requires a recyclable fixture volume: set PRUNLET_NATIVE_RECYCLE_ROOT to a directory on a volume whose Recycle Bin is enabled (TEMP is on an immediate-delete volume): {}",
+                data.display()
+            );
+        }
+        Ok(data)
+    }
     pub(super) fn before_recycle_contract(mode: &str, root: &Path) -> Result<Value> {
         use std::{
             io::{Read, Write},
             os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
             sync::atomic::{AtomicUsize, Ordering},
         };
-        let _serial = PERMANENT_TEST_SERIAL.lock().unwrap();
+        let _serial = PERMANENT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !["replace", "alias", "attributes", "large"].contains(&mode) {
             bail!("Unknown before-recycle mode");
         }
@@ -2382,7 +2475,7 @@ mod tests {
         let parked = moved.clone();
         let replacement_anchor = replacement_alias.clone();
         let selected_mode = mode.to_owned();
-        *FILE_CHECKPOINT.lock().unwrap() = Some(Arc::new(move |phase, path| {
+        let _reset = install_file_checkpoint(move |phase, path| {
             if phase == "before-shell" && path == selected {
                 if checkpoint_count.fetch_add(1, Ordering::SeqCst) != 0 {
                     bail!("Before-recycle checkpoint repeated");
@@ -2440,15 +2533,8 @@ mod tests {
                     serde_json::json!(hex::encode(security::read_member_security(fixed.raw())?));
             }
             Ok(())
-        }));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                FILE_CHECKPOINT.lock().unwrap().take();
-            }
-        }
-        let _reset = Reset;
-        let result = delete(&config, &[source.clone()], false, false, None, None)?;
+        });
+        let result = delete(&config, std::slice::from_ref(&source), false, false, None, None)?;
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(result.items[0].status, "ambiguous");
         let warning = result.items[0].error.as_deref().unwrap_or("");
@@ -2574,7 +2660,9 @@ mod tests {
             os::windows::io::AsRawHandle,
             sync::atomic::{AtomicUsize, Ordering},
         };
-        let _serial = PERMANENT_TEST_SERIAL.lock().unwrap();
+        let _serial = PERMANENT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _parents = path::pin_directories(root)?;
         let scope = root.join(format!(
             "shell-permanent-spawn-fault-{}",
@@ -2660,7 +2748,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let observed = count.clone();
         let selected = source.clone();
-        *FILE_CHECKPOINT.lock().unwrap() = Some(Arc::new(move |phase, path| {
+        let _reset = install_file_checkpoint(move |phase, path| {
             if path == selected
                 && phase
                     == if immediate {
@@ -2672,16 +2760,9 @@ mod tests {
                 observed.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
-        }));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                FILE_CHECKPOINT.lock().unwrap().take();
-            }
-        }
-        let _reset = Reset;
+        });
         let fault = native::process::test_faults::fail_spawn("file-permanent-worker", 1, None);
-        let result = delete(&config, &[source.clone()], false, false, None, None)?;
+        let result = delete(&config, std::slice::from_ref(&source), false, false, None, None)?;
         drop(fault);
         assert_eq!(
             count.load(Ordering::SeqCst),
@@ -2720,9 +2801,14 @@ mod tests {
     }
     #[test]
     fn native_spawn_failure_keeps_completed_effects_and_unstarted_targets() -> Result<()> {
-        let _serial = PERMANENT_TEST_SERIAL.lock().unwrap();
-        // 対象データは開発者固有の固定パスではなく、外部TEMP配下の一意なfixtureへ作る。
-        let data = fixture("spawn-fault-data")?;
+        let _serial = PERMANENT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 対象データは開発者固有の固定パスではなく、ゴミ箱が有効なvolumeの一意なfixtureへ作る。
+        // TEMPが即時削除設定のvolumeにあるとShellが利用不可を返し、Shell経路の障害注入点
+        // （shell-result-verified）へ到達しないため、`PRUNLET_NATIVE_RECYCLE_ROOT`で
+        // ゴミ箱が有効なvolumeを指定する。即時削除設定のvolumeでは黙ってskipせず明示的に失敗させる。
+        let data = recyclable_fixture("spawn-fault-data")?;
         let metadata_scope = fixture("spawn-fault-metadata")?;
         let metadata = metadata_scope.join("metadata");
         std::fs::create_dir(&metadata)?;
@@ -2753,7 +2839,7 @@ mod tests {
             let completed = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
             let notified = completed.clone();
             let first = paths[0].clone();
-            *FILE_CHECKPOINT.lock().unwrap() = Some(Arc::new(move |phase, path| {
+            let _reset = install_file_checkpoint(move |phase, path| {
                 if path == first
                     && phase
                         == if permanent {
@@ -2766,14 +2852,7 @@ mod tests {
                     notified.1.notify_all();
                 }
                 Ok(())
-            }));
-            struct Reset;
-            impl Drop for Reset {
-                fn drop(&mut self) {
-                    FILE_CHECKPOINT.lock().unwrap().take();
-                }
-            }
-            let _reset = Reset;
+            });
             let fault = native::process::test_faults::fail_spawn(
                 if permanent {
                     "file-permanent-worker"
@@ -2966,7 +3045,9 @@ mod tests {
     }
     #[test]
     pub(super) fn native_permanent_parent_replacement_preserves_both_aliases() -> Result<()> {
-        let _serial = PERMANENT_TEST_SERIAL.lock().unwrap();
+        let _serial = PERMANENT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = fixture("permanent-parent-swap")?;
         let target = root.join("target");
         let replacement = root.join("replacement");
@@ -3077,7 +3158,9 @@ mod tests {
         native_post_shell_at(&bin_root)
     }
     pub(super) fn native_post_shell_at(bin_root: &Path) -> Result<()> {
-        let _serial = PERMANENT_TEST_SERIAL.lock().unwrap();
+        let _serial = PERMANENT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let metadata_root = fixture("post-shell-metadata")?;
         let metadata = metadata_root.join("metadata");
         std::fs::create_dir(&metadata)?;
@@ -3145,7 +3228,9 @@ mod tests {
         {
             bail!("Unknown oversize native boundary mode");
         }
-        let _serial = PERMANENT_TEST_SERIAL.lock().unwrap();
+        let _serial = PERMANENT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _bin_pin = path::pin_directories(bin_root)?;
         let root_parallel_proof = if mode == "rendezvous" {
             Some(permanent_root_parallel_contract()?)
@@ -3297,7 +3382,7 @@ mod tests {
             }
             Ok(())
         };
-        *FILE_CHECKPOINT.lock().unwrap() = Some(Arc::new(move |phase, _path| {
+        let _reset = install_file_checkpoint(move |phase, _path| {
             if mode_owned == "rendezvous" || mode_owned == "child-race" {
                 if phase == "hardlink-state-contended" {
                     *contention.0.lock().unwrap() = true;
@@ -3475,15 +3560,8 @@ mod tests {
                 _ => {}
             }
             Ok(())
-        }));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                FILE_CHECKPOINT.lock().unwrap().take();
-                PERMANENT_AFTER_CAPTURE.lock().unwrap().take();
-            }
-        }
-        let _reset = Reset;
+        });
+        let _after_capture_reset = AfterCaptureReset;
         let result = delete(&config, &roots, false, true, None, None)?;
         holder.lock().unwrap().take();
         eprintln!("Native oversized root outcomes: {result:?}");
@@ -3624,7 +3702,7 @@ mod tests {
         let arrivals = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
         let a = active.clone();
         let m = maximum.clone();
-        *FILE_CHECKPOINT.lock().unwrap() = Some(Arc::new(move |phase, _| {
+        let reset = install_file_checkpoint(move |phase, _| {
             if phase == "permanent-root-start" {
                 let current = a.fetch_add(1, Ordering::SeqCst) + 1;
                 m.fetch_max(current, Ordering::SeqCst);
@@ -3648,14 +3726,7 @@ mod tests {
                 a.fetch_sub(1, Ordering::SeqCst);
             }
             Ok(())
-        }));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                FILE_CHECKPOINT.lock().unwrap().take();
-            }
-        }
-        let reset = Reset;
+        });
         let result = delete(&config, &paths, false, false, None, None)?;
         drop(reset);
         assert!(
@@ -3683,7 +3754,9 @@ mod tests {
                 atomic::{AtomicUsize, Ordering},
             },
         };
-        let _serial = PERMANENT_TEST_SERIAL.lock().unwrap();
+        let _serial = PERMANENT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !["replace", "lock"].contains(&mode) {
             bail!("Unknown oversized root race");
         }
@@ -3757,7 +3830,7 @@ mod tests {
         let selected = source.clone();
         let destination = moved.clone();
         let replace = mode == "replace";
-        *FILE_CHECKPOINT.lock().unwrap() = Some(Arc::new(move |phase, path| {
+        let _reset = install_file_checkpoint(move |phase, path| {
             if phase == "shell-size-permanent-permitted" && path == selected {
                 if observed.fetch_add(1, Ordering::SeqCst) != 0 {
                     bail!("Size-only race checkpoint was repeated");
@@ -3775,15 +3848,8 @@ mod tests {
                 }
             }
             Ok(())
-        }));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                FILE_CHECKPOINT.lock().unwrap().take();
-            }
-        }
-        let _reset = Reset;
-        let result = delete(&config, &[source.clone()], false, false, None, None)?;
+        });
+        let result = delete(&config, std::slice::from_ref(&source), false, false, None, None)?;
         holder.lock().unwrap().take();
         assert_eq!(
             checkpoints.load(Ordering::SeqCst),
@@ -3944,7 +4010,9 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
-        let _serial = PERMANENT_TEST_SERIAL.lock().unwrap();
+        let _serial = PERMANENT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _parents = path::pin_directories(data)?;
         let setting = ImmediateDeleteSetting::capture(data).ok_or_else(|| {
             anyhow::anyhow!(
@@ -3976,22 +4044,15 @@ mod tests {
         let observed = count.clone();
         let selected = source.clone();
         let destination = moved.clone();
-        *FILE_CHECKPOINT.lock().unwrap() = Some(Arc::new(move |phase, path| {
+        let _reset = install_file_checkpoint(move |phase, path| {
             if phase == "shell-permanent-permitted" && path == selected {
                 std::fs::rename(&selected, &destination)?;
                 std::fs::write(&selected, b"replacement must survive")?;
                 observed.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
-        }));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                FILE_CHECKPOINT.lock().unwrap().take();
-            }
-        }
-        let _reset = Reset;
-        let result = delete(&config, &[source.clone()], false, false, None, None)?;
+        });
+        let result = delete(&config, std::slice::from_ref(&source), false, false, None, None)?;
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(result.items[0].status, "ambiguous");
         assert_eq!(std::fs::read(&source)?, b"replacement must survive");

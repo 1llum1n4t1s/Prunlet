@@ -56,14 +56,19 @@ fn terminal(state: &Value) -> bool {
     !matches!(state["status"].as_str(), Some("pending" | "running"))
 }
 fn write_frame(mut stream: impl Write, value: &Value) -> Result<()> {
-    let bytes = serde_json::to_vec(value)?;
-    if bytes.is_empty() || bytes.len() > MAX_FRAME {
-        bail!("Queue frame exceeds the limit");
-    }
-    stream.write_all(&(bytes.len() as u32).to_le_bytes())?;
-    stream.write_all(&bytes)?;
+    // 長さ接頭辞付きのframe全体を`encode_frame`で作り、一度に書く（送信バイト列は同一）。
+    stream.write_all(&encode_frame(value, MAX_FRAME)?)?;
     stream.flush()?;
     Ok(())
+}
+/// `LocalAlloc`系APIが返した領域をdropで`LocalFree`する。
+struct Local(*mut std::ffi::c_void);
+impl Drop for Local {
+    fn drop(&mut self) {
+        unsafe {
+            LocalFree(self.0);
+        }
+    }
 }
 fn read_frame(stream: &mut std::fs::File, deadline: Instant) -> Result<Value> {
     let mut header = [0u8; 4];
@@ -145,14 +150,6 @@ fn new_pipe_with_security(id: &str, first: bool, sddl: &str) -> Result<OwnedHand
         ) == 0
         {
             return Err(std::io::Error::last_os_error().into());
-        }
-        struct Local(*mut std::ffi::c_void);
-        impl Drop for Local {
-            fn drop(&mut self) {
-                unsafe {
-                    LocalFree(self.0);
-                }
-            }
         }
         let _descriptor = Local(descriptor);
         let attributes = SECURITY_ATTRIBUTES {
@@ -244,14 +241,6 @@ fn peer_user(pipe: HANDLE, server: bool, expected: &str) -> Result<Peer> {
             );
             if code != 0 {
                 return Err(std::io::Error::from_raw_os_error(code as i32).into());
-            }
-            struct Local(*mut std::ffi::c_void);
-            impl Drop for Local {
-                fn drop(&mut self) {
-                    unsafe {
-                        LocalFree(self.0);
-                    }
-                }
             }
             let _descriptor = Local(descriptor);
             let mut text = std::ptr::null_mut();

@@ -13,7 +13,8 @@ $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 . (Join-Path $PSScriptRoot 'Verification-Common.ps1')
 . (Join-Path $PSScriptRoot 'Verification-Fixture.ps1')
-if (!$IsWindows -or [Environment]::Version.Major -ne 10) { throw 'Native Windows and .NET 10 PowerShell required' }
+# PowerShell 7.7以降は.NET 11上で動くため、.NET 10以上を受け付ける。
+if (!$IsWindows -or [Environment]::Version.Major -lt 10) { throw 'Native Windows and .NET 10 or later PowerShell required' }
 foreach ($path in @($ExecutablePath,$RustProbePath,$BuildManifestPath,$OutputDirectory,$ReportPath)) {
     if (![IO.Path]::IsPathFullyQualified($path)) { throw 'Absolute paths required' }
 }
