@@ -17,7 +17,7 @@ Prunletは、AIエージェントに許可されたファイル・フォルダ�
 
 権限の境界はホストのsandbox承認、Windowsの実トークン、Prunlet Coreの対象検証に分かれる。Prunlet自身は自動昇格しないが、許可された削除についてエージェントが明示的に管理者CMDを起動し、同じ配置済みCLIと設定を使う連携は別の責務である。起動成功だけを削除成功とは扱わず、拒否・結果不明を昇格で迂回しない。起動と結果確認の手順は[連携手順](docs/integration.md#sandboxとゴミ箱へのアクセス)に集約する。
 
-`protocol::bounded_input`はhookとstdio MCPで入力のUTF-8とUTF-16コード単位数の上限を検査する。hookは不正なUTF-8や上限超過を検出した時点で拒否し、入力の終了を待たない。MCPは有効なUnicode空白だけの行を上限超過時も読み飛ばし、次の要求を処理する。
+`protocol::bounded_input`はhookとstdio MCPで入力のUTF-8とUTF-16コード単位数の上限を検査する。hookは不正なUTF-8や上限超過を検出した時点で拒否し、入力の終了を待たない。MCPは有効なUnicode空白だけの行を上限超過時も読み飛ばし、次の要求を処理する。不正なUTF-8の行は区切りまで消費し、`id`が`null`のparse error（-32700）で拒否して継続する。この種別は入力検査由来の`InvalidData`だけで、stdin読取り自体の失敗は従来どおりMCPを終了する。
 
 ### フックのshell解析境界
 
@@ -41,6 +41,8 @@ Shellが削除元を8.3短縮名で返した場合、非reparseの対象だけ�
 
 新規ファイル削除では、操作ID・PIDL・File ID・内容hash・size・ACL snapshotを復元用に永続化しない。manifest・monitor・index・retirement・復元stageも作成しない。処理中の安全確認に使う情報と永続的な操作記録を区別する。共通の`maintenance.lock`は排他制御用の固定ファイルであり、操作記録ではない。
 
+互換入力の`volumeRecoveryDirectories`は、各エントリの値を保護領域として評価する。値のドライブrootが存在しないと確認できた（Win32 2・3）エントリだけは、その上に今回の対象が存在し得ないため評価から除外し、結果の`warnings`へ出す。ドライブ未準備（21）・不正な形・権限などで確認できない失敗は従来どおり検証失敗（fail-closed）とし、値が存在するボリューム上にありキーが別ボリュームを指す設定も拒否する。取り外したドライブの設定が無関係なボリューム上の削除まで止めないための扱いで、`migrate`のstore位置判定は変えず、存在しない値を従来どおり利用不可として扱う。
+
 再帰永久削除の子の照合では、列挙値のFile ID・属性を開いた実体と照合し、時刻の基準は保持handleから取得する。NTFSのハードリンクでは列挙情報に古い時刻が残るため、列挙時刻との差だけで変更とは判定しない。各フォルダーの全ての子のhandleと基準時刻を捕捉してから子の削除へ進み、兄弟の処理中に生じた変更も検出する。照合失敗は子の絶対パスと識別情報・時刻の診断を返して停止する。
 
 予約名ファイル・サイズ超過・確認済み即時削除設定時の固定削除は、共有inspectionで元実体を保持し、DELETE非共有のhandleで親・名前・ID・属性を再照合して、そのhandleへ削除を設定する。フォルダーは固定した親から子を列挙し、各実体を検証してから再帰的に削除する。Shellの全結果を受けてから固定削除を開始し、同じbatch内の同じFile IDをopen前からclose・確認まで排他する。独立した実体はworker上限内で並列に処理し、限られた排他枠が重なる場合は一時待機する。予約名ファイルは削除設定を試みる前の照合失敗なら`failed`、試行開始後の失敗や名前消失を確認できない場合は`ambiguous`で止める。サイズ超過と即時削除設定の経路は既にShellを試行しているため、固定削除前の照合失敗も`ambiguous`とする。
@@ -61,6 +63,8 @@ Shellがゴミ箱への移動を成功と返した場合は、返却項目だけ
 
 ロード済みモジュールの照会は、一時的なToolhelp process snapshotから自分を含め最大32プロセスの起動元チェーンを先に並べ、残りのプロセスを従来順で一度ずつ調べる。親関係は照会順にだけ使い、保持元の判定には実モジュールパスの一致を必要とする。snapshot取得に失敗した場合は従来順へ戻し、10秒・8件の上限と、全保持元を特定できない場合の注記を維持する。
 
+固定削除の設定は、ハードリンクguardの有無にかかわらずPOSIX削除（`FILE_DISPOSITION_POSIX_SEMANTICS`）を要求する。ウイルス対策・インデクサー・ディレクトリ監視などの外部プロセスが共有削除許可付きのhandleを保持していても、Prunletの削除handleを閉じた時点で元名が名前空間から外れ、名前の消失を確認でき、再帰削除の親も空になる。従来の削除設定では元名がdelete-pendingで残り、名前確認がWin32 5で`ambiguous`となって再帰削除が途中で止まっていた。guardの経路はPOSIX削除を必須とする。それ以外は、ファイルシステムがPOSIX削除を非対応として設定自体を拒否した場合（Win32 1・50・87）だけ、同じhandleへ従来の削除設定を要求する。拒否された設定は削除を開始していないため、結果不明な削除の再送には当たらない。
+
 固定実体への永久削除要求が受理された後、削除handleを解放してから名前の確認に失敗した場合は、その到達段階と確認できなかったentryをエラーへ含める。Win32 5はACLの制限や削除待ちなど複数の理由で返り得るため、番号だけでは原因を決めない。確認不能は引き続き`ambiguous`として扱い、名前の消失や削除完了を推測しない。
 
 ### 明示的な削除待機キュー
@@ -77,7 +81,7 @@ Windowsでは通常の同期削除とは別に、CLIの`delete-queue`・`delete-
 
 CLIとstdio MCPの`delete_files`は同じTrash処理を使う。絶対UTF-8パスを受け取り、既知のOS別名を照合し、任意のシンボリックリンク祖先を拒否する。末尾のリンクはリンク自体を扱う。設定、配置ルート、metadata、キューの予約領域、互換の旧復元領域をパスと実体で保護し、対象の重複も拒否する。privateなmetadataの`maintenance.lock`で要求を直列化し、全対象の事前検査を終えてから入力順に処理する。dry-runは対象を移さず、`would_recycle`は事前検査の結果を示す。
 
-同期処理は親と対象のFDを保持し、`recursive`を指定したフォルダーも最上位の項目を移す。子を個別に固定しないため、大きなツリーでも子の数に応じたFDを消費しない。`NSFileManager`にパスを渡す直前に実体を再照合し、返却されたTrashのパスが同じ実体を指し、元名の消失を確認できた場合に`recycled`を返す。OSへのパス指定と事前確認は一体の原子操作ではない。移動後の照合ができなければ`ambiguous`として後続対象を保全し、再送や永久削除への切替を行わない。OSが復元と保持を管理し、Prunletのファイル操作記録は作らない。
+同期処理は親と対象のFDを保持し、`recursive`を指定したフォルダーも最上位の項目を移す。子を個別に固定しないため、大きなツリーでも子の数に応じたFDを消費しない。`NSFileManager`にパスを渡す直前に実体を再照合し、返却されたTrashのパスが同じ実体を指し、元名の消失を確認できた場合に`recycled`を返す。OSへのパス指定と事前確認は一体の原子操作ではない。移動後の照合ができなければ`ambiguous`として後続対象を保全し、再送や永久削除への切替を行わない。`NSFileManager`がエラーを返した場合も、元の名前が移動前と同じ実体（device・inode・mode）のまま残っていると確認できたときだけ`failed`とし、元名が無い・別の実体・確認自体の失敗では`ambiguous`にする（Linuxの失敗後照合と同じ方針）。`ambiguous`は文言ではなく専用のエラー型で判定する。OSが復元と保持を管理し、Prunletのファイル操作記録は作らない。
 
 待機キューは同じCLIコマンドと`delete_files`の`action`を使い、再帰対象では子もFDで固定する。最大256パス、親を含む最大4096項目と利用可能なFD数の範囲で事前検査する。協調的な`flock`の競合だけを待ち、全ロックの取得後に同じTrash経路で実体を再照合する。取消は`pending`の間だけ受理する。固定のMachサービス枠は実効ユーザーごとに最大8件で、カーネルの監査トークンで相手を確認し、照会先はPIDとその世代も照合する。workerは開始許可を受け取ってから実行できる。許可送信後に応答を失った場合はジョブIDで照会し、自動再送しない。受付後はstdio切断と独立して実行し、結果はworkerのメモリーに1時間保持する。
 
@@ -113,9 +117,9 @@ snapshotを先に読んでから削除をstageすると、その間の外部書�
 
 schema 5の原文bytesはpendingファイルの最初の書込み時点から、Ownerを現在のユーザーSID、アクセス主体を現在のユーザーSIDとSYSTEMだけとするprotected DACLを指定してatomicに作成する。操作ディレクトリ・metadata・ロックも同じ非公開ACLで作成し、後からACLを締める公開期間を設けない。読取り・復元・整理でもACLを検証し、改変を検出した記録は処理せず保持する。
 
-manifest・snapshot・intent・receiptの公開は`registry::storage`が担当する。snapshotは容量予約に使った確定済みUTF-8 bytesを公開にも使い、公開のための再JSON化を避ける。manifestとreceiptは既存ownerの作成時刻を反映してからJSON化する。空のpendingを作成し、親と本文のidentity・公開先名・長さ・hashを結び付けた所有予約をflushしてから本文を書き、flush・検証後に同じhandleで正式名へrenameする。未公開本文を正式receiptへ昇格してcommit結果を推測しない。正式callerが原本とACLを再検証し、予約した完全bytesと既存prefixが一致した場合だけ書込みを再開できる。公開済み本文のidentity・長さ・hashを確認できれば所有予約を清掃できるが、pendingと正式名の共存、所有不明、改変は保全する。
+manifest・snapshot・intent・receiptの公開は`registry::storage`が担当する。snapshotは容量予約に使った確定済みUTF-8 bytesを公開にも使い、公開のための再JSON化を避ける。manifestとreceiptは既存ownerの作成時刻を反映してからJSON化する。空のpendingを作成し、親と本文のidentity・公開先名・長さ・hashを結び付けた所有予約をflushしてから本文を書き、flush・検証後に同じhandleで正式名へrenameする。未公開本文を正式receiptへ昇格してcommit結果を推測しない。正式callerが原本とACLを再検証し、予約した完全bytesと既存prefixが一致した場合だけ書込みを再開できる。公開済み本文のidentity・長さ・hashを確認できれば所有予約を清掃できるが、pendingと正式名の共存、所有不明、改変は保全する。正式名へのrenameと本文の再検証が済んだ後の所有予約の削除失敗は公開の成否を変えず、warningとして返す。残った予約は読取り時に本文照合つきで受理され、後続のcleanupが整理する。
 
-正式な削除intentの公開前に失敗・中断した記録は、正式receiptが1つもないことから未commit確定（`not_committed`）と分類する。現行版も旧版も正式intentの公開後にだけcommitするためであり、pendingのintent本文や公開予約を正式intentへ昇格せず、現在のキーの有無からcommitを推測しない。snapshotは既知容量として数えて後続の削除を止めず、明示`purge --apply`と保持期限・予算による整理の対象にする。このpurgeはreceipt・terminalを作らず、snapshot・manifest・lock・ディレクトリを既存の固定handle経路で消し、receiptの公開予約が残ればmetadataを保全する。`registry-reconcile`と`operations`は`not_committed`を返し、restoreは拒否する。正式manifestの公開前に止まった記録は、snapshotの所有予約の長さ（予約が無い正式snapshotは実サイズ）を容量に数えて本文を保全し、lockだけの記録だけを整理する。receiptの予約や未知memberを持つ記録は容量不明として保全し、正式intentの公開後の失敗は従来どおり`ambiguous`とする。
+正式な削除intentの公開前に失敗・中断した記録は、正式receiptが1つもないことから未commit確定（`not_committed`）と分類する。現行版も旧版も正式intentの公開後にだけcommitするためであり、pendingのintent本文や公開予約を正式intentへ昇格せず、現在のキーの有無からcommitを推測しない。snapshotは既知容量として数えて後続の削除を止めず、明示`purge --apply`と保持期限・予算による整理の対象にする。このpurgeはreceipt・terminalを作らず、snapshot・manifest・lock・ディレクトリを既存の固定handle経路で消し、receiptの公開予約が残ればmetadataを保全する。`registry-reconcile`と`operations`は`not_committed`を返し、restoreは拒否する。正式manifestの公開前に止まった記録は、snapshotの所有予約の長さ（予約が無い正式snapshotは実サイズ）を容量に数えて本文を保全し、lockだけの記録だけを整理する。receiptの予約や未知memberを持つ記録は容量不明として保全し、正式intentの公開後の失敗は従来どおり`ambiguous`とする。delete・restoreが失敗したときのwarningは、プロセス内のcommit済みフラグだけでなく保存済みの記録を読み直し、正式manifest・intent・completeの有無で決める。正式intentのrename後に失敗した記録は`ambiguous`として保全し、`purge`で除去できるとは案内しない。complete公開後の失敗は完了済みとして示し、読み直せない場合は結果を推測せず保全を伝える。この読み直しは分類だけに使い、intentを消して`not_committed`へ戻すことはしない。公開後の所有予約の削除失敗は非致命とし、commitの直前に残っている予約がすべて検証できること（`verify_reservations`）を確認して、検証できない予約はcommit前に止める（intent公開後に止めた記録は`ambiguous`として保全する）。外部プロセスが予約を共有READなしで保持して検証の読取りも失敗する場合は、安全側に止まり、保持の解放後に`registry-reconcile`で状態を確認する（未検証のままcommitしない）。
 
 キーの生セキュリティ記述子は`BACKUP_SECURITY_INFORMATION`（0x10000）で取得し、Owner・Group・DACL・SACLとMandatory Labelを含めて保持する。Owner/Group/DACL/SACLだけの取得フラグ（0xF）ではMandatory Label ACEが欠落するため使用しない。復元時は完全な記述子を指定して全キーを作成してから、必要なauto-inherited bitだけを要求するsetterを適用し、同じ完全取得方法で再読して生bytesを完全一致で比較する。親のsetterを子の作成前に適用すると、SACL実体がない子のauto-inherited bitが失われるため、この順序を維持する。比較を緩和せず、保持できない場合はロールバックしてsnapshotを保全する。
 
@@ -130,6 +134,8 @@ aliasの読み取り接続だけでは最終確認後の外部更新と競合し
 MSIX由来の仮想viewでtransactionが利用できない場合も、非transaction操作へ切り替えない。通常Windows側の操作には、通常デスクトップの期限付きnative sessionを用意し、`registryScope=nativeWindows`と専用接続情報を明示選択したCLI・MCPから同じCoreへ委任する。検証では`Verify-RegistrySession.ps1`のPrepareで固定したscopeと入力に限り、`Start -AssertNativeWindows`からdesktop Explorerの通常起動とWindowsの`runas`で起動できる。管理者起動の同意はOSのUACポリシーに従い、エージェントは同意を代行しない。入力のread handle・hash、nonce、原子的な開始claim、親の生存・期限、通常/管理者の実token、両者のreadyとRun permitを照合し、遅延起動や曖昧な開始を拒否する。手動のdesktop起動は診断互換として残す。job・silo制約を転送する方式ではなく、通常Windows scopeへの明示委任であり、汎用コマンドbroker・サービス・タスク登録・仮想viewからのfallbackは追加しない。要求ごとのeffective tokenを使用し、session固有の権限を呼出元へ貸さない。sessionはlocal・同じログオン・同じexeに限定し、期限後は新規受付を停止するが進行中のCoreを強制終了しない。
 
 native scopeの識別はmanifestとsnapshotのhash内に保存し、machine・SID・viewの一致を復元前に確認する。scope欠落の旧記録をnativeと推定せず、異なるscopeからの復元を拒否する。restoreのIPC分岐は共通ロックの取得前に行い、server側だけでCoreの共通ロックを取得する。deleteのoperationIdはclientで先に決め、応答喪失時は同じ削除を再送せず、read-onlyの`registry-reconcile`で記録を確認する。接続・scope・認証の不一致は元対象と復元データを保持して停止する。起動・設定の手順は[連携手順](docs/integration.md#通常windowsのレジストリを明示して操作する)を参照する。
+
+purge intentがありsnapshotもcomplete receiptもない記録（snapshot消費後にcompleteの公開が失敗した中断）は、`maintain --apply`の走査が共通ロックの排他下でpurge completeを公開して閉じる。復元のcomplete後に残ったsnapshotの回収と同じ責務である。走査は1件の名前確認の失敗でmaintain全体を止めず、その項目を容量不明のwarningとして保全し、他の記録の整理を続ける（確認が失敗する実OSの条件は特定しておらず、保護を弱めない予防である）。消費するmetadata（snapshot・receipt・空ディレクトリ）の削除はPOSIX削除を先に要求し、外部の`FILE_SHARE_DELETE`付きhandleが残っても名前が消えるようにする。非対応のファイルシステムだけが従来の削除設定へ戻り、ハードリンクguardの前提には触れない。storage状態（`storage-migration-v1.json`）が書込み途中の空・途中終了の場合は`migration_required:`として`migrate --apply`での再作成を示し、束縛不一致や改変の拒否とは区別する。
 
 ## 旧ファイル復元データの明示移行
 
@@ -165,7 +171,7 @@ latest導入時に`capacityDefaultMigrationVersion`が欠落または1未満の�
 
 ## 導入と検証の境界
 
-Windowsの利用者向け導入はソースをビルドせず、公開済み最新releaseの署名済み更新ZIP（`prunlet-update-<runtime>.zip`）を配置する。releaseの解決と取得は起動時自動更新と同じ条件（安定版・タグのcommitが既定ブランチ上・runtimeのassetが一意でdigestとsizeを持つ・公開URLから取得してdigestとsizeを照合）で行う。展開前に固定のentry集合・リンクなし・サイズ上限、`package.json`の取得元・既定ブランチ・release commit・runtime・各hash/長さを照合し、展開後に実体hash・CLIとhookの同一性・PEのmachine・Authenticode（Valid・署名者・タイムスタンプ）を確認する。いずれかが不一致、またはassetが未添付なら配置先・設定・タスク・登録へ書き込む前に止まる。`source-info.json`は起動時更新と同じ10項目（`downloadUrl`はreleaseのasset API、`archiveSha256`はZIP全体）で記録し、次回以降の自動更新が引き継ぐ。開発クローン・ローカルビルドをlatest導入の代用にしない。設定の検証には`validate-config`を使い、設定読込とservice構築だけで走査・変更しない。共通指示の生成元は`integration/PRUNLET.md`で、配置済み共通指示の更新とソース変更は別の結果として扱う。
+Windowsの利用者向け導入はソースをビルドせず、公開済み最新releaseの署名済み更新ZIP（`prunlet-update-<runtime>.zip`）を配置する。releaseの解決と取得は起動時自動更新と同じ条件（安定版・タグのcommitが既定ブランチ上・runtimeのassetが一意でdigestとsizeを持つ・公開URLから取得してdigestとsizeを照合）で行う。展開前に固定のentry集合・リンクなし・サイズ上限、`package.json`の取得元・既定ブランチ・release commit・runtime・各hash/長さを照合し、展開後に実体hash・CLIとhookの同一性・PEのmachine・Authenticode（Valid・署名者・タイムスタンプ）を確認する。いずれかが不一致、またはassetが未添付なら配置先・設定・タスク・登録へ書き込む前に止まる。`source-info.json`は起動時更新と同じ10項目（`downloadUrl`はreleaseのasset API、`archiveSha256`はZIP全体）で記録し、次回以降の自動更新は、導入済み`source-info.json`のbytes（整形・改行）ではなく内容（commitと各hash）を基準に引き継ぐ。インストーラーは更新状態とstageを変更しない。開発クローン・ローカルビルドをlatest導入の代用にしない。設定の検証には`validate-config`を使い、設定読込とservice構築だけで走査・変更しない。共通指示の生成元は`integration/PRUNLET.md`で、配置済み共通指示の更新とソース変更は別の結果として扱う。
 
 インストーラーの`-UseGitHubCliAuthentication`は、APIの未認証枠を使えない場合などに、既存のGitHub CLIへAPI取得を委ねる明示選択である。release解決の契約は変えず、`gh api --hostname github.com --method GET`を直接起動する。トークンを抽出せず、対話とデバッグ出力を抑止し、認証関連のstderrを記録へ転載しない。ghの導入・ログイン・cloneへの切替は行わず、失敗時は停止する。
 
@@ -183,15 +189,17 @@ MCPホストがMCPを起動しないPCでも追従させるため、インスト
 
 登録の検証では、登録済み`PRUNLET.md`のバイト列が候補と異なる場合に、両方を厳密なUTF-8として読み、CRLFをLFにそろえて本文を照合する。一致すれば既存ファイルのバイト列を保持したまま進める。登録への書込みが必要な候補は保留する。この同一性判定は登録済みガイドの読取り検証に限り、配布物のSHA-256照合は元のバイト列で行う。
 
-stageは再帰削除せず、完了した世代の正規製品とmetadataをhashと実体で照合して主streamだけを再利用する。正常な次回更新を、stageが存在するだけで止めない。未知の項目は残して容量へ含め、未確定の切替・移行は先に同じ候補で再開する。
+stageは再帰削除せず、完了した世代の正規製品とmetadataをhashと実体で照合して主streamだけを再利用する。正常な次回更新を、stageが存在するだけで止めない。適用済みstageの再利用は、導入済み来歴との一致を求めず、stateが記録したstage自身の`source-info.json`のhashとcommit、全製品・補助製品のhash、所有印の内容、previous来歴のcommitと原本との一致で所有を確認する（`prior_stage_commit`にもstage自身のcommitを記録する）。そのため手動導入（インストーラーの再実行）で導入済み来歴が変わっても次回の更新を止めない。旧来歴は、stateの記録hashと一致した`source-info.json`（stage側、次に導入済み側）だけを使い、どちらも一致しない場合は旧hashでの上書きを許可しない。未切替の候補に対して同じcommitで再開する場合、手動導入で導入済み来歴が変わっていれば、導入mutex下で基準hashを記録し直して警告し、切替時に従来どおり再照合する。`stage_cleanup: pending`は、stateが所有する恒久cacheがある状態を意味する。照合するのは書込み対象の固定名とstateが記録した名前だけで、未知の項目は変更せずに容量へ含めて保持し（更新は止めない）、未確定の切替・移行は先に同じ候補で再開する。
 
-切替前のidleで候補実行・移行・登録確定・未解決の書込みやrotationがない未適用stageも、旧owner・source-info・stateの公開ZIP hash/長さ・ZIP manifest・全12製品・3つのready slotが一致し、未知の項目・ADS・リンクがない場合に限りcacheとして再利用する。旧commit・owner/source-info hash・3製品と9補助製品のhashを任意stateの`cacheBaseline`へ先に固定してからownerを切り替え、中断時は同じbaselineで再開する。これはstage主streamの更新だけに用い、previousへの退避と製品rotationは現在のinstalled来歴を基準にする。認定できないstageは変更せず保持する。
+切替前のidleで候補実行・移行・登録確定・rotation・補助製品の置換がない未適用stageは、取得失敗・中断・適用済み来歴（`prior_*`）付き・基準（`cacheBaseline`）付きのどの状態からでも、次の候補向けに基準を作り直して更新を続ける。stageは削除しない固定cacheなので、上書きしてよい基準は導入済み来歴から導き直さず、stage自身の記録を起点にする。書込み対象の固定14パス（owner・`source-info.json`・3製品・9補助製品）だけを照合し、現物のhashが、記録済みの旧基準（`cacheBaseline`、なければ`prior_*`から内容で確認できた来歴、新品なら存在しないこと）、置き換わる候補（stateがreadyと記録し、認証済みのhash・長さと現物が一致するZIPの製品表と、その内容に一致する`source-info.json`）、進行中の`stage_write`記録のold/newのいずれかに一致する場合に限って認める。認めたパスの現物hash（存在しなければ空文字）を、照合に使った同じ読取りから任意stateの`cacheBaseline`へ先に固定してからownerを切り替え、中断時は同じbaselineで再開する。記録のない名前・どの記録とも一致しない内容・書込み途中の現物・ADS・リンク・所有印の不一致は変更せず保持して拒否する。`prior_*`と補助製品の退避hash・slot・ZIPの名前と状態は引き継ぎ、`cacheBaseline`と共存できる（`prior_*`が完全であることだけを求め、孤立した`prior_*`は拒否する。同じcommitを指す来歴のhashの一致は求めない。適用済みstageと同じcommitのreleaseがassetを差し替えて再公開されると候補側の`source-info.json`だけが変わり、一致を求めると次のreleaseでstateを書けず停止するため）。`cacheBaseline`の空文字はそのパスが存在しないことを表す。`prior_previous_info_sha256`は、切替の準備が中断してprevious来歴だけが先に書かれていた場合に限り、記録済みの旧hashまたは準備時の導入済みhashと一致した現物のhashへ更新する。基準はprepareと置換だけが使うので、`phase`が`switching`へ移る書込みで消す（この形式のstateは旧版が読めないため、候補が未適用の期間に限る）。これはstage主streamの更新だけに用い、previousへの退避と製品rotationは現在のinstalled来歴を基準にする。
 
 配布元は公開済みGitHub Releaseとする。`.github/workflows/prunlet-release-package.yml`が公開タグからwin-x64・win-arm64を1つのjobでビルドし、Sigilune（Certum SimplySignのクラウド鍵）で`scripts/Sign-PrunletBuild.ps1`が両runtimeの実行ファイルをまとめて署名してから、`scripts/Package-PrunletUpdate.ps1`でZIPを作成する。署名用Secretsはブランチ制限付きのEnvironment `release`（承認者なし）に置き、署名stepだけへ渡す。CLIを署名してからhookへ複製し、両者の同一hashを保つ。公開前に`Verify-ReleasePackage.ps1 -RequireSignature`がentryの過不足・重複、metadataの取得元・commit・runtime等、全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合し、各実行ファイルの署名・署名者・タイムスタンプを確認する。検証済みZIP全体のSHA-256をアップロード直前にも再確認し、同じreleaseへ添付する。既存assetは上書きしない。署名処理は`scripts/Signing.Common.ps1`に集約する。
 
 取得側はタグが既定ブランチ上のcommitを指すことと、パッケージ内のcommit・runtime・製品hashを検証する。通常の起動時更新では、照会済みタグと実行体のruntimeからGitHubの公開ZIP URLを組み立て、REST API枠を使わずにZIPを取得する。タグを渡さない旧launcherからの要求ではasset IDによるAPI取得を維持する。どちらの取得経路でも、APIが返したサイズとSHA-256で転送内容を照合する。ソースとビルドの対応は発行者への信頼に依存する。Actionsの期限付きartifactを更新の必須条件としない。
 
-更新用cacheはレジストリ復元領域とは別に合計2 GiBを上限とする。公開ZIP・stage・製品slot・固定candidate/previous・保全した異常世代・各ディレクトリのADS・更新管理ファイルを容量に含め、確保前と完了後に検査する。slotはcache専用で、実行・移動・削除しない。正規hash・長さ・単一linkを同じ排他handleで確認し、通常streamだけをin-place更新する。候補へはそのhandleの通常streamだけをCreateNewコピーする。ADSや不明な部分書込みは保持し、予算不足を自動削除で回避しない。
+更新用cacheはレジストリ復元領域とは別に合計2 GiBを上限とする。公開ZIP・stage・製品slot・固定candidate/previous・保全した異常世代・各ディレクトリのADS・更新管理ファイルを容量に含め、確保前と完了後に検査する。slotはcache専用で、実行・移動・削除しない。正規hash・長さ・単一linkを同じ排他handleで確認し、通常streamだけをin-place更新する。候補へはそのhandleの通常streamだけをCreateNewコピーする。stateが書込み前に記録した名前の書込み中（`writing`）の配布ZIPと製品slotは、記録済みの部分書込みとして同じ名前（slotは同じgeneration）のまま先頭から上書きする（単一link・代替ストリームなしで、長さがこれから書く長さ以下の場合に限る。記録名のファイルが失われていれば同じ名前で作り直し、slotは検証済みの再利用にせず必ず書き直す）。記録のないもの・記録と異なるもの（`ready`なのに内容が変わっている、記録のない`package.zip`、ADSあり等）は上書きせず、保持して別の名前を使う。予算不足を自動削除で回避しない。stateの公開は、読取り中のCLI・MCPによる共有違反（32）・置換不可（1175）だけを短い間隔で数回再試行する。最後まで公開できない場合は、作成時のFile ID・単一link・ADSなし・内容を照合できた一時ファイルだけを同じhandleで削除し、結果が不明な失敗（1176・1177など）では新しいstateの唯一の写しとして保持する。インストーラーは更新状態の`phase`が`idle`以外なら、製品・更新状態を変えずに導入を拒否する。launcherは、更新準備のCLIが拒否した場合に標準出力の`error`本文を延期の文言へ含め、恒久的な拒否と一時的な延期を区別できるようにする。
+
+導入mutexの鍵は、出荷済みのlauncher・インストーラー（`ToLowerInvariant()`・UTF-8・SHA-256）と互換を保つ。Rust側は.NETと同じ1文字単位の小文字化（U+0130は変えず、語末のΣもσにする）で作り、全コードポイントをPowerShell出力との総当たりで照合する。照合したのは.NET 11（PowerShell 7.7）だけで、別の.NETやICUの版では未検証である（.NET 11より新しいUnicode版で追加された大文字は.NETが変えないため変えない）。既知の制約として、導入先の綴り（8.3短縮名・`\\?\`・subst）がRustの正規化後の最終パスと異なる起動では、PowerShell側の鍵が一致せず排他が成立しない。排他が成立しない窓は、インストーラーが製品をコピーしている間に限る。launcherが所有印の`installRoot`を`-ine`で照合する処理も同じ綴りの違いで一致せず、その場合は更新を安全側に延期する（恒久的に延期しても製品は変わらない）。両者の鍵と正規化を新旧で変えると出荷済みの鍵との互換が崩れるため、PowerShell側は変更しない。
 
 既存のWindowsクライアント向けにも、同一ZIPをR2へ配置してからGitHub Releaseへ添付する。固定配信先・資格情報・順序は[配布手順](docs/distribution.md)を参照する。
 
