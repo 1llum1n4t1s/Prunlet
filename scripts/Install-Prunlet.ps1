@@ -473,6 +473,14 @@ try {
     try { $mutexAcquired = $installationMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $mutexAcquired = $true }
     if (!$mutexAcquired) { throw 'Another Prunlet installation is already running for this directory.' }
     if ($managedInstallation) { Assert-ManagedInstallationSnapshot $managedInstallation }
+    # 更新状態がidleでない（切替・移行・後片付けの途中）間は導入しない。製品を上書きすると、途中の更新を
+    # 再開できなくなり、更新状態がidleへ戻らないままCLIの起動gateが止まり続ける。
+    $updateStatePath = Join-Path $InstallDirectory '.prunlet-update-state.json'
+    if (Test-Path -LiteralPath $updateStatePath -PathType Leaf) {
+        $updateStatePhase = $null
+        try { $updateStatePhase = ([IO.File]::ReadAllText($updateStatePath) | ConvertFrom-Json).phase } catch { }
+        if ($null -ne $updateStatePhase -and $updateStatePhase -cne 'idle') { throw "A Prunlet update is in progress (phase: $updateStatePhase); nothing was installed. Let the update finish, then install again." }
+    }
     # 既定ブランチのHEADではなく、署名済みの更新ZIPを持つ公開済み最新releaseを導入する。
     # ソースのビルドをしないため、Rust・MSVC・Windows SDKは不要。
     $release = Get-LatestPrunletRelease

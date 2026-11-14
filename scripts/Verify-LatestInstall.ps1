@@ -1306,15 +1306,18 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         Set-FixtureVolumeMap (Join-Path $root 'config.json')
         return $root
     }
-    function Publish-NextRelease([string]$Root) {
+    # 公開するcommit・導入済みとして期待するcommit・製品の出所は既定で次releaseだが、導入後の再実行などで変えられる。
+    function Publish-NextRelease([string]$Root, [string]$Sha = $newCommit, [string]$Installed = $oldCommit, [string]$Publish = $fixturePublish) {
         # 新releaseを公開し、HTTP取得だけを「検証済みZIPを取得完了の位置へ置く」ことで代替する（Rustの取得は既存hashを再利用する）。
-        $global:PrunletLatestFixture.sha = $newCommit
-        $global:PrunletLatestFixture.publish = $fixturePublish
+        $global:PrunletLatestFixture.sha = $Sha
+        $global:PrunletLatestFixture.source = $fixtureSource
+        $global:PrunletLatestFixture.publish = $Publish
         $package = Get-FixturePackage
-        $begin = & (Join-Path $Root 'bin\prunlet.exe') --config (Join-Path $Root 'config.json') __begin-published-update $newCommit $oldCommit
+        $begin = & (Join-Path $Root 'bin\prunlet.exe') --config (Join-Path $Root 'config.json') __begin-published-update $Sha $Installed
         Assert-True ($LASTEXITCODE -eq 0) "Update stage could not be prepared: $begin"
         $state = [IO.File]::ReadAllText((Join-Path $Root '.prunlet-update-state.json')) | ConvertFrom-Json -AsHashtable
-        [IO.File]::Copy($package, (Join-Path (Join-Path $Root '.prunlet-update-stage') $state.packageName))
+        # 適用済みstageの再利用では、前回の配布ZIPが同名で残る。取得完了の位置へ置くfixtureとして上書きする（取得自体は検証しない）。
+        [IO.File]::Copy($package, (Join-Path (Join-Path $Root '.prunlet-update-stage') $state.packageName), $true)
         return $package
     }
     function Invoke-UpdateOnly([string]$Root, [string]$CodexHome) {
@@ -1330,6 +1333,25 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
             & (Join-Path $Root 'bin\start-prunlet-mcp.ps1') -UpdateOnly -ExecutablePath (Join-Path $Root 'bin\prunlet.exe') -ConfigPath (Join-Path $Root 'config.json')
             return $LASTEXITCODE
         } finally { $env:CODEX_HOME = $previous }
+    }
+    # 起動時更新の出力（延期の警告を含む）と終了コードを両方返す。
+    function Invoke-UpdateOnlyCaptured([string]$Root, [string]$CodexHome) {
+        # 延期の警告はlauncherが[Console]::Errorへ直接書くため、その間だけ標準エラーをStringWriterへ差し替えて取得する。
+        $previousError = [Console]::Error
+        $writer = [IO.StringWriter]::new()
+        [Console]::SetError($writer)
+        try { $text = & (Join-Path $Root 'bin\start-prunlet-mcp.ps1') -UpdateOnly -ExecutablePath (Join-Path $Root 'bin\prunlet.exe') -ConfigPath (Join-Path $Root 'config.json') -CodexHome $CodexHome *>&1 | Out-String; $code = $LASTEXITCODE }
+        finally { [Console]::SetError($previousError) }
+        return @{ exitCode = $code; text = ($text + $writer.ToString()) }
+    }
+    # 導入・取得直後の製品へウイルス対策などが一時的に書込み不可の開き方をすると、launcherは正規の延期として
+    # 「existing process」で戻る。その一時的な延期だけを短く再試行し、他の結果は最初の1回で判定する。
+    function Invoke-UpdateOnlyUntilApplied([string]$Root, [string]$CodexHome, [string]$Commit) {
+        for ($attempt = 1; ; $attempt++) {
+            $result = Invoke-UpdateOnlyCaptured $Root $CodexHome
+            if ((Get-InstalledCommit $Root) -ceq $Commit -or $attempt -ge 5 -or $result.text -notmatch 'existing process is active') { return $result }
+            Start-Sleep -Seconds 2
+        }
     }
     function Get-InstalledCommit([string]$Root) { return ([IO.File]::ReadAllText((Join-Path $Root 'source-info.json')) | ConvertFrom-Json).commitSha }
     function Get-UpdatePhase([string]$Root) { return ([IO.File]::ReadAllText((Join-Path $Root '.prunlet-update-state.json')) | ConvertFrom-Json).phase }
@@ -1350,6 +1372,41 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         $before = (Get-FileHash -LiteralPath (Join-Path $root 'source-info.json')).Hash
         Assert-True ((Invoke-UpdateOnly $root $noCodex) -eq 0 -and (Get-FileHash -LiteralPath (Join-Path $root 'source-info.json')).Hash -ceq $before) 'Current update-only check changed the installation.'
     }
+    Test-Case 'Installer rerun after a startup update does not stop later startup updates' {
+        # 起動時更新で適用済み（stage保持）の配置へ、手動でインストーラーを再実行した後も、
+        # 次のreleaseの起動時更新は延期されず適用される。インストーラーは更新状態とstageに触れない。
+        $noCodex = Join-Path $OutputDirectory 'update-rerun-no-codex'
+        $root = Install-PreviousRelease 'update-rerun-install' $noCodex
+        $null = Publish-NextRelease $root
+        $first = Invoke-UpdateOnlyUntilApplied $root $noCodex $newCommit
+        Assert-True ($first.exitCode -eq 0 -and (Get-InstalledCommit $root) -ceq $newCommit -and (Get-UpdatePhase $root) -ceq 'idle') "The first startup update did not apply (exit $($first.exitCode), commit $(Get-InstalledCommit $root), phase $(Get-UpdatePhase $root)): $($first.text)"
+        $statePath = Join-Path $root '.prunlet-update-state.json'
+        $stageRoot = Join-Path $root '.prunlet-update-stage'
+        Assert-True ((Test-Path -LiteralPath $stageRoot -PathType Container) -and ([IO.File]::ReadAllText($statePath) | ConvertFrom-Json).stageCleanup -ceq 'pending') 'The applied stage was not retained.'
+        # 手動導入: 旧overlay製品の別commitで、実際のインストーラーを再実行する。
+        $manualCommit = '3' * 40
+        $global:PrunletLatestFixture.sha = $manualCommit
+        $global:PrunletLatestFixture.source = $fixtureSource
+        $global:PrunletLatestFixture.publish = $oldPublish
+        $stateBefore = (Get-FileHash -LiteralPath $statePath).Hash
+        $stageBefore = (Get-ChildItem -LiteralPath $stageRoot -Recurse -Force -File | Sort-Object FullName | ForEach-Object { $_.FullName.Substring($stageRoot.Length) + '=' + (Get-FileHash -LiteralPath $_.FullName).Hash }) -join "`n"
+        $rerun = & $installer -UpdateBackupRoot $fixtureUpdateBackupRoot -InstallDirectory $root -WorkDirectory (Join-Path $OutputDirectory 'update-rerun-work') -CodexHome $noCodex | ConvertFrom-Json -AsHashtable
+        Assert-True ($rerun.status -ceq 'installed' -and $rerun.commitSha -ceq $manualCommit -and (Get-InstalledCommit $root) -ceq $manualCommit) 'The installer rerun did not install the manual release.'
+        Assert-True ((Get-FileHash -LiteralPath $statePath).Hash -ceq $stateBefore) 'The installer rerun changed the update state.'
+        $stageAfter = (Get-ChildItem -LiteralPath $stageRoot -Recurse -Force -File | Sort-Object FullName | ForEach-Object { $_.FullName.Substring($stageRoot.Length) + '=' + (Get-FileHash -LiteralPath $_.FullName).Hash }) -join "`n"
+        Assert-True ($stageAfter -ceq $stageBefore) 'The installer rerun changed the retained update stage.'
+        # 次のrelease（今回のビルド）を、手動導入したcommitを導入済みとして公開する。
+        $laterCommit = '4' * 40
+        $null = Publish-NextRelease $root $laterCommit $manualCommit
+        $result = Invoke-UpdateOnlyUntilApplied $root $noCodex $laterCommit
+        Assert-True ($result.exitCode -eq 0) "The update after the installer rerun failed: $($result.text)"
+        Assert-True ((Get-InstalledCommit $root) -ceq $laterCommit -and (Get-UpdatePhase $root) -ceq 'idle') "The update after the installer rerun did not apply: $($result.text)"
+        Assert-True ($result.text -notmatch '(?i)deferred') "The update after the installer rerun was deferred: $($result.text)"
+        foreach ($name in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
+            Assert-True ((Get-FileHash -LiteralPath (Join-Path $root ('bin\' + $name))).Hash -ceq ($fixtureProducts | Where-Object name -eq $name).sha256) "The update after the installer rerun left a previous product: $name"
+        }
+        Assert-True (!(Test-Path -LiteralPath $noCodex)) 'The update after the installer rerun created a Codex home.'
+    }
     Test-Case 'Update-only launcher defers when the maintenance executable is in use' {
         $noCodex = Join-Path $OutputDirectory 'update-busy-no-codex'
         $root = Install-PreviousRelease 'update-busy-install' $noCodex
@@ -1360,6 +1417,52 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         finally { $hold.Dispose() }
         Assert-True ((Get-InstalledCommit $root) -ceq $oldCommit) 'Update-only launcher replaced products that were in use.'
         Assert-True ((Invoke-UpdateOnly $root $noCodex) -eq 0 -and (Get-InstalledCommit $root) -ceq $newCommit) 'Deferred update did not resume after the product was released.'
+    }
+    Test-Case 'Installer refuses to overwrite products while an update is in progress' {
+        $noCodex = Join-Path $OutputDirectory 'installer-phase-no-codex'
+        $root = Install-PreviousRelease 'installer-phase-install' $noCodex
+        $null = Publish-NextRelease $root
+        $statePath = Join-Path $root '.prunlet-update-state.json'
+        $original = [IO.File]::ReadAllText($statePath)
+        Assert-True ($original.Contains('"phase":"idle"')) 'The fixture state is not idle.'
+        # 切替の途中（idle以外）を再現する。導入は製品も更新状態も変えずに拒否される。
+        [IO.File]::WriteAllText($statePath, $original.Replace('"phase":"idle"', '"phase":"switching"'), [Text.UTF8Encoding]::new($false))
+        $manualCommit = '3' * 40
+        $global:PrunletLatestFixture.sha = $manualCommit
+        $global:PrunletLatestFixture.source = $fixtureSource
+        $global:PrunletLatestFixture.publish = $oldPublish
+        $beforeState = (Get-FileHash -LiteralPath $statePath).Hash
+        $beforeInfo = (Get-FileHash -LiteralPath (Join-Path $root 'source-info.json')).Hash
+        $beforeProducts = (Get-ChildItem -LiteralPath (Join-Path $root 'bin') -File | Sort-Object Name | ForEach-Object { $_.Name + '=' + (Get-FileHash -LiteralPath $_.FullName).Hash }) -join ';'
+        $parameters = @{ UpdateBackupRoot = $fixtureUpdateBackupRoot; InstallDirectory = $root; WorkDirectory = (Join-Path $OutputDirectory 'installer-phase-work'); CodexHome = $noCodex }
+        Expect-Failure { & $installer @parameters } 'update is in progress \(phase: switching\)'
+        Assert-True ((Get-FileHash -LiteralPath $statePath).Hash -ceq $beforeState -and (Get-FileHash -LiteralPath (Join-Path $root 'source-info.json')).Hash -ceq $beforeInfo) 'The refused installation changed the state or provenance.'
+        $afterProducts = (Get-ChildItem -LiteralPath (Join-Path $root 'bin') -File | Sort-Object Name | ForEach-Object { $_.Name + '=' + (Get-FileHash -LiteralPath $_.FullName).Hash }) -join ';'
+        Assert-True ($afterProducts -ceq $beforeProducts) 'The refused installation changed installed products.'
+        # idleへ戻れば導入できる（拒否の条件は更新状態のphaseだけ）。
+        [IO.File]::WriteAllText($statePath, $original, [Text.UTF8Encoding]::new($false))
+        $parameters.WorkDirectory = Join-Path $OutputDirectory 'installer-phase-work-2'
+        $rerun = & $installer @parameters | ConvertFrom-Json -AsHashtable
+        Assert-True ($rerun.status -ceq 'installed' -and (Get-InstalledCommit $root) -ceq $manualCommit) 'The installer did not install once the update state was idle.'
+    }
+    Test-Case 'Update-only launcher reports the CLI refusal reason when it defers an update' {
+        $noCodex = Join-Path $OutputDirectory 'update-reason-no-codex'
+        $root = Install-PreviousRelease 'update-reason-install' $noCodex
+        $first = '5' * 40
+        $null = Publish-NextRelease $root $first
+        # 未適用の候補の所有印が他の導入先を指す（照合が通らない）状態で、さらに次のreleaseが来る。
+        $owner = Join-Path $root '.prunlet-update-stage\.prunlet-stage-owner.json'
+        $value = [IO.File]::ReadAllText($owner) | ConvertFrom-Json -AsHashtable
+        $value.installRoot = 'D:\unowned'
+        [IO.File]::WriteAllText($owner, ($value | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+        $global:PrunletLatestFixture.sha = '6' * 40
+        $global:PrunletLatestFixture.source = $fixtureSource
+        $global:PrunletLatestFixture.publish = $fixturePublish
+        $stateBefore = (Get-FileHash -LiteralPath (Join-Path $root '.prunlet-update-state.json')).Hash
+        $result = Invoke-UpdateOnlyCaptured $root $noCodex
+        Assert-True ($result.exitCode -eq 0) "A refused begin must defer, not fail the launcher: $($result.text)"
+        Assert-True ($result.text -match 'Published update state could not be prepared\.\s+Stage ownership does not match') "The deferral did not carry the CLI refusal reason: $($result.text)"
+        Assert-True ((Get-InstalledCommit $root) -ceq $oldCommit -and (Get-FileHash -LiteralPath (Join-Path $root '.prunlet-update-state.json')).Hash -ceq $stateBefore) 'The refused update changed the installation or its state.'
     }
     Test-Case 'Update-only launcher keeps Codex registration protection when Codex is registered' {
         $codex = Join-Path $OutputDirectory 'update-registered-codex'

@@ -1,5 +1,5 @@
 use super::{
-    coordinator::{PRODUCTS, exists},
+    coordinator::{SLOTS_NAME, STAGE, exists},
     state::{AUXILIARY_NAMES, STATE_NAME},
 };
 use crate::platform::windows::{self as native, PinnedFile, path};
@@ -120,7 +120,7 @@ pub fn measure(root: &Path) -> Result<u64> {
     let _parents = path::pin_directories(root)?;
     let mut total = 0;
     let mut count = 0;
-    for name in [".prunlet-update-stage", ".prunlet-update-slots"] {
+    for name in [STAGE, SLOTS_NAME] {
         let target = root.join(name);
         if exists(&target)? {
             tree(&target, 0, &mut total, &mut count)?;
@@ -155,6 +155,5 @@ pub fn measure(root: &Path) -> Result<u64> {
         }
     }
     ensure!(count <= 100000, "Update storage contains too many entries");
-    let _ = PRODUCTS;
     Ok(total)
 }

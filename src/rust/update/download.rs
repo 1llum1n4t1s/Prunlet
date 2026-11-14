@@ -1,4 +1,8 @@
-use super::{budget, coordinator::*, package::is_hex};
+use super::{
+    budget,
+    coordinator::*,
+    package::{MAX_ARCHIVE_BYTES, is_hex},
+};
 use crate::platform::windows::{self as native, path};
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -6,28 +10,6 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
-
-pub fn receive(
-    root: &Path,
-    repository: &str,
-    commit: &str,
-    asset: u64,
-    hash: &str,
-    bytes: u64,
-) -> Result<()> {
-    receive_from(root, repository, commit, asset, hash, bytes).map(|_| ())
-}
-
-pub fn receive_from(
-    root: &Path,
-    repository: &str,
-    commit: &str,
-    asset: u64,
-    hash: &str,
-    bytes: u64,
-) -> Result<bool> {
-    receive_release(root, repository, commit, asset, hash, bytes, None)
-}
 
 pub(super) fn receive_release(
     root: &Path,
@@ -42,7 +24,7 @@ pub(super) fn receive_release(
         regex::Regex::new(r"\A[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}\z")?
             .is_match(repository)
             && asset > 0
-            && (1..=536870912).contains(&bytes)
+            && (1..=MAX_ARCHIVE_BYTES).contains(&bytes)
             && is_hex(hash, 64),
         "Published asset identity is invalid."
     );
@@ -65,6 +47,21 @@ pub(super) fn receive_release(
         // 出荷済みlauncherからの引数を維持する。
         format!("https://api.github.com/repos/{repository}/releases/assets/{asset}")
     };
+    receive_with(root, commit, hash, bytes, &url, |url| {
+        super::http::get(url, Instant::now() + Duration::from_secs(120))
+    })
+}
+
+/// 取得先の応答を`fetch`で差し替えられる形にした本体。状態遷移と既存ファイルの扱いを
+/// ネットワークなしで検証できるよう、URLの組立てとは分けている。
+pub(super) fn receive_with(
+    root: &Path,
+    commit: &str,
+    hash: &str,
+    bytes: u64,
+    url: &str,
+    fetch: impl FnOnce(&str) -> Result<super::http::Response>,
+) -> Result<bool> {
     let stage = stage_path(root);
     let _parents = path::pin_directories(&stage)?;
     let _mutex = InstallationMutexes::acquire(root)?;
@@ -98,10 +95,17 @@ pub(super) fn receive_release(
                 write_state(root, &state)?;
                 return Ok(true);
             }
-            if state.package_status == "ready"
+            // 上書きしてよいのは、stateが記録した名前の次の2つだけ。
+            // - ready: 記録済みの長さ・hashと現物が一致する（来歴を確認済みの旧ZIP）。
+            // - writing: 取得の途中で止まった部分ファイル。hashは確定していないので内容では
+            //   判定せず、stateが書込み前に記録した名前・単一link・代替ストリームなし・長さが
+            //   これから書く長さ（bytes）以下であることだけを条件にする。
+            // 記録と異なる内容（readyなのに変わっている等）は上書きせず、下で新しい名前へ逃がす。
+            let ready_unchanged = state.package_status == "ready"
                 && state.package_previous_bytes == length as i64
-                && state.package_previous_sha256.eq_ignore_ascii_case(&actual)
-            {
+                && state.package_previous_sha256.eq_ignore_ascii_case(&actual);
+            let recorded_partial = state.package_status == "writing" && length <= bytes;
+            if ready_unchanged || recorded_partial {
                 existing = Some((pin, file, length));
             }
         }
@@ -114,15 +118,18 @@ pub(super) fn receive_release(
         (pin, file)
     } else {
         budget::ensure_snapshot(used, bytes)?;
-        state.package_name = format!("package-{}.zip", uuid::Uuid::new_v4().simple());
+        // 書込み中と記録した名前のファイルが失われている場合は、新しい名前を作らず記録済みの
+        // 名前で作り直す（名前を失うと旧ファイルがstateから見えない孤児になる）。
+        // 実体はあるが上書きできない（内容・代替ストリーム・linkの不一致）場合は保持して別名を使う。
+        let recreate = state.package_status == "writing" && !exists(&destination)?;
+        if !recreate {
+            state.package_name = format!("package-{}.zip", uuid::Uuid::new_v4().simple());
+        }
         state.package_status = "writing".into();
         write_state(root, &state)?;
         create_plain(&stage.join(&state.package_name))?
     };
-    let deadline = Instant::now() + Duration::from_secs(120);
-    transfer(&url, &mut output, bytes, hash, |url| {
-        super::http::get(url, deadline)
-    })?;
+    transfer(url, &mut output, bytes, hash, fetch)?;
     pin.verify_named()?;
     native::reject_named_streams(&stage.join(&state.package_name))?;
     drop(output);

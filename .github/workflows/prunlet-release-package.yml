@@ -76,10 +76,10 @@ jobs:
           }
       - name: Set up Sigilune
         # 他のactionと同じくcommit SHAで固定し、同じ版のリリース（SHA-256・Authenticode署名を検証）を導入する。
-        uses: 1llum1n4t1s/Sigilune@c9bfdd3958709568b812014cfda2c1bd07b4aec1 # v1.0.0
+        uses: 1llum1n4t1s/Sigilune@b087dc7eb2e144559680d60442f198f58e031d0c # v1.1.1
         with:
           # SHAを更新するとき（Dependabotを含む）は、この版も同じリリースへ揃える。
-          version: 1.0.0
+          version: 1.1.1
       - name: Sign the executables
         # 署名用Secretsはこのstepだけへ渡す。全runtimeを同じセッションで1ファイルずつ署名し、
         # hookを署名済みCLIの複製へ置き換え、署名者・タイムスタンプを確認する。

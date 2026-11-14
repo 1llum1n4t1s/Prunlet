@@ -49,13 +49,13 @@ pub fn acquire(
         matches!(product, "cli" | "maintenance" | "hook") && (1..=536870912).contains(&bytes),
         "Invalid product slot"
     );
-    let directory = root.join(".prunlet-update-slots");
+    let directory = root.join(SLOTS_NAME);
     let parents = path::pin_directories(&directory)?;
     let used = measure(&directory)?;
     let mut reason = "none";
     if let Some(previous) = previous {
         ensure!(
-            previous.status == "ready"
+            matches!(previous.status.as_str(), "ready" | "writing")
                 && super::package::is_hex(&previous.sha256, 64)
                 && previous.bytes > 0
                 && previous.bytes <= 536870912
@@ -63,29 +63,67 @@ pub fn acquire(
             "Prior product slot identity is incomplete"
         );
         let location = directory.join(format!("slot-{product}-{}.bin", previous.generation));
-        match plain(&location, GENERIC_READ | GENERIC_WRITE, 0) {
-            Ok(pin) => {
-                let mut lease = Lease {
-                    generation: previous.generation.clone(),
-                    reused: true,
-                    previous_status: "verified".into(),
-                    file: stream(&pin)?,
-                    pin,
-                    path: location,
-                    _parents: parents,
+        if previous.status == "writing" {
+            // stateが書込み前に記録したgenerationの部分ファイルは、記録済みの部分書込みとして
+            // 同じ名前のまま上書きする（新しいgenerationを作ると旧ファイルがstateから見えない孤児になる）。
+            // 内容は未確定なので検証済みの再利用（reused）にはせず、呼出し側は必ず書き直す。
+            // 実体はあるが上書きできない（link・代替ストリーム・書く長さより長い）場合は保持して別のgenerationを使う。
+            let resumed = (|| -> Result<Lease> {
+                let (pin, file, status) = if exists(&location)? {
+                    native::reject_named_streams(&location)?;
+                    let pin = plain(&location, GENERIC_READ | GENERIC_WRITE, 0)?;
+                    let file = stream(&pin)?;
+                    let length = file.metadata()?.len();
+                    ensure!(
+                        length <= bytes,
+                        "Partial product slot is longer than the product"
+                    );
+                    budget::ensure_snapshot(used, bytes.saturating_sub(length))?;
+                    (pin, file, "resumed_partial")
+                } else {
+                    budget::ensure_snapshot(used, bytes)?;
+                    let (pin, file) = create_plain(&location)?;
+                    (pin, file, "recreated_partial")
                 };
-                if lease
-                    .verify(previous.bytes as u64, &previous.sha256)
-                    .is_ok()
-                {
-                    budget::ensure_snapshot(used, bytes.saturating_sub(previous.bytes as u64))?;
-                    return Ok(lease);
-                }
-                drop(lease);
-                reason = "previous_contents_changed";
+                Ok(Lease {
+                    generation: previous.generation.clone(),
+                    reused: false,
+                    previous_status: status.into(),
+                    pin,
+                    file,
+                    path: location.clone(),
+                    _parents: path::pin_directories(&directory)?,
+                })
+            })();
+            match resumed {
+                Ok(lease) => return Ok(lease),
+                Err(_) => reason = "previous_unavailable",
             }
-            Err(_) => {
-                reason = "previous_unavailable";
+        } else {
+            match plain(&location, GENERIC_READ | GENERIC_WRITE, 0) {
+                Ok(pin) => {
+                    let mut lease = Lease {
+                        generation: previous.generation.clone(),
+                        reused: true,
+                        previous_status: "verified".into(),
+                        file: stream(&pin)?,
+                        pin,
+                        path: location,
+                        _parents: parents,
+                    };
+                    if lease
+                        .verify(previous.bytes as u64, &previous.sha256)
+                        .is_ok()
+                    {
+                        budget::ensure_snapshot(used, bytes.saturating_sub(previous.bytes as u64))?;
+                        return Ok(lease);
+                    }
+                    drop(lease);
+                    reason = "previous_contents_changed";
+                }
+                Err(_) => {
+                    reason = "previous_unavailable";
+                }
             }
         }
     }

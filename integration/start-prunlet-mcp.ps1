@@ -44,6 +44,16 @@ function Start-PrunletMcpJob {
     }
 }
 
+# CLIは失敗時に標準出力へ{"error":...}を書く。その本文を返す（JSONでなければ空）。
+# 延期のメッセージへ本文を含め、恒久的な拒否と一時的な延期を利用者が区別できるようにする。
+function Get-CliFailureDetail($Output) {
+    try {
+        $parsed = ($Output | Out-String | ConvertFrom-Json -AsHashtable)
+        if ($parsed -is [hashtable] -and $parsed.ContainsKey('error') -and $parsed.error) { return ' ' + [string]$parsed.error }
+    } catch { }
+    return ''
+}
+
 function Read-StartupState([string]$Path) {
     if (!(Test-Path -LiteralPath $Path)) { return @{ product = 'Prunlet'; schema = 1; phase = 'idle' } }
     $item = Get-Item -LiteralPath $Path -Force
@@ -51,24 +61,6 @@ function Read-StartupState([string]$Path) {
     $state = [IO.File]::ReadAllText($Path) | ConvertFrom-Json -AsHashtable
     if ($state.product -cne 'Prunlet' -or $state.schema -ne 1 -or !$state.ContainsKey('epoch') -or $state.epoch -ne 1 -or $state.phase -notin @('idle', 'switching', 'migrating', 'cleanup')) { throw 'Startup update state is invalid or incomplete.' }
     return $state
-}
-
-function Invoke-StageCleanup([string]$Executable, [string]$Config) {
-    $output = & $Executable --config $Config __cleanup-startup-stage
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) { throw 'Startup update stage cleanup was not confirmed; it was preserved.' }
-    $result = $output | ConvertFrom-Json -AsHashtable
-    if ($result.status -ceq 'retained') { throw 'Prunlet retained its update stage because its complete contents could not be proven owned.' }
-    if ($result.status -notin @('recycled', 'permanently_deleted', 'already_cleaned')) { throw 'Startup update stage cleanup returned an unknown result.' }
-}
-
-function Test-StageCleanupReady([hashtable]$State) {
-    if (!$State.ContainsKey('stageCleanup') -or $State.stageCleanup -cne 'pending') { return $false }
-    if (!$State.ContainsKey('candidateCliSha256') -or !$State.candidateCliSha256) { return $true }
-    foreach ($name in @('cleanupCli', 'cleanupMaintenance', 'cleanupHook')) {
-        if (!$State.ContainsKey($name) -or $State[$name] -cne 'done') { return $false }
-    }
-    return $true
 }
 
 function Test-CodexRegistrationPresent([string]$Codex) {
@@ -526,13 +518,17 @@ try {
                 } else {
                     if (!$script:StartupUpdateReady) { throw 'Prunlet startup updates are disabled until safe stage reuse is implemented and verified.' }
                     $begin = & $ExecutablePath --config $ConfigPath __begin-published-update $release.commit $sourceInfo.commitSha
-                    if ($LASTEXITCODE -ne 0 -or ($begin | ConvertFrom-Json -AsHashtable).status -notin @('ready', 'existing')) { throw 'Published update state could not be prepared.' }
+                    $beginExit = $LASTEXITCODE
+                    if ($beginExit -ne 0) { throw ('Published update state could not be prepared.' + (Get-CliFailureDetail $begin)) }
+                    if (($begin | ConvertFrom-Json -AsHashtable).status -notin @('ready', 'existing')) { throw 'Published update state could not be prepared.' }
                     $beginResult = $begin | ConvertFrom-Json -AsHashtable
                     if ($beginResult.ContainsKey('warnings')) { foreach ($warning in $beginResult.warnings) { [Console]::Error.WriteLine('Prunlet update: ' + $warning) } }
                     $received = & $ExecutablePath --config $ConfigPath __download-published-package $sourceInfo.repository $release.commit $release.assetId $release.assetSha256 $release.assetBytes $release.tag
-                    if ($LASTEXITCODE -ne 0 -or ($received | ConvertFrom-Json -AsHashtable).status -cne 'downloaded') { throw 'Published package download was not confirmed.' }
+                    $receivedExit = $LASTEXITCODE
+                    if ($receivedExit -ne 0) { throw ('Published package download was not confirmed.' + (Get-CliFailureDetail $received)) }
+                    if (($received | ConvertFrom-Json -AsHashtable).status -cne 'downloaded') { throw 'Published package download was not confirmed.' }
                     $prepared = & $ExecutablePath --config $ConfigPath __prepare-published-package $sourceInfo.repository $release.branch $release.commit $sourceInfo.runtime $release.assetSha256 $release.assetBytes $release.assetId
-                    if ($LASTEXITCODE -ne 0) { throw 'Published package preparation did not complete.' }
+                    if ($LASTEXITCODE -ne 0) { throw ('Published package preparation did not complete.' + (Get-CliFailureDetail $prepared)) }
                     $result = $prepared | ConvertFrom-Json -AsHashtable
                     if ($result.ContainsKey('warnings')) { foreach ($warning in $result.warnings) { [Console]::Error.WriteLine('Prunlet update: ' + $warning) } }
                     if ($result.status -ceq 'prepared') {

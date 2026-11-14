@@ -35,6 +35,17 @@ pub struct VerifiedPackage<R: Read + Seek> {
     pub products: Vec<Product>,
 }
 
+/// 既定ブランチ名の検証規則。空でなく、`..`を含まず、`/`で始まらず終わらず、
+/// 使える文字は英数字と`._/-`だけ。配布物metadataと未適用stageのprovenanceで共通に使う。
+pub(super) fn valid_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.contains("..")
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && branch
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'/' | b'-'))
+}
 pub fn is_hex(value: &str, count: usize) -> bool {
     value.len() == count && value.bytes().all(|c| c.is_ascii_hexdigit())
 }
@@ -166,13 +177,7 @@ impl<R: Read + Seek> VerifiedPackage<R> {
                 && metadata["repository"]
                     .as_str()
                     .is_some_and(|v| v.eq_ignore_ascii_case(repository))
-                && !recorded_branch.is_empty()
-                && !recorded_branch.contains("..")
-                && !recorded_branch.starts_with('/')
-                && !recorded_branch.ends_with('/')
-                && recorded_branch
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"._/-".contains(&c))
+                && valid_branch(recorded_branch)
                 && metadata["commitSha"]
                     .as_str()
                     .is_some_and(|v| v.eq_ignore_ascii_case(commit))

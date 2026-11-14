@@ -532,9 +532,11 @@ enum Event {
     Error(u32),
     Closed,
 }
+/// WinHTTPの非同期読取りバッファ長。callbackの長さ検査とReadDataへ渡す長さを同じ値に保つ。
+const NATIVE_READ_BUFFER: usize = 131072;
 struct ContextState {
     sender: mpsc::Sender<Event>,
-    buffer: UnsafeCell<Box<[u8; 131072]>>,
+    buffer: UnsafeCell<Box<[u8; NATIVE_READ_BUFFER]>>,
     _proxy_name: Option<Vec<u16>>,
 }
 #[cfg(test)]
@@ -568,7 +570,7 @@ unsafe extern "system" fn callback(
         WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE => Some(Event::Sent),
         WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE => Some(Event::Headers),
         WINHTTP_CALLBACK_STATUS_READ_COMPLETE => {
-            if length > 131072 || (length != 0 && information.is_null()) {
+            if length as usize > NATIVE_READ_BUFFER || (length != 0 && information.is_null()) {
                 Some(Event::Error(13))
             } else {
                 let bytes = if length == 0 {
@@ -648,24 +650,23 @@ impl NativeReader {
                 .as_ref()
                 .is_some_and(|(credentials, _)| matches!(credentials, ProxyCredentials::Default));
             let url = Url::parse(url)?;
-            ensure!(
-                url.scheme() == "https" && url.username().is_empty() && url.password().is_none(),
-                "Published package URL must use HTTPS without credentials"
-            );
+            validate_target(&url)?;
             let agent = wide(std::ffi::OsStr::new("Prunlet-Published-Updater"))?;
             let proxy_host = match route {
                 Route::Named(proxy, scoped) => Some(native_proxy_host(proxy, scoped)?),
                 _ => None,
             };
-            let proxy_name = proxy_host
+            // IPv6リテラルの角括弧付けは1回だけ計算し、名前とセッションのproxy指定で共有する。
+            let proxy_host_bracketed = proxy_host.as_ref().map(|host| {
+                if host.contains(':') {
+                    format!("[{host}]")
+                } else {
+                    host.clone()
+                }
+            });
+            let proxy_name = proxy_host_bracketed
                 .as_ref()
-                .map(|host| {
-                    wide(std::ffi::OsStr::new(&if host.contains(':') {
-                        format!("[{host}]")
-                    } else {
-                        host.clone()
-                    }))
-                })
+                .map(|host| wide(std::ffi::OsStr::new(host)))
                 .transpose()?;
             let access = match route {
                 Route::System => WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
@@ -675,13 +676,8 @@ impl NativeReader {
             let session_proxy = match route {
                 Route::Named(proxy, _) => Some(wide(std::ffi::OsStr::new(&format!(
                     "{}:{}",
-                    proxy_host
-                        .as_ref()
-                        .map(|host| if host.contains(':') {
-                            format!("[{host}]")
-                        } else {
-                            host.clone()
-                        })
+                    proxy_host_bracketed
+                        .as_deref()
                         .context("Missing proxy host")?,
                     proxy
                         .port_or_known_default()
@@ -803,7 +799,7 @@ impl NativeReader {
             let (sender, receiver) = mpsc::channel();
             let state = Arc::new(ContextState {
                 sender,
-                buffer: UnsafeCell::new(Box::new([0; 131072])),
+                buffer: UnsafeCell::new(Box::new([0; NATIVE_READ_BUFFER])),
                 _proxy_name: proxy_name,
             });
             #[cfg(test)]
@@ -961,7 +957,7 @@ impl Read for NativeReader {
             }
             let native = unsafe { (*self.state.buffer.get()).as_mut_ptr() };
             start(unsafe {
-                WinHttpReadData(self.request.0, native.cast(), 131072, ptr::null_mut())
+                WinHttpReadData(self.request.0, native.cast(), NATIVE_READ_BUFFER as u32, ptr::null_mut())
             })?;
             match self.wait()? {
                 Event::Data(bytes) => {
