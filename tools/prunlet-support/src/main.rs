@@ -7,8 +7,7 @@ fn main() {
     let rest: Vec<String> = args.collect();
     let result = match command.as_str() {
         "scan-failures" => scan::run(&rest),
-        "verify-hook" => hook::run(&rest),
-        _ => Err(anyhow::anyhow!("Expected scan-failures or verify-hook.")),
+        _ => Err(anyhow::anyhow!("Expected scan-failures.")),
     };
     if let Err(error) = result {
         eprintln!("{error:#}");

@@ -2,6 +2,27 @@ use std::io::{self, Read};
 
 pub const REQUEST_LIMIT: usize = 1_048_576;
 
+/// 不正なUTF-8を示す`InvalidData`の中身。OS側の読取り失敗と区別するための型で、
+/// MCPは行境界まで消費済みのこの種別だけをJSON-RPCエラーにして継続する。
+#[derive(Debug)]
+struct InvalidUtf8(String);
+impl std::fmt::Display for InvalidUtf8 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for InvalidUtf8 {}
+fn invalid_utf8(detail: impl ToString) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, InvalidUtf8(detail.to_string()))
+}
+/// 入力の不正UTF-8（不完全な末尾を含む）による`InvalidData`かを返す。
+/// 他のI/Oエラー（`InvalidData`を返すOS・コンソール由来を含む）では`false`。
+pub fn is_invalid_utf8(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<InvalidUtf8>())
+}
+
 // 不完全な文字は最大4バイトだけ保持し、不正な先頭・継続バイトを即座に拒否する。
 #[derive(Default)]
 struct Utf8Decoder {
@@ -19,7 +40,7 @@ impl Utf8Decoder {
                 Ok(Some(ch))
             }
             Err(e) if e.error_len().is_none() => Ok(None),
-            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+            Err(e) => Err(invalid_utf8(e)),
         }
     }
 
@@ -27,10 +48,7 @@ impl Utf8Decoder {
         if self.len == 0 {
             Ok(())
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Incomplete UTF-8",
-            ))
+            Err(invalid_utf8("Incomplete UTF-8"))
         }
     }
 }
@@ -193,6 +211,21 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         assert_eq!(invalid.read_line().unwrap().unwrap().text, "x");
+    }
+
+    #[test]
+    fn invalid_utf8_line_is_marked_and_the_next_line_survives() {
+        // MCPはこの種別だけをparse errorにして継続する。OS由来のInvalidDataとは区別する。
+        let mut reader = BoundedInput::new(Cursor::new(b"\xff\n{\"a\":1}\n\xe3\x81".to_vec()));
+        assert!(is_invalid_utf8(&reader.read_line().err().unwrap()));
+        assert_eq!(reader.read_line().unwrap().unwrap().text, "{\"a\":1}");
+        // 区切りの無い不完全な末尾もUTF-8エラーで、その後はEOFになる。
+        assert!(is_invalid_utf8(&reader.read_line().err().unwrap()));
+        assert!(reader.read_line().unwrap().is_none());
+        assert!(!is_invalid_utf8(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "console"
+        )));
     }
 
     #[test]

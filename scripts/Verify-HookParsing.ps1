@@ -1,3 +1,5 @@
+#requires -Version 7.0
+# ProcessStartInfo.ArgumentList等のPowerShell 7系の挙動に依存するため、7.0未満では開始しない。
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
     [Parameter(Mandatory)][string]$OutputDirectory,
@@ -14,6 +16,10 @@ $ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath)
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $ReportPath = [IO.Path]::GetFullPath($ReportPath)
 $ConfigPath = [IO.Path]::GetFullPath($ConfigPath)
+# 他のsuiteと同じ外部出力先ガード（リポジトリ・Codex home配下・リンク経由・UNC/デバイスパスを拒否）。
+$repo = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
+. (Join-Path $PSScriptRoot 'Verification-Common.ps1')
+foreach ($path in @($OutputDirectory, $ReportPath)) { Assert-ExternalVerificationPath $path @($repo) }
 if (![IO.File]::Exists($ExecutablePath)) { throw "Executable not found: $ExecutablePath" }
 if ([IO.Directory]::Exists($OutputDirectory) -or [IO.File]::Exists($OutputDirectory)) { throw "Output already exists: $OutputDirectory" }
 if ([IO.File]::Exists($ReportPath) -or [IO.Directory]::Exists($ReportPath)) { throw "Report already exists: $ReportPath" }
@@ -484,6 +490,41 @@ $cases += @(
     @{ name='quoted-search-ambiguous-shell'; command="rg -n 'item|rmdir|tail' sample.txt"; pass=$false },
     @{ name='quoted-search-powershell'; command="rg -n 'item|rmdir|tail' sample.txt"; shell='pwsh'; pass=$true; bashPass=$false }
 )
+# POSIX hookケース集（このスクリプトだけが読む）。期待値は`windowsPass ?? pass`で、Windowsでも`pass`を使う
+# （`windowsPass`を持つケースは現在1件だけで、残りは`pass`がそのままWindowsの期待値になる）。非Windowsの`pass`は`hook.rs`の単体テスト
+# （`hook_posix_json_cases_hold_under_the_posix_rules_alone`）と`Verify-LinuxFiles.ts`がこのJSONを読んで検証し、このスクリプトはWindows上の実プロセスだけを担う。
+# 拒否期待のケースはJSONの`reason`（POSIX規則が出す検知理由と検知token）を拒否理由に含むことまで確認する。Windowsのhookは`shell`名`sh`を不明扱いにして
+# 候補解釈（CMD→PowerShell→POSIX）で検査するため、先頭規則が先に拒否するケースは`windowsOtherRule`で、`reason`の照合を省き（POSIX規則単独の確認は単体テストが担う）、
+# 汎用の拒否理由だけを検査する。
+# 以前は専用の弱い実行器だけが読んでいたため、ここで同じ実プロセスhookへ全件流す。shellは/bin/shを明示し、期待値はwindowsPassがあればそれを優先する
+# （Windows上のhookはshell不明時の解釈差でこの一部だけ結果が変わる）。Bashツールも同じ期待値で検査する。
+$posixCasesPath = Join-Path $repo 'src\rust\protocol\tests\hook-posix.json'
+if (![IO.File]::Exists($posixCasesPath)) { throw "POSIX hook cases not found: $posixCasesPath" }
+$posixCasesSha256 = (Get-FileHash -LiteralPath $posixCasesPath -Algorithm SHA256).Hash
+$posixCases = @([IO.File]::ReadAllText($posixCasesPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json)
+if ($posixCases.Count -eq 0) { throw 'POSIX hook cases are empty.' }
+$existingNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($case in $cases) { [void]$existingNames.Add([string]$case.name) }
+$posixNames = [Collections.Generic.List[string]]::new()
+foreach ($item in $posixCases) {
+    if ([string]::IsNullOrEmpty($item.name) -or $null -eq $item.command -or $null -eq $item.pass) { throw "Invalid POSIX hook case: $($item | ConvertTo-Json -Compress)" }
+    $caseName = 'hook-posix/' + $item.name
+    if (!$existingNames.Add($caseName)) { throw "Duplicate hook case name: $caseName" }
+    $expectedPosix = [bool]$item.pass
+    if ($null -ne $item.windowsPass) { $expectedPosix = [bool]$item.windowsPass }
+    $posixCase = @{ name=$caseName; command=[string]$item.command; shell='/bin/sh'; pass=$expectedPosix; bashPass=$expectedPosix }
+    # `windowsPass`だけで拒否になるケース（POSIXでは通過）は、POSIX規則の拒否理由を持たない。
+    if (!$expectedPosix -and !$item.pass) {
+        # 拒否期待は`reason`を必須にする（検知理由を問わず合格になる状態を許さない）。
+        if (!$item.windowsOtherRule) {
+            if ([string]::IsNullOrEmpty($item.reason)) { throw "Denied POSIX hook case needs a reason: $($item.name)" }
+            $posixCase.reason = [string]$item.reason
+        }
+    }
+    $cases += $posixCase
+    $posixNames.Add($caseName)
+}
+
 foreach ($case in $cases) {
     foreach ($tool in @('Bash', 'exec_command', 'functions.exec_command')) {
         $inputObject = @{ cwd = $OutputDirectory }
@@ -508,15 +549,17 @@ foreach ($case in $cases) {
         $stderrTask = $process.StandardError.ReadToEndAsync()
         $process.StandardInput.Write($json)
         $process.StandardInput.Close()
-        if (!$process.WaitForExit(30000)) { $process.Kill(); $process.WaitForExit(); throw "Hook timed out: $($case.name) / $tool" }
+        # 時間切れはreportを残さず中断せず、そのケースの失敗として記録して全ケース完了後に非0で終了する。
+        $timedOut = $false
+        if (!$process.WaitForExit(30000)) { $process.Kill($true); $process.WaitForExit(); $timedOut = $true }
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
-        $decision = 'invalid'
-        try {
+        $decision = if ($timedOut) { 'timeout' } else { 'invalid' }
+        if (!$timedOut) { try {
             $parsed = $stdout | ConvertFrom-Json
             if ($stdout.Trim() -ceq '{}') { $decision = 'pass' }
             elseif ($parsed.hookSpecificOutput.permissionDecision -ceq 'deny' -and !$parsed.hookSpecificOutput.updatedInput -and $parsed.hookSpecificOutput.permissionDecisionReason -match '(?i)prunlet') { $decision = 'deny' }
-        } catch { }
+        } catch { } }
         $fixtureUnchanged = [IO.File]::Exists($fixture) -and (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash -ceq $fixtureHash
         $expectedPass = if ($tool -eq 'Bash' -and $case.ContainsKey('bashPass')) { $case.bashPass } else { $case.pass }
         $expected = if ($expectedPass) { 'pass' } else { 'deny' }
@@ -534,12 +577,12 @@ foreach ($case in $cases) {
             # 単独形式でない呼出しは、shell不明時に従来どおり候補注記を付ける。
             if ($case.name -eq 'encoded-flag-delete--e' -and !$case.ContainsKey('shell')) { $reasonValid = $reasonValid -and $reason.Contains('candidate interpretation') }
         }
-        $results.Add([pscustomobject]@{ name=$case.name; tool=$tool; input=$event; inputJson=$json; expected=$expected; decision=$decision; exitCode=$process.ExitCode; stdout=$stdout; stderr=$stderr; fixtureUnchanged=$fixtureUnchanged; reasonValid=$reasonValid; passed=($process.ExitCode -eq 0 -and $decision -ceq $expected -and $fixtureUnchanged -and $reasonValid) })
+        $results.Add([pscustomobject]@{ name=$case.name; tool=$tool; input=$event; inputJson=$json; expected=$expected; decision=$decision; exitCode=$process.ExitCode; timedOut=$timedOut; stdout=$stdout; stderr=$stderr; fixtureUnchanged=$fixtureUnchanged; reasonValid=$reasonValid; passed=(!$timedOut -and $process.ExitCode -eq 0 -and $decision -ceq $expected -and $fixtureUnchanged -and $reasonValid) })
         $process.Dispose()
     }
 }
 $failed = @($results | Where-Object { !$_.passed })
-$report = [ordered]@{ executable=$ExecutablePath; executableSha256=(Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash; configPath=$ConfigPath; runner=$PSCommandPath; runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash; fixture=$fixture; fixtureSha256=$fixtureHash; passed=$results.Count-$failed.Count; failed=$failed.Count; results=@($results) }
+$report = [ordered]@{ executable=$ExecutablePath; executableSha256=(Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash; configPath=$ConfigPath; runner=$PSCommandPath; runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash; fixture=$fixture; fixtureSha256=$fixtureHash; posixCasesPath=$posixCasesPath; posixCasesSha256=$posixCasesSha256; posixCaseCount=$posixNames.Count; posixCaseNames=@($posixNames); passed=$results.Count-$failed.Count; failed=$failed.Count; results=@($results) }
 [IO.File]::WriteAllText($ReportPath, ($report | ConvertTo-Json -Depth 16), [Text.UTF8Encoding]::new($false))
 Write-Output "passed=$($report.passed) failed=$($report.failed) report=$ReportPath"
 foreach ($result in $failed) { Write-Output "FAIL $($result.name) $($result.tool): expected=$($result.expected) actual=$($result.decision) exit=$($result.exitCode) fixtureUnchanged=$($result.fixtureUnchanged)" }

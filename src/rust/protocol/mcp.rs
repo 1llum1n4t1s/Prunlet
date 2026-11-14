@@ -1,9 +1,10 @@
-use super::bounded_input::BoundedInput;
+use super::bounded_input::{BoundedInput, is_invalid_utf8};
 use crate::service::{Backend, Progress};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::{
     io::{self, Write},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
 };
@@ -173,6 +174,56 @@ fn has_errors(v: &Value) -> bool {
 }
 
 #[cfg(test)]
+mod worker_tests {
+    use super::*;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    #[test]
+    fn finish_joins_every_worker_before_keeping_the_first_error() {
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut pending: Vec<JoinHandle<Result<()>>> = Vec::new();
+        pending.push(thread::spawn(|| Err(anyhow::anyhow!("write failed"))));
+        for _ in 0..3 {
+            let done = done.clone();
+            pending.push(thread::spawn(move || {
+                // 先頭のworkerが失敗した後でも完了まで待たれることを確かめるため、遅れて終わらせる。
+                thread::sleep(Duration::from_millis(150));
+                done.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }));
+        }
+        let mut deferred = None;
+        finish(&mut pending, &mut deferred);
+        assert!(pending.is_empty());
+        assert_eq!(done.load(Ordering::SeqCst), 3);
+        assert_eq!(deferred.expect("first error").to_string(), "write failed");
+    }
+
+    #[test]
+    fn worker_panic_is_an_error_and_does_not_hide_later_workers() {
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut pending: Vec<JoinHandle<Result<()>>> = Vec::new();
+        pending.push(thread::spawn(|| panic!("worker panic for test")));
+        let flag = done.clone();
+        pending.push(thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            flag.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        let mut deferred = None;
+        finish(&mut pending, &mut deferred);
+        assert_eq!(done.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            deferred.expect("panic error").to_string(),
+            "MCP request worker panicked"
+        );
+    }
+}
+
+#[cfg(test)]
 mod result_tests {
     use super::*;
 
@@ -231,12 +282,21 @@ fn call(backend: &dyn Backend, params: &Value, out: &Output) -> RpcResult {
         Err(e) => json!({"content":[{"type":"text","text":e.to_string()}],"isError":true}),
     })
 }
-fn finish(pending: &mut Vec<JoinHandle<Result<()>>>) -> Result<()> {
-    for h in pending.drain(..) {
-        h.join()
-            .map_err(|_| anyhow::anyhow!("MCP request worker panicked"))??;
+/// workerの終了を待ち、結果を返す。panicはエラーとして扱う。
+fn join_worker(handle: JoinHandle<Result<()>>) -> Result<()> {
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("MCP request worker panicked"))?
+}
+/// 受付済みの全workerを最後まで待つ。最初のエラーは`deferred`へ保持し、途中で打ち切らない。
+/// 1件の応答書込み失敗（クライアント切断）で残りのJoinHandleをdetachすると、`main`のprocess終了で
+/// 実行中の削除が途中で打ち切られるため、エラーを見ても必ず全員をjoinする。
+fn finish(pending: &mut Vec<JoinHandle<Result<()>>>, deferred: &mut Option<anyhow::Error>) {
+    for handle in pending.drain(..) {
+        if let Err(error) = join_worker(handle) {
+            deferred.get_or_insert(error);
+        }
     }
-    Ok(())
 }
 pub fn run(backend: Arc<dyn Backend>) -> Result<()> {
     let output = Arc::new(Mutex::new(io::stdout()));
@@ -244,8 +304,24 @@ pub fn run(backend: Arc<dyn Backend>) -> Result<()> {
     let mut initialized = false;
     let mut ready = false;
     let mut pending: Vec<JoinHandle<Result<()>>> = Vec::new();
+    // worker側で起きた最初のエラー。無関係な要求の応答には使わず、終了時にまとめて返す。
+    let mut deferred: Option<anyhow::Error> = None;
     let result = (|| -> Result<()> {
-        while let Some(line) = reader.read_stdin_line()? {
+        loop {
+            let line = match reader.read_stdin_line() {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                // 不正なUTF-8の行は区切りまで消費済み。JSON-RPCのparse error（idはnull）で拒否し、
+                // 次の行から処理を続ける。OS・コンソール由来を含む他のI/Oエラーは従来どおり終了する。
+                Err(e) if is_invalid_utf8(&e) => {
+                    write(
+                        &output,
+                        &error(Value::Null, -32700, "Request is not valid UTF-8."),
+                    )?;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             if line.whitespace {
                 continue;
             }
@@ -282,28 +358,40 @@ pub fn run(backend: Arc<dyn Backend>) -> Result<()> {
                     return Err(invalid("Duplicate accessMode is refused."));
                 }
                 let params = request.get("params").cloned().unwrap_or(Value::Null);
+                if method == "tools/call" && deferred.is_some() {
+                    // 応答の書込みが既に失敗している（クライアント切断）場合、結果を返せない新しい操作は
+                    // 実行しない。受付済みの要求は`finish`で最後まで完了させる契約を維持する。
+                    return Err((
+                        -32603,
+                        "MCP output is no longer writable; the request was not executed.".into(),
+                    ));
+                }
                 if method == "tools/call" && ready && params["name"] == "delete_files" {
                     // MCP要求枠は4つ。Core側のprocess共通worker上限とは独立。
                     if pending.len() >= 4 {
-                        let h = pending.remove(0);
-                        h.join()
-                            .map_err(|_| (-32603, "MCP request worker panicked".into()))?
-                            .map_err(|e| (-32603, e.to_string()))?;
+                        // 最古workerの失敗は今回の要求と無関係なので、保持して終了時に返す。
+                        let handle = pending.remove(0);
+                        if let Err(error) = join_worker(handle) {
+                            deferred.get_or_insert(error);
+                        }
                     }
                     let b = backend.clone();
                     let o = output.clone();
                     let i = id.clone();
                     pending.push(thread::spawn(move || {
-                        let v = match call(&*b, &params, &o) {
-                            Ok(r) => json!({"jsonrpc":"2.0","id":i,"result":r}),
-                            Err((c, m)) => error(i, c, m),
+                        // backendのpanicでも当該idへエラー応答を返し、クライアントを待たせ続けない。
+                        let v = match catch_unwind(AssertUnwindSafe(|| call(&*b, &params, &o))) {
+                            Ok(Ok(r)) => json!({"jsonrpc":"2.0","id":i,"result":r}),
+                            Ok(Err((c, m))) => error(i, c, m),
+                            Err(_) => error(i, -32603, "MCP request worker panicked"),
                         };
                         write(&o, &v)
                     }));
                     return Ok(Value::Null);
                 }
                 if method == "tools/call" {
-                    finish(&mut pending).map_err(|e| (-32603, e.to_string()))?;
+                    // 以前のworkerの失敗はこの要求の失敗ではないため、保持だけして続行する。
+                    finish(&mut pending, &mut deferred);
                 }
                 let result = match method {
                     "ping" => json!({}),
@@ -336,11 +424,11 @@ pub fn run(backend: Arc<dyn Backend>) -> Result<()> {
         Ok(())
     })();
     // stdin EOFでも受付済みの要求は完了させる。
-    let workers = finish(&mut pending);
-    result.and(workers)
+    finish(&mut pending, &mut deferred);
+    result.and(deferred.map_or(Ok(()), Err))
 }
 #[cfg(windows)]
-const INSTRUCTIONS: &str = r#"Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true for directory contents. Files and directories normally go to the Windows Recycle Bin without Prunlet operation records. An ordinary file with a Windows reserved final name is permanently deleted after identity checks without using the bin; dry-run reports would_permanently_delete. Reserved-name directories and links are rejected. If Windows reports that an item is too large for the bin and its original identity is confirmed, Prunlet attempts to permanently delete its original name. Only confirmed removal returns permanently_deleted; an uncertain attempt returns ambiguous. A permanently deleted name cannot be restored from the bin. Other recycling failures do not trigger permanent deletion. Dry-run cannot predict an ordinary item's bin-size outcome. File results have no operationId. For ambiguous results, do not resend deletion; inspect the source and Windows Recycle Bin. Windows controls bin retention and users may empty it. Metadata and legacy volume recovery directories and their ancestors remain protected. Links are handled without following their targets. Hard links share content with surviving aliases. Prunlet retention and capacity settings default to 7 days and 1 GiB for registry snapshots only, never for the Windows bin. list_operations lists registry recovery only. Use delete_registry for explicitly authorized local keys/values with required view 32 or 64, and restore_registry for their operationId. Empty valueName selects the default value; omitted valueName selects the key. Full key ACL snapshots require SeSecurityPrivilege; no automatic elevation or nontransactional fallback. Existing host approvals and policies still apply."#;
+const INSTRUCTIONS: &str = r#"Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true for directory contents. Files and directories normally go to the Windows Recycle Bin without Prunlet operation records. An ordinary file with a Windows reserved final name is permanently deleted after identity checks without using the bin; dry-run reports would_permanently_delete. Reserved-name directories and links are rejected. If Windows reports that an item is too large for the bin and its original identity is confirmed, Prunlet attempts to permanently delete its original name. Only confirmed removal returns permanently_deleted; an uncertain attempt returns ambiguous. A permanently deleted name cannot be restored from the bin. On a volume whose confirmed immediate-delete setting means the bin is unavailable, an item may also be permanently deleted after the same identity checks; its status is permanently_deleted, never recycled. Other recycling failures do not trigger permanent deletion. Dry-run cannot predict an ordinary item's bin-size outcome. File results have no operationId. For ambiguous results, do not resend deletion; inspect the source and Windows Recycle Bin. Windows controls bin retention and users may empty it. Metadata and legacy volume recovery directories and their ancestors remain protected. Links are handled without following their targets. Hard links share content with surviving aliases. Prunlet retention and capacity settings default to 7 days and 1 GiB for registry snapshots only, never for the Windows bin. list_operations lists registry recovery only. Use delete_registry for explicitly authorized local keys/values with required view 32 or 64, and restore_registry for their operationId. Empty valueName selects the default value; omitted valueName selects the key. Full key ACL snapshots require SeSecurityPrivilege; no automatic elevation or nontransactional fallback. Existing host approvals and policies still apply."#;
 #[cfg(target_os = "macos")]
 const INSTRUCTIONS: &str = "Use delete_files for authorized absolute macOS paths. Set recursive=true for directory contents. Files move to the macOS Trash without operation records. Links are handled without following their targets. Inspect the source and Trash after ambiguous results. The queue waits for cooperative flock locks.";
 #[cfg(target_os = "linux")]

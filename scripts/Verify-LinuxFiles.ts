@@ -132,4 +132,44 @@ assert.match(hook.hookSpecificOutput.permissionDecisionReason, /local Linux targ
 assert.deepEqual(await readFile(config), beforeConfig);
 assert.deepEqual(await readdir(metadata), []);
 cases.push("hook-refusal-and-configuration-preservation");
+
+// hook-posix.jsonの全ケースを実プロセスのhookへ流し、非Windowsの期待値（pass）を検証する。
+// Windows上のhookはshell不明時の解釈差で`windowsPass`を持つケースの結果が変わるため、このJSONの`pass`を
+// 非Windowsで確認する経路はここだけである。ケースの実行は文字列をhookへ渡すだけで、実行はしない。
+// exec_command（shell=sh）とBashの両方を検査し、拒否の応答は`reason`の検知理由を含むこと、
+// 通過の応答は空のJSONであること、ファイルfixtureが変更されないことまで確認する。
+const posixCases: { name: string; command: string; pass: boolean; reason?: string }[] = JSON.parse(
+  await readFile(join(import.meta.dir, "..", "src", "rust", "protocol", "tests", "hook-posix.json"), "utf8"));
+assert(posixCases.length > 0);
+const hookFixture = join(root, "hook-posix-fixture.txt");
+await writeFile(hookFixture, "hook fixture");
+const hookFixtureBefore = await lstat(hookFixture);
+const seenNames = new Set<string>();
+for (const item of posixCases) {
+  assert(item.name && typeof item.command === "string" && typeof item.pass === "boolean", JSON.stringify(item));
+  assert(!seenNames.has(item.name), `duplicate hook case: ${item.name}`);
+  seenNames.add(item.name);
+  const command = item.command.replaceAll("<FILE>", hookFixture);
+  for (const [tool, input] of [
+    ["exec_command", { cmd: command, shell: "sh" }],
+    ["Bash", { command }],
+  ] as const) {
+    const output = JSON.parse(invoke(["--config", config, "hook"], 0,
+      JSON.stringify({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input })));
+    const label = `${item.name} (${tool})`;
+    if (item.pass) {
+      assert.deepEqual(output, {}, `${label}: expected the hook to allow it`);
+    } else {
+      assert.equal(output.hookSpecificOutput?.permissionDecision, "deny", `${label}: expected the hook to deny it`);
+      // 拒否の検知理由（POSIX規則の文言と検知token）まで照合する。理由を問わない拒否は合格にしない。
+      assert(item.reason, `${label}: a denied case needs a reason`);
+      assert(String(output.hookSpecificOutput?.permissionDecisionReason ?? "").includes(item.reason),
+        `${label}: unexpected denial reason: ${output.hookSpecificOutput?.permissionDecisionReason}`);
+    }
+  }
+}
+const hookFixtureAfter = await lstat(hookFixture);
+assert.equal(hookFixtureAfter.ino, hookFixtureBefore.ino);
+assert.equal(await readFile(hookFixture, "utf8"), "hook fixture");
+cases.push(`hook-posix-cases-${posixCases.length}`);
 console.log(JSON.stringify({ passed: cases.length, runtime: info.runtime, cases }));

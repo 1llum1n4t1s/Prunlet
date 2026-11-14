@@ -774,6 +774,7 @@ An ordinary file with a Windows reserved final name is permanently deleted after
 Dry-run reports that case as would_permanently_delete. Reserved-name directories and links are rejected.
 When Windows reports a file or folder too large for the bin, Prunlet attempts to permanently delete its confirmed original.
 Only a confirmed removal returns permanently_deleted; an uncertain attempt returns ambiguous.
+On a volume whose confirmed immediate-delete setting means the bin is unavailable, an item may also be permanently deleted after the same identity checks; its status is permanently_deleted, never recycled.
 Other recycling failures do not trigger permanent deletion. Dry-run cannot predict an ordinary item's bin-size outcome.
 Restore recycled items using Windows Recycle Bin; permanently deleted items cannot be restored there.
 Registry snapshots retain the configured 7-day / 1 GiB defaults.

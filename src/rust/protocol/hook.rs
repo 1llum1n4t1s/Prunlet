@@ -3,7 +3,7 @@ use anyhow::{Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use regex::Regex;
 use serde_json::{Value, json};
-use std::{io, path::Path, sync::LazyLock};
+use std::{borrow::Cow, io, path::Path, sync::LazyLock};
 
 static REDIRECTION: LazyLock<std::result::Result<Regex, regex::Error>> =
     LazyLock::new(|| Regex::new(r"\A[0-9]*[<>]"));
@@ -828,7 +828,7 @@ impl Inspector {
             if let Some(result) = self.posix_prefix(w, depth, strict)? {
                 return Ok(result);
             }
-            if let Some(result) = self.posix_shell(w, depth, strict)? {
+            if let Some(result) = self.posix_shell(w, depth, strict, Some(Mode::Posix))? {
                 return Ok(result);
             }
         }
@@ -997,35 +997,27 @@ impl Inspector {
             // `if exist C:\x,del/q,C:\x`）もcmd.exeは`,`で区切って後続を実行する。
             // `if_command`は語単位で条件を数えるため、先に引用外の`,`で語を割り直してから判定する。
             // 割り直しは`,`を含む語がある場合だけ行い、それ以外は従来の語列をそのまま使う。
-            if self.mode == Some(Mode::Cmd) && w[i + 1..].iter().any(|t| !t.commas.is_empty()) {
-                let split = split_cmd_commas(&w[i + 1..]);
-                let mut c = 0;
-                if split
-                    .get(c)
-                    .is_some_and(|t| t.text.eq_ignore_ascii_case("/i"))
-                {
-                    c += 1;
-                }
-                if split
-                    .get(c)
-                    .is_some_and(|t| t.text.eq_ignore_ascii_case("not"))
-                {
-                    c += 1;
-                }
-                return match if_command(&split, c) {
-                    Some(s) => self.command(&split[s..], depth + 1, strict),
-                    None => Ok(false),
-                };
-            }
-            let mut c = i + 1;
-            if w.get(c).is_some_and(|t| t.text.eq_ignore_ascii_case("/i")) {
+            let (words, mut c): (Cow<[Token]>, usize) = if self.mode == Some(Mode::Cmd)
+                && w[i + 1..].iter().any(|t| !t.commas.is_empty())
+            {
+                (Cow::Owned(split_cmd_commas(&w[i + 1..])), 0)
+            } else {
+                (Cow::Borrowed(w), i + 1)
+            };
+            if words
+                .get(c)
+                .is_some_and(|t| t.text.eq_ignore_ascii_case("/i"))
+            {
                 c += 1;
             }
-            if w.get(c).is_some_and(|t| t.text.eq_ignore_ascii_case("not")) {
+            if words
+                .get(c)
+                .is_some_and(|t| t.text.eq_ignore_ascii_case("not"))
+            {
                 c += 1;
             }
-            return match if_command(w, c) {
-                Some(s) => self.command(&w[s..], depth + 1, strict),
+            return match if_command(&words, c) {
+                Some(s) => self.command(&words[s..], depth + 1, strict),
                 None => Ok(false),
             };
         }
@@ -1091,6 +1083,22 @@ impl Inspector {
                     self.contains(&body, depth + 1, Some(Mode::Cmd), strict)
                 }
             };
+        }
+        // 外側の規則（PowerShell・CMD）が何であれ、`sh`・`bash`・`zsh`はPOSIXのoption規則で起動される。
+        // 結合flag（`-ec`・`-xc`）や`-c`後の`--`・option（`-c -- "<本文>"`）を、完全一致だけの下の走査が
+        // 見落とさないよう先に解析する。検知しなければ従来の走査へ進み、検知範囲は狭めない。
+        if matches!(name.as_str(), "sh" | "bash" | "zsh")
+            && self.mode != Some(Mode::Posix)
+            && let Some(true) = self.posix_shell(&w[i..], depth, strict, shell(&name))?
+        {
+            return Ok(true);
+        }
+        // Windows PowerShell 5.1の`powershell`は、名前のない位置引数を`-Command`として実行する
+        // （pwsh 7は`-File`扱い）。値を取る既知optionを読み飛ばした最初の位置引数以降を本文として検査する。
+        if name == "powershell"
+            && let Some(result) = self.powershell_positional(w, i, depth, strict)
+        {
+            return result;
         }
         let ps = shell(&name) == Some(Mode::PowerShell);
         for j in i + 1..w.len() {
@@ -1405,71 +1413,192 @@ impl Inspector {
         }
         self.command(words, depth + 1, strict)
     }
-    fn posix_shell(&mut self, words: &[Token], depth: usize, strict: bool) -> Result<Option<bool>> {
+    /// Windows PowerShell 5.1（`powershell`）の位置引数を本文として検査する。
+    ///
+    /// 起動optionを左から読み、`-Command`・`-File`・`-EncodedCommand`が先に現れる場合は従来の走査へ任せる
+    /// （`None`）。値を取る既知optionは値を読み飛ばし、最初の位置引数以降を`-Command`本文として再帰検査する。
+    /// 未知のoptionは位置引数の手前に本文が隠れている可能性があるため拒否する。
+    /// 位置引数が`.ps1`のパスなら実行名として評価され、削除でなければ通過する。
+    fn powershell_positional(
+        &mut self,
+        w: &[Token],
+        i: usize,
+        depth: usize,
+        strict: bool,
+    ) -> Option<Result<bool>> {
+        // (正式名, 値を取るか)。PowerShellは一意な前方一致の省略形を受け付ける。
+        const OPTIONS: [(&str, bool); 16] = [
+            // `-ep`は`-ExecutionPolicy`の公式の短縮名（前方一致では得られない）。
+            ("ep", true),
+            ("noexit", false),
+            ("nologo", false),
+            ("noninteractive", false),
+            ("noprofile", false),
+            ("sta", false),
+            ("mta", false),
+            ("help", false),
+            ("executionpolicy", true),
+            ("inputformat", true),
+            ("outputformat", true),
+            ("windowstyle", true),
+            ("configurationname", true),
+            ("psconsolefile", true),
+            ("version", true),
+            ("encodedarguments", true),
+        ];
+        let mut j = i + 1;
+        while j < w.len() {
+            let text = w[j].text.as_str();
+            let dashed = text.starts_with(['-', '/', '\u{2013}', '\u{2014}', '\u{2015}']);
+            if !dashed {
+                // 位置引数。以降すべてが本文。
+                let rest = &w[j..];
+                let body = if rest.len() == 1 && rest[0].quoted {
+                    rest[0].text.clone()
+                } else {
+                    rest.iter()
+                        .map(|t| quote_token(t, false))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                return Some(self.contains(&body, depth + 1, Some(Mode::PowerShell), strict));
+            }
+            if encoded(text) || file_option(text) || command_option(text) {
+                return None;
+            }
+            let name = option(text);
+            if matches!(name.as_str(), "?" | "h") {
+                return Some(Ok(false));
+            }
+            let matches: Vec<bool> = if name.is_empty() {
+                Vec::new()
+            } else {
+                OPTIONS
+                    .iter()
+                    .filter(|(full, _)| full.starts_with(&name))
+                    .map(|(_, value)| *value)
+                    .collect()
+            };
+            // 一致しない・値の有無が食い違う省略形は、本文の位置を確定できない。
+            if matches.is_empty() || matches.iter().any(|v| *v != matches[0]) {
+                return Some(Ok(self.detected(
+                    "unsupported PowerShell wrapper option cannot be inspected",
+                    text,
+                )));
+            }
+            j += 1;
+            if matches[0] {
+                j += 1;
+            }
+        }
+        None
+    }
+    /// `sh`・`bash`・`zsh`の起動optionを左から解析し、`-c`の本文を再帰検査する。
+    ///
+    /// POSIX shellは`-c`を見つけた後もoption解析を続け、`--`または最初の非option語を本文とする
+    /// （`bash -c -- "<本文>"`・`sh -c -x "<本文>"`）。値を取る`o`・`O`はclusterに結合しても
+    /// （`-oc posix "<本文>"`）、clusterの後に値が1語ずつ続く。値や本文が欠落・動的なら検査不能として拒否する。
+    /// `body_mode`は本文を検査する規則。POSIX規則では`Some(Posix)`、外側がCMD・PowerShell規則のときは
+    /// 従来の汎用wrapperと同じ`shell(name)`を渡し、検知範囲を狭めない。
+    fn posix_shell(
+        &mut self,
+        words: &[Token],
+        depth: usize,
+        strict: bool,
+        body_mode: Option<Mode>,
+    ) -> Result<Option<bool>> {
         if !matches!(leaf(&words[0].text).as_str(), "sh" | "bash" | "zsh") {
             return Ok(None);
         }
+        // `-c`を含むoption語（本文欠落時の拒否理由に使う）。
+        let mut command: Option<&str> = None;
         let mut index = 1;
         while index < words.len() {
             let word = &words[index];
             if word.dynamic {
-                return Ok(Some(self.detected(
-                    "dynamic POSIX shell arguments cannot be inspected",
-                    &word.text,
-                )));
+                return Ok(Some(match command {
+                    Some(option) => self.detected(
+                        "missing or dynamic POSIX shell command cannot be inspected",
+                        option,
+                    ),
+                    None => self.detected(
+                        "dynamic POSIX shell arguments cannot be inspected",
+                        &word.text,
+                    ),
+                }));
             }
             let option = word.text.as_str();
-            if option == "--" || !option.starts_with(['-', '+']) {
-                return Ok(Some(false));
+            if option == "--" {
+                // option列の終端。`-c`済みなら次の語が本文。
+                index += 1;
+                break;
+            }
+            if !option.starts_with(['-', '+']) {
+                break;
             }
             if matches!(option, "--help" | "--version") {
                 return Ok(Some(false));
             }
-            if matches!(
+            // この語の後ろに続く値の数（`-o`・`-O`・`--rcfile`・`--init-file`）。
+            let mut values = 0;
+            if matches!(option, "--rcfile" | "--init-file") {
+                values = 1;
+            } else if matches!(
                 option,
-                "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file"
+                "--noprofile" | "--norc" | "--posix" | "--restricted" | "--verbose" | "--login"
             ) {
-                index += 1;
+                // 値を取らない既知の長いoption。
+            } else if option.starts_with("--") {
+                return Ok(Some(self.detected(
+                    "unsupported POSIX shell options cannot be inspected",
+                    option,
+                )));
+            } else {
+                let letters = &option[1..];
+                let has_command = option.starts_with('-') && letters.contains('c');
+                if has_command {
+                    command.get_or_insert(option);
+                }
+                for letter in letters.chars() {
+                    if matches!(letter, 'o' | 'O') {
+                        values += 1;
+                    } else if !has_command && !"abefhkmnptuvxBCEHPTilrs".contains(letter) {
+                        // `-c`を含む語の未知文字は従来どおり本文検査を優先し、拒否しない。
+                        return Ok(Some(self.detected(
+                            "unsupported POSIX shell options cannot be inspected",
+                            option,
+                        )));
+                    }
+                }
+            }
+            index += 1;
+            for _ in 0..values {
                 if index == words.len() || words[index].dynamic {
                     return Ok(Some(self.detected(
                         "missing or dynamic POSIX shell option cannot be inspected",
                         option,
                     )));
                 }
-            } else if option.starts_with('-')
-                && !option.starts_with("--")
-                && option[1..].contains('c')
-            {
                 index += 1;
-                if index == words.len() || words[index].dynamic {
-                    return Ok(Some(self.detected(
-                        "missing or dynamic POSIX shell command cannot be inspected",
-                        option,
-                    )));
-                }
-                let previous = self.posix_script;
-                self.posix_script = true;
-                let result =
-                    self.contains(&words[index].text, depth + 1, Some(Mode::Posix), strict);
-                self.posix_script = previous;
-                return result.map(Some);
-            } else if !matches!(
-                option,
-                "--noprofile" | "--norc" | "--posix" | "--restricted" | "--verbose" | "--login"
-            ) && (option.starts_with("--")
-                || !option[1..]
-                    .chars()
-                    .all(|c| "abefhkmnptuvxBCEHPTilrs".contains(c)))
-            {
-                return Ok(Some(self.detected(
-                    "unsupported POSIX shell options cannot be inspected",
-                    option,
-                )));
             }
-            index += 1;
         }
-        // 外部script本文や対話入力は読まない。
-        Ok(Some(false))
+        let Some(option) = command else {
+            // 外部script本文や対話入力は読まない。
+            return Ok(Some(false));
+        };
+        if index == words.len() || words[index].dynamic {
+            return Ok(Some(self.detected(
+                "missing or dynamic POSIX shell command cannot be inspected",
+                option,
+            )));
+        }
+        let previous = self.posix_script;
+        // 外側がCMD・PowerShell規則で本文を全規則に当てる場合は、従来の汎用wrapperと同じく
+        // 制御本文扱い（動的な先頭語の拒否）にしない。拒否が増えるのは新しく解析できた形だけに保つ。
+        self.posix_script = previous || body_mode == Some(Mode::Posix);
+        let result = self.contains(&words[index].text, depth + 1, body_mode, strict);
+        self.posix_script = previous;
+        result.map(Some)
     }
     /// 式の位置にある語をコマンドとして検査する。引用で始まる式は文字列dataとして扱う。
     /// `strict`は呼出し元の規則を引き継ぎ、非strictのPowerShell規則でEncodedCommand専用の拒否を働かせない。
@@ -2358,11 +2487,21 @@ fn inspect(input: &Value, config: &Path, cli: &Path) -> Result<Value> {
         .get("tool_input")
         .filter(|v| v.is_object())
         .ok_or_else(|| anyhow::anyhow!("Hook tool_input must be an object."))?;
-    let command = arguments
-        .get("command")
-        .or_else(|| arguments.get("cmd"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("Hook command must be a string."))?;
+    // `command`と`cmd`が併存する場合、どちらをホストが実行するかはここで決められないため、
+    // 存在する全てを検査する（どれかが拒否対象なら拒否）。片方だけの入力の挙動は従来どおり。
+    let mut commands = Vec::new();
+    for key in ["command", "cmd"] {
+        if let Some(value) = arguments.get(key) {
+            commands.push(
+                value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Hook command must be a string."))?,
+            );
+        }
+    }
+    if commands.is_empty() {
+        bail!("Hook command must be a string.");
+    }
     let mode = if name != "Bash" {
         arguments
             .get("shell")
@@ -2371,14 +2510,21 @@ fn inspect(input: &Value, config: &Path, cli: &Path) -> Result<Value> {
     } else {
         None
     };
-    let mut inspection = Inspector {
-        admin_cli: cli.to_string_lossy().into_owned(),
-        admin_config: config.to_string_lossy().into_owned(),
-        ..Inspector::default()
-    };
-    if !inspection.contains(command, 0, mode, false)? {
-        return Ok(json!({}));
+    let mut detected = None;
+    for command in commands {
+        let mut inspection = Inspector {
+            admin_cli: cli.to_string_lossy().into_owned(),
+            admin_config: config.to_string_lossy().into_owned(),
+            ..Inspector::default()
+        };
+        if inspection.contains(command, 0, mode, false)? {
+            detected = Some(inspection);
+            break;
+        }
     }
+    let Some(inspection) = detected else {
+        return Ok(json!({}));
+    };
     // 単独EncodedCommandは復号本文をPowerShellとして確定検査しているため、
     // shell不明時の候補注記とEncodedCommandへの変換案内を付けない。
     let standalone_encoded = inspection.standalone_encoded;
@@ -2394,20 +2540,10 @@ fn inspect(input: &Value, config: &Path, cli: &Path) -> Result<Value> {
         if mode.is_none() && cfg!(windows) && !standalone_encoded {
             reason.push_str(" Shell metadata is missing or unsupported; this is a candidate interpretation, not a confirmed local deletion.");
         }
-        // CLIの表記は各OSの完全な案内と同じ引用規則にそろえる。
-        let quote = |s: &str| {
-            if !cfg!(windows) {
-                format!("'{}'", s.replace('\'', "'\\''"))
-            } else if s.chars().any(char::is_whitespace) {
-                format!("\"{s}\"")
-            } else {
-                s.into()
-            }
-        };
         reason.push_str(&format!(
             " The hook did not execute the command. This is an inspection limit, not a detected deletion: rewrite the command without that construct (for example, run the logic from a script file). For authorized deletions use the installed Prunlet CLI: {} --config {} delete --paths-file <absolute-json-file>.",
-            quote(&executable),
-            quote(&config)
+            cli_quote(&executable),
+            cli_quote(&config)
         ));
         return Ok(deny(&reason));
     }
@@ -2415,22 +2551,24 @@ fn inspect(input: &Value, config: &Path, cli: &Path) -> Result<Value> {
         reason.push_str(" Shell metadata is missing or unsupported; this is a candidate interpretation, not a confirmed local deletion. Quoted search text or remote script data may be interpreted as command syntax. If the host forwards the tool as Bash without shell metadata, setting exec_command.shell alone cannot resolve this ambiguity. For an authorized SSH script sent from PowerShell, encode the entire local PowerShell script as UTF-16LE Base64 and submit the standalone form pwsh -NoProfile -EncodedCommand <base64>. The hook decodes and inspects that script; it does not exempt SSH names or remote deletion targets from inspection. See docs/integration.md for the supported form.");
     }
     if cfg!(windows) {
-        let quote = |s: &str| {
-            if s.chars().any(char::is_whitespace) {
-                format!("\"{s}\"")
-            } else {
-                s.into()
-            }
-        };
-        reason.push_str(&format!(" The hook did not execute the command. The following CLI guidance applies only to authorized Windows deletion targets. For explicitly authorized targets, use the installed Prunlet CLI from the start with shell=cmd.exe and login=false: {} --config {} delete --paths-file <absolute-json-file>; for registry keys/values use {} --config {} registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <registry-key-path>. File and folder deletions have no Prunlet operation record. Normally restore recycled items using Windows Recycle Bin; a file or folder Windows reports as too large may instead be permanently deleted. Dry-run cannot predict the final disposition. Keep registry operationId and use registry-restore <operationId>. On hosts supporting exec_command sandbox permissions, request sandbox_permissions=\"require_escalated\" from the first real file deletion because Recycle Bin access may be restricted. This is a formal host permission request, not Windows UAC or administrator elevation. A dry-run does not prove real-operation permissions. Existing host approvals and policies still apply. Do not retry a policy-rejected target through another route or automatically resend a failed deletion; check uncertain file results using the source and Windows Recycle Bin; reconcile registry results using registry-reconcile <operationId> before deciding next steps.",quote(&executable),quote(&config),quote(&executable),quote(&config)));
+        reason.push_str(&format!(" The hook did not execute the command. The following CLI guidance applies only to authorized Windows deletion targets. For explicitly authorized targets, use the installed Prunlet CLI from the start with shell=cmd.exe and login=false: {} --config {} delete --paths-file <absolute-json-file>; for registry keys/values use {} --config {} registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <registry-key-path>. File and folder deletions have no Prunlet operation record. Normally restore recycled items using Windows Recycle Bin; a file or folder Windows reports as too large may instead be permanently deleted. Dry-run cannot predict the final disposition. Keep registry operationId and use registry-restore <operationId>. On hosts supporting exec_command sandbox permissions, request sandbox_permissions=\"require_escalated\" from the first real file deletion because Recycle Bin access may be restricted. This is a formal host permission request, not Windows UAC or administrator elevation. A dry-run does not prove real-operation permissions. Existing host approvals and policies still apply. Do not retry a policy-rejected target through another route or automatically resend a failed deletion; check uncertain file results using the source and Windows Recycle Bin; reconcile registry results using registry-reconcile <operationId> before deciding next steps.",cli_quote(&executable),cli_quote(&config),cli_quote(&executable),cli_quote(&config)));
     } else if cfg!(target_os = "linux") {
-        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-        reason.push_str(&format!(" The hook did not execute the command. For explicitly authorized local Linux targets use the installed Prunlet CLI: {} --config {} delete --paths-file <absolute-json-file>. Items move to the freedesktop home Trash on the same mount. Existing host approvals and policies still apply. Do not resend ambiguous deletion; inspect the source and Trash.", q(&executable), q(&config)));
+        reason.push_str(&format!(" The hook did not execute the command. For explicitly authorized local Linux targets use the installed Prunlet CLI: {} --config {} delete --paths-file <absolute-json-file>. Items move to the freedesktop home Trash on the same mount. Existing host approvals and policies still apply. Do not resend ambiguous deletion; inspect the source and Trash.", cli_quote(&executable), cli_quote(&config)));
     } else {
-        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-        reason.push_str(&format!(" The hook did not execute the command. For explicitly authorized local macOS targets use the installed native Prunlet CLI: {} --config {} delete --paths-file <absolute-json-file>. Files normally go to macOS Trash without Prunlet operation records. On macOS, delete-queue waits only for cooperating processes that hold an advisory flock; merely opening a file or mapping a dylib does not delay deletion. Registry operations are Windows-only and are unsupported on macOS. SSH names and remote script text do not bypass inspection. Existing host approvals and policies still apply. Do not resend failed or ambiguous deletion; inspect the source and Trash.",q(&executable),q(&config)));
+        reason.push_str(&format!(" The hook did not execute the command. For explicitly authorized local macOS targets use the installed native Prunlet CLI: {} --config {} delete --paths-file <absolute-json-file>. Files normally go to macOS Trash without Prunlet operation records. On macOS, delete-queue waits only for cooperating processes that hold an advisory flock; merely opening a file or mapping a dylib does not delay deletion. Registry operations are Windows-only and are unsupported on macOS. SSH names and remote script text do not bypass inspection. Existing host approvals and policies still apply. Do not resend failed or ambiguous deletion; inspect the source and Trash.",cli_quote(&executable),cli_quote(&config)));
     }
     Ok(deny(&reason))
+}
+/// 拒否理由へ添えるCLIパスの引用規則。各OSの完全な案内と同じ規則にそろえる。
+/// Windowsは空白を含むときだけ二重引用し、他OSは常にPOSIXの単一引用にする。
+fn cli_quote(s: &str) -> String {
+    if !cfg!(windows) {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    } else if s.chars().any(char::is_whitespace) {
+        format!("\"{s}\"")
+    } else {
+        s.into()
+    }
 }
 fn deny(reason: &str) -> Value {
     json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":reason}})
@@ -2474,6 +2612,20 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    /// PowerShellスクリプトをUTF-16LEのBase64へ変換する（-EncodedCommandの引数形式）。
+    fn encode_utf16_base64(script: &str) -> String {
+        let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        STANDARD.encode(bytes)
+    }
+
+    /// `pwsh -NoProfile -EncodedCommand <base64>` の完全なコマンド文字列を作る。
+    fn encoded_command(script: &str) -> String {
+        format!(
+            "pwsh -NoProfile -EncodedCommand {}",
+            encode_utf16_base64(script)
+        )
     }
 
     /// hook入力を組み立ててinspectへ渡し、拒否なら理由を返す。検査errorもrun()と同じく拒否として扱う。
@@ -2883,7 +3035,6 @@ mod tests {
                 false,
                 true,
             ),
-            (r#"cmd=/c del "<FILE>""#, Some("cmd.exe"), false, false),
             // shell不明（Bash）でのPOSIX代入は削除命令とみなさない。
             ("rm=1; echo ok", None, true, true),
             ("ri=0", None, true, true),
@@ -3274,11 +3425,7 @@ mod tests {
         if !cfg!(windows) {
             return;
         }
-        let encode = |script: &str| {
-            let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-            STANDARD.encode(bytes)
-        };
-        let data = encode(r"Remove-Item -LiteralPath C:\fixture\file.txt");
+        let data = encode_utf16_base64(r"Remove-Item -LiteralPath C:\fixture\file.txt");
         let confirmed = reason(
             &format!("pwsh -NoProfile -EncodedCommand {data}"),
             "Bash",
@@ -3310,10 +3457,7 @@ mod tests {
         if !cfg!(windows) {
             return;
         }
-        let encode = |script: &str| {
-            let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-            format!("pwsh -NoProfile -EncodedCommand {}", STANDARD.encode(bytes))
-        };
+        let encode = encoded_command;
         // reason()がhookへ渡す配置済みCLI・設定（C:\fixture\…）と同じパスだけが許可される。
         let cli = r#""C:\fixture\prunlet.exe" --config "C:\fixture\config.json""#;
         let admin_registry = format!(
@@ -3422,6 +3566,86 @@ mod tests {
         result.is_err() || result.unwrap()
     }
 
+    /// `hook-posix.json`の全ケースを、外側の規則に覆われないよう`Mode::Posix`だけで直接検査する。
+    /// 実プロセスのhook検証（Verify-HookParsing.ps1）はWindowsでshell不明の候補解釈や他の規則が先に拒否する
+    /// 形を区別できず、非Windowsで`pass`を検証する経路も限られるため、全OSで走るこの表で補う。
+    /// 拒否期待のケースは、JSONの`reason`（POSIX規則が出す検知理由・検知tokenを含む文言）まで確認する。
+    /// `windowsOtherRule`は、Windowsの実プロセスhookではshell名`sh`が不明扱いで候補解釈の先頭規則
+    /// （CMD・PowerShell）が先に拒否するケースの印で、ここでのPOSIX規則単独の検査がその隠れた分を補う。
+    #[test]
+    fn hook_posix_json_cases_hold_under_the_posix_rules_alone() {
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("tests/hook-posix.json")).expect("hook-posix.json");
+        assert!(cases.len() >= 90, "unexpected case count: {}", cases.len());
+        let mut names = std::collections::HashSet::new();
+        for case in &cases {
+            let name = case["name"].as_str().expect("name");
+            assert!(names.insert(name.to_owned()), "duplicate case name: {name}");
+            let command = case["command"]
+                .as_str()
+                .expect("command")
+                .replace("<FILE>", "/tmp/prunlet-fixture.txt");
+            let expect_pass = case["pass"].as_bool().expect("pass");
+            let mut inspector = Inspector::default();
+            let result = inspector.contains(&command, 0, Some(Mode::Posix), false);
+            if expect_pass {
+                assert!(
+                    matches!(result, Ok(false)),
+                    "{name}: expected pass under POSIX rules: {command:?} -> {result:?}"
+                );
+            } else {
+                // 拒否期待のケースは検知理由`reason`（POSIX規則による固定の文言）を必ず持ち、
+                // 検知が別の理由に変わる退行を見逃さない。
+                let expected = case["reason"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name}: a denied case needs a reason"));
+                match result {
+                    Ok(true) => assert!(
+                        inspector
+                            .detection
+                            .as_deref()
+                            .is_some_and(|d| d.contains(expected)),
+                        "{name}: expected reason {expected:?}, got {:?}",
+                        inspector.detection
+                    ),
+                    other => panic!("{name}: POSIX rules alone did not detect: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// `command`と`cmd`が併存する入力は、どちらを実行するかを決めずに全てを検査する。
+    /// 片方だけの入力の挙動は変えない。
+    #[test]
+    fn command_and_cmd_together_are_both_inspected() {
+        let run = |tool_input: Value| {
+            let input = json!({"tool_name":"exec_command","tool_input":tool_input});
+            inspect(
+                &input,
+                Path::new("/fixture/config.json"),
+                Path::new("/fixture/prunlet"),
+            )
+        };
+        let denied = |tool_input: Value| {
+            run(tool_input).map_or(true, |v| {
+                v["hookSpecificOutput"]["permissionDecision"] == "deny"
+            })
+        };
+        let safe = "echo ok";
+        let bad = "rm -rf /tmp/fixture";
+        // 片方だけ（従来どおり）。
+        assert!(!denied(json!({"command":safe,"shell":"sh"})));
+        assert!(!denied(json!({"cmd":safe,"shell":"sh"})));
+        assert!(denied(json!({"command":bad,"shell":"sh"})));
+        assert!(denied(json!({"cmd":bad,"shell":"sh"})));
+        // 併存: どちらか一方でも拒否対象なら拒否する（従来は`command`だけを検査していた）。
+        assert!(denied(json!({"command":safe,"cmd":bad,"shell":"sh"})));
+        assert!(denied(json!({"command":bad,"cmd":safe,"shell":"sh"})));
+        assert!(!denied(json!({"command":safe,"cmd":safe,"shell":"sh"})));
+        // 併存でどちらかが文字列でなければ検査不能として拒否する。
+        assert!(denied(json!({"command":safe,"cmd":1,"shell":"sh"})));
+    }
+
     /// 引用終端のヒアドキュメントは、ファイルへの`cat`・インタプリタが受け取る形に限って本文をdataとして読み、
     /// shellへ渡りうる形や本文の後ろの削除命令は従来どおり拒否する。
     #[test]
@@ -3510,10 +3734,7 @@ mod tests {
         if !cfg!(windows) {
             return;
         }
-        let encode = |script: &str| {
-            let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-            format!("pwsh -NoProfile -EncodedCommand {}", STANDARD.encode(bytes))
-        };
+        let encode = encoded_command;
         for allowed in [
             r#"$sw = [Diagnostics.Stopwatch]::StartNew(); "test sec: $($sw.Elapsed.TotalSeconds)""#,
             r#""first: $($r.items[0].Name) of $($r.Count)""#,
@@ -3552,10 +3773,7 @@ mod tests {
         if !cfg!(windows) {
             return;
         }
-        let encode = |script: &str| {
-            let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-            format!("pwsh -NoProfile -EncodedCommand {}", STANDARD.encode(bytes))
-        };
+        let encode = encoded_command;
         for allowed in [
             r#"rg -n "net8" -g "*.csproj" . ; dotnet build -c Release"#,
             r"Get-ChildItem -Recurse -Force -Filter config.toml -Path . -Depth 3",
@@ -3603,6 +3821,108 @@ mod tests {
                 .expect("unsupported syntax must be denied");
             assert!(candidate.contains("candidate interpretation"), "{candidate}");
             assert!(candidate.len() < 800, "{} chars: {candidate}", candidate.len());
+        }
+    }
+
+    /// POSIX shellの`-c`後のoption・`--`・値付きoptionの結合形でも、静的な本文を再帰検査する。
+    #[test]
+    fn posix_shell_command_body_follows_options_after_dash_c() {
+        for command in [
+            r#"bash -c -- "rm -rf /tmp/owned-fixture""#,
+            r#"sh -c -x "rm -rf /tmp/owned-fixture""#,
+            r#"bash -oc posix "rm -rf /tmp/owned-fixture""#,
+            r#"bash -co posix "rm -rf /tmp/owned-fixture""#,
+            r#"bash -O extglob -c "rm -rf /tmp/owned-fixture""#,
+            r#"bash -c -o posix -- "rm -rf /tmp/owned-fixture""#,
+        ] {
+            for (tool, shell) in [("Bash", None), ("exec_command", Some("bash"))] {
+                assert!(reason(command, tool, shell).is_some(), "{tool}: {command}");
+            }
+        }
+        for command in [
+            r#"bash -c "echo hi""#,
+            r#"sh -c -x "echo hi""#,
+            r#"bash -c -- "echo hi""#,
+            r#"bash -oc posix "echo hi""#,
+            r#"bash -lc "echo hi""#,
+        ] {
+            for (tool, shell) in [("Bash", None), ("exec_command", Some("bash"))] {
+                assert_eq!(reason(command, tool, shell), None, "{tool}: {command}");
+            }
+        }
+        // 本文や値が欠落・動的なら検査不能として既存の拒否文言で拒否する。
+        for (command, expected) in [
+            ("bash -c --", "missing or dynamic POSIX shell command"),
+            ("bash -oc posix", "missing or dynamic POSIX shell command"),
+            ("bash -oc", "missing or dynamic POSIX shell option"),
+        ] {
+            let reason = reason(command, "exec_command", Some("bash")).expect(command);
+            assert!(reason.contains(expected), "{command}: {reason}");
+            assert!(reason.contains("interpretation="), "{command}: {reason}");
+        }
+        // 動的な本文は別の規則が先に拒否する（理由の文言は問わず、許可されないことだけを確認する）。
+        assert!(reason(r#"bash -c -- "$BODY""#, "exec_command", Some("bash")).is_some());
+    }
+
+    /// 外側がPowerShell・CMD規則でも、`sh`・`bash`・`zsh`の結合flagと`-c`後の`--`を検査する。
+    #[test]
+    fn posix_shell_wrapper_under_other_rules_inspects_combined_flags() {
+        for command in [
+            r#"bash -ec "rm -rf /tmp/owned-fixture""#,
+            r#"sh -xc "rm -rf /tmp/owned-fixture""#,
+            r#"zsh -lic "rm -rf /tmp/owned-fixture""#,
+            r#"bash -c -- "rm -rf /tmp/owned-fixture""#,
+            r#"bash -oc posix "rm -rf /tmp/owned-fixture""#,
+        ] {
+            for shell in ["pwsh", "cmd.exe"] {
+                assert!(denied(command, shell), "{shell}: {command}");
+            }
+        }
+        for command in [
+            r#"bash -ec "echo hi""#,
+            r#"sh -xc "echo hi""#,
+            r#"bash -c -- "echo hi""#,
+            r#"bash script.sh"#,
+        ] {
+            for shell in ["pwsh", "cmd.exe"] {
+                assert!(!denied(command, shell), "{shell}: {command}");
+            }
+        }
+    }
+
+    /// Windows PowerShell 5.1の名前なし位置引数は`-Command`として実行されるため本文として検査する。
+    #[test]
+    fn windows_powershell_positional_argument_is_inspected_as_command() {
+        for command in [
+            r#"powershell "Remove-Item C:\fixture\x""#,
+            r#"powershell -NoProfile "Remove-Item C:\fixture\x""#,
+            r"powershell -ExecutionPolicy Bypass Remove-Item C:\fixture\x",
+            r"powershell -NoProfile -WindowStyle Hidden Remove-Item C:\fixture\x",
+            r"powershell.exe -ep Bypass Remove-Item C:\fixture\x",
+        ] {
+            for shell in ["pwsh", "cmd.exe"] {
+                assert!(denied(command, shell), "{shell}: {command}");
+            }
+        }
+        // 位置引数の手前に未知のoptionがあれば本文の位置を確定できない。
+        let unknown = reason("powershell -Foo x", "exec_command", Some("pwsh")).expect("unknown");
+        assert!(
+            unknown.contains("unsupported PowerShell wrapper option"),
+            "{unknown}"
+        );
+        for command in [
+            "powershell -File x.ps1",
+            "powershell x.ps1",
+            r#"powershell -NoProfile -Command "echo hi""#,
+            r#"powershell -NoProfile "echo hi""#,
+            "powershell -ExecutionPolicy Bypass -File x.ps1",
+            "powershell -NoProfile",
+            "pwsh x.ps1",
+            "pwsh -NoProfile -File x.ps1",
+        ] {
+            for shell in ["pwsh", "cmd.exe"] {
+                assert!(!denied(command, shell), "{shell}: {command}");
+            }
         }
     }
 
