@@ -110,7 +110,7 @@ fn read(store: &Store, id: &str, consume: bool) -> Result<(Terminal, Held)> {
     migration::validate(store, id, &state.binding)?;
     ensure!(
         state.schema == 1
-            && state.closed_utc.timestamp() != -62135596800
+            && state.closed_utc.timestamp() != MIN_TIMESTAMP
             && matches!(state.reason.as_str(), "restored" | "purged")
             && !state
                 .binding
@@ -309,12 +309,12 @@ fn expire(store: &Store, id: &str) -> Result<()> {
                 .as_ref()
                 .context("Missing fixed cleanup authority")?
                 .verify_current()?;
-            sec::delete_fixed(pin.raw(), false)?;
+            sec::delete_permanent_fixed(pin.raw(), false, false)?;
             #[cfg(test)]
             fault_checkpoint("member.consumed", store, id);
         }
         drop(held);
-        sec::delete_fixed(directory.raw(), false)?;
+        sec::delete_permanent_fixed(directory.raw(), false, false)?;
         drop(directory);
     }
     #[cfg(test)]
@@ -358,12 +358,7 @@ pub fn inspect_member(store: &Store, name: &str, apply: bool) -> Result<bool> {
         );
         let cleanup: Cleanup = Held::read(&store.root.join(name))?.lifecycle()?;
         let terminal = Held::read(&store.root.join(format!("{id}.terminal.json")))?;
-        ensure!(
-            cleanup.schema == 1
-                && cleanup.operation_id == id
-                && cleanup.terminal_sha256 == hash(&terminal.bytes),
-            "Registry terminal cleanup binding differs."
-        );
+        validate_cleanup(&cleanup, id, &terminal.bytes)?;
         drop(terminal);
         if apply {
             expire(store, id)?;

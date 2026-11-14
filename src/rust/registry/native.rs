@@ -1298,11 +1298,8 @@ fn security(key: &Key, full: bool) -> Result<Vec<u8>> {
         "Cannot read registry security",
     )?;
     bytes.truncate(size as usize);
+    // IsValidSecurityDescriptorによる検査もvalidate_security（model側）に含まれる。
     validate_security(&bytes)?;
-    ensure!(
-        unsafe { IsValidSecurityDescriptor(bytes.as_ptr()) } != 0,
-        "Native security descriptor validation failed."
-    );
     Ok(bytes)
 }
 fn node(
@@ -2167,7 +2164,6 @@ unsafe extern "system" {
     ) -> u32;
     fn RegGetKeySecurity(key: Handle, info: u32, data: *mut u8, size: *mut u32) -> u32;
     fn RegSetKeySecurity(key: Handle, info: u32, data: *const u8) -> u32;
-    fn IsValidSecurityDescriptor(data: *const u8) -> i32;
     fn RegDeleteValueW(key: Handle, name: *const u16) -> u32;
     fn RegSetValueExW(
         key: Handle,

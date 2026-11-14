@@ -37,7 +37,6 @@ pub fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let mut output = String::with_capacity(source.len());
     let mut previous = 0;
     for captures in pattern.captures_iter(source) {
-        let whole = captures.get(0).unwrap();
         let encoded = captures.get(2).unwrap();
         let text: String = serde_json::from_str(&format!("\"{}\"", encoded.as_str()))?;
         let date = DateTime::parse_from_rfc3339(&text)?;
@@ -51,7 +50,6 @@ pub fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>> {
         output.push_str(&source[previous..encoded.start()]);
         output.push_str(&rendered);
         previous = encoded.end();
-        let _ = whole;
     }
     output.push_str(&source[previous..]);
     let source = output;
@@ -223,6 +221,16 @@ pub fn machine() -> Result<String> {
 unsafe extern "system" {
     fn GetComputerNameW(name: *mut u16, length: *mut u32) -> i32;
 }
+// 固定したmetadataの大きさが空または上限超過であることを示す型付きエラー。
+// 文言は従来どおりだが、storage状態の読取りで「書込み途中の空ファイル」を識別するために型で区別する。
+#[derive(Debug)]
+struct MetadataSizeInvalid;
+impl std::fmt::Display for MetadataSizeInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Registry metadata size is invalid.")
+    }
+}
+impl std::error::Error for MetadataSizeInvalid {}
 pub fn exists(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -273,10 +281,9 @@ impl Held {
         let security = sec::read_member_security(pin.raw())?;
         let mut reader = file(pin.raw())?;
         let size = reader.metadata()?.len();
-        ensure!(
-            size > 0 && size <= MAX_BYTES as u64,
-            "Registry metadata size is invalid."
-        );
+        if !(size > 0 && size <= MAX_BYTES as u64) {
+            return Err(MetadataSizeInvalid.into());
+        }
         let mut bytes = vec![0u8; size as usize];
         reader.seek(SeekFrom::Start(0))?;
         reader.read_exact(&mut bytes)?;
@@ -295,7 +302,7 @@ impl Held {
     // 読み取った同じDELETE handleを最終dispositionまで保持する。再openしない。
     pub fn consume(self) -> Result<()> {
         self.verify_current()?;
-        sec::delete_fixed(self.pin.raw(), false)
+        sec::delete_permanent_fixed(self.pin.raw(), false, false)
     }
     pub fn decode<T: DeserializeOwned + Serialize>(&self) -> Result<T> {
         decode(&self.bytes)
@@ -359,7 +366,7 @@ pub fn validate_publication(
 pub fn remove(path: &Path) -> Result<()> {
     let pin = sec::open_lifecycle_delete(path)?;
     verify(&pin, false)?;
-    sec::delete_fixed(pin.raw(), false)
+    sec::delete_permanent_fixed(pin.raw(), false, false)
 }
 pub fn write_handle(handle: HANDLE, bytes: &[u8]) -> Result<()> {
     let mut writer = file(handle)?;
@@ -542,6 +549,8 @@ pub struct Store<'a> {
     _metadata: PinnedFile,
     pub registry: PinnedFile,
     pub state: State,
+    // 公開後の所有予約の削除失敗など、結果を変えない後始末の失敗を要求の終わりまで集める。
+    notes: std::sync::Mutex<Vec<String>>,
 }
 impl<'a> Store<'a> {
     pub fn open(config: &'a Config, create: bool) -> Result<Self> {
@@ -598,7 +607,19 @@ impl<'a> Store<'a> {
             _metadata: metadata,
             registry,
             state,
+            notes: Default::default(),
         })
+    }
+    /// 非致命として扱った後始末の失敗を、呼出元がresultのwarningへ載せられるよう記録する。
+    fn note(&self, message: String) {
+        self.notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(message);
+    }
+    /// 記録済みの注記を取り出す。delete・restoreが要求の終わりにwarningへ移す。
+    pub fn take_notes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.notes.lock().unwrap_or_else(|e| e.into_inner()))
     }
     fn provision(base: &Path, metadata_id: &str, owner: &str, machine: &str) -> Result<()> {
         let root = base.join(ROOT);
@@ -787,8 +808,7 @@ impl<'a> Store<'a> {
                 "migration_required: A registry migration is pending."
             );
         }
-        let state: State = Held::read(&self.root.join("storage-migration-v1.json"))?.lifecycle()?;
-        self.validate_state(&state)?;
+        let state = self.read_validated_state()?;
         ensure!(
             state.registry_ready && state.assessment_complete,
             "migration_required: Legacy registry records remain unresolved."
@@ -797,14 +817,40 @@ impl<'a> Store<'a> {
         Ok(())
     }
     pub fn require_ready_check(&self) -> Result<()> {
-        let state: State = Held::read(&self.root.join("storage-migration-v1.json"))?.lifecycle()?;
-        self.validate_state(&state)?;
+        let state = self.read_validated_state()?;
         ensure!(
             state.registry_ready && state.assessment_complete,
             "Registry storage is not ready."
         );
         Ok(())
     }
+    /// 保存済みのstorage状態を読み、現在のstoreとの結び付きを検証して返す。
+    ///
+    /// `save_state`は既存ファイルを同じ場所へ書き直すため、書込み中のプロセス終了・停電で空または途中までの
+    /// JSONが残り得る。この「空・途中終了」だけは通常の改変拒否と区別し、`migrate --apply`で自己修復できる
+    /// ことを示す`migration_required:`へ写す。ACL・identity・bindingの不一致や未知schemaなど、改変を疑う
+    /// 失敗は従来どおりそのまま拒否する（migrate側の`verify`も同じ検査で拒否する）。
+    fn read_validated_state(&self) -> Result<State> {
+        let held = Held::read(&self.root.join("storage-migration-v1.json"))
+            .map_err(Self::incomplete_state_error)?;
+        let state: State = held.lifecycle().map_err(Self::incomplete_state_error)?;
+        self.validate_state(&state)?;
+        Ok(state)
+    }
+    fn incomplete_state_error(error: anyhow::Error) -> anyhow::Error {
+        let truncated = error.downcast_ref::<MetadataSizeInvalid>().is_some()
+            || error
+                .downcast_ref::<serde_json::Error>()
+                .is_some_and(serde_json::Error::is_eof);
+        if truncated {
+            anyhow::anyhow!(
+                "migration_required: The registry storage state is empty or incomplete (an interrupted write); run migrate --apply. {error}"
+            )
+        } else {
+            error
+        }
+    }
+
     pub fn validate_state(&self, state: &State) -> Result<()> {
         ensure!(
             state.schema == 1
@@ -887,7 +933,7 @@ impl<'a> Store<'a> {
                     && receipt.manifest_sha256 == manifest_hash
                     && receipt.action == action
                     && receipt.phase == phase
-                    && receipt.created_utc.timestamp() != -62135596800,
+                    && receipt.created_utc.timestamp() != MIN_TIMESTAMP,
                 "Registry receipt differs from its manifest or filename."
             );
             receipts.insert(name);
@@ -973,7 +1019,7 @@ impl<'a> Store<'a> {
                 && owner.length > 0
                 && owner.length <= MAX_BYTES as u64
                 && digest(&owner.sha256)
-                && (final_name == SNAPSHOT || owner.created_utc.timestamp() != -62135596800),
+                && (final_name == SNAPSHOT || owner.created_utc.timestamp() != MIN_TIMESTAMP),
             "Registry publication reservation binding differs."
         );
         Ok(owner)
@@ -1065,7 +1111,7 @@ impl<'a> Store<'a> {
         } else {
             let handle = sec::create_private_file(&pending)?;
             let created = if name == SNAPSHOT {
-                DateTime::parse_from_rfc3339("0001-01-01T00:00:00+00:00")?
+                DateTime::parse_from_rfc3339(MIN_TIMESTAMP_RFC3339)?
             } else {
                 crate::json::parse_unique(&bytes)?
                     .get("createdUtc")
@@ -1176,7 +1222,14 @@ impl<'a> Store<'a> {
         );
         validate_publication(name, &held.bytes, &bytes, owner.length, &owner.sha256)?;
         held.verify_current()?;
-        remove(&owner_path)?;
+        // 正式本文は同じidentity・bytes・hashで検証済みなので、所有予約の削除失敗は公開の成否を変えない。
+        // 失敗でErrを返すと、公開済みの正式receiptについて呼出元が「未公開」と誤認する。
+        // 残った予約はrecord_at/inspect_publicationが本文照合つきで受理し、cleanup_publicationsが後で整理する。
+        if let Err(e) = remove(&owner_path) {
+            self.note(format!(
+                "Registry publication reservation for {name} remains after a verified publication ({e}); later cleanup removes it."
+            ));
+        }
         Ok(held)
     }
     pub fn create_record(&self, id: &str) -> Result<PinnedFile> {
@@ -1186,6 +1239,23 @@ impl<'a> Store<'a> {
         let pin = directory(&path)?;
         drop(sec::create_private_file(&path.join("operation.lock"))?);
         Ok(pin)
+    }
+    /// commit前に、残っている所有予約がすべて検証できる（本文・identity・hashと矛盾しない）ことを確認する。
+    /// 公開後の予約削除の失敗は非致命だが、予約自体が改変されて検証できない場合にcommitへ進むと、
+    /// commit後に記録を読めなくなる。そのため検証できない予約はcommit前に止める。予約は削除しない。
+    pub fn verify_reservations(&self, id: &str) -> Result<()> {
+        operation_id(id)?;
+        let path = self.root.join(id);
+        let parent = directory(&path)?;
+        for name in win::directory_names(parent.raw())? {
+            if !name.starts_with(".registry-publication-") {
+                continue;
+            }
+            let final_name =
+                publication_final(&name)?.context("Invalid registry publication name")?;
+            self.inspect_publication(id, &path, &final_name)?;
+        }
+        Ok(())
     }
     pub fn cleanup_publications(&self, id: &str) -> Result<bool> {
         operation_id(id)?;
@@ -1389,14 +1459,14 @@ impl<'a> Store<'a> {
                 file(lock.raw())?.metadata()?.len() == 0,
                 "Registry operation lock is not empty."
             );
-            sec::delete_fixed(lock.raw(), false)?;
+            sec::delete_permanent_fixed(lock.raw(), false, false)?;
         }
         verify(directory, true)?;
         ensure!(
             win::directory_names(directory.raw())?.is_empty(),
             "Registry record directory is not empty; retained."
         );
-        sec::delete_fixed(directory.raw(), false)
+        sec::delete_permanent_fixed(directory.raw(), false, false)
     }
 }
 // manifest公開前の記録の分類結果（Store::unpublished）。新しい永続fieldは作らずファイル構成から導出する。
@@ -1546,7 +1616,7 @@ impl Record {
             hex::encode(digest.finalize()) == self.manifest.sha256,
             "Registry snapshot bytes changed before consumption."
         );
-        sec::delete_fixed(pin.raw(), false)?;
+        sec::delete_permanent_fixed(pin.raw(), false, false)?;
         self.snapshot = None;
         Ok(())
     }
@@ -1567,7 +1637,7 @@ pub(crate) fn test_reservation(
     let parent = directory(&path)?;
     let handle = sec::create_private_file(&path.join(pending_name(name)))?;
     let created = if name == SNAPSHOT {
-        DateTime::parse_from_rfc3339("0001-01-01T00:00:00+00:00")?
+        DateTime::parse_from_rfc3339(MIN_TIMESTAMP_RFC3339)?
     } else {
         crate::json::parse_unique(fresh)?
             .get("createdUtc")
@@ -1755,6 +1825,25 @@ mod tests {
         data: Vec<u8>,
         name: String,
     }
+    /// 外部TEMP（リポジトリ・Codex homeの外）に新しい非公開の記録領域を作る。
+    /// 戻り値のleaseはTEMPの親の固定で、fixtureを使う間は保持する。
+    fn external_base(label: &str) -> Result<(win::path::DirectoryLease, std::path::PathBuf)> {
+        let temp = win::path::external_verification_path(&std::env::temp_dir())?;
+        let lease = win::path::pin_directories(&temp)?;
+        let base = temp.join(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
+        drop(sec::create_private_directory(&base)?);
+        Ok((lease, base))
+    }
+    /// `base`をbackupDirectoryとする設定。設定ファイル自体は作らない。
+    fn config_for(base: &Path) -> Config {
+        Config {
+            path: base.join("config.json"),
+            data: crate::config::ConfigData {
+                backup_directory: base.to_str().unwrap().into(),
+                ..Default::default()
+            },
+        }
+    }
     #[test]
     fn dotnet_publication_bytes_preserve_datetime_base64_and_web_encoder() {
         let fixture = Fixture {
@@ -1768,18 +1857,7 @@ mod tests {
     }
     #[test]
     fn persisted_corruption_refuses_publication_before_commit_callback() {
-        let parent = std::env::temp_dir();
-        assert!(parent.is_absolute());
-        assert!(
-            !win::path::within(&parent, Path::new(env!("CARGO_MANIFEST_DIR"))),
-            "Test TEMP must be outside repository."
-        );
-        let _parents = win::path::pin_directories(&parent).unwrap();
-        let path = parent.join(format!(
-            "prunlet-registry-publication-fault-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        drop(sec::create_private_directory(&path).unwrap());
+        let (_parents, path) = external_base("prunlet-registry-publication-fault").unwrap();
         let file_path = path.join("registry-delete-intent.json");
         let handle = sec::create_private_file(&file_path).unwrap();
         let receipt = Receipt {
@@ -1822,26 +1900,9 @@ mod tests {
     #[test]
     fn fresh_private_store_publication_lease_and_consumption() -> Result<()> {
         for corrupt in [false, true] {
-            let temp = std::env::temp_dir();
-            ensure!(
-                temp.is_absolute()
-                    && !win::path::within(&temp, Path::new(env!("CARGO_MANIFEST_DIR"))),
-                "Test TEMP must be external."
-            );
-            let _temp_parents = win::path::pin_directories(&temp)?;
-            let base = temp.join(format!(
-                "prunlet-registry-store-{}",
-                uuid::Uuid::new_v4().simple()
-            ));
-            drop(sec::create_private_directory(&base)?);
+            let (_temp_parents, base) = external_base("prunlet-registry-store")?;
             eprintln!("Registry storage fixture: {}", base.display());
-            let config = Config {
-                path: base.join("config.json"),
-                data: crate::config::ConfigData {
-                    backup_directory: base.to_str().unwrap().into(),
-                    ..Default::default()
-                },
-            };
+            let config = config_for(&base);
             let coord = crate::files::coordination::acquire(&config, None, None)?;
             let mut store = Store::open(&config, true)?;
             let mut state = store.state.clone();
@@ -1992,24 +2053,9 @@ mod tests {
     }
     #[test]
     fn interrupted_manifest_and_receipt_rebind_only_the_reserved_timestamp() -> Result<()> {
-        let temp = std::env::temp_dir();
-        ensure!(
-            temp.is_absolute() && !win::path::within(&temp, Path::new(env!("CARGO_MANIFEST_DIR")))
-        );
-        let _parents = win::path::pin_directories(&temp)?;
-        let base = temp.join(format!(
-            "registry-timestamp-retry-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        drop(sec::create_private_directory(&base)?);
+        let (_parents, base) = external_base("registry-timestamp-retry")?;
         eprintln!("Timestamp owner retry fixture retained: {}", base.display());
-        let config = Config {
-            path: base.join("config.json"),
-            data: crate::config::ConfigData {
-                backup_directory: base.to_str().unwrap().into(),
-                ..Default::default()
-            },
-        };
+        let config = config_for(&base);
         let store = Store::open(&config, true)?;
         for name in [MANIFEST, "registry-restore-intent.json"] {
             let id = uuid::Uuid::new_v4().simple().to_string();

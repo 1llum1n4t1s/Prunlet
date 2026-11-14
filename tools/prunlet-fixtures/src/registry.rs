@@ -44,7 +44,6 @@ struct ObjectAttributes {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> Handle;
     fn CloseHandle(handle: Handle) -> i32;
     fn GetCurrentProcess() -> Handle;
     fn SetLastError(error: u32);
@@ -54,13 +53,6 @@ unsafe extern "system" {
 #[link(name = "advapi32")]
 unsafe extern "system" {
     fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
-    fn GetTokenInformation(
-        token: Handle,
-        class: u32,
-        buffer: *mut c_void,
-        size: u32,
-        returned: *mut u32,
-    ) -> i32;
     fn LookupPrivilegeValueW(system: *const u16, name: *const u16, luid: *mut c_void) -> i32;
     fn AdjustTokenPrivileges(
         token: Handle,
@@ -202,7 +194,6 @@ unsafe extern "system" {
     fn NtQueryKey(key: Handle, class: u32, data: *mut c_void, size: u32, returned: *mut u32)
     -> i32;
     fn RtlNtStatusToDosError(status: i32) -> u32;
-    fn NtRenameKey(key: Handle, name: *const UnicodeString) -> i32;
     fn NtOpenKeyEx(key: *mut Handle, access: u32, attributes: *const c_void, options: u32) -> i32;
 }
 
@@ -266,62 +257,6 @@ fn classes_alias_state(args: &Value) -> Result<Value> {
         RegCloseKey(key);
     }
     result
-}
-
-fn rename_link(args: &Value) -> Result<Value> {
-    let handle = borrowed_key(args)?;
-    let relative = args
-        .get("path")
-        .and_then(Value::as_str)
-        .context("path required")?;
-    let prefix = args
-        .get("prefix")
-        .and_then(Value::as_str)
-        .context("prefix required")?;
-    let machine = args
-        .get("machine")
-        .and_then(Value::as_bool)
-        .context("machine required")?;
-    let allowed = if machine {
-        "SYSTEM\\PrunletE2E\\"
-    } else {
-        "Software\\PrunletE2E\\"
-    };
-    if prefix.len() != allowed.len() + 32
-        || !prefix
-            .get(..allowed.len())
-            .is_some_and(|s| s.eq_ignore_ascii_case(allowed))
-        || !prefix
-            .get(allowed.len()..)
-            .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
-        || !relative
-            .to_lowercase()
-            .starts_with(&(prefix.to_lowercase() + "-link-probes\\"))
-    {
-        bail!("Rename escaped dedicated link fixture");
-    }
-    let name = args
-        .get("name")
-        .and_then(Value::as_str)
-        .context("name required")?;
-    if name.is_empty() || name.chars().any(|c| c == '\\' || c == '/' || c == '\0') {
-        bail!("Invalid registry rename");
-    }
-    let text = wide(name)?;
-    if text.len() > 256 {
-        bail!("Registry rename exceeds fixture limit");
-    }
-    let native = UnicodeString {
-        length: u16::try_from((text.len() - 1) * 2)?,
-        maximum_length: u16::try_from(text.len() * 2)?,
-        buffer: text.as_ptr(),
-    };
-    let status = unsafe { NtRenameKey(handle, &native) };
-    Ok(json!(if status < 0 {
-        unsafe { RtlNtStatusToDosError(status) }
-    } else {
-        0
-    }))
 }
 
 fn borrowed_key(args: &Value) -> Result<Handle> {
@@ -850,62 +785,6 @@ impl Drop for OwnedHandle {
     }
 }
 
-fn process_privileges(pid: u32) -> Result<Value> {
-    unsafe {
-        let process = OpenProcess(0x1000, 0, pid);
-        if process.is_null() {
-            return Err(std::io::Error::last_os_error()).context("OpenProcess");
-        }
-        let process = OwnedHandle(process);
-        let mut token = ptr::null_mut();
-        if OpenProcessToken(process.0, 8, &mut token) == 0 {
-            return Err(std::io::Error::last_os_error()).context("OpenProcessToken");
-        }
-        let token = OwnedHandle(token);
-        let mut size = 0;
-        GetTokenInformation(token.0, 3, ptr::null_mut(), 0, &mut size);
-        if !(4..=65536).contains(&size) {
-            bail!("Invalid token privilege information size");
-        }
-        let mut bytes = vec![0u8; size as usize];
-        if GetTokenInformation(token.0, 3, bytes.as_mut_ptr().cast(), size, &mut size) == 0 {
-            return Err(std::io::Error::last_os_error()).context("GetTokenInformation");
-        }
-        bytes.truncate(size as usize);
-        if bytes.len() < 4 {
-            bail!("Truncated token privileges");
-        }
-        let count = u32::from_ne_bytes(bytes[..4].try_into()?) as usize;
-        if count > (bytes.len() - 4) / 12 {
-            bail!("Truncated token privilege entries");
-        }
-        let mut result = serde_json::Map::new();
-        for name in [
-            "SeBackupPrivilege",
-            "SeRestorePrivilege",
-            "SeSecurityPrivilege",
-        ] {
-            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-            let mut luid = Luid { low: 0, high: 0 };
-            if LookupPrivilegeValueW(ptr::null(), wide.as_ptr(), (&mut luid as *mut Luid).cast())
-                == 0
-            {
-                return Err(std::io::Error::last_os_error()).context("LookupPrivilegeValueW");
-            }
-            let mut value = "absent".to_owned();
-            for entry in bytes[4..4 + count * 12].chunks_exact(12) {
-                if u32::from_ne_bytes(entry[..4].try_into()?) == luid.low
-                    && i32::from_ne_bytes(entry[4..8].try_into()?) == luid.high
-                {
-                    value = format!("0x{:08X}", u32::from_ne_bytes(entry[8..12].try_into()?));
-                }
-            }
-            result.insert(name.to_owned(), json!(value));
-        }
-        Ok(Value::Object(result))
-    }
-}
-
 pub fn dispatch(op: &str, args: &Value) -> Result<Value> {
     match op {
         "registry.class" => key_class(borrowed_key(args)?),
@@ -915,7 +794,6 @@ pub fn dispatch(op: &str, args: &Value) -> Result<Value> {
         "registry.createOwned" => create_owned(args),
         "registry.openOwned" => open_owned(args),
         "registry.lowIntegrity" => low_integrity(args),
-        "registry.renameLink" => rename_link(args),
         "registry.classesAliasState" => classes_alias_state(args),
         "registry.value" => key_value(
             borrowed_key(args)?,
@@ -985,13 +863,6 @@ pub fn dispatch(op: &str, args: &Value) -> Result<Value> {
             let error =
                 unsafe { RegSetValueExW(handle, name.as_ptr(), 0, kind, data.as_ptr(), size) };
             Ok(json!(error))
-        }
-        "registry.processPrivileges" => {
-            let pid = args
-                .get("processId")
-                .and_then(Value::as_u64)
-                .context("processId required")?;
-            process_privileges(u32::try_from(pid).context("processId out of range")?)
         }
         _ => bail!("Unknown registry fixture operation: {op}"),
     }

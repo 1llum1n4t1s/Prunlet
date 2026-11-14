@@ -283,7 +283,6 @@ fn delete(
     use model::*;
     let target = parse_target(args)?;
     let mut result = json!({"operationId":null,"dryRun":dry,"items":[item(&target)],"warnings":[]});
-    let mut intent = false;
     let mut committed = false;
     let mut privileges = None;
     let operation = (|| -> Result<()> {
@@ -434,10 +433,11 @@ fn delete(
                 && persisted_intent.phase == "intent",
             "Published registry deletion intent binding differs."
         );
-        intent = true;
         payload.verify_current()?;
         saved.verify_current()?;
         saved_intent.verify_current()?;
+        // 公開後に残った所有予約が検証できない場合は、commit前に止める（commit後に記録を読めなくなるため）。
+        store.verify_reservations(&id)?;
         tx.commit()?;
         committed = true;
         let saved_complete = store.publish(
@@ -449,27 +449,18 @@ fn delete(
         drop((payload, saved, saved_intent, saved_complete));
         Ok(())
     })();
+    for note in store.take_notes() {
+        warning(&mut result, &note);
+    }
     if let Err(e) = operation {
         result["items"][0]["status"] = json!("failed");
         result["items"][0]["error"] = json!(e.to_string());
-        if intent {
-            warning(
-                &mut result,
-                if committed {
-                    "Registry deletion committed but completion is unconfirmed. Snapshot retained; automatic purge and restoration are refused."
-                } else {
-                    "Registry commit was not confirmed. Snapshot and intent are retained without inferring the outcome."
-                },
-            );
-        } else if let Some(id) = result["operationId"].as_str().map(str::to_string) {
-            // 正式intentの公開前に失敗した。Transactionはcommitされずにdropでrollbackされ、対象は残っている。
-            // 記録はscanで未commit確定として容量に数え、後続の削除を止めない。ここでは即時削除しない。
-            warning(
-                &mut result,
-                &format!(
-                    "Registry deletion was not committed before its intent was published; the registry target was retained. Recovery data {id} is counted toward capacity and can be removed with purge --apply."
-                ),
-            );
+        // プロセス内のフラグだけで案内すると、正式receiptの公開後（rename後）に失敗した場合などに
+        // 保存された記録の状態と食い違う。保存済みの記録を読み直して案内を決める。
+        // Transactionはcommitされずにdropでrollbackされた場合、対象は残っている。
+        if let Some(id) = result["operationId"].as_str().map(str::to_string) {
+            let message = delete_failure_warning(store, &id, committed);
+            warning(&mut result, &message);
         }
     }
     if let Some(mut privileges) = privileges {
@@ -502,7 +493,6 @@ fn restore(
     i["size"] = json!(record.manifest.size);
     i["sha256"] = json!(record.manifest.sha256);
     let mut result = json!({"operationId":id,"items":[i],"warnings":[]});
-    let mut intent = record.has("restore", "intent");
     let mut committed = false;
     let mut privileges = None;
     let operation = (|| -> Result<()> {
@@ -553,8 +543,9 @@ fn restore(
             );
         }
         record.receipt(store, "restore", "intent")?;
-        intent = true;
         record.verify_current()?;
+        // 公開後に残った所有予約が検証できない場合は、commit前に止める（commit後に記録を読めなくなるため）。
+        store.verify_reservations(id)?;
         tx.commit()?;
         committed = true;
         record.receipt(store, "restore", "complete")?;
@@ -579,16 +570,14 @@ fn restore(
             "failed"
         });
         result["items"][0]["error"] = json!(e.to_string());
-        if intent && !record.has("restore", "complete") {
-            warning(
-                &mut result,
-                if committed {
-                    "Registry restoration committed but completion is unconfirmed. Snapshot retained; repeat restoration and automatic purge are refused."
-                } else {
-                    "Registry restoration intent has no confirmed completion; the snapshot was retained."
-                },
-            );
+        // deleteと同じく、保存済みの記録を読み直して案内を決める。
+        // 失敗前から復元intentがあった記録も、読み直しで同じ分類になる。
+        if let Some(message) = restore_failure_warning(store, id, committed) {
+            warning(&mut result, &message);
         }
+    }
+    for note in store.take_notes() {
+        warning(&mut result, &note);
     }
     if let Some(mut privileges) = privileges {
         if let Err(e) = privileges.finish() {
@@ -616,6 +605,66 @@ fn consume_restored(record: &mut storage::Record, result: &mut Value) {
                 "Registry restoration is complete, but snapshot consumption did not finish; maintain --apply reclaims it. Do not repeat restoration: {e}"
             ),
         );
+    }
+}
+// 結果を推測できないときの案内。記録は削除も変更もせず保全する。
+#[cfg(windows)]
+fn unclassified_warning(id: &str, error: &anyhow::Error) -> String {
+    format!(
+        "Registry operation {id} could not be re-read to classify the failure ({error}); the outcome is not inferred and the recovery data is retained."
+    )
+}
+// deleteが失敗した後の案内を、保存済みの記録を読み直して決める（読取りだけで、記録は変更しない）。
+// - 正式manifestが無い: 未commit確定。空の記録だけpurgeで整理でき、所有予約を持つ記録はpurgeが保全する。
+// - 正式receiptが無い: 未commit確定（正式intentの公開前に失敗）。
+// - complete receiptまで公開済み: 失敗は公開後の検証（rename後）で起きており、削除は完了している。
+// - 正式intentのみ: commitの成否を推測しない。snapshotとintentを保全し、purge・restoreは拒否される。
+// 正式intentのrename後に失敗した場合もここへ来るため、プロセス内のcommit済みフラグだけでは判定できない。
+#[cfg(windows)]
+fn delete_failure_warning(store: &storage::Store, id: &str, committed: bool) -> String {
+    match storage::exists(&store.root.join(id).join(storage::MANIFEST)) {
+        Ok(true) => match store.record(id) {
+            Ok(record) if record.has("delete", "complete") => format!(
+                "Registry deletion committed and its completion receipt is published; the failure came after publication. Snapshot retained; restoration is available for {id}."
+            ),
+            Ok(record) if record.not_committed() => format!(
+                "Registry deletion was not committed before its intent was published; the registry target was retained. Recovery data {id} is counted toward capacity and purge --apply removes it unless an unverifiable receipt reservation remains."
+            ),
+            Ok(_) if committed => "Registry deletion committed but completion is unconfirmed. Snapshot retained; automatic purge and restoration are refused.".into(),
+            Ok(_) => "Registry commit was not confirmed. Snapshot and intent are retained without inferring the outcome; automatic purge and restoration are refused.".into(),
+            Err(e) => unclassified_warning(id, &e),
+        },
+        Ok(false) => match store.unpublished(id) {
+            Ok(residue) if residue.empty => format!(
+                "Registry deletion was not committed before its manifest was published; the registry target was retained. The empty recovery record {id} can be removed with purge --apply."
+            ),
+            Ok(_) => format!(
+                "Registry deletion was not committed before its manifest was published; the registry target was retained. Recovery data {id} is counted toward capacity and retained because its reservation residue cannot be verified; purge --apply reports it retained."
+            ),
+            Err(e) => unclassified_warning(id, &e),
+        },
+        Err(e) => unclassified_warning(id, &e),
+    }
+}
+// restoreが失敗した後の案内。deleteと同じく保存済みの記録から決める。
+// 復元intentが無ければNone（拒否・競合など、記録へ影響しない失敗）。
+#[cfg(windows)]
+fn restore_failure_warning(store: &storage::Store, id: &str, committed: bool) -> Option<String> {
+    match store.record(id) {
+        // スコープ不一致などで拒否された、すでに復元済みの記録には、この失敗の警告を付けない。
+        Ok(record) if committed && record.has("restore", "complete") => Some(format!(
+            "Registry restoration is complete (its completion receipt is published); the failure came afterwards. Do not repeat restoration; maintain --apply reclaims the snapshot of {id}."
+        )),
+        Ok(record) if record.has("restore", "intent") && !record.has("restore", "complete") => Some(
+            if committed {
+                "Registry restoration committed but completion is unconfirmed. Snapshot retained; repeat restoration and automatic purge are refused."
+            } else {
+                "Registry restoration intent has no confirmed completion; the snapshot was retained and repeat restoration is refused."
+            }
+            .into(),
+        ),
+        Ok(_) => None,
+        Err(e) => Some(unclassified_warning(id, &e)),
     }
 }
 #[cfg(windows)]
@@ -759,6 +808,20 @@ fn purge_unpublished(store: &storage::Store, id: &str, apply: bool) -> Result<Va
     }
     Ok(result)
 }
+// scanの名前確認。単体テストでは、指定した名前だけ確認を失敗させて、1件の失敗がmaintain全体へ
+// 波及しないこと（per-member隔離）を決定的に確かめる。実処理はstorage::existsと同じ。
+#[cfg(all(test, windows))]
+thread_local! {
+    static SCAN_EXISTS_FAULT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(windows)]
+fn scan_member_exists(store: &storage::Store, name: &str) -> Result<bool> {
+    #[cfg(test)]
+    if SCAN_EXISTS_FAULT.with(|fault| fault.borrow().as_deref() == Some(name)) {
+        anyhow::bail!("Access is denied. (os error 5)");
+    }
+    storage::exists(&store.root.join(name))
+}
 #[cfg(windows)]
 fn scan(
     store: &storage::Store,
@@ -773,8 +836,18 @@ fn scan(
     let mut known = true;
     let mut candidates = vec![];
     for name in crate::platform::windows::directory_names(store.registry.raw())? {
-        if !storage::exists(&store.root.join(&name))? {
-            continue;
+        // 1件の名前確認の失敗でmaintain全体を止めない。
+        // 他の記録の期限整理は続け、この項目は容量を確定できないものとして警告する（保護は弱めない）。
+        match scan_member_exists(store, &name) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                known = false;
+                warnings.push(format!(
+                    "Registry storage member {name} could not be checked and was retained: {e}"
+                ));
+                continue;
+            }
         }
         if matches!(name.as_str(), "layout.json" | "storage-migration-v1.json") {
             continue;
@@ -807,6 +880,16 @@ fn scan(
                 let mut record = store.record(&name)?;
                 if apply && record.has("restore", "complete") && record.payload.is_some() {
                     record.consume()?;
+                }
+                // purge中にsnapshot消費後のcomplete公開が失敗すると、purge intentありpayloadなしcompleteなしの
+                // 記録が残る。restoreのcompleteと同様にscanで回収する。applyは共通ロックの排他下であり、
+                // record_atの不変条件によりpayload不在はpurge intentで説明済み（不変条件を変えない）。
+                if apply
+                    && record.payload.is_none()
+                    && record.has("purge", "intent")
+                    && !record.has("purge", "complete")
+                {
+                    record.receipt(store, "purge", "complete")?;
                 }
                 if record.payload.is_some() {
                     bytes = bytes
@@ -1433,5 +1516,323 @@ mod tests {
                 .is_err()
         );
         assert_eq!(native::current_sid().unwrap(), sid);
+    }
+    // ---- 独立検証で見つかった保存境界・表示の不具合の回帰テスト（fixtureのmetadataだけを使い、実registryには触れない） ----
+
+    // 外部プロセス相当のhandle。FILE_SHARE_DELETEを許す／許さないを選んで読取りで開く。
+    fn external_reader(
+        path: &std::path::Path,
+        share_delete: bool,
+    ) -> std::io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ(1) | FILE_SHARE_WRITE(2) | FILE_SHARE_DELETE(4)
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(if share_delete { 7 } else { 3 })
+            .open(path)
+    }
+    fn receipt_for(id: &str, manifest_sha256: String, action: &str, phase: &str) -> model::Receipt {
+        model::Receipt {
+            schema: 5,
+            operation_id: id.into(),
+            manifest_sha256,
+            action: action.into(),
+            phase: phase.into(),
+            created_utc: storage::now(),
+        }
+    }
+
+    // 正式本文の公開（rename）後に所有予約の削除だけが失敗しても、公開は成功として扱う。
+    // 修正前はremoveの失敗がErrで返り、公開済みの正式intentを「未公開」と誤認させていた。
+    #[test]
+    fn reservation_removal_failure_after_verified_publication_is_nonfatal() -> Result<()> {
+        let config = uncommitted_fixture("reservation-remove")?;
+        let store = Store::open(&config, false)?;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let _parent = store.create_record(&id)?;
+        let (snapshot, bytes) = fixture_snapshot(&store, &id)?;
+        drop(store.publish_bytes(&id, SNAPSHOT, &bytes)?);
+        let manifest = fixture_manifest(&store, &id, &snapshot, &bytes);
+        let saved = store.publish(&id, MANIFEST, &manifest)?;
+        let manifest_hash = model::hash(&saved.bytes);
+        drop(saved);
+        let intent_name = storage::receipt_name("delete", "intent");
+        // 本文の途中まで書込み済みの予約（中断した公開）を作り、その所有予約をDELETEを許さない読取りhandleで
+        // 固定してから公開を再開させる。renameと本文の再検証は成功し、予約の削除だけが失敗する。
+        // 全プロセス共通のcheckpoint hookは他のテストと干渉するため使わない。
+        let receipt = receipt_for(&id, manifest_hash, "delete", "intent");
+        let body = storage::serialize(&receipt)?;
+        storage::test_reservation(&store, &id, &intent_name, &body, body.len() / 2)?;
+        let dir = store.root.join(&id);
+        let reservation = names(&store, &id)?
+            .into_iter()
+            .find(|n| n.starts_with(".registry-publication-") && n.contains("intent"))
+            .context("intent reservation")?;
+        let holder = external_reader(&dir.join(reservation), false)?;
+        let published = store.publish(&id, &intent_name, &receipt)?;
+        // 予約が残った状態（正式本文あり・holder生存中）でも、commit前の予約検証は通る。
+        store.verify_reservations(&id)?;
+        let notes = store.take_notes();
+        ensure!(
+            notes.len() == 1 && notes[0].contains("reservation"),
+            "Reservation removal failure was not downgraded to a note: {notes:?}"
+        );
+        drop(published);
+        // 公開済みの正式intentは保存され、残った予約付きでも記録は読める。曖昧状態（intentのみ）として保全される。
+        let record = store.record(&id)?;
+        ensure!(record.has("delete", "intent") && record.ambiguous());
+        drop(record);
+        let warning = delete_failure_warning(&store, &id, false);
+        ensure!(
+            warning.contains("commit was not confirmed")
+                && !warning.contains("purge --apply removes"),
+            "Stored intent was described as not committed: {warning}"
+        );
+        // holderを閉じた後は、後続のcleanupが所有予約を整理する。
+        drop(holder);
+        ensure!(store.cleanup_publications(&id)?);
+        ensure!(
+            names(&store, &id)?
+                .iter()
+                .all(|n| !n.starts_with(".registry-publication-"))
+        );
+        Ok(())
+    }
+
+    // commit前の予約検証: 検証できる予約は通し、改変されて検証できない予約はcommit前に止める。
+    // 予約削除の失敗を非致命にしたため、改変された予約を見逃してcommitすると記録が読めなくなる。
+    #[test]
+    fn unverifiable_reservation_is_refused_before_commit() -> Result<()> {
+        let config = uncommitted_fixture("reservation-verify")?;
+        let store = Store::open(&config, false)?;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let _parent = store.create_record(&id)?;
+        let (snapshot, bytes) = fixture_snapshot(&store, &id)?;
+        drop(store.publish_bytes(&id, SNAPSHOT, &bytes)?);
+        let manifest = fixture_manifest(&store, &id, &snapshot, &bytes);
+        let saved = store.publish(&id, MANIFEST, &manifest)?;
+        let manifest_hash = model::hash(&saved.bytes);
+        drop(saved);
+        let intent_name = storage::receipt_name("delete", "intent");
+        let receipt = receipt_for(&id, manifest_hash, "delete", "intent");
+        let body = storage::serialize(&receipt)?;
+        storage::test_reservation(&store, &id, &intent_name, &body, body.len() / 2)?;
+        store.verify_reservations(&id)?;
+        let reservation = names(&store, &id)?
+            .into_iter()
+            .find(|n| n.starts_with(".registry-publication-") && n.contains("intent"))
+            .context("intent reservation")?;
+        std::fs::write(store.root.join(&id).join(reservation), b"x")?;
+        ensure!(
+            store.verify_reservations(&id).is_err(),
+            "A tampered reservation was accepted before commit"
+        );
+        Ok(())
+    }
+
+    // deleteの失敗後の案内は、保存済みの記録の状態で決める。
+    #[test]
+    fn delete_failure_warning_follows_the_stored_record() -> Result<()> {
+        let config = uncommitted_fixture("delete-warning")?;
+        let store = Store::open(&config, false)?;
+        // 正式receiptなし: 未commit確定。
+        let (a, _) = published_record(&store, &[])?;
+        let w = delete_failure_warning(&store, &a, false);
+        ensure!(
+            w.contains("not committed before its intent was published"),
+            "{w}"
+        );
+        // 正式intentのみ: commitの成否を推測しない。
+        let (b, _) = published_record(&store, &[("delete", "intent")])?;
+        let w = delete_failure_warning(&store, &b, false);
+        ensure!(
+            w.contains("commit was not confirmed") && w.contains("without inferring"),
+            "{w}"
+        );
+        let w = delete_failure_warning(&store, &b, true);
+        ensure!(w.contains("committed but completion is unconfirmed"), "{w}");
+        // complete公開済み: 失敗はrename後の検証で起きており、削除は完了している。
+        let (c, _) = published_record(&store, &[("delete", "intent"), ("delete", "complete")])?;
+        let w = delete_failure_warning(&store, &c, true);
+        ensure!(
+            w.contains("completion receipt is published") && !w.contains("unconfirmed"),
+            "{w}"
+        );
+        // manifest公開前: 空の記録はpurgeで整理でき、所有予約・snapshotを持つ記録は保全される。
+        let empty = uuid::Uuid::new_v4().simple().to_string();
+        drop(store.create_record(&empty)?);
+        let w = delete_failure_warning(&store, &empty, false);
+        ensure!(w.contains("empty recovery record"), "{w}");
+        let staged = uuid::Uuid::new_v4().simple().to_string();
+        drop(store.create_record(&staged)?);
+        let (_, staged_bytes) = fixture_snapshot(&store, &staged)?;
+        drop(store.publish_bytes(&staged, SNAPSHOT, &staged_bytes)?);
+        let w = delete_failure_warning(&store, &staged, false);
+        ensure!(
+            w.contains("retained") && !w.contains("can be removed with purge"),
+            "{w}"
+        );
+        ensure!(purge(&store, &staged, true)?["items"][0]["status"] == "retained");
+        Ok(())
+    }
+
+    // restoreの失敗後の案内。intentの有無・complete公開済みを保存状態から分類する。
+    #[test]
+    fn restore_failure_warning_follows_the_stored_record() -> Result<()> {
+        let config = uncommitted_fixture("restore-warning")?;
+        let store = Store::open(&config, false)?;
+        let base = [("delete", "intent"), ("delete", "complete")];
+        let (none, _) = published_record(&store, &base)?;
+        ensure!(restore_failure_warning(&store, &none, false).is_none());
+        let with_intent = [base[0], base[1], ("restore", "intent")];
+        let (intent, _) = published_record(&store, &with_intent)?;
+        // 呼出元のフラグ（intent公開の確認前に失敗）に依らず、保存されたintentから警告する。
+        let w = restore_failure_warning(&store, &intent, false).unwrap();
+        ensure!(w.contains("no confirmed completion"), "{w}");
+        let w = restore_failure_warning(&store, &intent, true).unwrap();
+        ensure!(w.contains("committed but completion is unconfirmed"), "{w}");
+        let with_complete = [
+            base[0],
+            base[1],
+            ("restore", "intent"),
+            ("restore", "complete"),
+        ];
+        let (complete, _) = published_record(&store, &with_complete)?;
+        // すでに復元済みの記録を、スコープ不一致などで拒否した場合（commitしていない）は警告を付けない。
+        ensure!(restore_failure_warning(&store, &complete, false).is_none());
+        let w = restore_failure_warning(&store, &complete, true).unwrap();
+        ensure!(
+            w.contains("restoration is complete") && !w.contains("unconfirmed"),
+            "{w}"
+        );
+        Ok(())
+    }
+
+    // purge中にsnapshot消費後のcomplete公開が失敗して残った記録を、maintain --applyが回収する。
+    #[test]
+    fn scan_apply_completes_a_purge_interrupted_after_snapshot_consumption() -> Result<()> {
+        let config = uncommitted_fixture("purge-complete")?;
+        let store = Store::open(&config, false)?;
+        let receipts = [
+            ("delete", "intent"),
+            ("delete", "complete"),
+            ("purge", "intent"),
+        ];
+        let (id, _) = published_record(&store, &receipts)?;
+        // purgeがsnapshotを消費した直後に止まった状態を作る。
+        store.record(&id)?.consume()?;
+        let record = store.record(&id)?;
+        ensure!(
+            record.payload.is_none() && !record.has("purge", "complete") && !record.ambiguous()
+        );
+        drop(record);
+        // dry-runは何も変更しない。
+        maintain(&store, false, 0, false)?;
+        ensure!(!store.record(&id)?.has("purge", "complete"));
+        let applied = maintain(&store, true, 0, false)?;
+        ensure!(applied["capacityKnown"] == true, "{applied}");
+        // complete公開後はterminalへ閉じる（記録の本文は保持期間まで残る）。
+        ensure!(
+            storage::exists(&store.root.join(format!("{id}.terminal.json")))?,
+            "Interrupted purge was not completed and closed: {applied}"
+        );
+        Ok(())
+    }
+
+    // 外部のFILE_SHARE_DELETE付きhandleが残っても、消費したmetadataの名前はその場で名前空間から外れる。
+    // 従来のdelete設定ではdelete-pendingの名前が残り、親の削除が145、名前のopenが5で失敗した。
+    #[test]
+    fn consumed_snapshot_name_disappears_despite_external_delete_sharing_handle() -> Result<()> {
+        let config = uncommitted_fixture("posix-consume")?;
+        let store = Store::open(&config, false)?;
+        let receipts = [
+            ("delete", "intent"),
+            ("delete", "complete"),
+            ("purge", "intent"),
+        ];
+        let (id, _) = published_record(&store, &receipts)?;
+        let snapshot_path = store.root.join(&id).join(SNAPSHOT);
+        let external = external_reader(&snapshot_path, true)?;
+        store.record(&id)?.consume()?;
+        let exists = storage::exists(&snapshot_path);
+        drop(external);
+        ensure!(
+            matches!(exists, Ok(false)),
+            "Consumed snapshot name stayed delete-pending: {exists:?}"
+        );
+        Ok(())
+    }
+
+    // 1件の名前確認の失敗でmaintain全体が失敗せず、他の記録の整理は続く。実OSで名前確認が失敗する条件は再現できておらず、失敗の注入で確かめる。
+    #[test]
+    fn scan_isolates_a_member_that_cannot_be_checked() -> Result<()> {
+        let mut config = uncommitted_fixture("scan-isolation")?;
+        config.data.max_recovery_bytes = 1;
+        let store = Store::open(&config, false)?;
+        let (expired, _) = published_record(&store, &[])?;
+        // 名前の確認だけが失敗する項目を、確認の失敗を注入して再現する。
+        drop(sec::create_private_file(
+            &store.root.join("stuck-member.tmp"),
+        )?);
+        SCAN_EXISTS_FAULT.with(|fault| *fault.borrow_mut() = Some("stuck-member.tmp".into()));
+        let result = maintain(&store, true, 0, false);
+        SCAN_EXISTS_FAULT.with(|fault| *fault.borrow_mut() = None);
+        let result = result?;
+        ensure!(
+            result["capacityKnown"] == false
+                && result["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|w| w.as_str().unwrap().contains("stuck-member.tmp")),
+            "Unreadable member was not reported: {result}"
+        );
+        ensure!(
+            !storage::exists(&store.root.join(&expired))?,
+            "Other records were not maintained: {result}"
+        );
+        Ok(())
+    }
+
+    // 書込み途中で終了したstorage状態は、通常の改変拒否ではなくmigrate --applyで直せる状態として示す。
+    #[test]
+    fn truncated_storage_state_is_reported_as_migration_required_and_self_heals() -> Result<()> {
+        let config = uncommitted_fixture("state-truncated")?;
+        let state_path = std::path::Path::new(&config.data.backup_directory)
+            .join(storage::ROOT)
+            .join("storage-migration-v1.json");
+        let original = std::fs::read(&state_path)?;
+        let mut store = Store::open(&config, false)?;
+        // Store::openの状態は未準備なので、fixtureと同じ準備済みの状態を保存対象にする。
+        let mut saved = store.state.clone();
+        saved.registry_ready = true;
+        saved.assessment_complete = true;
+        saved.complete = true;
+        saved.legacy_file_policy_version = 2;
+        for body in [&original[..0], &original[..original.len() / 2]] {
+            let handle = sec::open_lifecycle_pending_publisher(&state_path)?;
+            storage::write_handle(handle.raw(), body)?;
+            drop(handle);
+            let error = store.require_ready().unwrap_err().to_string();
+            ensure!(
+                error.starts_with("migration_required:") && error.contains("migrate --apply"),
+                "Interrupted state write was not mapped: {error}"
+            );
+        }
+        // 改変（有効なJSONだが別の束縛）はmigration_requiredへ写さず、そのまま拒否する。
+        let mut tampered = saved.clone();
+        tampered.owner_sid = "S-1-5-21-0-0-0-1".into();
+        let handle = sec::open_lifecycle_pending_publisher(&state_path)?;
+        storage::write_handle(handle.raw(), &storage::serialize(&tampered)?)?;
+        drop(handle);
+        let error = store.require_ready().unwrap_err().to_string();
+        ensure!(
+            !error.starts_with("migration_required:") && error.contains("binding differs"),
+            "Tampered state was not refused as such: {error}"
+        );
+        // migrateが使う書込み（save_state）で自己修復できる。
+        store.save_state(&saved)?;
+        store.require_ready()?;
+        Ok(())
     }
 }

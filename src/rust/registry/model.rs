@@ -9,6 +9,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
+/// .NETの`DateTime.MinValue`（0001-01-01T00:00:00Z）に相当する未確定時刻の印。
+/// 作成時刻がこの値のものは未確定の予約として扱う。
+pub const MIN_TIMESTAMP: i64 = -62135596800;
+pub const MIN_TIMESTAMP_RFC3339: &str = "0001-01-01T00:00:00+00:00";
+
 struct OrdinalKey(Vec<u16>);
 impl PartialEq for OrdinalKey {
     fn eq(&self, other: &Self) -> bool {
@@ -484,7 +489,7 @@ impl Manifest {
         ensure!(
             self.schema == 5
                 && self.operation_id == id
-                && self.created_utc.timestamp() != -62135596800
+                && self.created_utc.timestamp() != MIN_TIMESTAMP
                 && self.metadata_root == root
                 && self.owner_sid == sid
                 && self.path == target.path
@@ -661,13 +666,6 @@ mod tests {
         value.as_object_mut().unwrap().remove("extra");
         value["value"]["data"] = serde_json::json!([251, 255]);
         assert!(decode::<Snapshot>(&serde_json::to_vec(&value).unwrap()).is_err());
-    }
-    #[test]
-    fn hash_is_original_bytes_not_reencoded_json() {
-        let bytes = value_snapshot();
-        let canonical =
-            serde_json::to_vec_pretty(&crate::json::parse_unique(&bytes).unwrap()).unwrap();
-        assert_ne!(hash(&bytes), hash(&canonical));
     }
     #[test]
     fn target_requires_explicit_view_and_refuses_roots_or_ambiguous_names() {

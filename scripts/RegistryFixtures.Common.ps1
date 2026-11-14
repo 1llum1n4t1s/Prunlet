@@ -97,9 +97,6 @@ function Set-RegistryFixtureValue([Microsoft.Win32.RegistryKey]$Key, [string]$Na
 function Get-RegistryFixtureSecurity([Microsoft.Win32.RegistryKey]$Key) {
     Invoke-RegistryFixtureKey $Key 'registry.securityReopen'
 }
-function Get-RegistryFixtureProcessPrivileges([uint32]$ProcessId) {
-    Invoke-PrunletFixture -Operation 'registry.processPrivileges' -Arguments @{processId=$ProcessId}
-}
 function Test-RegistryFixtureKtm([int]$View, [bool]$Machine = $script:RegistryFixtureMachine) {
     Invoke-PrunletFixture -Operation 'registry.preflightKtm' -Arguments @{view=$View;machine=$Machine}
 }
@@ -109,10 +106,6 @@ function Enable-RegistryFixtureSecurity {
 function Set-RegistryFixtureLowIntegrity([string]$Relative, [int]$View) {
     Assert-RegistryFixturePath $Relative
     $null = Invoke-PrunletFixture -Operation 'registry.lowIntegrity' -Arguments @{machine=$script:RegistryFixtureMachine;prefix=$script:RegistryFixturePrefix;path=$Relative;view=$View}
-}
-function Rename-RegistryFixtureLink([string]$Relative, [Microsoft.Win32.RegistryKey]$Key, [string]$NewName) {
-    Assert-RegistryFixturePath $Relative
-    Invoke-RegistryFixtureKey $Key 'registry.renameLink' @{machine=$script:RegistryFixtureMachine;prefix=$script:RegistryFixturePrefix;path=$Relative;name=$NewName}
 }
 function New-RegistryFixtureLink([string]$Relative, [string]$Target) {
     Assert-RegistryFixturePath $Target
@@ -132,13 +125,6 @@ function Get-RegistryFixtureDacl([string]$Relative, [Microsoft.Win32.RegistryKey
 function Set-RegistryFixtureDacl([string]$Relative, [Microsoft.Win32.RegistryKey]$Key, [byte[]]$Bytes, [uint32]$Information) {
     Assert-RegistryFixturePath $Relative
     $null = Invoke-RegistryFixtureKey $Key 'registry.setFixtureDacl' @{machine=$script:RegistryFixtureMachine;prefix=$script:RegistryFixturePrefix;path=$Relative;base64=[Convert]::ToBase64String($Bytes);information=$Information}
-}
-function Deny-RegistryFixtureSetValue([string]$Relative, [Microsoft.Win32.RegistryKey]$Key) {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    try { $sid = $identity.User.Value } finally { $identity.Dispose() }
-    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new("D:P(D;;0x2;;;$sid)(A;;KA;;;$sid)(A;;KA;;;SY)")
-    $bytes = [byte[]]::new($descriptor.BinaryLength); $descriptor.GetBinaryForm($bytes,0)
-    Set-RegistryFixtureDacl $Relative $Key $bytes 4
 }
 function Restore-RegistryFixtureDacl([string]$Relative, [Microsoft.Win32.RegistryKey]$Key, [byte[]]$Bytes) {
     $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($Bytes,0)
