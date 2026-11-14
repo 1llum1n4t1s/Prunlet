@@ -449,6 +449,32 @@ mod directory_scan_tests {
         assert_eq!(fs::read_dir("/dev/fd").unwrap().count(), before);
     }
     #[test]
+    fn trash_error_is_ambiguous_unless_the_original_name_is_confirmed_unchanged() {
+        let directory = fixture();
+        let file = directory.join("kept");
+        fs::write(&file, b"fixture").unwrap();
+        let expected = Identity::from(&fs::symlink_metadata(&file).unwrap());
+        // 元の名前が同じ実体のまま残っていれば、移動されていないので通常の失敗。
+        let error = trash_failure(&file, &expected, "denied");
+        assert!(error.downcast_ref::<Ambiguous>().is_none(), "{error}");
+        assert!(error.to_string().contains("denied"));
+        // 元の名前が無い（移動済みの可能性）は結果不明。文言ではなく型で判定できる。
+        let moved = directory.join("moved");
+        fs::rename(&file, &moved).unwrap();
+        let error = trash_failure(&file, &expected, "denied");
+        assert!(error.downcast_ref::<Ambiguous>().is_some(), "{error}");
+        assert!(error.to_string().starts_with("ambiguous:"));
+        // 元の名前が別の実体に差し替わっている場合も結果不明。
+        fs::write(&file, b"replacement").unwrap();
+        let error = trash_failure(&file, &expected, "denied");
+        assert!(error.downcast_ref::<Ambiguous>().is_some(), "{error}");
+        // コンテキストで包まれてもAmbiguous型は判別できる（`trash`内の`.context`と同じ形）。
+        let wrapped: Result<()> = Err(anyhow::anyhow!("inner")).context(Ambiguous::new("x"));
+        assert!(wrapped.unwrap_err().downcast_ref::<Ambiguous>().is_some());
+        let missing: Result<u8> = None.context(Ambiguous::new("y"));
+        assert!(missing.unwrap_err().downcast_ref::<Ambiguous>().is_some());
+    }
+    #[test]
     fn scan_finishes_all_entries_before_rejecting_changed_name_and_closes_fd() {
         let directory = fixture();
         fs::write(directory.join("first"), b"fixture").unwrap();
@@ -562,6 +588,38 @@ fn verify_tree_after_moves(
     Ok(())
 }
 
+/// Trash処理後の結果が確認できない失敗。呼出し側は文言ではなくこの型で`ambiguous`と`failed`を
+/// 区別する（元のパスとTrashを確認させ、後続の対象は実行しない）。表示文には`ambiguous: `を付ける。
+#[derive(Debug)]
+struct Ambiguous(String);
+impl Ambiguous {
+    fn new(message: impl std::fmt::Display) -> Self {
+        Self(format!("ambiguous: {message}"))
+    }
+}
+impl std::fmt::Display for Ambiguous {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Ambiguous {}
+/// `trashItemAtURL`がエラーを返した後の分類。元の名前が移動前と同じ実体（device/inode/mode）のまま
+/// 残っていると確認できれば移動されていないため通常の失敗とし、元名が無い・別の実体・確認自体の失敗の
+/// ときは移動済みの可能性を排除できないため`Ambiguous`にする（Linuxの失敗後照合と同じ方針）。
+fn trash_failure(
+    path: &Path,
+    expected: &Identity,
+    detail: impl std::fmt::Display,
+) -> anyhow::Error {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if expected.same_object(&Identity::from(&meta)) => {
+            anyhow::anyhow!("Native Trash error: {detail}")
+        }
+        _ => anyhow::Error::new(Ambiguous::new(format!(
+            "Native Trash reported an error but the original name was not confirmed unchanged; inspect the source and Trash: {detail}"
+        ))),
+    }
+}
 #[allow(unexpected_cfgs)]
 fn trash(path: &Path, expected: &Identity) -> Result<()> {
     use objc2_foundation::{NSFileManager, NSString, NSURL};
@@ -571,30 +629,36 @@ fn trash(path: &Path, expected: &Identity) -> Result<()> {
         let mut result = None;
         NSFileManager::defaultManager()
             .trashItemAtURL_resultingItemURL_error(&url, Some(&mut result))
-            .map_err(|e| anyhow::anyhow!("Native Trash error: {e}"))?;
-        let result = result.context("ambiguous: Trash did not return resulting URL")?;
+            .map_err(|e| trash_failure(path, expected, e))?;
+        let result = result.context(Ambiguous::new("Trash did not return resulting URL"))?;
         let returned = result
             .path()
-            .context("ambiguous: Trash URL has no filesystem path")?;
+            .context(Ambiguous::new("Trash URL has no filesystem path"))?;
         let returned = PathBuf::from(returned.to_string());
         #[cfg(all(debug_assertions, prunlet_macos_race_tests))]
         race_tests::barrier(
             "trash-before-result-pin",
             json!({"resultPath":returned,"expected":expected}),
         )
-        .context("ambiguous: Race test boundary failed after native Trash")?;
+        .context(Ambiguous::new(
+            "Race test boundary failed after native Trash",
+        ))?;
         let returned = path::resolve(&returned, false, true)
-            .context("ambiguous: Cannot validate Trash ancestors")?;
-        let target = Pinned::open(&returned)
-            .context("ambiguous: Cannot open Trash result without following links")?;
+            .context(Ambiguous::new("Cannot validate Trash ancestors"))?;
+        let target = Pinned::open(&returned).context(Ambiguous::new(
+            "Cannot open Trash result without following links",
+        ))?;
         if !expected.same_object(&target.id) {
-            bail!("ambiguous: Trash result identity mismatch");
+            return Err(Ambiguous::new("Trash result identity mismatch").into());
         }
         match fs::symlink_metadata(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            _ => bail!(
-                "ambiguous: Original name is still present or its absence cannot be established"
-            ),
+            _ => {
+                return Err(Ambiguous::new(
+                    "Original name is still present or its absence cannot be established",
+                )
+                .into());
+            }
         }
         Ok(())
     })
@@ -849,7 +913,7 @@ pub(super) fn execute_delete_inner(
                         }
                     }
                     Err(e) => {
-                        stopped = e.to_string().contains("ambiguous:");
+                        stopped = e.downcast_ref::<Ambiguous>().is_some();
                         item["status"] = json!(if stopped { "ambiguous" } else { "failed" });
                         item["error"] = json!(e.to_string());
                     }
