@@ -30,7 +30,7 @@ Windowsの管理者起動はsandbox権限申請と区別する。許可済みの
 
 ## Apple Silicon版の実装
 
-ファイル削除は`src/rust/platform/macos`の共通Trash経路に集約し、MCPは`delete_files`のみとする。対象と祖先の実体確認、リンク先の保全、Trashの返却実体と元名の照合を維持する。待機キューは協調的な`flock`だけを待ち、開始許可とMach監査トークンの照合を維持する。`ambiguous`は元のパスとゴミ箱を確認し、自動再送しない。配置済みCLI・MCP・workerは固定の更新ロックを共有する。詳しい境界は[macOSの削除設計](DESIGN.md#macosのファイル削除)と[更新の設計](DESIGN.md#macosの起動時自動更新)を参照する。
+ファイル削除は`src/rust/platform/macos`の共通Trash経路に集約し、MCPは`delete_files`のみとする。対象と祖先の実体確認、リンク先の保全、Trashの返却実体と元名の照合を維持する。待機キューは協調的な`flock`だけを待ち、開始許可とMach監査トークンの照合を維持する。`ambiguous`は元のパスとゴミ箱を確認し、自動再送しない。配置済みCLI・MCP・workerは固定の更新ロックを共有する。導入は`scripts/Install-Prunlet.sh`に集約し、署名・公証・SHA-256の照合を緩めるオプションや、MCPホスト設定の自動書換えを追加しない。詳しい境界は[macOSの削除設計](DESIGN.md#macosのファイル削除)と[更新の設計](DESIGN.md#macosの起動時自動更新)を参照する。
 
 ## Linux版の実装
 
