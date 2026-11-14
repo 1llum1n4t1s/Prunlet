@@ -30,7 +30,7 @@ CodexからMacなどへ送るPowerShellスクリプトは、[フックの連携�
 
 ### Apple Silicon Mac
 
-[GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases/latest)から`prunlet-update-osx-arm64.zip`を取得します。署名・公証の確認、専用フォルダーへの新規導入、CodexのMCP登録は[macOSの導入手順](docs/macos.md)に従ってください。登録済みMCPは起動時に更新を確認し、使用中なら次回以降に延期します。
+[GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases/latest)から`prunlet-update-osx-arm64.zip`を取得します。`scripts/Install-Prunlet.sh`が、取得・サイズとSHA-256の照合・署名と公証の検証・専用フォルダーへの新規導入までを1回で行います（手順は[macOSの導入手順](docs/macos.md)）。CodexなどのMCP登録は、表示される設定行を使って自分で行います。登録済みMCPは起動時に更新を確認し、使用中なら次回以降に延期します。
 
 ### Linux
 

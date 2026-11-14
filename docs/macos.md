@@ -1,5 +1,19 @@
 # Apple Silicon MacでPrunletを使う
 
+## インストーラー（推奨）
+
+`scripts/Install-Prunlet.sh` が、最新の安定版Releaseの取得、サイズ・SHA-256の照合、Developer ID・公証の検証、`--install-macos` による配置までを1回で行います。既定の導入先は `$HOME/.local/share/Prunlet` で、既に存在する場合は何も変更しません（更新はMCPの起動時自動更新が行います）。MCPホストの設定ファイルは書き換えず、登録に使う設定行だけを表示します。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/1llum1n4t1s/Prunlet/main/scripts/Install-Prunlet.sh -o /tmp/Install-Prunlet.sh &&
+bash /tmp/Install-Prunlet.sh --dry-run &&
+bash /tmp/Install-Prunlet.sh
+```
+
+`--dry-run` は取得元・版・配布物を表示するだけです。`--tag vX.Y.Z` で版、`--install-dir <絶対パス>` で導入先を指定できます。GitHub APIの未認証枠が尽きた場合は環境変数 `GH_TOKEN` を設定します。初回は公証チケットの取得のため、検証が数秒かかることがあります。
+
+## 手動で導入する
+
 [GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases/latest)の `prunlet-update-osx-arm64.zip` を取得し、専用フォルダーへ展開します。ZIP内の `prunlet` はDeveloper IDで署名し、Appleの公証を受けています。初回起動時の公証チケット確認にはネット接続が必要です。
 
 ```bash
