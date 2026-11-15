@@ -11,6 +11,8 @@ param(
     [switch]$UseGitHubCliAuthentication
 )
 $ErrorActionPreference = 'Stop'
+# インストーラーの英語の案内・エラー文を照合するため、検証中は表示言語を英語に固定する（このプロセスだけに効く）。
+$env:PRUNLET_LANGUAGE = 'en'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $installer = Join-Path $PSScriptRoot 'Install-Prunlet.ps1'
 $forbidden = @($repoRoot, (Join-Path $env:USERPROFILE '.codex'))
@@ -125,7 +127,7 @@ $installerErrors = $null
 $installerAst = [Management.Automation.Language.Parser]::ParseFile($installer, [ref]$installerTokens, [ref]$installerErrors)
 if ($installerErrors.Count) { throw 'Installer script has parse errors.' }
 $githubHelperSource = ($installerAst.FindAll({ param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Invoke-PrunletGitHubCli', 'Get-PrunletGitHubApiResponse')
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Invoke-PrunletGitHubCli', 'Get-PrunletGitHubApiResponse', 'Format-PrunletMessage')
 }, $false) | ForEach-Object { $_.Extent.Text }) -join "`n"
 $githubHelperBlock = [scriptblock]::Create($githubHelperSource)
 Test-Case 'Explicit GitHub CLI authentication fails closed when gh is missing' {
@@ -1191,7 +1193,7 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
             $before = (Get-FileHash -LiteralPath (Join-Path $managedRoot 'source-info.json')).Hash
             $Repository='1llum1n4t1s/Prunlet'; $Runtime='win-x64'; $CodexHome=$managedCodex
             $script:ForbiddenRoots=@($repoRoot,$managedCodex,(Join-Path $env:USERPROFILE '.codex'))
-            foreach ($definition in $installerAst.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Test-InTree','Assert-PlainPath','Assert-ExternalPath','Test-RegisteredManagedInstallation','Assert-ManagedExistingPath','Read-ManagedInstallationJson','Get-ManagedInstallationSnapshot','Assert-ManagedInstallationSnapshot','Get-GuideRegistrationPreviousHash','Get-ManagedGuideRegistrationHash')},$true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
+            foreach ($definition in $installerAst.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Test-InTree','Assert-PlainPath','Assert-ExternalPath','Test-RegisteredManagedInstallation','Assert-ManagedExistingPath','Read-ManagedInstallationJson','Get-ManagedInstallationSnapshot','Assert-ManagedInstallationSnapshot','Get-GuideRegistrationPreviousHash','Get-ManagedGuideRegistrationHash','Format-PrunletMessage')},$true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
             $snapshot=Get-ManagedInstallationSnapshot $managedRoot
             $registeredGuide=Join-Path $managedCodex 'PRUNLET.md'
             $guideText=[IO.File]::ReadAllText((Join-Path $managedRoot 'bin\PRUNLET.md')).Replace("`r`n","`n").Replace("`n","`r`n")
@@ -1247,7 +1249,7 @@ Windowsのファイル削除では、[PRUNLET.md](PRUNLET.md)を読み、Prunlet
         $script:ForbiddenRoots = @($repoRoot,(Join-Path $env:USERPROFILE '.codex'))
         $tokens = $null; $parseErrors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile($installer,[ref]$tokens,[ref]$parseErrors)
-        foreach ($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Test-InTree','Assert-PlainPath','Assert-ExternalPath','Test-RegisteredManagedInstallation','Assert-ManagedExistingPath','Read-ManagedInstallationJson','Get-ManagedInstallationSnapshot','Assert-ManagedInstallationSnapshot','Assert-ManagedRecoveryBinding')},$true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
+        foreach ($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Test-InTree','Assert-PlainPath','Assert-ExternalPath','Test-RegisteredManagedInstallation','Assert-ManagedExistingPath','Read-ManagedInstallationJson','Get-ManagedInstallationSnapshot','Assert-ManagedInstallationSnapshot','Assert-ManagedRecoveryBinding','Format-PrunletMessage')},$true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
         $snapshot = Get-ManagedInstallationSnapshot $managedRoot
         $configPath = Join-Path $managedRoot 'config.json'
         $original = [IO.File]::ReadAllBytes($configPath)
