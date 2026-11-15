@@ -1,7 +1,9 @@
 pub mod cli;
 pub mod config;
 pub mod files;
+pub mod help;
 pub mod json;
+pub mod locale;
 pub mod migration;
 pub mod platform;
 pub mod protocol;

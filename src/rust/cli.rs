@@ -158,7 +158,9 @@ fn run_inner(args: &[String]) -> Result<i32> {
         return Ok(0);
     }
     if args.is_empty() || args == ["--help"] || args == ["help"] {
-        println!("{HELP}");
+        // ヘルプは人が端末で読む唯一の平文出力なので、利用者の言語で出す（英語は従来と同じ文字列）。
+        // 言語判定はここでだけ行い、JSON を返す他のコマンドや hook・MCP の経路では行わない。
+        println!("{}", crate::help::current());
         return Ok(0);
     }
     ensure!(
@@ -564,6 +566,8 @@ pub fn has_errors(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::help::CURRENT as HELP;
 
     #[test]
     fn hook_start_failures_are_hook_denials() {
@@ -723,69 +727,3 @@ mod tests {
         assert!(command_failed("migrate", &malformed));
     }
 }
-
-#[cfg(target_os = "linux")]
-const HELP: &str = r#"Prunlet — Linux freedesktop Trash.
-prunlet --config <absolute-json-path> init --backup-directory <directory>
-prunlet --config <absolute-json-path> validate-config
-prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]
-prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>
-prunlet --config <absolute-json-path> mcp
-prunlet --config <absolute-json-path> hook
-"#;
-#[cfg(target_os = "macos")]
-const HELP: &str = r#"Prunlet — Apple Silicon macOS Trash.
-prunlet --install-macos <new absolute installation path>
-prunlet --config <absolute-json-path> init --backup-directory <directory>
-prunlet --config <absolute-json-path> validate-config
-prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]
-prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>
-prunlet --config <absolute-json-path> delete-queue [--recursive] -- <absolute-path> [...]
-prunlet --config <absolute-json-path> delete-queue-status <job-id>
-prunlet --config <absolute-json-path> delete-queue-cancel <job-id>
-prunlet --config <absolute-json-path> mcp
-prunlet --config <absolute-json-path> hook
-"#;
-#[cfg(windows)]
-const HELP: &str = r#"Prunlet — Windows Recycle Bin deletion and registry recovery.
-prunlet --config <absolute-json-path> init --backup-directory <directory>
-prunlet --config <absolute-json-path> validate-config
-prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] -- <absolute-path> [...]
-prunlet --config <absolute-json-path> delete [--dry-run] [--recursive] --paths-file <absolute-json-file>
-prunlet --config <absolute-json-path> delete-queue [--recursive] -- <absolute-path> [...]
-prunlet --config <absolute-json-path> delete-queue [--recursive] --paths-file <absolute-json-file>
-prunlet --config <absolute-json-path> delete-queue-status <job-id>
-prunlet --config <absolute-json-path> delete-queue-cancel <job-id>
-prunlet --config <absolute-json-path> registry-delete --view <32|64> [--access-mode <normal|backupRestore>] [--value-name <literal-name> | --value-name=] [--recursive] [--dry-run] -- <registry-key-path>
-prunlet --config <absolute-json-path> registry-session --minutes <1..60> --assert-native-windows
-prunlet --config <absolute-json-path> registry-reconcile <operation-id>
-prunlet --config <absolute-json-path> registry-restore <operation-id> [--access-mode <normal|backupRestore>]
-prunlet --config <absolute-json-path> restore <registry-operation-id> [--access-mode <normal|backupRestore>]
-prunlet --config <absolute-json-path> purge <operation-id> [--dry-run | --apply]
-prunlet --config <absolute-json-path> maintain [--dry-run | --apply] [--audit-records]
-prunlet --config <absolute-json-path> operations
-prunlet --config <absolute-json-path> migrate [--dry-run | --apply [--if-needed | --retry-legacy-discard]]
-prunlet --config <absolute-json-path> mcp
-prunlet --config <absolute-json-path> hook [--hook-script <legacy-path>]
-Legacy --allowed-root <directory> options are accepted but do not restrict target directories.
-Metadata and volume recovery directories are protected.
-Files and folders normally move into the Windows Recycle Bin without Prunlet operation records.
-An ordinary file with a Windows reserved final name is permanently deleted after identity checks, without using the bin.
-Dry-run reports that case as would_permanently_delete. Reserved-name directories and links are rejected.
-When Windows reports a file or folder too large for the bin, Prunlet attempts to permanently delete its confirmed original.
-Only a confirmed removal returns permanently_deleted; an uncertain attempt returns ambiguous.
-On a volume whose confirmed immediate-delete setting means the bin is unavailable, an item may also be permanently deleted after the same identity checks; its status is permanently_deleted, never recycled.
-Other recycling failures do not trigger permanent deletion. Dry-run cannot predict an ordinary item's bin-size outcome.
-Restore recycled items using Windows Recycle Bin; permanently deleted items cannot be restored there.
-Registry snapshots retain the configured 7-day / 1 GiB defaults.
-Maintain and purge manage registry recovery only; inspection is the default.
-Migrate discards owned legacy file recovery data through Windows Recycle Bin; registry recovery stays protected.
-After checking an interrupted discard, use migrate --apply --retry-legacy-discard to explicitly acknowledge retry.
-Restore and registry-restore accept registry operation IDs and never overwrite existing keys or values.
-Recycled hard links share content with surviving aliases.
-For ambiguous file results, inspect the source and Windows Recycle Bin; do not resend deletion.
-Empty directories are supported; deleting directory contents requires --recursive.
-Wildcard expansion is unsupported. Links are deleted without following their targets.
-Registry view is required. Omit value-name for a key; an empty value-name selects the default value.
-Registry access defaults to normal. backupRestore is explicit per deletion/restoration, requires effective-token privileges, and supports only view 64 in a 64-bit Windows process.
-Registry key snapshots require full Owner/Group/DACL/SACL access and SeSecurityPrivilege; no automatic elevation or fallback."#;
