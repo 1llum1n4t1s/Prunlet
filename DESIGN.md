@@ -165,6 +165,16 @@ registryの旧記録は専用namespaceへ移し、ID・snapshot・完全ACL・sc
 
 latest導入時に`capacityDefaultMigrationVersion`が欠落または1未満の既存設定だけを対象に、`maxRecoveryBytes`を1 GiB、移行印を1へ一度だけ更新する。移行済み印と移行後の利用者変更を尊重し、未知の設定・ACLを保持する。設定読込やdry-runへ設定書込みを持ち込まない。詳細の動作検証は[導入検証](docs/verification.md#latestインストーラー)を参照する。
 
+## ローカライズ
+
+人が読む文言だけを9言語（`ja`・`en`・`zh-CN`・`zh-TW`・`ko`・`es`・`fr`・`de`・`pt-BR`）で実行時に切り替える。言語は`PRUNLET_LANGUAGE`→`LC_ALL`→`LC_MESSAGES`→`LANG`（空・`C`・`POSIX`は飛ばす）→OSの表示言語（Windowsは`GetUserDefaultUILanguage`、macOSは`AppleLanguages`の先頭）→英語の順で決める。タグは`zh-Hans`・`zh-CN`・`zh-SG`を`zh-CN`、`zh-Hant`・`zh-TW`・`zh-HK`・`zh-MO`を`zh-TW`、`pt-*`を`pt-BR`、それ以外を主言語で照合する。キーは英語の原文とし、辞書に無いキーと英語では原文をそのまま出すため、英語の出力は多言語化の前と同じ文字列になる。
+
+- CLIのヘルプ（`src/rust/help.rs`）: 行単位で`src/rust/locales/<タグ>.json`（`include_str!`で埋め込み、`en.json`は原文→原文）を引き、`prunlet `で始まる用法の行は訳さない。言語判定（`src/rust/locale.rs`）はヘルプ表示の経路だけで行い、削除・hook・MCPの経路では判定しない。
+- Windowsのインストーラー（`scripts/Install-Prunlet.ps1`）: 単独で取得されるため、英語以外の8言語の辞書をスクリプト内のJSONに持ち、`Format-PrunletMessage`でエラー・警告を出す。判定や辞書の読込みに失敗しても例外を出さず英語へ落とし、案内の表示で導入を失敗させない。最終結果・バックアップ説明のJSONは訳さない。
+- Apple Siliconのインストーラー（`scripts/Install-Prunlet.sh`）: macOS標準のbash 3.2で動く表引きで案内・エラーを出し、貼り付けて使う設定行とコマンド例は訳さない。
+
+AIが読む文言（MCPツールの名前・説明・スキーマ、hookの拒否理由と案内、MCP起動スクリプトの診断）と、機械可読の出力（CLIの結果・エラーのJSON、hookのプロトコル応答）は英語のまま固定し、言語設定で変えない。エージェント・検証スクリプト・他のフックがこれらの文字列を照合するためである。配置する共通指示（`integration/PRUNLET.md`と、`install-agent-instructions.ps1`が共通`AGENTS.md`へ書く参照行）は現在日本語のまま多言語化の対象外とし、変更していない。登録済みの写しとの照合が起動時更新の保留条件と既存登録の所有判定に関わるため、英語化する場合は移行を含めて別途決める。`tests/localization.rs`が3つの辞書のキー集合・プレースホルダー・コードの参照キー・タグ照合を検査する。
+
 ## 不変条件と設計判断
 
 拒否された削除を別shell・別API・別exeへ付け替えない。処理が不明な場合は元のパスとOSのゴミ箱を確認し、自動再送しない。Windowsでは明示的なサイズ超過と確認済み即時削除設定だけをゴミ箱失敗後の永久削除条件とする。保護領域・祖先・リンク先を通常削除で破壊しない。レジストリの完全ACL・raw bytes・transaction・非上書き復元を維持する。

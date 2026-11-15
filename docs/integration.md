@@ -4,7 +4,7 @@ PrunletはWindows向けCLIとstdio MCPを同じexeで提供します。Codexの`
 
 ## 準備
 
-通常は[READMEのlatestインストール手順](../README.md#インストールと更新)を使います。GitHubの最新releaseから署名済みの更新ZIPを取得・照合し、exe・連携スクリプト・共通指示を`%USERPROFILE%\.local\Prunlet\bin`へ配置します。`-RegisterCodex`で下記の共通登録も実行できます。ローカルクローン内のファイルを実行元に登録しません。
+通常は[READMEのlatestインストール手順](../README.ja.md#インストールと更新)を使います。GitHubの最新releaseから署名済みの更新ZIPを取得・照合し、exe・連携スクリプト・共通指示を`%USERPROFILE%\.local\Prunlet\bin`へ配置します。`-RegisterCodex`で下記の共通登録も実行できます。ローカルクローン内のファイルを実行元に登録しません。
 
 登録後のMCP起動時には配置済みの起動スクリプトがlatestを確認します。旧MCP・保守プロセスの使用中は切替を延期し、フック用exeは切替中も独立して動作します。更新状態・候補の所有と互換性を確認できない場合は保全し、自動再送や旧版への無条件な巻戻しを行いません。レジストリの移行が必要な更新では新しいexeで既存の明示移行を完了させ、復元記録を維持します。最初の導入・既存の旧フック定義からの移行にはCodexでのフック信頼が必要です。
 
@@ -32,7 +32,7 @@ RTKの共通指示と同様、エージェントのツール選択を案内す�
 
 作業先・更新バックアップ・ソース・Codex内部へのガードは維持する。配置前と移行前にパス・設定・hashを再確認し、`-ExpectedCommitSha <40桁SHA>`を渡した場合は取得した最新releaseのcommitとも照合する。共通guideの再登録では、検証済み配置のguideとUTF-8本文が一致するLF/CRLFの差だけを認識し、編集済み本文は拒否する。旧更新stageはこのモードで清掃しない。これらは非原子的な整合確認であり、ディレクトリ実体を固定する機構ではない。
 
-通常はインストーラーが設定を作成します。手動の初期化は[README](../README.md#初期設定)を参照してください。`backupDirectory`は保護された共通metadata基点で、レジストリ記録を`.registry-records-v1/<operationId>`へ保存します。新しいファイル・フォルダー削除は操作記録やsnapshotを作りません。
+通常はインストーラーが設定を作成します。手動の初期化は[README](../README.ja.md#初期設定)を参照してください。`backupDirectory`は保護された共通metadata基点で、レジストリ記録を`.registry-records-v1/<operationId>`へ保存します。新しいファイル・フォルダー削除は操作記録やsnapshotを作りません。
 
 ファイル・フォルダーは通常Windowsのゴミ箱へ移し、復元はWindowsの画面で行います。末尾名がWindows予約名の通常ファイルは、実体と親・名前・属性を固定して照合し、追加確認やShell試行なしで永久削除します。予約名の祖先・ディレクトリ・reparse pointは対象外です。通常名の対象は、Windowsが対象をゴミ箱に対して大きすぎると判定し、元の実体を再確認できた場合は、元の名前の永久削除を試みます。削除の完了を確認できたときだけ`permanently_deleted`を返します。サイズ超過以外の失敗からは永久削除へ切り替えません。CLIの`restore`（`registry-restore`の別名）とMCPの`restore_registry`はレジストリ専用です。MCPは`delete_files`・`delete_registry`・`restore_registry`・`reconcile_registry`・`list_operations`の5ツールです。`operations`と`list_operations`にもファイル削除を載せません。
 
@@ -158,11 +158,11 @@ text(result.output);
 
 削除と無関係な定型の構文は検査不能として扱いません。POSIX規則では、終端語を引用したヒアドキュメント（`<<'EOF'`・`<<"EOF"`・`<<\EOF`）の本文を、受け取る文が`cat`で標準出力を`/dev`・`/proc`以外の静的なパスへ書き出す形か、`python`・`python3`・`py`・`node`にoptionだけを付けた形のときに限り、コマンドではなくdataとして読み飛ばします（インタプリタの本文は`-c`と同じく検査対象外）。パイプ・同じ行の後続文・`(`/`{`の中・`$(`や逆引用の中・算術や`[[`の中・shellやssh・終端語を引用しない本文は、従来どおり本文を文として検査します。本文の終わりは前後の空白を除いて終端語と一致した行とし、bashより早めに判定します。制御構文の中の代入（`do n=$(basename $f)`）、`[`・`[[`、終端語の後ろのリダイレクトだけ（`done 2>&1`・`done < list`）も検査します。PowerShellの`EncodedCommand`本文では、二重引用内の`$(...)`のうち変数・プロパティ参照・数値添字だけの形（`$($sw.Elapsed.TotalSeconds)`）と、静的な`.ps1`を`-File`で実行するpwsh（`-NoProfile`・`-NonInteractive`・`-NoLogo`・`-ExecutionPolicy <値>`のみ併用可）を通します。メソッド呼出し・コマンド・変数のパス・`-File -`は従来どおり拒否します。Windowsで`Bash`のshellが不明な場合は、CMD・PowerShellの候補解釈でも従来どおりヒアドキュメント本文を検査します。
 
-拒否時は配置済みexe・設定で、ファイルには`delete --paths-file <absolute-json-file>`、レジストリには`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <single-key-path>`を最初からCMDで使う手順を案内します。レジストリで成功した`operationId`を保持し、`registry-restore <operationId>`（`restore`もレジストリ専用の別名）で非上書き復元します。ファイル・フォルダーは操作IDを保存せず、`recycled`の項目だけをWindowsのゴミ箱で復元できます。MCP代替入口は`delete_registry`・`restore_registry`です。view必須、既定値の空文字、完全ACLの権限とKTMの境界は[README](../README.md#レジストリの削除復元)を参照してください。削除許可とホスト承認を維持し、拒否対象を別経路で再試行しません。hook自身は削除・自動置換・PowerShell backend起動を行いません。
+拒否時は配置済みexe・設定で、ファイルには`delete --paths-file <absolute-json-file>`、レジストリには`registry-delete --view <32|64> [--value-name <literal-name> | --value-name=] [--recursive] -- <single-key-path>`を最初からCMDで使う手順を案内します。レジストリで成功した`operationId`を保持し、`registry-restore <operationId>`（`restore`もレジストリ専用の別名）で非上書き復元します。ファイル・フォルダーは操作IDを保存せず、`recycled`の項目だけをWindowsのゴミ箱で復元できます。MCP代替入口は`delete_registry`・`restore_registry`です。view必須、既定値の空文字、完全ACLの権限とKTMの境界は[README](../README.ja.md#レジストリの削除復元)を参照してください。削除許可とホスト承認を維持し、拒否対象を別経路で再試行しません。hook自身は削除・自動置換・PowerShell backend起動を行いません。
 
 MCPの1行とhookの入力全体は、UTF-16の文字数で1,048,576文字まで受理します。MCPは空白だけの行を従来どおり無視します。それ以外の超過行は残りを改行まで読み捨ててエラーを返し、次の要求を処理します。不正なUTF-8を含む行も改行まで読み捨て、`id`を`null`にしたJSON-RPCのparse error（-32700）で拒否して次の要求を処理します（stdinの読取りそのものの失敗では従来どおり終了します）。hookは上限超過を検出するとEOFを待たず拒否します。読み取り中も保持する入力をこの上限までに抑えます。
 
-このhookは任意コードの全削除を検出する境界ではありません。動的なコマンド名、独自alias、.NETのファイルAPI、他言語のコード、外部スクリプト、対話型shellへ後から送る入力などは検出対象外です。エンコード済みコマンドは、単独の`pwsh -NoProfile -EncodedCommand <base64>`だけを復号して検査し、それ以外の形（省略形のoption、wrapper内、追加コマンドとの併用、引用・動的な値など）で認識したものは検査できないため拒否します。Prunletのローカル絶対パス検査・復元データ保存先の保護はCLIとMCPの入口で別途適用されます。通常の削除例とJSON一覧の制限は[README](../README.md#削除復元)を参照してください。
+このhookは任意コードの全削除を検出する境界ではありません。動的なコマンド名、独自alias、.NETのファイルAPI、他言語のコード、外部スクリプト、対話型shellへ後から送る入力などは検出対象外です。エンコード済みコマンドは、単独の`pwsh -NoProfile -EncodedCommand <base64>`だけを復号して検査し、それ以外の形（省略形のoption、wrapper内、追加コマンドとの併用、引用・動的な値など）で認識したものは検査できないため拒否します。Prunletのローカル絶対パス検査・復元データ保存先の保護はCLIとMCPの入口で別途適用されます。通常の削除例とJSON一覧の制限は[README](../README.ja.md#削除復元)を参照してください。
 
 ## 保護されたレジストリへの明示アクセス
 

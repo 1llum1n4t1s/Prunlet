@@ -93,4 +93,8 @@ Windowsのlatest導入の検証は`scripts/Install-Prunlet.ps1`の[導入契約]
 
 WindowsのMCP起動時自動更新は手動導入とは別の経路である。[更新の設計](DESIGN.md#起動時自動更新)に従い、更新状態・製品排他・配布検証・容量検査を迂回しない。Windowsの配布物は`scripts/Package-PrunletUpdate.ps1`で生成し、公開タグから生成・署名するrelease workflowとの形式の一致を維持する。署名は`scripts/Sign-PrunletBuild.ps1`（Sigilune）で行う。Windowsの公開ZIPは`scripts/Verify-ReleasePackage.ps1 -PackagePath <ZIP絶対パス> -SourceRoot <ソース絶対パス> -PublishDirectory <publish絶対パス> -CommitSha <40桁SHA> -DefaultBranch <既定ブランチ> -Runtime <win-x64|win-arm64> -Repository <owner/repo> -RequireSignature`で生成元・署名と照合し、返されたZIP全体のSHA-256がアップロード直前にも一致することを確認する。署名・ZIP生成・R2配置を変更した場合は、Sigiluneで実際に署名したビルドで`Sign-PrunletBuild.ps1`・梱包・`-RequireSignature`の検証を確認する。本番の署名は最小限にし、対象は外部の一時ビルドだけにする。
 
+ローカライズは[DESIGN.md](DESIGN.md#ローカライズ)に従う。人が読む文言（CLIのヘルプ、インストーラーの案内・エラー・警告）を足したり変えたりしたら、英語の原文をキーにした9言語の辞書（`src/rust/locales/*.json`、`scripts/Install-Prunlet.ps1`・`scripts/Install-Prunlet.sh`の埋め込み表）と`tests/localization.rs`を同時に更新し、`cargo test --locked --test localization`を通す。AIが読む文言（MCPの説明・hookの拒否理由と案内）と機械可読の出力（CLIの結果・エラーのJSON、hookの応答）は英語のまま変えない。共通指示（`integration/PRUNLET.md`と`install-agent-instructions.ps1`の参照行）は訳し分けず、言語の変更は登録済みの写しとの照合・起動時更新の保留に影響するため、移行を含めて決めてから行う。検証スクリプトが英語の文言を照合する場合はプロセス内で`PRUNLET_LANGUAGE=en`に固定する。
+
+READMEは英語の`README.md`を正本とし、`README.ja.md`・`README.zh-CN.md`・`README.zh-TW.md`・`README.ko.md`・`README.es.md`・`README.fr.md`・`README.de.md`・`README.pt-BR.md`を置く。READMEを変えたら全言語版を同時に直し、先頭の9言語の切替行・見出しアンカー・コマンド・パス・設定キー・製品名・URLを揃える。日本語の`docs/`からREADMEの見出しへリンクする場合は`README.ja.md`のアンカーを使う。
+
 コードコメントは日本語。[README](README.md)は利用者向け、[DESIGN.md](DESIGN.md)は現在の設計、連携と検証の詳細は`docs/`、エージェントの作業規約は本ファイルに置き、同じ説明を複製せず参照する。
