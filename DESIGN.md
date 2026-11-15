@@ -227,6 +227,8 @@ macOSとLinuxは`update::github`で同じGitHub Releaseを照合する。導入�
 
 同じCPU向けのtar.gzは展開先のパスを作らずに解析し、`prunlet`・`manifest.json`の2項目、各上限、実行体の長さ・SHA-256・ELFのCPUを照合する。同じ`bin`に新しいinodeを作成し、同期した候補から版・コミット・CPUを読み返す。配置と新旧の実体を再照合して実行ファイルの名前を原子的に置き換える。共用ロックの取得後に世代が変わっていた入口は現行の実行体を起動する。取得・候補検証に失敗した場合は標準エラーへ理由を出し、現行のMCPを起動する。置換対象を実行ファイルだけに絞り、設定・復元領域・Codex登録を保持する。
 
+Linux版の配布tar.gzは、Releaseの公開で動く`.github/workflows/prunlet-linux-release.yml`が、x64は`ubuntu-24.04`、ARM64は`ubuntu-24.04-arm`のGitHub提供ランナーでビルドする。Rustテスト、`Verify-LinuxFiles.ts`・`Verify-UnixStartupUpdate.ts`、`manifest.json`（版・commit・runtime・長さ・SHA-256）の照合、実行体のglibc要件が2.39以下であることの確認を通した成果物だけを、チェックサムとともに同じReleaseへ添付する。`ubuntu-latest`はglibc要件が2.39を超える版へ移ったため使わず、ランナーを固定する。過去タグへの後付けと添付しない検証は`workflow_dispatch`で行う。
+
 ## 製品と検証の境界
 
 `Publish-Prunlet.ps1`は入力とCargo設定のビルド前後の一致を検査し、`build-manifest.json`に入力の指紋、toolchain、target、製品のSHA-256を記録する。検証ビルドでは同じ入力からCoreのlibtestプローブを生成し、別crateの`tools/prunlet-fixtures`と`tools/prunlet-support`がfixture DLLと補助CLIを供給する。これらのhashもmanifestに記録し、候補を検証時に照合する。障害注入はテスト用のCoreに限定し、製品exe・配布ZIPには検証入口やツールを含めない。Core境界の結果は製品CLI・MCP・hookの実プロセス検証と区別する。
