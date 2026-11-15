@@ -13,6 +13,7 @@ Prunletは、AIエージェントに許可されたファイル・フォルダ�
 - `platform::windows`がパス・実体・ACLの照合やWindows Shellとの接続を担当する。ゴミ箱からの復元と保持期間の管理はWindowsに委ねる。Prunletはファイル復元APIや通常の履歴圧縮入口を提供しない。
 - `platform::macos`がファイルパスと実体の照合、FoundationのTrash呼び出し、Mach IPCによる待機キュー、署名済み実行ファイルの導入と起動時更新を担当する。
 - `platform::linux`がfdを使ったパスと実体の検証、freedesktopのホームTrashへの同期移動、単一実行ファイルの起動時更新を担当する。macOSとLinuxは署名付きマニフェストによる候補選定と取得を`update::r2`・`update::manifest`で共有する。
+- `app_update`（Windows専用）はVelopack管理下の導入（Setup版）の確認・取得・信頼検査・適用・登録を担当し、管理外のビルドでは何もしない。詳細は[Windows Setup（Velopack）版の更新](#windows-setupvelopack版の更新)を参照する。
 - Windows向けの`integration/`のPowerShellスクリプトはCodex登録、MCP起動時更新の調停、定期保守タスクの登録を担当する。製品Coreの削除処理は持たない。
 
 権限の境界はホストのsandbox承認、Windowsの実トークン、Prunlet Coreの対象検証に分かれる。Prunlet自身は自動昇格しないが、許可された削除についてエージェントが明示的に管理者CMDを起動し、同じ配置済みCLIと設定を使う連携は別の責務である。起動成功だけを削除成功とは扱わず、拒否・結果不明を昇格で迂回しない。起動と結果確認の手順は[連携手順](docs/integration.md#sandboxとゴミ箱へのアクセス)に集約する。
@@ -228,6 +229,15 @@ macOSとLinuxは`update::r2`で、R2の最新ポインタ（`latest/<runtime>.js
 同じCPU向けのtar.gzは展開先のパスを作らずに解析し、`prunlet`・`manifest.json`の2項目、各上限、実行体の長さ・SHA-256・ELFのCPUを照合する。同じ`bin`に新しいinodeを作成し、同期した候補から版・コミット・CPUを読み返す。配置と新旧の実体を再照合して実行ファイルの名前を原子的に置き換える。共用ロックの取得後に世代が変わっていた入口は現行の実行体を起動する。取得・候補検証に失敗した場合は標準エラーへ理由を出し、現行のMCPを起動する。置換対象を実行ファイルだけに絞り、設定・復元領域・Codex登録を保持する。
 
 Linux版の配布tar.gzは、`release/<版>`ブランチへのpushで動く`.github/workflows/prunlet-linux-release.yml`が、x64は`ubuntu-24.04`、ARM64は`ubuntu-24.04-arm`のGitHub提供ランナーでビルドする。Rustテスト、`Verify-LinuxFiles.ts`・`Verify-UnixStartupUpdate.ts`、`manifest.json`（版・commit・runtime・長さ・SHA-256）の照合、実行体のglibc要件が2.39以下であることの確認を通した成果物だけを、Secretsを持たないbuild jobからEnvironment `release`のpublish jobへ渡し、`scripts/Publish-PrunletLinuxR2.ps1`が中身を再検査してR2へ置き、署名付きマニフェストを発行する。手動取得用の固定名（`download/latest/`のtar.gzと`.sha256`）は最新ポインタの後に置き換える。`ubuntu-latest`はglibc要件が2.39を超える版へ移ったため使わず、ランナーを固定する。配信しない検証は、`release/*`以外のrefでの`workflow_dispatch`で行う。
+
+### Windows Setup（Velopack）版の更新
+
+Windows x64にはZIP経路と併存して、Velopackの Setup（packId `PrunletApp`、ユーザー単位・管理者不要）を配る。実装は`src/rust/app_update/`に集約し、`velopack` crateは`=1.2.161`に固定する。導入先は`%LOCALAPPDATA%\PrunletApp`、状態・ロック・hook複製は導入先の外の`%LOCALAPPDATA%\Prunlet`に置く。Velopackが導入先を丸ごと入れ替えても、削除ガードの排他・マーカー・hookを失わないためである。実行ファイルの親が`current`でその親に`Update.exe`がある場合（`is_managed_exe`）だけ動き、従来の導入（`.local\Prunlet\bin`）・開発ビルド・hook名のexeでは状態フォルダーを含め何も読み書きしない。
+
+- 構成: `lock`（製品ロックと適用中マーカー。CLI・MCP・worker・保守が共有し`update-apply`が排他）、`processes`（導入先から動くプロセスの二重確認。パスを読めない`prunlet*.exe`はbusy）、`trust`・`authenticode`・`release`（nupkgの信頼検査）、`hook`・`host`・`logon`（hook複製・ホスト設定の書換え・HKCU Runへの`update-apply`登録）、`legacy`（旧導入の検知）。
+- 更新の流れ: MCP内で24時間に1回、確認と取得だけを行い適用しない。ログオン時の`update-apply`が、確認・取得 → 信頼検査 → 排他ロック → 列挙 → 再照合 → マーカー → `Update.exe`への引き渡しを行う。busyでも他のプロセスを強制終了せず、引き渡したら直ちに終了する。インストール・更新直後のVelopackフックは必ず終了コード0で、失敗は記録して`setup status|repair`・次回のMCP起動・ログオンで再試行する。
+- 信頼: 取得はVelopackの`download_updates`を使わず自前で行う。`download_updates`は取得直後に`<root>\Update.exe`を上書きし、検査前の未検証コードをrootへ置くためである。フィードのFullだけを選び（Deltaは使わない）、rootの外の`incoming`へ取得し、サイズ・SHA-256・署名者・製品名・版・エントリ集合・machine・署名付きマニフェスト`manifests/<版>/velopack-win-x64.json`のすべてに通ったものだけを`packages\`へ移す。適用時にも同じ検査を再実行し、`Update.exe`は検証済みnupkgの`Squirrel.exe`からだけ展開して、引き渡し直前に署名を再確認する。すべてfail-closedである。
+- 配信と検証の手順は[Windowsの Setup（Velopack）](docs/distribution.md#windowsの-setupvelopack)と[Setup（Velopack）の梱包・配信の検証](docs/verification.md#setupvelopackの梱包配信の検証)を参照する。ZIP経路・launcher・`src/rust/update/`は、Setup版の導入が完了するまで残す。
 
 ## 製品と検証の境界
 
