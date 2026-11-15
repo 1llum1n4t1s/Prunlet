@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.0.48 - 2026-11-16
+
+- Windows向けにSetup版（Velopack）を追加。`https://prunlet.kagayoi.com/velopack/`から導入でき、起動時に新しい版を確認して自動更新する。適用前に、R2の署名付きマニフェストでパッケージのSHA-256を照合する。
+- 更新・配布の取得元を、GitHub Release（タグ・`releases/latest`）から`https://prunlet.kagayoi.com`（Cloudflare R2）の署名付きマニフェストへ変更。Windows・Apple Siliconのインストーラー、各OSの起動時自動更新、Setup版の更新は、専用の鍵で署名したマニフェストを組み込みの公開鍵で検証し、製品・runtime・配布物名・取得先・長さ・SHA-256が一致し、導入済みより新しい版だけを、リダイレクトを辿らずに取得して適用する。1つでも合わなければ何も適用せず、次回へ延期する。
+- 導入と更新にGitHubの認証が不要になった。Windowsのインストーラーの`-UseGitHubCliAuthentication`と、Apple Siliconのインストーラーの`GH_TOKEN`の利用を削除し、起動時自動更新も`gh`の認証へ切り替えなくなった。`-Repository`・`--repository`は互換のために残るが、公式以外のリポジトリはマニフェストと一致しないため導入しない。Apple Siliconのインストーラーの`--tag vX.Y.Z`は、その版のマニフェストを使う。
+- Linuxの手動取得先を`https://prunlet.kagayoi.com/download/latest/`（固定名のtar.gzと同名の`.sha256`）に変更し、署名付きマニフェストを`openssl`で検証して取得する手順を追加。
+- 配布は`release/<版>`ブランチのpushで始まり、タグとGitHub Releaseは作らない。
+- この変更より前の版（GitHub Releaseで配布していた版）は新しい版を検知できず、現在の版のまま動き続ける。壊れはしないが自動では移行しないため、一度だけ再導入が必要。Windowsはインストーラーを再実行し、Apple SiliconとLinuxは各導入手順の「旧版からの再導入」に従う。
+
 ## 1.0.47 - 2026-11-15
 
 - CLIのヘルプと、Windows・Apple Siliconのインストーラーの案内・エラーを9言語（日本語・英語・簡体字中国語・繁体字中国語・韓国語・スペイン語・フランス語・ドイツ語・ブラジル・ポルトガル語）に対応。言語は`PRUNLET_LANGUAGE`、`LC_ALL`・`LC_MESSAGES`・`LANG`、OSの表示言語の順で決まり、判定できない場合は英語になる（Apple Siliconのインストーラーの既定表示は日本語から英語に変わる）。CLIの結果・エラーのJSON、フックの拒否理由、MCPの説明は従来どおり英語のまま。
