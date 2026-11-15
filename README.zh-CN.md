@@ -30,19 +30,21 @@ Codex 发送到 Mac 等处的 PowerShell 脚本，请按[hook 集成步骤](docs
 
 ## 安装与更新
 
+在发布源迁移到 `https://prunlet.kagayoi.com` 的签名清单之前发布的版本（通过 GitHub Releases 分发的版本）无法检测到新版本。它们会继续以当前版本运行而不会损坏，但不会自动迁移，因此请重新安装一次：Windows 请再次运行 [Windows](#windows) 中的安装程序命令；Apple Silicon Mac 和 Linux 请按照 [macOS 重新安装步骤](docs/macos.md#旧版からの再導入)或 [Linux 重新安装步骤](docs/linux.md#旧版からの再導入)操作。
+
 ### Apple Silicon Mac
 
-从 [GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases/latest) 获取 `prunlet-update-osx-arm64.zip`。`scripts/Install-Prunlet.sh` 一次完成下载、大小和 SHA-256 校验、签名与公证验证，以及到专用文件夹的全新安装（步骤见 [macOS 安装步骤](docs/macos.md)）。请使用它显示的配置行，自行向 Codex 等注册 MCP。已注册的 MCP 在启动时检查更新，正在使用时推迟到以后的启动。
+`scripts/Install-Prunlet.sh` 从 `https://prunlet.kagayoi.com` 获取签名清单，用脚本内置的公钥验证，然后从清单记录的位置获取 `prunlet-update-osx-arm64.zip`。它一次完成下载、大小和 SHA-256 校验、签名与公证验证，以及到专用文件夹的全新安装（步骤见 [macOS 安装步骤](docs/macos.md)）。请使用它显示的配置行，自行向 Codex 等注册 MCP。已注册的 MCP 在启动时检查更新，正在使用时推迟到以后的启动。
 
 ### Linux
 
-获取与 CPU 对应的 `prunlet-linux-x64.tar.gz` 或 `prunlet-linux-arm64.tar.gz`，以及同名的 `.sha256` 文件。[GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases)
+从 `https://prunlet.kagayoi.com` 获取与 CPU 对应的 `prunlet-linux-x64.tar.gz` 或 `prunlet-linux-arm64.tar.gz`。其获取位置和 SHA-256 记录在签名清单中。如需简便获取，`https://prunlet.kagayoi.com/download/latest/` 下也有固定名称的软件包和同名的 `.sha256` 文件。
 
-校验和的核对、放置到专用目录以及注册到 Codex，请参阅 [Linux 安装步骤](docs/linux.md#初回インストール)。按步骤放置后，官方发行版会在 MCP 启动时检查更新，正在使用时推迟到以后的启动。
+签名清单和校验和的核对、放置到专用目录以及注册到 Codex，请参阅 [Linux 安装步骤](docs/linux.md#初回インストール)。按步骤放置后，官方发行版会在 MCP 启动时检查更新，正在使用时推迟到以后的启动。
 
 ### Windows
 
-支持 Windows x64 和 ARM64。下面的安装程序会从 [GitHub 仓库](https://github.com/1llum1n4t1s/Prunlet)的最新 release 获取已签名的预构建软件包（`prunlet-update-<runtime>.zip`）并放置。只需要 PowerShell 7，不需要 Rust、MSVC 构建工具和 Windows SDK。
+支持 Windows x64 和 ARM64。下面的安装程序会从 `https://prunlet.kagayoi.com` 获取最新版本的已签名预构建软件包（`prunlet-update-<runtime>.zip`）并放置。只需要 PowerShell 7，不需要 Rust、MSVC 构建工具和 Windows SDK。
 
 | 安装目标 | 安装程序选项 |
 | --- | --- |
@@ -59,15 +61,15 @@ Invoke-WebRequest 'https://raw.githubusercontent.com/1llum1n4t1s/Prunlet/main/sc
 pwsh -NoProfile -File $installer
 ```
 
-如果 GitHub API 的未认证额度达到上限，在上面的 `pwsh` 命令中添加 `-UseGitHubCliAuthentication`，即可使用已登录的 GitHub CLI。它不会自动安装 gh 或代为登录。此选项仅用于手动安装程序。
+安装和更新不需要 GitHub 帐户、登录或令牌。
 
-安装程序从 GitHub API 获取最新的稳定版 release，并确认其 tag 指向默认分支上的 commit，且只附加了一个目标 runtime 的软件包。放置下载的 ZIP 前，会核对 GitHub 返回的大小和 SHA-256、所含文件列表及各自的 hash、release 的 commit 和 runtime，以及可执行文件的 Authenticode 签名（签名者正确且带时间戳的 Valid）。这些核对与启动时自动更新的条件相同。如果刚发布后软件包尚未完成签名和附加，或核对失败，它将不写入任何内容并停止。它不会从源代码构建，也不会切换到本地克隆。
+安装程序从 `https://prunlet.kagayoi.com` 获取最新版本的签名清单（`latest/<runtime>.json`），用安装程序内置的公钥验证签名，并确认产品、仓库、runtime、软件包名称和获取位置一致。它从该固定位置获取 ZIP，不跟随重定向；放置前会核对清单记录的长度和 SHA-256、所含文件列表及各自的 hash、commit 和 runtime，以及可执行文件的 Authenticode 签名（签名者正确且带时间戳的 Valid）。这些核对与启动时自动更新的条件相同。如果无法获取清单或核对失败，它将不写入任何内容并停止。它不会从源代码构建，也不会切换到本地克隆。
 
 默认安装位置为 `%USERPROFILE%\.local\Prunlet`。它放置 `bin\prunlet.exe`、注册用脚本和共同指令，并以与启动时自动更新相同的格式，在 `source-info.json` 中记录来源、分支、commit 和软件包的 hash。默认不会写入 Codex 等 AI 工具的配置文件或文件夹，只注册维护任务和更新任务。
 
-自动更新会在 MCP 主机启动 Prunlet MCP 时，以及由安装程序注册的更新任务（每天 12:30 和登录 10 分钟后，无窗口）中，检查 GitHub Release 上的预构建二进制文件，并在旧 MCP 和维护进程退出后切换。由于有更新任务，未注册 MCP 的电脑也会跟进最新版本。自动更新不需要重新从源代码构建。运行产品可执行文件不需要另外安装 .NET 运行时或 VC 运行时。正在使用时不会强制结束，而是在下次 MCP 启动时再次检查。当 GitHub API 的未认证普通请求额度用尽时，会自动使用已配置的 GitHub CLI（`gh`）的认证继续查询。如果通信或下载失败，只要更新前的状态安全保留，就使用当前版本。
+自动更新会在 MCP 主机启动 Prunlet MCP 时，以及由安装程序注册的更新任务（每天 12:30 和登录 10 分钟后，无窗口）中，检查 `https://prunlet.kagayoi.com` 上的签名清单，并在旧 MCP 和维护进程退出后切换。只会应用比已安装版本更新的版本。由于有更新任务，未注册 MCP 的电脑也会跟进最新版本。自动更新不需要重新从源代码构建。运行产品可执行文件不需要另外安装 .NET 运行时或 VC 运行时。正在使用时不会强制结束，而是在下次 MCP 启动时再次检查。如果通信、下载或验证失败，则不应用任何内容；只要更新前的状态安全保留，就使用当前版本。
 
-自动更新信任 GitHub Release 的发布者，并检查下载的软件包是否一致。验证机制和信任范围请参阅[启动时自动更新的设计](DESIGN.md#起動時自動更新)。
+自动更新只信任发布专用密钥所做的签名。发布 workflow 会先确认 commit 包含在 `main` 中，并构建、签名和验证软件包，然后才为清单签名。验证机制和信任范围请参阅[启动时自动更新的设计](DESIGN.md#起動時自動更新)。
 
 更新数据在专用的 2 GiB 配额内管理。已确认的区域会被复用，未知数据和中断的输出会被保留。空间不足时推迟更新，注册表的恢复数据不会因此被清理。
 

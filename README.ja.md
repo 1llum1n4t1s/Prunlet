@@ -30,19 +30,21 @@ CodexからMacなどへ送るPowerShellスクリプトは、[フックの連携�
 
 ## インストールと更新
 
+配布元を`https://prunlet.kagayoi.com`の署名付きマニフェストへ移す前の版（GitHub Releasesで配布していた版）は、新しい版を検知できません。現在の版のまま動き続けて壊れることはありませんが、自動では移行しないため、一度だけ再導入してください。Windowsは[Windows](#windows)のインストーラーのコマンドを再実行します。Apple Silicon MacとLinuxは[macOSの再導入手順](docs/macos.md#旧版からの再導入)・[Linuxの再導入手順](docs/linux.md#旧版からの再導入)に従います。
+
 ### Apple Silicon Mac
 
-[GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases/latest)から`prunlet-update-osx-arm64.zip`を取得します。`scripts/Install-Prunlet.sh`が、取得・サイズとSHA-256の照合・署名と公証の検証・専用フォルダーへの新規導入までを1回で行います（手順は[macOSの導入手順](docs/macos.md)）。CodexなどのMCP登録は、表示される設定行を使って自分で行います。登録済みMCPは起動時に更新を確認し、使用中なら次回以降に延期します。
+`scripts/Install-Prunlet.sh`が、`https://prunlet.kagayoi.com`から署名付きマニフェストを取得してスクリプトに組み込んだ公開鍵で検証し、そこに記録された取得先から`prunlet-update-osx-arm64.zip`を取得します。取得・サイズとSHA-256の照合・署名と公証の検証・専用フォルダーへの新規導入までを1回で行います（手順は[macOSの導入手順](docs/macos.md)）。CodexなどのMCP登録は、表示される設定行を使って自分で行います。登録済みMCPは起動時に更新を確認し、使用中なら次回以降に延期します。
 
 ### Linux
 
-CPUに合う`prunlet-linux-x64.tar.gz`または`prunlet-linux-arm64.tar.gz`と、同名の`.sha256`ファイルを取得します。[GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases)
+CPUに合う`prunlet-linux-x64.tar.gz`または`prunlet-linux-arm64.tar.gz`を`https://prunlet.kagayoi.com`から取得します。取得先とSHA-256は署名付きマニフェストに記録されています。手軽に取得する場合は、`https://prunlet.kagayoi.com/download/latest/`に固定名の配布物と同名の`.sha256`ファイルもあります。
 
-チェックサムの照合、専用ディレクトリへの配置、Codex登録は[Linuxの導入手順](docs/linux.md#初回インストール)を参照してください。公式配布版は、手順どおりに配置するとMCP起動時に更新を確認し、使用中なら次回以降に延期します。
+署名付きマニフェストとチェックサムの照合、専用ディレクトリへの配置、Codex登録は[Linuxの導入手順](docs/linux.md#初回インストール)を参照してください。公式配布版は、手順どおりに配置するとMCP起動時に更新を確認し、使用中なら次回以降に延期します。
 
 ### Windows
 
-Windows x64・ARM64に対応します。下のインストーラーは[GitHubリポジトリ](https://github.com/1llum1n4t1s/Prunlet)の最新リリースから、署名済みのビルド済み配布物（`prunlet-update-<runtime>.zip`）を取得して配置します。必要なのはPowerShell 7だけで、Rust・MSVCビルドツール・Windows SDKは不要です。
+Windows x64・ARM64に対応します。下のインストーラーは`https://prunlet.kagayoi.com`から最新版の署名済みのビルド済み配布物（`prunlet-update-<runtime>.zip`）を取得して配置します。必要なのはPowerShell 7だけで、Rust・MSVCビルドツール・Windows SDKは不要です。
 
 | 導入先 | インストーラーの指定 |
 | --- | --- |
@@ -59,15 +61,15 @@ Invoke-WebRequest 'https://raw.githubusercontent.com/1llum1n4t1s/Prunlet/main/sc
 pwsh -NoProfile -File $installer
 ```
 
-GitHub APIの未認証枠が上限に達した場合は、上の`pwsh`コマンドに`-UseGitHubCliAuthentication`を追加すると、既存のログイン済みGitHub CLIを利用できます。ghの自動導入・ログインは行いません。この指定は手動インストーラー用です。
+導入と更新に、GitHubのアカウント・ログイン・トークンは不要です。
 
-インストーラーはGitHub APIから最新の安定版リリースを取得し、そのタグが既定ブランチ上のコミットを指すこと、対象runtimeの配布物が1つだけ添付されていることを確認します。取得したZIPは、GitHubが返したサイズ・SHA-256、同梱物の一覧と各hash、リリースのコミット・runtime、実行ファイルのAuthenticode署名（署名者・タイムスタンプ付きのValid）を照合してから配置します。照合は起動時自動更新と同じ条件です。リリース直後で配布物の署名・添付がまだ終わっていない場合や、照合に失敗した場合は何も書き込まずに停止します。ソースのビルドやローカルクローンへの切替えは行いません。
+インストーラーは`https://prunlet.kagayoi.com`から最新版の署名付きマニフェスト（`latest/<runtime>.json`）を取得し、インストーラーに組み込んだ公開鍵で署名を検証して、製品・リポジトリ・runtime・配布物名・取得先が一致することを確認します。ZIPはその固定の取得先からリダイレクトを辿らずに取得し、マニフェストに記録された長さ・SHA-256、同梱物の一覧と各hash、コミット・runtime、実行ファイルのAuthenticode署名（署名者・タイムスタンプ付きのValid）を照合してから配置します。照合は起動時自動更新と同じ条件です。マニフェストを取得できない場合や照合に失敗した場合は何も書き込まずに停止します。ソースのビルドやローカルクローンへの切替えは行いません。
 
 既定の配置先は`%USERPROFILE%\.local\Prunlet`です。`bin\prunlet.exe`と登録用スクリプト・共通指示を配置し、`source-info.json`に取得元・ブランチ・コミット・配布物のhashを起動時自動更新と同じ形式で記録します。既定ではCodexなどAIツールの設定ファイル・フォルダーへ書き込まず、保守タスクと更新タスクだけを登録します。
 
-自動更新では、MCPホストがPrunlet MCPを起動する際と、インストーラーが登録する更新タスク（毎日12:30とログオン10分後、窓なし）でGitHub Releaseのビルド済みバイナリを確認し、旧MCPや保守プロセスが終了しているときに切り替えます。更新タスクがあるため、MCPを登録していないPCでも最新版へ追従します。自動更新ではソースの再ビルドは不要です。製品exeの実行に.NETランタイムやVCランタイムの追加導入は不要です。使用中なら終了させず、次のMCP起動時に再確認します。GitHub APIの未認証の通常リクエスト枠を使い切った場合は、設定済みのGitHub CLI（`gh`）の認証を使って自動で照会を続けます。通信や取得に失敗した場合は、更新前の状態が安全に保たれていれば現在の版を使います。
+自動更新では、MCPホストがPrunlet MCPを起動する際と、インストーラーが登録する更新タスク（毎日12:30とログオン10分後、窓なし）で`https://prunlet.kagayoi.com`の署名付きマニフェストを確認し、旧MCPや保守プロセスが終了しているときに切り替えます。適用するのは導入済みより新しい版だけです。更新タスクがあるため、MCPを登録していないPCでも最新版へ追従します。自動更新ではソースの再ビルドは不要です。製品exeの実行に.NETランタイムやVCランタイムの追加導入は不要です。使用中なら終了させず、次のMCP起動時に再確認します。通信・取得・検証に失敗した場合は何も適用せず、更新前の状態が安全に保たれていれば現在の版を使います。
 
-自動更新はGitHub Releaseの発行者を信頼し、取得した配布物の一致を検査します。検証の仕組みと信頼範囲は[起動時自動更新の設計](DESIGN.md#起動時自動更新)を参照してください。
+自動更新は、配信専用の鍵による署名だけを信頼します。配布workflowは、コミットが`main`に含まれることを確認し、配布物をビルド・署名・検証してからマニフェストに署名します。検証の仕組みと信頼範囲は[起動時自動更新の設計](DESIGN.md#起動時自動更新)を参照してください。
 
 更新データは専用の2 GiB枠で管理します。確認済みの領域を再利用し、未知のデータや中断した出力は保全します。容量不足時は更新を延期し、レジストリの復元データは整理対象にしません。
 

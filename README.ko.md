@@ -30,19 +30,21 @@ Codex가 Mac 등으로 보내는 PowerShell 스크립트는 [hook 연동 절차]
 
 ## 설치 및 업데이트
 
+배포 원본을 `https://prunlet.kagayoi.com`의 서명된 매니페스트로 옮기기 전에 배포된 버전(GitHub Releases로 배포하던 버전)은 새 버전을 감지할 수 없습니다. 현재 버전으로 계속 동작하며 망가지지는 않지만 자동으로 이전되지 않으므로 한 번만 다시 설치하십시오. Windows는 [Windows](#windows)의 설치 프로그램 명령을 다시 실행합니다. Apple Silicon Mac과 Linux는 [macOS 재설치 절차](docs/macos.md#旧版からの再導入) 또는 [Linux 재설치 절차](docs/linux.md#旧版からの再導入)를 따릅니다.
+
 ### Apple Silicon Mac
 
-[GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases/latest)에서 `prunlet-update-osx-arm64.zip`을 받습니다. `scripts/Install-Prunlet.sh`가 다운로드, 크기와 SHA-256 확인, 서명과 공증 검증, 전용 폴더로의 새 설치까지 한 번에 수행합니다(절차는 [macOS 설치 절차](docs/macos.md)). Codex 등의 MCP 등록은 표시되는 구성 줄을 사용해 직접 합니다. 등록된 MCP는 시작할 때 업데이트를 확인하고, 사용 중이면 다음 시작 이후로 미룹니다.
+`scripts/Install-Prunlet.sh`가 `https://prunlet.kagayoi.com`에서 서명된 매니페스트를 받아 스크립트에 내장된 공개 키로 검증하고, 거기에 기록된 위치에서 `prunlet-update-osx-arm64.zip`을 받습니다. 다운로드, 크기와 SHA-256 확인, 서명과 공증 검증, 전용 폴더로의 새 설치까지 한 번에 수행합니다(절차는 [macOS 설치 절차](docs/macos.md)). Codex 등의 MCP 등록은 표시되는 구성 줄을 사용해 직접 합니다. 등록된 MCP는 시작할 때 업데이트를 확인하고, 사용 중이면 다음 시작 이후로 미룹니다.
 
 ### Linux
 
-CPU에 맞는 `prunlet-linux-x64.tar.gz` 또는 `prunlet-linux-arm64.tar.gz`와 같은 이름의 `.sha256` 파일을 받습니다. [GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases)
+CPU에 맞는 `prunlet-linux-x64.tar.gz` 또는 `prunlet-linux-arm64.tar.gz`를 `https://prunlet.kagayoi.com`에서 받습니다. 받을 위치와 SHA-256은 서명된 매니페스트에 기록되어 있습니다. 간편하게 받으려면 `https://prunlet.kagayoi.com/download/latest/`에 고정 이름의 패키지와 같은 이름의 `.sha256` 파일도 있습니다.
 
-체크섬 확인, 전용 디렉터리로의 배치, Codex 등록은 [Linux 설치 절차](docs/linux.md#初回インストール)를 참조하십시오. 절차대로 배치하면 공식 배포판은 MCP 시작 시 업데이트를 확인하고, 사용 중이면 다음 시작 이후로 미룹니다.
+서명된 매니페스트와 체크섬 확인, 전용 디렉터리로의 배치, Codex 등록은 [Linux 설치 절차](docs/linux.md#初回インストール)를 참조하십시오. 절차대로 배치하면 공식 배포판은 MCP 시작 시 업데이트를 확인하고, 사용 중이면 다음 시작 이후로 미룹니다.
 
 ### Windows
 
-Windows x64와 ARM64를 지원합니다. 아래 설치 프로그램은 [GitHub 리포지토리](https://github.com/1llum1n4t1s/Prunlet)의 최신 release에서 서명된 사전 빌드 패키지(`prunlet-update-<runtime>.zip`)를 받아 배치합니다. 필요한 것은 PowerShell 7뿐이며 Rust, MSVC 빌드 도구, Windows SDK는 필요하지 않습니다.
+Windows x64와 ARM64를 지원합니다. 아래 설치 프로그램은 `https://prunlet.kagayoi.com`에서 최신 버전의 서명된 사전 빌드 패키지(`prunlet-update-<runtime>.zip`)를 받아 배치합니다. 필요한 것은 PowerShell 7뿐이며 Rust, MSVC 빌드 도구, Windows SDK는 필요하지 않습니다.
 
 | 설치 대상 | 설치 프로그램 옵션 |
 | --- | --- |
@@ -59,15 +61,15 @@ Invoke-WebRequest 'https://raw.githubusercontent.com/1llum1n4t1s/Prunlet/main/sc
 pwsh -NoProfile -File $installer
 ```
 
-GitHub API의 인증되지 않은 호출 한도에 도달하면 위 `pwsh` 명령에 `-UseGitHubCliAuthentication`을 추가해 이미 로그인한 GitHub CLI를 사용할 수 있습니다. gh를 자동으로 설치하거나 대신 로그인하지는 않습니다. 이 옵션은 수동 설치 프로그램 전용입니다.
+설치와 업데이트에는 GitHub 계정, 로그인, 토큰이 필요하지 않습니다.
 
-설치 프로그램은 GitHub API에서 최신 안정 release를 가져와, 그 tag가 기본 브랜치의 commit을 가리키는지, 대상 runtime의 패키지가 하나만 첨부되어 있는지 확인합니다. 받은 ZIP은 GitHub가 반환한 크기와 SHA-256, 포함된 파일 목록과 각 hash, release의 commit과 runtime, 실행 파일의 Authenticode 서명(서명자와 타임스탬프가 있는 Valid)을 확인한 뒤 배치합니다. 확인 조건은 시작 시 자동 업데이트와 같습니다. release 직후 패키지의 서명·첨부가 아직 끝나지 않았거나 확인에 실패하면 아무것도 쓰지 않고 중지합니다. 소스에서 빌드하거나 로컬 클론으로 전환하지 않습니다.
+설치 프로그램은 `https://prunlet.kagayoi.com`에서 최신 버전의 서명된 매니페스트(`latest/<runtime>.json`)를 받아 설치 프로그램에 내장된 공개 키로 서명을 검증하고, 제품, 리포지토리, runtime, 패키지 이름, 받을 위치가 일치하는지 확인합니다. ZIP은 그 고정된 위치에서 리디렉션을 따르지 않고 받으며, 배치하기 전에 매니페스트에 기록된 길이와 SHA-256, 포함된 파일 목록과 각 hash, commit과 runtime, 실행 파일의 Authenticode 서명(서명자와 타임스탬프가 있는 Valid)을 확인합니다. 확인 조건은 시작 시 자동 업데이트와 같습니다. 매니페스트를 받을 수 없거나 확인에 실패하면 아무것도 쓰지 않고 중지합니다. 소스에서 빌드하거나 로컬 클론으로 전환하지 않습니다.
 
 기본 설치 위치는 `%USERPROFILE%\.local\Prunlet`입니다. `bin\prunlet.exe`와 등록용 스크립트, 공통 지시를 배치하고, `source-info.json`에 출처, 브랜치, commit, 패키지 hash를 시작 시 자동 업데이트와 같은 형식으로 기록합니다. 기본적으로 Codex 등 AI 도구의 구성 파일·폴더에는 쓰지 않으며, 유지 관리 작업과 업데이트 작업만 등록합니다.
 
-자동 업데이트는 MCP 호스트가 Prunlet MCP를 시작할 때와 설치 프로그램이 등록하는 업데이트 작업(매일 12:30과 로그온 10분 후, 창 없음)에서 GitHub Release의 사전 빌드 바이너리를 확인하고, 이전 MCP와 유지 관리 프로세스가 종료되었을 때 전환합니다. 업데이트 작업이 있으므로 MCP를 등록하지 않은 PC도 최신 버전을 따라갑니다. 자동 업데이트에는 소스 재빌드가 필요하지 않습니다. 제품 실행 파일을 실행하는 데 .NET 런타임이나 VC 런타임을 추가로 설치할 필요가 없습니다. 사용 중이면 강제로 종료하지 않고 다음 MCP 시작 시 다시 확인합니다. GitHub API의 인증되지 않은 일반 요청 한도를 모두 사용하면 이미 구성된 GitHub CLI(`gh`)의 인증을 사용해 자동으로 조회를 계속합니다. 통신이나 다운로드에 실패하면 업데이트 전 상태가 안전하게 유지되는 한 현재 버전을 사용합니다.
+자동 업데이트는 MCP 호스트가 Prunlet MCP를 시작할 때와 설치 프로그램이 등록하는 업데이트 작업(매일 12:30과 로그온 10분 후, 창 없음)에서 `https://prunlet.kagayoi.com`의 서명된 매니페스트를 확인하고, 이전 MCP와 유지 관리 프로세스가 종료되었을 때 전환합니다. 설치된 버전보다 새로운 버전만 적용합니다. 업데이트 작업이 있으므로 MCP를 등록하지 않은 PC도 최신 버전을 따라갑니다. 자동 업데이트에는 소스 재빌드가 필요하지 않습니다. 제품 실행 파일을 실행하는 데 .NET 런타임이나 VC 런타임을 추가로 설치할 필요가 없습니다. 사용 중이면 강제로 종료하지 않고 다음 MCP 시작 시 다시 확인합니다. 통신, 다운로드, 검증에 실패하면 아무것도 적용하지 않으며, 업데이트 전 상태가 안전하게 유지되는 한 현재 버전을 사용합니다.
 
-자동 업데이트는 GitHub Release의 게시자를 신뢰하고, 받은 패키지가 일치하는지 검사합니다. 검증 방식과 신뢰 범위는 [시작 시 자동 업데이트 설계](DESIGN.md#起動時自動更新)를 참조하십시오.
+자동 업데이트는 배포 전용 키로 만든 서명만 신뢰합니다. 배포 workflow는 commit이 `main`에 포함되어 있는지 확인하고 패키지를 빌드, 서명, 검증한 뒤에만 매니페스트에 서명합니다. 검증 방식과 신뢰 범위는 [시작 시 자동 업데이트 설계](DESIGN.md#起動時自動更新)를 참조하십시오.
 
 업데이트 데이터는 전용 2 GiB 한도 안에서 관리합니다. 확인된 영역은 재사용하고, 알 수 없는 데이터와 중단된 출력은 보존합니다. 공간이 부족하면 업데이트를 미루며, 레지스트리 복구 데이터는 이를 위해 정리하지 않습니다.
 

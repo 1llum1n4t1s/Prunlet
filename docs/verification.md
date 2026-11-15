@@ -16,7 +16,7 @@ Windowsの`cargo test --locked --lib`では、`files::recordless`の`native_*`�
 
 `Verify-LargeOperations.ps1`の既定経路は、現行の`Verify-RecordlessFiles.ps1`の大規模ケースだけを呼ぶ。`-FixtureRoot`でゴミ箱が有効な検証先を渡せる。現行の`-FileCount`は32,769〜65,535件で、通常の全件検証とは区別する。`-ProcessTimeoutSeconds`は従来と同じく既定1,800秒・委譲時の上限3,600秒で、削除CLIの待機へ引き継ぐ。`-LegacyCopyVerification`は廃止され、指定すると拒否する。真正な旧版exeを使う検証は`Verify-FileRecordMigration.ps1`の明示移行に限定する。
 
-公開HEADを確認する`Verify-LatestInstall.ps1 -CheckPublicHead`は、必要なら`-UseGitHubCliAuthentication`を明示する。既存のログイン済み`gh`による同じGitHub APIの読取りを検証し、未認証経路の成功とは区別してreportへ記録する。gh欠如・非0終了・不正JSONは元データを変更せず停止する。トークン取得やCLIの自動導入・ログインは行わない。
+公開済みの最新版を確認する`Verify-LatestInstall.ps1 -CheckPublicHead`は、実R2の最新ポインタ（`https://prunlet.kagayoi.com/latest/win-x64.json`）を本番の公開鍵で検証して導入する。GitHubの認証・トークンは使わない。マニフェストが無い・拒否された・未署名の場合は配置先を変更せずに停止したことを確認し、reportの`publicHeadChecked`・`publicHeadSource`へ記録する。
 
 ## 通常E2Eの検証範囲
 
@@ -108,9 +108,22 @@ New-Item -ItemType Directory -Path (Split-Path -Parent $latestReport) -Force | O
 pwsh -NoProfile -File .\scripts\Verify-LatestInstall.ps1 -ExecutablePath $exe -OutputDirectory $latestRun -ReportPath $latestReport -CheckPublicHead
 ```
 
-GitHub応答（最新release・タグ・既定ブランチとの比較・asset）を、今回のビルド出力と作業ツリーの補助ファイルから`Package-PrunletUpdate.ps1`で作った更新ZIPへ差し替え、実際のインストーラーの取得・照合・展開・配置・Codex登録を通すE2Eです。検証用ビルドは署名できないため、Authenticodeの判定結果だけを置換します。未署名の拒否は置換せず実際のWindows判定で確認し、署名者違い・タイムスタンプなしは置換した判定で確認します。assetの未添付、既定ブランチ外のcommit、digest不一致、`package.json`のcommit・runtime不一致、ZIPの不正経路・重複・リンク・欠落・余分なentry・内容改変を、導入先へ書き込む前に拒否することも確認します。`source-info.json`が起動時更新と同じ10項目で、取得したassetとZIPを指すことを照合します。releaseの再解決、同一SHAからの導入、クローンに依存しない登録、旧設定の容量を一度だけ1 GiBへ移すこと、新規設定の移行印、移行後の明示容量と他設定・レジストリ復元データの保持、大小文字を変えた印・容量、設定だけ残る再導入、未知設定の拒否、設定ロック時の保全、制限DACLの保存と登録失敗時の設定バイト列・SDDL復旧、取得の失敗、製品更新の失敗時の復元を検証します。Codex設定がロックされて登録が途中で失敗した場合の復旧と、旧`allowedRoots`内外にある作業場所での導入も確認します。実ユーザーの配置先・Codex設定は使いません。設定検証が`validate-config`で走査・変更せず、全登録・旧backend退役後に明示移行することを確認します。移行開始後の失敗は旧binaryへrollbackせず新exe・設定・登録を保全し、同じCLIで再開できることを確認します。
+R2の応答（署名付きマニフェストの封筒と、それが指す配布物）を、今回のビルド出力と作業ツリーの補助ファイルから`Package-PrunletUpdate.ps1`で作った更新ZIPと、テスト鍵で署名した封筒へ差し替え、実際のインストーラーの取得・照合・展開・配置・Codex登録を通すE2Eです。本番のURLは固定のまま、HTTP取得と署名照合だけを置換し、インストーラーの写しの公開鍵定数だけをテスト鍵へ置き換えます（封筒の鍵IDは本番のもの）。検証用ビルドは署名できないため、Authenticodeの判定結果だけを置換します。未署名の拒否は置換せず実際のWindows判定で確認し、署名者違い・タイムスタンプなしは置換した判定で確認します。最新ポインタの欠落、固定公開鍵以外の署名・非正規形・他runtimeのキーを指すマニフェスト、導入済み以下の版、マニフェストとZIPの長さ・SHA-256の不一致、`package.json`のcommit・runtime不一致、ZIPの不正経路・重複・リンク・欠落・余分なentry・内容改変を、導入先へ書き込む前に拒否することも確認します。`source-info.json`が起動時更新と同じ10項目で、R2の不変URLと取得したZIPを指すことを照合します。最新版の再解決、同一SHAからの導入、クローンに依存しない登録、旧設定の容量を一度だけ1 GiBへ移すこと、新規設定の移行印、移行後の明示容量と他設定・レジストリ復元データの保持、大小文字を変えた印・容量、設定だけ残る再導入、未知設定の拒否、設定ロック時の保全、制限DACLの保存と登録失敗時の設定バイト列・SDDL復旧、取得の失敗、製品更新の失敗時の復元を検証します。Codex設定がロックされて登録が途中で失敗した場合の復旧と、旧`allowedRoots`内外にある作業場所での導入も確認します。実ユーザーの配置先・Codex設定は使いません。設定検証が`validate-config`で走査・変更せず、全登録・旧backend退役後に明示移行することを確認します。移行開始後の失敗は旧binaryへrollbackせず新exe・設定・登録を保全し、同じCLIで再開できることを確認します。
 
 起動時更新では、旧MCPが応答中の延期と終了後の切替、独立hookの応答、標準入出力とEOF、複数起動の排他、取得失敗時の旧版利用、切替・登録・移行途中からの再開を確認します。 配布と同じZIPから複数回更新し、補助製品の変更・据置・再変更、旧slotの実体再利用、schema 5記録の不変更を確認します。容量検査はファイルとディレクトリのADS、stateの一時出力を含め、上限拒否時に元データを変えないことを確認します。改変した登録・不正state・互換性を確認できない候補は保持して停止し、不明な清掃を自動再送しないことを確認します。起動時更新で適用済みの配置へ実際のインストーラーを再実行した後（別commit・旧overlay製品）も、更新状態とstageが変わらず、次のreleaseの起動時更新が延期されず適用されることをE2Eで確認します。更新状態が`idle`でない配置へ実際のインストーラーを再実行すると製品・更新状態・来歴を変えずに拒否され、`idle`へ戻せば導入できること、launcherが更新準備CLIの拒否理由を延期の文言へ含めることもE2Eで確認します。Rustの単体テスト（`cargo test --locked --lib`）は、取得失敗後のZIP再利用・未適用stageの置き換え・stateの共存検証・stateの公開の再試行と一時ファイルの回収・slotの再利用を、実体のあるfixtureで確認します。導入mutexの鍵は、`scripts/Dump-DotNetLowering.ps1`でPowerShellの`ToLowerInvariant()`を全コードポイント（サロゲートを除く）について書き出し、環境変数`PRUNLET_DOTNET_LOWER_REFERENCE`にその絶対パスを渡した`cargo test --locked --lib installation_key_lowering -- --ignored`で、Rust側の写像との一致を総当たりで確認します（基準なしでは成功扱いにしません）。隔離fixtureでの成功と、公開後の実ホストでの読み込み・hook信頼は区別します。
+
+起動時更新のケースは、launcherが呼ぶRustの内部コマンド（`__check-release-manifest`・`__download-release-package`・`__prepare-release-package`）のR2取得を、通信なしのfixtureへ置き換えて実行します。この入口は`all(windows, debug_assertions, prunlet_windows_update_tests)`のビルドだけにあり（Unixの`prunlet_linux_update_tests`・`prunlet_macos_race_tests`と同じ形）、同じcfgのときだけテスト鍵`prunlet-release-test-1`を受理します。配布用のreleaseビルドには入口・環境変数名・テスト鍵が残りません。検証用ビルドは次のように作ります。`build-manifest.json`には`profile`が`release`と記録され、`RUSTFLAGS`は残らないため、このビルドを製品ZIP・公開や通常の検証の代わりに使いません。
+
+```powershell
+$env:RUSTFLAGS = '--cfg prunlet_windows_update_tests -C debug-assertions=on'
+pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot -IncludeVerificationProbe
+Remove-Item Env:RUSTFLAGS
+```
+
+- `PRUNLET_WINDOWS_UPDATE_FIXTURE`（絶対パスのフォルダー）: `https://prunlet.kagayoi.com/latest/<runtime>.json`・`manifests/<版>/<runtime>.json`・`releases/1llum1n4t1s/prunlet/<commit>/<runtime>/<sha256>.zip`の3種類のURLを、URLのUTF-8バイト列のSHA-256（小文字16進）を名前にしたファイルから返します。該当ファイルが無ければ取得失敗として扱い、ネットワークへは出ません。
+- `PRUNLET_WINDOWS_UPDATE_FIXTURE_VERSION`（厳密な`x.y.z`）: 版の新旧の判定に使う導入済みの版を、実行体の版の代わりにこの値にします。`Verify-LatestInstall.ps1`は導入済みexeの版リソースから毎回読んで渡します。
+
+署名・正規形・runtime・版・commit・長さ・SHA-256の照合は置き換えず、本番と同じコードで確かめます。`Verify-LatestInstall.ps1`は、検査対象のexeにテスト鍵IDと入口の環境変数名が無ければlauncherを呼ばずに起動時更新のケースを不合格（未検証）にし、reportの`startupUpdateFixture`へ記録します。通常ビルドでの合格を起動時更新の検証として扱いません。
 
 未適用stageを残した手動導入後の更新準備は、`scripts/Verify-UnappliedStartupStage.ps1 -ExecutablePath <今回のCLI絶対パス> -PublishDirectory <同じビルドのpublish絶対パス> -OutputDirectory <未使用の外部絶対パス> -ReportPath <未使用の外部JSON絶対パス>`で隔離検証します。配布用スクリプトで生成・照合した実ZIPを使い、実CLIのbegin・prepareと、今回のビルドにhash一致する新candidateのCore apply・補助製品適用・統合確認・移行完了を通し、旧製品の既定保持による`cleanup_pending`から次候補の準備へ戻れることを確認します。次候補eは直前候補dとexeが同一で、補助guideだけを変更したZIPです。HTTP取得だけを検証済みZIPと取得完了stateの配置で代替し、実ユーザーのCodex登録・Task Schedulerは変更しません。未署名の旧3製品だけPE overlayを加えた非実行fixtureで変更hashを作り、新旧stageの主stream更新とFile ID保持、slot再利用、準備の反復、state保存後owner更新前からの再開を確認します。未知hashの途中主stream、ADS・リンク・所有marker・未知内容・不整合stateは保持停止し、拒否理由と不変更を確認します。総容量上限は実CLIの追加予約要求で拒否を確認し、実容量超過やHTTPの部分取得再開の検証とは区別します。Coreの統合確認は実ホストの登録済み内容の検証を代替しません。適用済みstage（`cleanup_pending`）に手動導入（`ConvertTo-Json`整形・別commit・別製品hashの導入済み来歴）を重ねた後も、次releaseのbegin・prepare・新候補のCore適用・統合確認・移行完了が通り、`priorStageCommit`がstageのcommit、導入済みファイルがbegin・prepareで不変、stage補助のFile IDが不変（主stream上書き）、旧製品の退避が手動導入した製品になることを確認します。未適用の候補を準備した後に手動導入し、同じcommitでbeginした場合は`existing`と警告で導入済み来歴の基準を記録し直し、切替まで完了することも確認します。手動導入後のstageで、製品・`source-info.json`・`previous-auxiliary`・`previous-source-info.json`・所有印・stateのhashの改変がそれぞれ拒否され、拒否後に何も変わらないことで、照合が導入済み来歴からstate記録のhashへ移っただけで弱まっていないことを確認します。取得失敗（途中書込みのZIP）・適用済み来歴付き候補・基準付き候補が未適用のまま次のreleaseが来ても、旧候補のZIP名・slot・`prior_*`を引き継いで準備と実際の切替まで進み、旧ZIPの孤児を残さず同じ実体を主streamで上書きすること、未知のファイル・ディレクトリ・孤児ZIPはbyte単位とFile IDが同一のまま保持され容量にだけ数えられること、書込み中のslotが記録済みのgenerationのまま書き直されること、切替で`cacheBaseline`が消えることも確認します。固定名の現物の改変・ADS・リンク・所有印・孤立した`prior_*`・書込み途中の現物は、これらの受理側の変更の後も拒否され不変更であることを対で確認します。実登録と旧製品の物理清掃を含む複数回の完全更新・実ホスト検証は、この専用検証の対象外です。
 
@@ -120,9 +133,52 @@ GitHub応答（最新release・タグ・既定ブランチとの比較・asset�
 
 非表示起動は`scripts/Verify-MaintenanceTask.ps1 -ExecutablePath <今回のCLI exe> -BuildManifestPath <同じビルドのmanifest> -ExpectedBuildManifestSha256 <manifestのSHA-256> -MoveExecutablePath <移行前のschema 4旧版exe> -OutputDirectory <新しい外部作業領域> -ReportPath <外部JSONレポート>`で、実Task Schedulerと保守専用exeを検証します。同じpublishフォルダーに`prunlet-maintenance.exe`が必要です。CLIのconsole subsystemと保守exeのGUI subsystem、旧タスクからの設定を保つ移行、保守以外のコマンドの拒否、期限切れ整理・保持対象の復元、失敗終了コード、所有者検証を確認します。`-PauseForWindowInspection`は旧・新タスクを専用lockで待機させ、別途ウィンドウを観測するための指定です。配置後も同じ登録タスクを手動起動して表示と終了コードを確認し、実際のWindows再起動と区別します。
 
-`-CheckPublicHead`では実際のGitHubの最新releaseも参照します。署名済み更新ZIPが添付されていれば導入して署名と取得元を確認し、未署名・未添付なら配置先を変更せず停止することを確認します。検証用ZIPでの成功を、実GitHubからの導入成功として扱いません。公開後は実GitHubから導入し、`source-info.json`のリポジトリ・ブランチ・コミット・asset、配置済みexeの署名と登録先を照合してください。
+`-CheckPublicHead`では実際のR2の最新ポインタも参照します。署名付きマニフェストが指す署名済み更新ZIPがあれば導入して署名と取得元を確認し、マニフェストが無い・拒否された・未署名なら配置先を変更せず停止することを確認します。検証用ZIPでの成功を、実R2からの導入成功として扱いません。公開後は実R2から導入し、`source-info.json`のリポジトリ・ブランチ・コミット・取得元のURL、配置済みexeの署名と登録先を照合してください。
 
 共通指示の登録では、明示オプションなしの不変更、既存AGENTSの保持、配置済みexe・設定のbinding、既知の旧MCP優先ブロックとguideハッシュに一致する移行、冪等な登録と解除、利用者編集の保護、登録途中の失敗時の復旧を隔離したCodex homeで確認します。旧配置済みPowerShell backendの退役では、製品バックアップとCoreによるWindowsゴミ箱への削除を照合します。実ユーザーの共通AGENTS本文はこのE2Eで変更しません。実登録後は、専用guide・管理マーカー・bindingの保存内容、新しいチャットでの読込、最初からCMD CLIが選ばれた実動作を分けて確認してください。
+
+## 配信（署名付きマニフェスト・R2）の検証
+
+`scripts/Verify-ReleasePublication.ps1 -OutputDirectory <未使用の外部絶対パス>`は、実R2・本番鍵・実ネットワークに接続せず、偽のR2（`scripts/release-test-fixtures/FakeR2Handler.cs`）とテスト用の鍵対（`prunlet-release-test-1`。本番鍵ではない）だけで配信側を確かめる。確認する項目:
+
+- 封筒と署名: .NETのECDsaと`openssl dgst -sha256 -verify`の両方で検証できるDER署名であること。改ざん・形式違反・別鍵・本番の信頼での検証を拒否すること。
+- 公開の順序: 配布物→公開URLでの照合→版マニフェスト→最新ポインタ→固定名で、create-onlyとETag条件付きの置換を使うこと。後退・同版の内容違い・payloadの不一致・既存マニフェストの署名不正・鍵の取り違えが、R2への書込み0件で失敗すること。
+- 鍵整合の関門: 必須の3か所（Rust・`Install-Prunlet.ps1`・`Install-Prunlet.sh`）がすべて一致すれば成功し、不在・不一致・重複で失敗すること。launcherは定数を持たなくても成功し、持つ場合は一致が必要であること。実リポジトリの定数が本番の公開鍵と一致すること。
+- Linux・macOSの配布物の中身の検査、Velopackの配信順序・後退防止、`publish-r2.ps1 -DryRun`。
+
+失敗が1件でもあれば終了コード1になる。skipは件数を別に表示し、成功に数えない。Rustの`cargo test --locked --lib`は、配信側が作った封筒（`scripts/release-test-fixtures/sample-envelope.json`）を受理することと、改ざん・形式違反・runtime違い・キー違い・後退の拒否を確かめる。本番鍵での署名と実R2への公開は、これらの確認に含めない。
+
+## Setup（Velopack）の梱包・配信の検証
+
+Velopackの梱包・検証・配信の各スクリプト（`scripts/velopack/`）は、実機の導入・実R2・実署名に触れずに確かめる。`vpk` 1.2.161が必要。出力先はリポジトリ・`~/.claude`・実機の導入先の外の新しい外部ディレクトリにする。
+
+```powershell
+# 通常のビルド出力（Publish-Prunlet.ps1）を使い、未署名・テスト用packIdで梱包する。
+pwsh -NoProfile -File .\scripts\velopack\pack-windows.ps1 -WorkDirectory <空の外部ディレクトリ> -PublishDirectory <build>\publish -PackId PrunletVelopackTest
+pwsh -NoProfile -File .\scripts\velopack\verify-windows.ps1 -PackagesDirectory <work>\packages -ExpectedVersion <版> -PackId PrunletVelopackTest -ReleaseAssetsDirectory <新しい外部ディレクトリ> -ScratchDirectory <既存の外部ディレクトリ>
+pwsh -NoProfile -File .\scripts\velopack\publish-r2.ps1 -PackagesDirectory <work>\packages -PackId PrunletVelopackTest -CommitSha <40桁SHA> -DryRun -CurrentFeedPath <現行フィード相当のJSON>
+```
+
+- 梱包: nupkg・Setup（固定名・版付き）・`releases.win.json`・`assets.win.json`・`RELEASES`ができ、`lib/app/`が契約のエントリ集合（`prunlet.exe`・`prunlet-maintenance.exe`・`LICENSE`・`Squirrel.exe`・`Prunlet_ExecutionStub.exe`・`sq.version`）になること。nupkg内の`prunlet.exe`・`prunlet-maintenance.exe`が入力のpublishとバイト列まで同一であること（vpkが製品exeを書き換えない）。本番のpackIdは、`-PackVersion`がexeの版と一致しない梱包を拒否する。`Squirrel.exe`の製品名は`Velopack`（版1.2.161）、実行スタブは製品exeの版リソースを引き継ぐので、製品名・版の照合は製品exe 2つだけに適用する。vpk自身の作業領域は`TEMP`を見ず`%LOCALAPPDATA%\Temp\velopack`に作られる（梱包後は空）。`verify-windows.ps1`は展開したPEを`-ScratchDirectory`（CIは`RUNNER_TEMP`）に残し、削除しない。
+- 検証（`verify-windows.ps1`）は、余分なエントリ（ps1・`prunlet-hook.exe`・サブディレクトリ）・フィードとnupkgのSHA-256／Size不一致・複数のnupkg・製品版の不一致・署名必須での未署名を、それぞれ配信前に拒否する。署名の成功経路（Valid・CN・タイムスタンプ）は、Sigiluneで実際に署名した一式でしか確認できない。実署名は本番の署名を最小限にする方針に従い、本人の許可があるときだけ外部の一時ビルドで行う。
+- 検証は`packages\`の外へnupkgのSHA-256ファイル（`-ReleaseAssetsDirectory`）を作る。これは保存物とやり直し時の整合確認に使うだけで、クライアントの信頼の基点はR2の署名付きマニフェスト`manifests/<版>/velopack-win-x64.json`である。
+- 配信計画（`-DryRun`。実バケットへ接続せず、署名鍵も不要）は、署名付きマニフェスト（create-only）がnupkgより先、版付きの成果物のcreate-only、`releases.win.json`（フィード）が版付きの成果物の直後、固定名のSetup・assets・RELEASESがその後であることを表示する。`-CurrentFeedPath`で渡した現行フィードが古い・無い・空なら通常、同じ版なら固定名を置かずに版付きの照合だけ、新しい版なら失敗、JSONとして読めなければ失敗する。実際のR2のGET・PUT・照合とマニフェストの署名は、実バケットへ書かないこの確認の対象外で、`scripts/Verify-ReleasePublication.ps1`の偽のR2による配信順序・後退防止の検証と区別する。
+- 署名テンプレート: `vpk pack --signTemplate`が、空白を含むコマンド（先頭トークン）・空白を含む引数でも`{{file}}`を1つの引数として1ファイルずつ渡すこと、コマンドが終了コード1を返すと`vpk pack`が失敗することを、署名しないスタブで確認する（vpkは製品exe・`Squirrel.exe`・実行スタブ・Setupの各ファイルでテンプレートを呼ぶ）。署名済みのexeを再署名しない分岐は、本番の証明書がないと実行できない。
+- クライアント側の適用前検査（Rust）と、本スクリプトの検査は同じ条件（署名者CN・タイムスタンプ・製品名・版・エントリ集合・machine）。エントリ集合の許可名を変える場合は両方を同時に変える。
+
+隔離E2E（`scripts/velopack/e2e-windows.ps1 -OutputDirectory <新しい外部ディレクトリ>`）は、`velopack-test`機能付き・未署名のビルドを3版（既定9.0.0・9.0.1・9.0.2）作り、Setupで導入して更新・延期・拒否・アンインストールまで通す。版ごとに別のビルドが要るため、ソースを作業フォルダーへ複製してパッケージの版だけを書き換えてビルドする（元のリポジトリは変えない）。初回はフルビルドで十数分かかり、再実行はビルドと梱包を再利用する。テスト用packId`PrunletVelopackTest`・外部の`--installto`・隔離した`LOCALAPPDATA`・`APPDATA`・`USERPROFILE`・`CLAUDE_CONFIG_DIR`・`CODEX_HOME`と`PRUNLET_VELOPACK_TEST_*`（データ・ホーム・APPDATA・ローカルフィード・署名付きマニフェストの隔離フォルダー・専用ハイブ）を使い、実機の`%LOCALAPPDATA%\PrunletApp`・旧導入・スケジュールタスク・`~/.claude`・Toolportの実registry.json・HKCU Runの実値に触れず、ウィンドウを出さない。実レジストリに書かれるのはSetup自身のHKCU `Uninstall\PrunletVelopackTest`だけで、開始前の不在・アンインストール後の消去を確認する。このスクリプトは削除を行わない。確認する項目:
+
+- 導入: hook複製（rootの外・`current\prunlet.exe`と同一）、設定の自動書換え（`settings.json`・`CLAUDE.md`・`powershell-guard.ts`は旧パスだけが置換され他は不変、元のバイト列のバックアップが1つ、`PRUNLET.md`とToolportの扱い、Toolportの旧launcher登録は直接起動へ）、新規利用者のconfigとrecovery、`setup status`、専用ハイブへのRun登録。
+- 更新2回（9.0.0→9.0.1→9.0.2）の間、別プロセスでhookを連続実行（`e2e-hook-loop.ps1`）し、deny以外の応答・起動失敗が0件。hookのループが複製を掴んでいる間は更新フックが置換できず旧hookを残して延期し（`needsRetry`）、ループを止めた後の`setup repair`で新版へ置換される経路も確認する。更新後に設定が変わらず、バックアップが増えない。
+- 悪性フィード: 更新器`lib/app/Squirrel.exe`を差し替えたnupkgとDeltaの資産を載せたフィードで、`update-check`が`failed`（クライアントは取得を`state\incoming`で自前に行い、検査に通るまで`packages\`へ移さない）、導入先の`Update.exe`がバイト単位で不変、`packages\`が空、`incoming`が空、Deltaが取得されない、続く`update-apply`は`nothingPending`であること。
+- 署名付きマニフェスト（R2の`manifests/<版>/velopack-win-x64.json`をテスト鍵で隔離フォルダーに再現）: 取得時（`update-check`）はSHA-256の不一致・欠落・信頼しない鍵の署名のどれも`failed`で、`packages\`・`incoming`へ何も置かない。取得後に基点が変わった場合の適用時（`update-apply`）は、不一致が`untrusted`（終了コード2）、欠落・署名不正が`deferred`で、どれも適用しない。
+- M1: hook複製の内容を壊す・複製が無い状態でMCPを起動すると、導入処理の再試行で現行の`prunlet.exe`と同じ内容に再配置される。
+- M3: 別の版を指す新しい適用中マーカーは新規起動を拒否し（終了コード1）、猶予（20秒）を過ぎてUpdate.exeが動いていないマーカーは放棄として消えて起動できる。
+- L3: `auto_update`が無効でも、`update-apply`は`disabled`を返したうえでログオン時の保守（`maintenance`）の結果を続けて報告する。
+- MCPを直接起動したままの`update-apply`は`busy`（`locked`）で、MCPは強制終了されず、入力を閉じると終了コード0で終わる。止めてから`applied`になり、新版へ切り替わる。
+- アンインストール: テスト用のRun値（専用ハイブ）とHKCUのUninstall登録が残らない。hook複製はホスト設定から参照されている間は残す。
+
+署名の成功経路・実R2・本番鍵の署名は対象外で、梱包・配信スクリプトとこのE2Eの成功を、実署名した一式の確認の代わりにしない。
 
 ## 一時的なロックとロード中DLL
 
@@ -153,9 +209,9 @@ case-sensitive属性の準備で通常tokenの`fsutil`が拒否された場合�
 結果と再現方法は会話内へ残し、再検証に必要なJSON・入力・ログだけを外部作業領域へ保持する。今回のfixtureだけを対象として、利用中プロセス・リンク・混在を確認してからPrunletで清掃する。ゴミ箱全体を空にせず、旧領域や不明な残存データを手動削除しない。保全対象・未清掃パス・理由・再開条件を報告する。
 ## Apple Siliconの検証
 
-macOSの通常ビルドで `Verify-MacRecordlessFiles.py` を実行し、Trash往復、CLI・stdio MCPの終了コード、リンク先、切断後の待機キューを照合する。このスクリプトにhookのケースは無い（`hook`・`PreToolUse`・`permissionDecision`を含まない）。macOSでもhookは有効だが、判定は`Verify-HookParsing.ps1`（Windows）と`Verify-LinuxFiles.ts`（Linux）で確認し、macOS実機のhook実プロセスは未検証として記録する。隔離の `PRUNLET_MACOS_UNIT_TEST_ROOT` を指定し、`cargo test --locked --lib -- --test-threads=1` でMach資源・ディレクトリ境界も確認する。Mach IPCと競合を注入する `Verify-MacQueueIpc.py`・`Verify-MacRaceBoundaries.py` は `RUSTFLAGS='--cfg prunlet_macos_race_tests'` のデバッグビルド専用で、配布用ビルドと分ける。
+macOSの通常ビルドで `Verify-MacRecordlessFiles.py` を実行し、Trash往復、CLI・stdio MCPの終了コード、リンク先、切断後の待機キューを照合する。このスクリプトにhookのケースは無い（`hook`・`PreToolUse`・`permissionDecision`を含まない）。macOSでもhookは有効だが、判定は`Verify-HookParsing.ps1`（Windows）と`Verify-LinuxFiles.ts`（Linux）で確認し、macOS実機のhook実プロセスは未検証として記録する。隔離の `PRUNLET_MACOS_UNIT_TEST_ROOT` を指定し、`cargo test --locked --lib -- --test-threads=1` でMach資源・ディレクトリ境界も確認する。Mach IPCと競合を注入する `Verify-MacQueueIpc.py`・`Verify-MacRaceBoundaries.py` は `RUSTFLAGS='--cfg prunlet_macos_race_tests'` のデバッグビルド専用で、配布用ビルドと分ける（Windowsの同じ役割は`prunlet_windows_update_tests`。[latestインストーラー](#latestインストーラー)を参照）。
 
-起動時更新は、上記のデバッグcfgで作成した別バージョン・別コミットのA/B/Cを同じDeveloper IDで署名・公証する。Aの実行ファイルとB/Cの公開形式ZIPを `bun scripts/Verify-MacStartupUpdate.ts <新規の外部ディレクトリ> <Aのexe> <BのZIP> <CのZIP>` に渡す。GitHub応答だけをローカルに置換し、署名・ZIP・stdio・排他・置換は製品の経路で確認する。配布用ビルドにはこの応答置換を含めない。
+起動時更新は、上記のデバッグcfgで作成した別バージョン・別コミットのA/B/Cを同じDeveloper IDで署名・公証する。Aの実行ファイルとB/Cの公開形式ZIPを `bun scripts/Verify-MacStartupUpdate.ts <新規の外部ディレクトリ> <Aのexe> <BのZIP> <CのZIP>` に渡す。R2の応答（最新ポインタの封筒と、それが指す不変キーの配布物）だけをローカルのfixtureに置換し、封筒はテスト鍵（`prunlet-release-test-1`）で署名する。マニフェストの検証・Developer IDの署名・ZIP・stdio・排他・置換は製品の経路で確認する。配布用ビルドにはこの応答置換とテスト鍵の受理を含めない。
 ## Linuxの検証
 
 GitHub ActionsのGitHub提供ランナー（x64は `ubuntu-24.04`、ARM64は `ubuntu-24.04-arm`）で両アーキテクチャをビルドする。配布tar.gzをそれぞれ外部へ展開し、各CPUのランナーで `bun scripts/Verify-LinuxFiles.ts <prunletの絶対パス> <新規の外部出力先>` を実行する。ARM64環境でx64を検証する場合は、末尾に次を追加する。
@@ -166,4 +222,4 @@ GitHub ActionsのGitHub提供ランナー（x64は `ubuntu-24.04`、ARM64は `ub
 
 動的ローダーを直接指定し、`-L` でルートディレクトリの解決をsysrootへ変えない。専用の `XDG_DATA_HOME` で、元名・Trash内のinode・復元後の内容を照合する。CLIとstdio MCPの終了コード、フックの拒否、別マウント・リンク・設定の保全も確認する。
 
-起動時自動更新は、各CPUでバージョンとコミットが異なる3世代を、`RUSTFLAGS='--cfg prunlet_linux_update_tests'` を指定したデバッグビルドとして用意する。CPUをエミュレーションする環境向けのfixtureは `CARGO_PROFILE_DEV_OPT_LEVEL=2` を指定する。後の2世代は公開物と同じustar形式のtar.gzにする。 `bun scripts/Verify-UnixStartupUpdate.ts <新規の外部出力先> <初期実行体> <2世代目のtar.gz> <3世代目のtar.gz>` をCPUが一致するLinuxランナーで実行する。これはGitHub応答だけを隔離fixtureに置き換え、通常MCPのstdio・実行体の交換と引継ぎ・設定と復元領域の保全を確認する。x64のビルドと、実行体の再起動を含む更新の検証は `ubuntu-24.04` で行う。
+起動時自動更新は、各CPUでバージョンとコミットが異なる3世代を、`RUSTFLAGS='--cfg prunlet_linux_update_tests'` を指定したデバッグビルドとして用意する（Windowsの起動時更新は`prunlet_windows_update_tests`で、[latestインストーラー](#latestインストーラー)の手順を使う）。CPUをエミュレーションする環境向けのfixtureは `CARGO_PROFILE_DEV_OPT_LEVEL=2` を指定する。後の2世代は公開物と同じustar形式のtar.gzにする。 `bun scripts/Verify-UnixStartupUpdate.ts <新規の外部出力先> <初期実行体> <2世代目のtar.gz> <3世代目のtar.gz>` をCPUが一致するLinuxランナーで実行する。これはR2の応答（テスト鍵で署名した最新ポインタの封筒と配布物）だけを隔離fixtureに置き換え、マニフェストの検証、通常MCPのstdio・実行体の交換と引継ぎ・設定と復元領域の保全を確認する。x64のビルドと、実行体の再起動を含む更新の検証は `ubuntu-24.04` で行う。

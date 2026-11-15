@@ -4,9 +4,9 @@ PrunletはWindows向けCLIとstdio MCPを同じexeで提供します。Codexの`
 
 ## 準備
 
-通常は[READMEのlatestインストール手順](../README.ja.md#インストールと更新)を使います。GitHubの最新releaseから署名済みの更新ZIPを取得・照合し、exe・連携スクリプト・共通指示を`%USERPROFILE%\.local\Prunlet\bin`へ配置します。`-RegisterCodex`で下記の共通登録も実行できます。ローカルクローン内のファイルを実行元に登録しません。
+通常は[READMEのlatestインストール手順](../README.ja.md#インストールと更新)を使います。`https://prunlet.kagayoi.com`の署名付きマニフェスト（`latest/<runtime>.json`）を固定の公開鍵で検証し、それが指す署名済みの更新ZIPを取得・照合して、exe・連携スクリプト・共通指示を`%USERPROFILE%\.local\Prunlet\bin`へ配置します。`-RegisterCodex`で下記の共通登録も実行できます。ローカルクローン内のファイルを実行元に登録しません。
 
-登録後のMCP起動時には配置済みの起動スクリプトがlatestを確認します。旧MCP・保守プロセスの使用中は切替を延期し、フック用exeは切替中も独立して動作します。更新状態・候補の所有と互換性を確認できない場合は保全し、自動再送や旧版への無条件な巻戻しを行いません。レジストリの移行が必要な更新では新しいexeで既存の明示移行を完了させ、復元記録を維持します。最初の導入・既存の旧フック定義からの移行にはCodexでのフック信頼が必要です。
+登録後のMCP起動時には配置済みの起動スクリプトが、Rustの内部コマンドで同じ署名付きマニフェストを検証し、導入済みより版が大きい場合だけ候補を準備します。候補の3つのexeはAuthenticodeと製品版（`<版>+<commit>`）を確かめてから切り替えます。GitHubの認証は使いません。配布元をR2の署名付きマニフェストへ移す前の版（GitHub Releaseで配布していた版）は新しい版を検知できないため、同じインストーラーを一度だけ再実行して再導入します。旧MCP・保守プロセスの使用中は切替を延期し、フック用exeは切替中も独立して動作します。更新状態・候補の所有と互換性を確認できない場合は保全し、自動再送や旧版への無条件な巻戻しを行いません。レジストリの移行が必要な更新では新しいexeで既存の明示移行を完了させ、復元記録を維持します。最初の導入・既存の旧フック定義からの移行にはCodexでのフック信頼が必要です。
 
 ## エージェント共通指示
 
@@ -30,7 +30,7 @@ RTKの共通指示と同様、エージェントのツール選択を案内す�
 
 既存の管理済み配置がGitの祖先配下にある場合だけ、導入スクリプトの`-UpdateManagedInstallation`を明示できる。既存設定・配置情報・実行ファイルと補助ファイルのhash一致、リンクのない既存ディレクトリ、Gitの追跡対象がないことを確認する。Gitの除外対象でない場合は、実効CodexHomeの正規管理blockにあるCLI登録と配置先が一致することも必要である。復元先は既存設定の値を保持し、配置外の復元先には通常の導入ガードを適用する。
 
-作業先・更新バックアップ・ソース・Codex内部へのガードは維持する。配置前と移行前にパス・設定・hashを再確認し、`-ExpectedCommitSha <40桁SHA>`を渡した場合は取得した最新releaseのcommitとも照合する。共通guideの再登録では、検証済み配置のguideとUTF-8本文が一致するLF/CRLFの差だけを認識し、編集済み本文は拒否する。旧更新stageはこのモードで清掃しない。これらは非原子的な整合確認であり、ディレクトリ実体を固定する機構ではない。
+作業先・更新バックアップ・ソース・Codex内部へのガードは維持する。配置前と移行前にパス・設定・hashを再確認し、`-ExpectedCommitSha <40桁SHA>`を渡した場合は署名付きマニフェストが示す最新版のcommitとも照合する。共通guideの再登録では、検証済み配置のguideとUTF-8本文が一致するLF/CRLFの差だけを認識し、編集済み本文は拒否する。旧更新stageはこのモードで清掃しない。これらは非原子的な整合確認であり、ディレクトリ実体を固定する機構ではない。
 
 通常はインストーラーが設定を作成します。手動の初期化は[README](../README.ja.md#初期設定)を参照してください。`backupDirectory`は保護された共通metadata基点で、レジストリ記録を`.registry-records-v1/<operationId>`へ保存します。新しいファイル・フォルダー削除は操作記録やsnapshotを作りません。
 
@@ -225,6 +225,17 @@ AppContainerの正規API [`DeleteAppContainerProfile`](https://learn.microsoft.c
 セッションはlocal接続・同じログオン・同じexeに限定し、要求ごとに呼出元をimpersonateします。管理者側は専用の管理者clientから接続します。管理者セッションへ通常clientが接続した場合も、要求はそのclientのtokenで実行し、不足する権限を補いません。UACで別のログオン識別子になったプロセスは、同じSIDでも接続を拒否します。完全ACLの保全・復元に必要な権限が呼出元になければ拒否し、セッション自身の権限を貸しません。期限後は新しい要求を受け付けず、処理中のCoreは安全に完了またはrollbackして終了します。未接続・期限切れ・設定やscopeの不一致では停止し、呼出元の仮想viewへ切り替えません。
 
 native scopeのmachine・SID・32/64 viewを復元記録とsnapshotへ結び付け、復元も同じscopeに限定します。scopeのない旧記録をnativeと推定しません。`registryScope`を省略した設定は従来の呼出元viewを使い、native記録をそこで復元することはできません。
+
+## Setup（Velopack）版の配置
+
+Windows x64には、`%LOCALAPPDATA%\PrunletApp`へ導入するSetup（Velopack）の配布物がある（梱包と配信は[配布](distribution.md#windowsの-setupvelopack)）。latestインストーラーによる`%USERPROFILE%\.local\Prunlet\bin`への配置と、上の登録手順は残る。Setup版の配置の契約は次のとおり。
+
+- CLI・stdio MCP・待機キューのworker・保守は`%LOCALAPPDATA%\PrunletApp\current\`の`prunlet.exe`・`prunlet-maintenance.exe`から動く。nupkgへ入れるのはこの2つ（とVelopackの管理ファイル・`LICENSE`）だけで、ps1と`PRUNLET.md`は同梱しない（共通指示は`prunlet.exe`に埋め込む）。
+- hookはVelopackのroot外の`%LOCALAPPDATA%\Prunlet\hook\prunlet-hook.exe`で、導入・更新の後に署名済みの`current\prunlet.exe`の複製として置く。更新の最中も名前が無い瞬間を作らない。
+- 設定は`--config`の絶対パスを渡し続ける。旧導入の利用者は`%USERPROFILE%\.local\Prunlet\config.json`と`recovery`をそのまま使い、新規は`%LOCALAPPDATA%\Prunlet\config.json`。旧導入の`.local\Prunlet\bin`は消さず、互換用のシムも作らない。
+- Setup版の更新はZIPとは別で、ログオン時の`update-apply`が適用する。R2から取得したnupkgは、署名・製品名・版・エントリ集合の検査と、R2の署名付きマニフェスト（`manifests/<版>/velopack-win-x64.json`）のSHA-256との照合を通ったものだけを適用する。
+
+ホスト設定の自動書換えも実装済みで、導入・更新の直後（Velopackのinstall・updatedフック）に、hook複製が検証済みで存在する場合だけ行う。対象は`settings.json`のhook行・`PRUNLET.md`・`CLAUDE.md`・`hooks/powershell-guard.ts`と、存在する場合のCodexの`hooks.json`・`config.toml`、Toolportの`registry.json`で、旧パス（`.local\Prunlet\bin\...`）の完全一致だけを新パスへ置換する（Toolportの旧launcher登録は直接起動へ）。書換え前に同じフォルダーへ`.<名前>.prunlet-backup-<時刻>`を作り、一時ファイルから原子的に置換し、冪等で、結果は状態フォルダーの記録と`prunlet setup status`に出る。ログオン時の更新は`update-apply`、導入処理の再試行は`setup repair`でも行える。隔離環境での確認範囲は[検証手順](verification.md#setupvelopackの梱包配信の検証)を参照する。
 
 ## 解除と復元
 

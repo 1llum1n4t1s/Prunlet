@@ -30,19 +30,21 @@ PowerShell scripts that Codex sends to a Mac or elsewhere must be passed in the 
 
 ## Installation and updates
 
+Versions released before distribution moved to the signed manifests on `https://prunlet.kagayoi.com` (the versions distributed through GitHub Releases) cannot detect newer releases. They keep running the current version without breaking, but they do not migrate automatically, so reinstall once: on Windows, run the installer command in [Windows](#windows) again; on Apple Silicon Mac and Linux, follow [reinstalling on macOS](docs/macos.md#旧版からの再導入) or [reinstalling on Linux](docs/linux.md#旧版からの再導入).
+
 ### Apple Silicon Mac
 
-Get `prunlet-update-osx-arm64.zip` from [GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases/latest). `scripts/Install-Prunlet.sh` performs the download, size and SHA-256 checks, signature and notarization verification, and a fresh installation into a dedicated folder in one run (see [macOS installation](docs/macos.md)). Register the MCP server with Codex or other hosts yourself, using the configuration lines it prints. A registered MCP server checks for updates at startup and postpones them to a later start while in use.
+`scripts/Install-Prunlet.sh` gets the signed release manifest from `https://prunlet.kagayoi.com`, verifies it with the public key built into the script, and downloads `prunlet-update-osx-arm64.zip` from the location recorded in it. It performs the download, size and SHA-256 checks, signature and notarization verification, and a fresh installation into a dedicated folder in one run (see [macOS installation](docs/macos.md)). Register the MCP server with Codex or other hosts yourself, using the configuration lines it prints. A registered MCP server checks for updates at startup and postpones them to a later start while in use.
 
 ### Linux
 
-Get `prunlet-linux-x64.tar.gz` or `prunlet-linux-arm64.tar.gz` for your CPU, together with the `.sha256` file of the same name. [GitHub Releases](https://github.com/1llum1n4t1s/Prunlet/releases)
+Get `prunlet-linux-x64.tar.gz` or `prunlet-linux-arm64.tar.gz` for your CPU from `https://prunlet.kagayoi.com`. Its location and SHA-256 are recorded in the signed release manifest; for a quick download, the fixed names and the `.sha256` files of the same name are also under `https://prunlet.kagayoi.com/download/latest/`.
 
-See [Linux installation](docs/linux.md#初回インストール) for verifying the checksum, placing it in a dedicated directory and registering it with Codex. When placed as described, the official build checks for updates when the MCP server starts and postpones them to a later start while in use.
+See [Linux installation](docs/linux.md#初回インストール) for verifying the signed manifest and the checksum, placing it in a dedicated directory and registering it with Codex. When placed as described, the official build checks for updates when the MCP server starts and postpones them to a later start while in use.
 
 ### Windows
 
-Windows x64 and ARM64 are supported. The installer below downloads the signed prebuilt package (`prunlet-update-<runtime>.zip`) from the latest release of the [GitHub repository](https://github.com/1llum1n4t1s/Prunlet) and places it. Only PowerShell 7 is required; Rust, the MSVC build tools and the Windows SDK are not needed.
+Windows x64 and ARM64 are supported. The installer below downloads the signed prebuilt package (`prunlet-update-<runtime>.zip`) of the latest release from `https://prunlet.kagayoi.com` and places it. Only PowerShell 7 is required; Rust, the MSVC build tools and the Windows SDK are not needed.
 
 | Target | Installer option |
 | --- | --- |
@@ -59,15 +61,15 @@ Invoke-WebRequest 'https://raw.githubusercontent.com/1llum1n4t1s/Prunlet/main/sc
 pwsh -NoProfile -File $installer
 ```
 
-If the unauthenticated GitHub API rate limit is reached, add `-UseGitHubCliAuthentication` to the `pwsh` command above to use an existing, signed-in GitHub CLI. It does not install gh or sign in for you. This option is for the manual installer only.
+Installation and updates need no GitHub account, sign-in or token.
 
-The installer gets the latest stable release from the GitHub API and checks that its tag points to a commit on the default branch and that exactly one package for the target runtime is attached. Before placing the downloaded ZIP, it verifies the size and SHA-256 returned by GitHub, the list of bundled files and each hash, the release commit and runtime, and the Authenticode signature of the executables (Valid, with the expected signer and a timestamp). These are the same checks as the startup auto-update. If the package is not yet signed and attached right after a release, or any check fails, it stops without writing anything. It never builds from source or switches to a local clone.
+The installer gets the signed manifest of the latest release (`latest/<runtime>.json`) from `https://prunlet.kagayoi.com`, verifies its signature with the public key built into the installer, and checks that the product, repository, runtime, package name and download location match. It downloads the ZIP from that fixed location without following redirects and, before placing it, verifies the length and SHA-256 recorded in the manifest, the list of bundled files and each hash, the commit and runtime, and the Authenticode signature of the executables (Valid, with the expected signer and a timestamp). These are the same checks as the startup auto-update. If the manifest cannot be retrieved or any check fails, it stops without writing anything. It never builds from source or switches to a local clone.
 
 The default installation directory is `%USERPROFILE%\.local\Prunlet`. It places `bin\prunlet.exe`, the registration scripts and the shared instructions, and records the source, branch, commit and package hash in `source-info.json` in the same format as the startup auto-update. By default it writes nothing to the configuration files or folders of Codex or other AI tools, and registers only the maintenance task and the update task.
 
-The auto-update checks the prebuilt binaries on GitHub Releases when an MCP host starts the Prunlet MCP server and from the update task the installer registers (daily at 12:30 and 10 minutes after logon, without a window), and switches over once the old MCP server and maintenance processes have exited. Because of the update task, PCs that do not register the MCP server also follow the latest release. The auto-update does not rebuild from source. Running the product executables does not require installing the .NET runtime or the VC runtime. While in use, nothing is terminated; it checks again at the next MCP start. When the unauthenticated GitHub API request limit is used up, it automatically continues the lookup with the authentication of an already configured GitHub CLI (`gh`). If communication or download fails, it uses the current version as long as the pre-update state is safely preserved.
+The auto-update checks the signed manifest at `https://prunlet.kagayoi.com` when an MCP host starts the Prunlet MCP server and from the update task the installer registers (daily at 12:30 and 10 minutes after logon, without a window), and switches over once the old MCP server and maintenance processes have exited. Only a release newer than the installed version is applied. Because of the update task, PCs that do not register the MCP server also follow the latest release. The auto-update does not rebuild from source. Running the product executables does not require installing the .NET runtime or the VC runtime. While in use, nothing is terminated; it checks again at the next MCP start. If communication, download or verification fails, nothing is applied and it uses the current version as long as the pre-update state is safely preserved.
 
-The auto-update trusts the publisher of the GitHub Release and verifies that the downloaded package matches. See the [startup auto-update design](DESIGN.md#起動時自動更新) for how verification works and what is trusted.
+The auto-update trusts only the signature made with the dedicated release key. The release workflow signs the manifest only after checking that the commit is on `main` and building, signing and verifying the package. See the [startup auto-update design](DESIGN.md#起動時自動更新) for how verification works and what is trusted.
 
 Update data is managed within a dedicated 2 GiB budget. Verified areas are reused, and unknown data and interrupted output are preserved. When space runs short, the update is postponed; registry recovery data is never cleaned up for it.
 
