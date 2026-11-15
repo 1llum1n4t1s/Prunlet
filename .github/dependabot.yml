@@ -20,6 +20,9 @@ updates:
     prefix: deps
 - package-ecosystem: cargo
   directory: /
+  # velopackは版を固定している（Cargo.tomlの=1.2.161）。更新は本人が判断して手で行う。
+  ignore:
+  - dependency-name: velopack
   schedule:
     interval: weekly
     day: monday

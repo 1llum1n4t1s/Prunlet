@@ -1,69 +1,82 @@
 name: Prunlet release packages
 
+# release/<版> ブランチの push で、Windows（win-x64・win-arm64）の更新ZIPとSetup（Velopack）をビルド・署名し、
+# 署名付きマニフェストと一緒に Cloudflare R2（https://prunlet.kagayoi.com）へ配信する。
+# GitHub Release もタグも使わない。R2 が唯一の配布元で、クライアントは固定の公開鍵でマニフェストの署名を検証する。
+# - 起動: release/** ブランチへの push（/vava が release/<版> を push すると始まる）。workflow_dispatch は、
+#   同じ release/<版> の ref を選んだ再実行にだけ使う（ブランチ名と Cargo.toml の版は一致させる）。
+# - 公開の順序: ZIP（create-only）→ 公開URLで照合 → 版マニフェスト（create-only）→ 最新ポインタ。
+#   Setupは 署名マニフェスト → nupkg → フィード → 固定名。いずれも書込みの前に、鍵の整合・既存マニフェスト・
+#   最新ポインタ（後退）の検査を、読取りだけで全runtime分済ませる。
+# - 署名用Secrets（SIGILUNE_*）はSigiluneの署名stepだけへ、マニフェスト署名鍵（PRUNLET_RELEASE_SIGNING_KEY）は
+#   鍵整合の関門とR2へ書くstepだけへ渡す。ビルドstepには何も渡さない。承認者なし・ブランチ制限付きの
+#   Environment `release`（release/* だけを許可）にだけ置く。
+# - 署名の失敗を自動で再実行しない。原因を確認してから、同じrefで workflow_dispatch する。同じ版のZIPは再ビルドで
+#   hashが変わるため、配信済みの版の再配信はpayload不一致で失敗する（patchを上げて新しい release/<版> を切る）。
+#   Setupだけをやり直すときは prunlet-velopack-redo.yml を使う。
+
 on:
-  release:
-    types: [published]
+  push:
+    branches:
+      - 'release/**'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: prunlet-release-${{ github.event.release.tag_name }}
+  # R2の固定名（最新ポインタ・feed）を同時に取り合わない。Setupのやり直しworkflowも同じgroupを使う。
+  group: prunlet-release-windows
   cancel-in-progress: false
 
 jobs:
   package:
-    # 公開タグからwin-x64・win-arm64をビルドし、Sigilune（Certum SimplySignのクラウド鍵）で
-    # 署名した実物だけを、既存のR2と同じreleaseへ配置する。
-    # 署名用Secrets（SIGILUNE_EMAIL・SIGILUNE_TOTP_URI）は、承認者なし・ブランチ制限付きの
-    # Environment `release` にだけ置く。別マシンの並列jobが同じTOTP時間枠を使うとCertumが
-    # 後者を拒否するため、両runtimeを1つのjobで扱い、同じSigiluneセッションでログインを1回にする。
-    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && !github.event.release.prerelease && !github.event.release.draft }}
+    # release/<版> のブランチからwin-x64・win-arm64をビルドし、Sigilune（Certum SimplySignのクラウド鍵）で
+    # 署名した実物だけをR2へ配置する。
+    # 別マシンの並列jobが同じTOTP時間枠を使うとCertumが後者を拒否するため、両runtimeを1つのjobで扱い、
+    # 同じSigiluneセッションでログインを1回にする。
+    if: ${{ github.repository == '1llum1n4t1s/Prunlet' }}
     runs-on: windows-latest
     timeout-minutes: 60
     environment: release
     permissions:
-      contents: write
+      contents: read
+    env:
+      # vpk 1.2.161を、ランナーに合う.NETランタイムが無くても動かす（導入・梱包の両方のstepで必要）。
+      DOTNET_ROLL_FORWARD: Major
+      PRUNLET_R2_BUCKET: ${{ vars.PRUNLET_R2_BUCKET || 'prunlet-updates' }}
     defaults:
       run:
         shell: pwsh
     steps:
-      - name: Checkout the released tag
+      - name: Checkout the release branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
           persist-credentials: false
       - name: Prepare Rust targets
         run: |
           rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify the released commit
+      - name: Verify the release commit
+        # ref名 release/<版> とCargo.tomlの版の一致、HEADとイベントcommitの一致、既定ブランチの祖先であることを検査する。
         id: source
         env:
           GH_TOKEN: ${{ github.token }}
-          PRUNLET_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if ($env:PRUNLET_TAG -cnotmatch '^v?[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?$') { throw 'Unsupported release tag.' }
-          $commit = (git rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $commit -cnotmatch '^[0-9a-f]{40}$') { throw 'Checkout commit is invalid.' }
-          if ($commit -cne $env:GITHUB_SHA) { throw 'Checkout differs from the release event commit.' }
-          $tagCommit = (git rev-list -n 1 ('refs/tags/' + $env:PRUNLET_TAG)).Trim()
-          if ($LASTEXITCODE -ne 0 -or $tagCommit -cne $commit) { throw 'Checkout does not match the release tag.' }
-          $branch = (gh api "repos/$env:GITHUB_REPOSITORY" --jq '.default_branch').Trim()
-          if ($LASTEXITCODE -ne 0 -or $branch -cnotmatch '^[A-Za-z0-9._/-]+$') { throw 'Default branch is invalid.' }
-          git merge-base --is-ancestor $commit ('refs/remotes/origin/' + $branch)
-          if ($LASTEXITCODE -ne 0) { throw 'Release commit is not on the default branch.' }
-          "commit=$commit" >> $env:GITHUB_OUTPUT
-          "branch=$branch" >> $env:GITHUB_OUTPUT
-      - name: Build the released commit
+        run: ./scripts/Assert-PrunletReleaseRef.ps1
+      - name: Check the signing key against the client public keys
+        # 鍵整合の関門。署名した試験封筒を、配信側とクライアント側3か所（Rust・Install-Prunlet.ps1・
+        # Install-Prunlet.sh。launcherは定数を持たない）の公開鍵定数のすべてで検証できなければ、署名もR2への書込みも行わず止める。
+        # 署名鍵だけをこのstepへ渡す（R2のSecretsは渡さない）。
+        env:
+          PRUNLET_RELEASE_SIGNING_KEY: ${{ secrets.PRUNLET_RELEASE_SIGNING_KEY }}
+        run: ./scripts/Test-PrunletReleaseKeyGate.ps1
+      - name: Build the release commit
         # 依存crateのbuild scriptも動くため、このstepには署名用Secretsを渡さない。
         env:
-          PRUNLET_TAG: ${{ github.event.release.tag_name }}
+          PRUNLET_VERSION: ${{ steps.source.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $expectedVersion = $env:PRUNLET_TAG -replace '^v', ''
           foreach ($runtime in @('win-x64', 'win-arm64')) {
             $output = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $runtime)
             & ./scripts/Publish-Prunlet.ps1 -OutputDirectory $output -Runtime $runtime | Out-Null
@@ -71,24 +84,50 @@ jobs:
               $product = Join-Path $output ('publish/' + $name)
               if (![IO.File]::Exists($product)) { throw "Published product missing: $runtime $name" }
               $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($product).ProductVersion
-              if (($version -split '\+')[0] -cne $expectedVersion) { throw "Published product version differs: $runtime $name $version" }
+              if (($version -split '\+')[0] -cne $env:PRUNLET_VERSION) { throw "Published product version differs: $runtime $name $version" }
             }
           }
+      - name: Prepare the Velopack CLI
+        # Setup（Velopack）の梱包に使う固定版。失敗してもZIPの配布は止めず、最後のstepでjobを失敗にする。
+        id: vpk
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet tool install --global vpk --version 1.2.161
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # vpkは色付け用のエスケープシーケンスを出すため、取り除いてから版を照合する。
+          $help = (vpk --help 2>&1 | Out-String) -replace "`e\[[0-9;]*m", ''
+          if ($help -notmatch '\bVelopack CLI 1\.2\.161\b') { throw 'vpk 1.2.161 could not start.' }
       - name: Set up Sigilune
         # 他のactionと同じくcommit SHAで固定し、同じ版のリリース（SHA-256・Authenticode署名を検証）を導入する。
         uses: 1llum1n4t1s/Sigilune@05006dcad019e5e863a08985b9208d72004f1b5f # v1.1.3
         with:
           # SHAを更新するとき（Dependabotを含む）は、この版も同じリリースへ揃える。
           version: 1.1.1
-      - name: Sign the executables
-        # 署名用Secretsはこのstepだけへ渡す。全runtimeを同じセッションで1ファイルずつ署名し、
-        # hookを署名済みCLIの複製へ置き換え、署名者・タイムスタンプを確認する。
+      - name: Sign the executables and pack the Velopack Setup
+        # 署名用Secretsはこのstepだけへ渡す（Sigiluneのログインは1回のまま、別jobに分けない）。全runtimeを同じ
+        # セッションで1ファイルずつ署名し、hookを署名済みCLIの複製へ置き換え、署名者・タイムスタンプを確認する。
+        # 続けて署名済みwin-x64のpublishからvpkでSetup（nupkg・releases.win.json）を梱包し、vpk自身の生成物を署名する。
+        # このstepではcargoを動かさない。vpkの失敗はZIPの配布を止めず、結果を出力へ残して最後のstepでjobを失敗にする。
+        id: sign
         env:
           SIGILUNE_EMAIL: ${{ secrets.SIGILUNE_EMAIL }}
           SIGILUNE_TOTP_URI: ${{ secrets.SIGILUNE_TOTP_URI }}
+          PRUNLET_VERSION: ${{ steps.source.outputs.version }}
+          PRUNLET_VPK_OUTCOME: ${{ steps.vpk.outcome }}
         run: |
           $ErrorActionPreference = 'Stop'
           & ./scripts/Sign-PrunletBuild.ps1 -BuildDirectory (Join-Path $env:RUNNER_TEMP 'prunlet-build-win-x64'), (Join-Path $env:RUNNER_TEMP 'prunlet-build-win-arm64')
+          try {
+            if ($env:PRUNLET_VPK_OUTCOME -cne 'success') { throw 'The Velopack CLI is not available.' }
+            $work = Join-Path $env:RUNNER_TEMP 'prunlet-velopack'
+            New-Item -ItemType Directory -Path $work | Out-Null
+            & ./scripts/velopack/pack-windows.ps1 -WorkDirectory $work -PublishDirectory (Join-Path $env:RUNNER_TEMP 'prunlet-build-win-x64/publish') -Sign -PackVersion $env:PRUNLET_VERSION | Out-Null
+            'velopack_pack=ok' >> $env:GITHUB_OUTPUT
+          } catch {
+            Write-Host "::error title=Velopack pack failed::$($_.Exception.Message)"
+            'velopack_pack=failed' >> $env:GITHUB_OUTPUT
+          }
       - name: Package and verify
         id: verified_package
         env:
@@ -103,33 +142,119 @@ jobs:
             $sha256 = & ./scripts/Verify-ReleasePackage.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory $publish -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $runtime -Repository $env:GITHUB_REPOSITORY -RequireSignature
             ($runtime.Replace('-', '_') + "=$sha256") >> $env:GITHUB_OUTPUT
           }
-      - name: Publish the verified packages to the existing R2 destination
+      - name: Verify the Velopack packages
+        # クライアントが適用前に課す条件（署名者CN・タイムスタンプ・製品名・版・エントリ集合・x64）を配信側でも通す。
+        # nupkgのSHA-256ファイルはローカルの照合用（保存物の整合確認）に作る。信頼の基点はR2の署名マニフェスト。
+        # 署名用・R2用のSecretsは渡さない。
+        id: vp_verify
+        if: ${{ steps.sign.outputs.velopack_pack == 'ok' }}
+        continue-on-error: true
+        env:
+          PRUNLET_VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/velopack/verify-windows.ps1 -PackagesDirectory (Join-Path $env:RUNNER_TEMP 'prunlet-velopack/packages') -ExpectedVersion $env:PRUNLET_VERSION -ReleaseAssetsDirectory (Join-Path $env:RUNNER_TEMP 'prunlet-velopack-assets') -RequireSignature
+      - name: Stage the verified Velopack packages
+        # prunlet-velopack-redo.ymlが、再ビルド・再署名なしで同じ一式を配信し直すための保存物を揃える
+        # （検証済みのpackages\と.sha256。Secretsは含まない）。
+        id: vp_stage
+        if: ${{ steps.vp_verify.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'prunlet-velopack-artifact'
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'prunlet-velopack/packages') -Destination (Join-Path $stage 'packages') -Recurse
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'prunlet-velopack-assets') -Destination (Join-Path $stage 'assets') -Recurse
+      - name: Save the verified Velopack packages
+        id: vp_upload
+        if: ${{ steps.vp_stage.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prunlet-velopack-${{ steps.source.outputs.version }}
+          path: ${{ runner.temp }}/prunlet-velopack-artifact
+          retention-days: 30
+          if-no-files-found: error
+      - name: Check the ZIP packages against R2 before any write
+        # 全runtimeについて、読取りだけで次を確認する。ここで失敗すれば、R2には何も書かれない。
+        #  - 既存の版マニフェストが、今回のZIPと同じpayloadで署名が有効であること（同版の別内容は失敗）
+        #  - 最新ポインタが読めること、今回より新しい版でないこと（後退拒否）
+        # R2への書込み権限のトークンだけを渡す（マニフェスト署名鍵は渡さない）。
         env:
           PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
           PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          PRUNLET_VERSION: ${{ steps.source.outputs.version }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           PRUNLET_R2_ACCOUNT_ID: ${{ secrets.PRUNLET_R2_ACCOUNT_ID }}
-          PRUNLET_R2_ACCESS_KEY_ID: ${{ secrets.PRUNLET_R2_ACCESS_KEY_ID }}
-          PRUNLET_R2_SECRET_ACCESS_KEY: ${{ secrets.PRUNLET_R2_SECRET_ACCESS_KEY }}
-          PRUNLET_R2_BUCKET: ${{ vars.PRUNLET_R2_BUCKET || 'prunlet-updates' }}
         run: |
           $ErrorActionPreference = 'Stop'
           foreach ($runtime in @('win-x64', 'win-arm64')) {
             $publish = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $runtime + '/publish')
             $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $runtime + '.zip')
-            & ./scripts/Publish-PrunletR2.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory $publish -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $runtime -Repository $env:GITHUB_REPOSITORY
+            & ./scripts/Publish-PrunletR2.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory $publish -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $runtime -Version $env:PRUNLET_VERSION -Repository $env:GITHUB_REPOSITORY -CheckOnly
           }
-      - name: Attach the same packages to the release
+      - name: Publish the signed ZIP packages to R2
+        # ZIP（create-only）→ 公開URLで照合 → 版マニフェスト（署名・create-only）→ 最新ポインタ（ETag条件付き）。
+        # 公開後に $LASTEXITCODE を見ない（スクリプトは失敗を例外で知らせる。成功後の内部の終了コードで誤って失敗扱いにしない）。
         env:
-          GH_TOKEN: ${{ github.token }}
-          PRUNLET_TAG: ${{ github.event.release.tag_name }}
-          PRUNLET_SHA256_WIN_X64: ${{ steps.verified_package.outputs.win_x64 }}
-          PRUNLET_SHA256_WIN_ARM64: ${{ steps.verified_package.outputs.win_arm64 }}
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          PRUNLET_VERSION: ${{ steps.source.outputs.version }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRUNLET_R2_ACCOUNT_ID: ${{ secrets.PRUNLET_R2_ACCOUNT_ID }}
+          PRUNLET_RELEASE_SIGNING_KEY: ${{ secrets.PRUNLET_RELEASE_SIGNING_KEY }}
         run: |
           $ErrorActionPreference = 'Stop'
           foreach ($runtime in @('win-x64', 'win-arm64')) {
+            $publish = Join-Path $env:RUNNER_TEMP ('prunlet-build-' + $runtime + '/publish')
             $package = Join-Path $env:RUNNER_TEMP ('prunlet-update-' + $runtime + '.zip')
-            $expected = if ($runtime -eq 'win-x64') { $env:PRUNLET_SHA256_WIN_X64 } else { $env:PRUNLET_SHA256_WIN_ARM64 }
-            if (!$expected -or (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -cne $expected) { throw "Package changed after verification: $runtime" }
-            gh release upload $env:PRUNLET_TAG $package --repo $env:GITHUB_REPOSITORY
-            if ($LASTEXITCODE -ne 0) { throw "Release asset upload failed for $runtime; an existing asset was not overwritten." }
+            & ./scripts/Publish-PrunletR2.ps1 -PackagePath $package -SourceRoot $env:GITHUB_WORKSPACE -PublishDirectory $publish -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -Runtime $runtime -Version $env:PRUNLET_VERSION -Repository $env:GITHUB_REPOSITORY
           }
+      - name: Publish the Velopack signed manifest to R2
+        # 署名付きマニフェスト（manifests/<版>/velopack-win-x64.json）を create-only で、nupkgより先に置く。
+        # 現行のフィードが新しい版なら何も置かずに失敗する。既存のマニフェストは署名とpayloadで照合する。
+        id: vp_manifest
+        if: ${{ steps.vp_upload.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRUNLET_R2_ACCOUNT_ID: ${{ secrets.PRUNLET_R2_ACCOUNT_ID }}
+          PRUNLET_RELEASE_SIGNING_KEY: ${{ secrets.PRUNLET_RELEASE_SIGNING_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/velopack/publish-r2.ps1 -PackagesDirectory (Join-Path $env:RUNNER_TEMP 'prunlet-velopack/packages') -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -ManifestOnly
+      - name: Publish the Velopack feed to R2
+        # 署名マニフェスト → nupkg（create-only）→ フィード（ETag条件付き）→ 固定名の順。現行のreleases.win.jsonが
+        # 同じか新しい版なら置き換えない（新しい版なら失敗）。
+        id: vp_publish
+        if: ${{ steps.vp_manifest.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRUNLET_R2_ACCOUNT_ID: ${{ secrets.PRUNLET_R2_ACCOUNT_ID }}
+          PRUNLET_RELEASE_SIGNING_KEY: ${{ secrets.PRUNLET_RELEASE_SIGNING_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/velopack/publish-r2.ps1 -PackagesDirectory (Join-Path $env:RUNNER_TEMP 'prunlet-velopack/packages') -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH
+      - name: Fail the job if the Velopack delivery is incomplete
+        # ZIPの配布を止めないようVelopackの各stepは失敗を許容しているので、ここで結果をまとめてjobを失敗にする。
+        # 保存済みの検証済み一式から配信だけをやり直す場合は、prunlet-velopack-redo.ymlを使う（ZIPは再配布しない）。
+        if: ${{ !cancelled() }}
+        env:
+          VPK: ${{ steps.vpk.outcome }}
+          PACK: ${{ steps.sign.outputs.velopack_pack }}
+          VERIFY: ${{ steps.vp_verify.outcome }}
+          SAVE: ${{ steps.vp_upload.outcome }}
+          MANIFEST: ${{ steps.vp_manifest.outcome }}
+          PUBLISH: ${{ steps.vp_publish.outcome }}
+        run: |
+          $summary = "vpk=$env:VPK pack=$env:PACK verify=$env:VERIFY save=$env:SAVE manifest=$env:MANIFEST publish=$env:PUBLISH"
+          if ($env:VPK -cne 'success' -or $env:PACK -cne 'ok' -or $env:VERIFY -cne 'success' -or $env:SAVE -cne 'success' -or $env:MANIFEST -cne 'success' -or $env:PUBLISH -cne 'success') {
+            throw "The Velopack delivery did not complete ($summary). The ZIP packages were handled independently."
+          }
+          Write-Host "Velopack delivery complete ($summary)."

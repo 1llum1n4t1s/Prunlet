@@ -14,7 +14,6 @@ param(
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [string]$SettingsBackupDirectory,
     [switch]$PrepareStartupUpdate,
-    [switch]$UseGitHubCliAuthentication,
     [switch]$UpdateManagedInstallation,
     [ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedCommitSha
 )
@@ -72,12 +71,6 @@ try {
     $script:PrunletMessages = ConvertFrom-Json -AsHashtable -InputObject @'
 {
  "ja": {
-  "GitHub CLI authentication requires an existing gh executable.": "GitHub CLI の認証には既存の gh 実行ファイルが必要です。",
-  "GitHub CLI could not be started.": "GitHub CLI を起動できませんでした。",
-  "GitHub CLI request timed out after 60 seconds.": "GitHub CLI の要求が60秒でタイムアウトしました。",
-  "GitHub CLI request failed (exit code {code}).": "GitHub CLI の要求が失敗しました（終了コード {code}）。",
-  "GitHub CLI returned invalid JSON.": "GitHub CLI が不正な JSON を返しました。",
-  "GitHub CLI returned an invalid API response.": "GitHub CLI が不正な API 応答を返しました。",
   "{name} must be an absolute path.": "{name} は絶対パスで指定してください。",
   "{name} cannot be a filesystem root.": "{name} にファイルシステムのルートは使えません。",
   "{name} cannot traverse links: {path}": "{name} はリンクを経由できません: {path}",
@@ -101,16 +94,6 @@ try {
   "Unowned retired backend was preserved; managed update cannot replace it.": "所有していない廃止済みのバックエンドを保全しました。管理された更新ではこれを置き換えられません。",
   "Managed installation or recovery configuration changed; nothing was replaced.": "管理された導入先または復元データの設定が変わりました。何も置き換えていません。",
   "Managed recovery configuration changed; migration was not started.": "管理された復元データの設定が変わりました。移行は開始していません。",
-  "GitHub did not return a valid default branch.": "GitHub が有効な既定ブランチを返しませんでした。",
-  "GitHub did not return a published stable release.": "GitHub が公開済みの安定版 release を返しませんでした。",
-  "Published release tag is invalid.": "公開された release の tag が不正です。",
-  "Release tag has an invalid object SHA.": "release の tag の object SHA が不正です。",
-  "Release commit is not on the default branch.": "release の commit が既定ブランチ上にありません。",
-  "The latest release {tag} has no unique {asset} yet; retry after its release workflow finishes. Nothing was installed.": "最新の release {tag} には、まだ一意の {asset} がありません。release の workflow が終わってから再試行してください。何も導入していません。",
-  "Published package digest or size is invalid.": "公開された配布物の digest またはサイズが不正です。",
-  "Published package identity is invalid.": "公開された配布物の識別情報が不正です。",
-  "Release tag does not identify a commit.": "release の tag が commit を指していません。",
-  "Release tag nesting exceeds the supported depth.": "release の tag の入れ子が対応できる深さを超えています。",
   "Unexpected or duplicate package entry: {entry}": "配布物に想定外または重複したエントリがあります: {entry}",
   "Package links, directories, or special files are forbidden: {entry}": "配布物にリンク・ディレクトリ・特殊ファイルは含められません: {entry}",
   "Package entry size is invalid: {entry}": "配布物のエントリのサイズが不正です: {entry}",
@@ -161,15 +144,12 @@ try {
   "New configuration was changed or replaced; it was preserved.": "新しい設定が変更または置き換えられていました。設定はそのまま保全しています。",
   "Installation failed: {error}. Rollback requires recovery from {backup}: {details}": "導入に失敗しました: {error}。巻き戻しには {backup} からの復旧が必要です: {details}",
   "Work directory contains links; automatic cleanup stopped.": "作業用ディレクトリにリンクがあるため、自動清掃を止めました。",
-  "Temporary files retained at {path}: {error}": "一時ファイルを {path} に残しました: {error}"
+  "Temporary files retained at {path}: {error}": "一時ファイルを {path} に残しました: {error}",
+  "The release manifest was rejected ({reason}); nothing was installed.": "リリースのマニフェストを拒否しました（{reason}）。何も導入していません。",
+  "The release manifest could not be retrieved from {url}; nothing was installed.": "{url} からリリースのマニフェストを取得できませんでした。何も導入していません。",
+  "The package could not be downloaded from {url}; nothing was installed.": "{url} から配布物をダウンロードできませんでした。何も導入していません。"
  },
  "zh-CN": {
-  "GitHub CLI authentication requires an existing gh executable.": "GitHub CLI 认证需要已有的 gh 可执行文件。",
-  "GitHub CLI could not be started.": "无法启动 GitHub CLI。",
-  "GitHub CLI request timed out after 60 seconds.": "GitHub CLI 请求在 60 秒后超时。",
-  "GitHub CLI request failed (exit code {code}).": "GitHub CLI 请求失败（退出代码 {code}）。",
-  "GitHub CLI returned invalid JSON.": "GitHub CLI 返回了无效的 JSON。",
-  "GitHub CLI returned an invalid API response.": "GitHub CLI 返回了无效的 API 响应。",
   "{name} must be an absolute path.": "{name} 必须是绝对路径。",
   "{name} cannot be a filesystem root.": "{name} 不能是文件系统根目录。",
   "{name} cannot traverse links: {path}": "{name} 不能经过链接：{path}",
@@ -193,16 +173,6 @@ try {
   "Unowned retired backend was preserved; managed update cannot replace it.": "已保留不属于本安装的已停用后端；托管更新无法替换它。",
   "Managed installation or recovery configuration changed; nothing was replaced.": "托管安装或恢复配置已更改；未替换任何内容。",
   "Managed recovery configuration changed; migration was not started.": "托管的恢复配置已更改；未开始迁移。",
-  "GitHub did not return a valid default branch.": "GitHub 未返回有效的默认分支。",
-  "GitHub did not return a published stable release.": "GitHub 未返回已发布的稳定版 release。",
-  "Published release tag is invalid.": "已发布 release 的 tag 无效。",
-  "Release tag has an invalid object SHA.": "release tag 的对象 SHA 无效。",
-  "Release commit is not on the default branch.": "release 的 commit 不在默认分支上。",
-  "The latest release {tag} has no unique {asset} yet; retry after its release workflow finishes. Nothing was installed.": "最新的 release {tag} 还没有唯一的 {asset}；请在其 release workflow 完成后重试。未安装任何内容。",
-  "Published package digest or size is invalid.": "已发布软件包的 digest 或大小无效。",
-  "Published package identity is invalid.": "已发布软件包的标识无效。",
-  "Release tag does not identify a commit.": "release tag 未指向 commit。",
-  "Release tag nesting exceeds the supported depth.": "release tag 的嵌套超过了支持的深度。",
   "Unexpected or duplicate package entry: {entry}": "软件包中有意外或重复的条目：{entry}",
   "Package links, directories, or special files are forbidden: {entry}": "软件包中不允许链接、目录或特殊文件：{entry}",
   "Package entry size is invalid: {entry}": "软件包条目的大小无效：{entry}",
@@ -253,15 +223,12 @@ try {
   "New configuration was changed or replaced; it was preserved.": "新配置已被更改或替换；配置已保留。",
   "Installation failed: {error}. Rollback requires recovery from {backup}: {details}": "安装失败：{error}。回滚需要从 {backup} 恢复：{details}",
   "Work directory contains links; automatic cleanup stopped.": "工作目录包含链接；已停止自动清理。",
-  "Temporary files retained at {path}: {error}": "临时文件保留在 {path}：{error}"
+  "Temporary files retained at {path}: {error}": "临时文件保留在 {path}：{error}",
+  "The release manifest was rejected ({reason}); nothing was installed.": "已拒绝发布清单（{reason}）。未安装任何内容。",
+  "The release manifest could not be retrieved from {url}; nothing was installed.": "无法从 {url} 获取发布清单。未安装任何内容。",
+  "The package could not be downloaded from {url}; nothing was installed.": "无法从 {url} 下载软件包。未安装任何内容。"
  },
  "zh-TW": {
-  "GitHub CLI authentication requires an existing gh executable.": "GitHub CLI 驗證需要現有的 gh 執行檔。",
-  "GitHub CLI could not be started.": "無法啟動 GitHub CLI。",
-  "GitHub CLI request timed out after 60 seconds.": "GitHub CLI 要求在 60 秒後逾時。",
-  "GitHub CLI request failed (exit code {code}).": "GitHub CLI 要求失敗（結束代碼 {code}）。",
-  "GitHub CLI returned invalid JSON.": "GitHub CLI 傳回了無效的 JSON。",
-  "GitHub CLI returned an invalid API response.": "GitHub CLI 傳回了無效的 API 回應。",
   "{name} must be an absolute path.": "{name} 必須是絕對路徑。",
   "{name} cannot be a filesystem root.": "{name} 不能是檔案系統根目錄。",
   "{name} cannot traverse links: {path}": "{name} 不能經過連結：{path}",
@@ -285,16 +252,6 @@ try {
   "Unowned retired backend was preserved; managed update cannot replace it.": "已保留不屬於本安裝的已停用後端；受管理的更新無法取代它。",
   "Managed installation or recovery configuration changed; nothing was replaced.": "受管理的安裝或復原設定已變更；未取代任何內容。",
   "Managed recovery configuration changed; migration was not started.": "受管理的復原設定已變更；未開始移轉。",
-  "GitHub did not return a valid default branch.": "GitHub 未傳回有效的預設分支。",
-  "GitHub did not return a published stable release.": "GitHub 未傳回已發布的穩定版 release。",
-  "Published release tag is invalid.": "已發布 release 的 tag 無效。",
-  "Release tag has an invalid object SHA.": "release tag 的物件 SHA 無效。",
-  "Release commit is not on the default branch.": "release 的 commit 不在預設分支上。",
-  "The latest release {tag} has no unique {asset} yet; retry after its release workflow finishes. Nothing was installed.": "最新的 release {tag} 尚未有唯一的 {asset}；請在其 release workflow 完成後重試。未安裝任何內容。",
-  "Published package digest or size is invalid.": "已發布套件的 digest 或大小無效。",
-  "Published package identity is invalid.": "已發布套件的識別資訊無效。",
-  "Release tag does not identify a commit.": "release tag 未指向 commit。",
-  "Release tag nesting exceeds the supported depth.": "release tag 的巢狀層數超過支援的深度。",
   "Unexpected or duplicate package entry: {entry}": "套件中有非預期或重複的項目：{entry}",
   "Package links, directories, or special files are forbidden: {entry}": "套件中不允許連結、目錄或特殊檔案：{entry}",
   "Package entry size is invalid: {entry}": "套件項目的大小無效：{entry}",
@@ -345,15 +302,12 @@ try {
   "New configuration was changed or replaced; it was preserved.": "新設定已被變更或取代；設定已保留。",
   "Installation failed: {error}. Rollback requires recovery from {backup}: {details}": "安裝失敗：{error}。回復需要從 {backup} 復原：{details}",
   "Work directory contains links; automatic cleanup stopped.": "工作目錄包含連結；已停止自動清理。",
-  "Temporary files retained at {path}: {error}": "暫存檔案保留在 {path}：{error}"
+  "Temporary files retained at {path}: {error}": "暫存檔案保留在 {path}：{error}",
+  "The release manifest was rejected ({reason}); nothing was installed.": "已拒絕發行資訊清單（{reason}）。未安裝任何內容。",
+  "The release manifest could not be retrieved from {url}; nothing was installed.": "無法從 {url} 取得發行資訊清單。未安裝任何內容。",
+  "The package could not be downloaded from {url}; nothing was installed.": "無法從 {url} 下載套件。未安裝任何內容。"
  },
  "ko": {
-  "GitHub CLI authentication requires an existing gh executable.": "GitHub CLI 인증에는 기존 gh 실행 파일이 필요합니다.",
-  "GitHub CLI could not be started.": "GitHub CLI를 시작할 수 없습니다.",
-  "GitHub CLI request timed out after 60 seconds.": "GitHub CLI 요청이 60초 후 시간 초과되었습니다.",
-  "GitHub CLI request failed (exit code {code}).": "GitHub CLI 요청이 실패했습니다(종료 코드 {code}).",
-  "GitHub CLI returned invalid JSON.": "GitHub CLI가 잘못된 JSON을 반환했습니다.",
-  "GitHub CLI returned an invalid API response.": "GitHub CLI가 잘못된 API 응답을 반환했습니다.",
   "{name} must be an absolute path.": "{name}은(는) 절대 경로여야 합니다.",
   "{name} cannot be a filesystem root.": "{name}은(는) 파일 시스템 루트일 수 없습니다.",
   "{name} cannot traverse links: {path}": "{name}은(는) 링크를 거칠 수 없습니다: {path}",
@@ -377,16 +331,6 @@ try {
   "Unowned retired backend was preserved; managed update cannot replace it.": "소유하지 않은 폐기된 백엔드를 보존했습니다. 관리형 업데이트로는 이를 교체할 수 없습니다.",
   "Managed installation or recovery configuration changed; nothing was replaced.": "관리형 설치 또는 복구 구성이 변경되었습니다. 아무것도 교체하지 않았습니다.",
   "Managed recovery configuration changed; migration was not started.": "관리형 복구 구성이 변경되었습니다. 마이그레이션을 시작하지 않았습니다.",
-  "GitHub did not return a valid default branch.": "GitHub가 유효한 기본 브랜치를 반환하지 않았습니다.",
-  "GitHub did not return a published stable release.": "GitHub가 게시된 안정 release를 반환하지 않았습니다.",
-  "Published release tag is invalid.": "게시된 release tag가 올바르지 않습니다.",
-  "Release tag has an invalid object SHA.": "release tag의 객체 SHA가 올바르지 않습니다.",
-  "Release commit is not on the default branch.": "release commit이 기본 브랜치에 없습니다.",
-  "The latest release {tag} has no unique {asset} yet; retry after its release workflow finishes. Nothing was installed.": "최신 release {tag}에 아직 고유한 {asset}이(가) 없습니다. release workflow가 끝난 후 다시 시도하십시오. 아무것도 설치하지 않았습니다.",
-  "Published package digest or size is invalid.": "게시된 패키지의 digest 또는 크기가 올바르지 않습니다.",
-  "Published package identity is invalid.": "게시된 패키지의 식별 정보가 올바르지 않습니다.",
-  "Release tag does not identify a commit.": "release tag가 commit을 가리키지 않습니다.",
-  "Release tag nesting exceeds the supported depth.": "release tag의 중첩이 지원되는 깊이를 초과합니다.",
   "Unexpected or duplicate package entry: {entry}": "패키지에 예상치 못했거나 중복된 항목이 있습니다: {entry}",
   "Package links, directories, or special files are forbidden: {entry}": "패키지에는 링크, 디렉터리 또는 특수 파일을 포함할 수 없습니다: {entry}",
   "Package entry size is invalid: {entry}": "패키지 항목의 크기가 올바르지 않습니다: {entry}",
@@ -437,15 +381,12 @@ try {
   "New configuration was changed or replaced; it was preserved.": "새 구성이 변경되었거나 교체되었습니다. 구성은 그대로 보존했습니다.",
   "Installation failed: {error}. Rollback requires recovery from {backup}: {details}": "설치에 실패했습니다: {error}. 롤백하려면 {backup}에서 복구해야 합니다: {details}",
   "Work directory contains links; automatic cleanup stopped.": "작업 디렉터리에 링크가 있어 자동 정리를 중지했습니다.",
-  "Temporary files retained at {path}: {error}": "임시 파일을 {path}에 남겼습니다: {error}"
+  "Temporary files retained at {path}: {error}": "임시 파일을 {path}에 남겼습니다: {error}",
+  "The release manifest was rejected ({reason}); nothing was installed.": "릴리스 매니페스트를 거부했습니다({reason}). 아무것도 설치하지 않았습니다.",
+  "The release manifest could not be retrieved from {url}; nothing was installed.": "{url}에서 릴리스 매니페스트를 가져올 수 없습니다. 아무것도 설치하지 않았습니다.",
+  "The package could not be downloaded from {url}; nothing was installed.": "{url}에서 패키지를 다운로드할 수 없습니다. 아무것도 설치하지 않았습니다."
  },
  "es": {
-  "GitHub CLI authentication requires an existing gh executable.": "La autenticación de GitHub CLI requiere un ejecutable gh existente.",
-  "GitHub CLI could not be started.": "No se pudo iniciar GitHub CLI.",
-  "GitHub CLI request timed out after 60 seconds.": "La solicitud de GitHub CLI agotó el tiempo de espera tras 60 segundos.",
-  "GitHub CLI request failed (exit code {code}).": "La solicitud de GitHub CLI falló (código de salida {code}).",
-  "GitHub CLI returned invalid JSON.": "GitHub CLI devolvió un JSON no válido.",
-  "GitHub CLI returned an invalid API response.": "GitHub CLI devolvió una respuesta de API no válida.",
   "{name} must be an absolute path.": "{name} debe ser una ruta absoluta.",
   "{name} cannot be a filesystem root.": "{name} no puede ser la raíz de un sistema de archivos.",
   "{name} cannot traverse links: {path}": "{name} no puede atravesar enlaces: {path}",
@@ -469,16 +410,6 @@ try {
   "Unowned retired backend was preserved; managed update cannot replace it.": "Se conservó un backend retirado que no es propio; la actualización administrada no puede reemplazarlo.",
   "Managed installation or recovery configuration changed; nothing was replaced.": "La configuración de la instalación administrada o de la recuperación cambió; no se reemplazó nada.",
   "Managed recovery configuration changed; migration was not started.": "La configuración de la recuperación administrada cambió; no se inició la migración.",
-  "GitHub did not return a valid default branch.": "GitHub no devolvió una rama predeterminada válida.",
-  "GitHub did not return a published stable release.": "GitHub no devolvió una release estable publicada.",
-  "Published release tag is invalid.": "El tag de la release publicada no es válido.",
-  "Release tag has an invalid object SHA.": "El tag de la release tiene un SHA de objeto no válido.",
-  "Release commit is not on the default branch.": "El commit de la release no está en la rama predeterminada.",
-  "The latest release {tag} has no unique {asset} yet; retry after its release workflow finishes. Nothing was installed.": "La release más reciente {tag} aún no tiene un {asset} único; vuelva a intentarlo cuando termine su workflow de release. No se instaló nada.",
-  "Published package digest or size is invalid.": "El digest o el tamaño del paquete publicado no es válido.",
-  "Published package identity is invalid.": "La identidad del paquete publicado no es válida.",
-  "Release tag does not identify a commit.": "El tag de la release no identifica un commit.",
-  "Release tag nesting exceeds the supported depth.": "El anidamiento del tag de la release supera la profundidad admitida.",
   "Unexpected or duplicate package entry: {entry}": "Entrada del paquete inesperada o duplicada: {entry}",
   "Package links, directories, or special files are forbidden: {entry}": "No se permiten enlaces, directorios ni archivos especiales en el paquete: {entry}",
   "Package entry size is invalid: {entry}": "El tamaño de la entrada del paquete no es válido: {entry}",
@@ -529,15 +460,12 @@ try {
   "New configuration was changed or replaced; it was preserved.": "La nueva configuración se cambió o reemplazó; se conservó.",
   "Installation failed: {error}. Rollback requires recovery from {backup}: {details}": "La instalación falló: {error}. La reversión requiere recuperar desde {backup}: {details}",
   "Work directory contains links; automatic cleanup stopped.": "El directorio de trabajo contiene enlaces; se detuvo la limpieza automática.",
-  "Temporary files retained at {path}: {error}": "Se conservaron archivos temporales en {path}: {error}"
+  "Temporary files retained at {path}: {error}": "Se conservaron archivos temporales en {path}: {error}",
+  "The release manifest was rejected ({reason}); nothing was installed.": "Se rechazó el manifiesto de la versión ({reason}); no se instaló nada.",
+  "The release manifest could not be retrieved from {url}; nothing was installed.": "No se pudo obtener el manifiesto de la versión desde {url}; no se instaló nada.",
+  "The package could not be downloaded from {url}; nothing was installed.": "No se pudo descargar el paquete desde {url}; no se instaló nada."
  },
  "fr": {
-  "GitHub CLI authentication requires an existing gh executable.": "L'authentification GitHub CLI nécessite un exécutable gh existant.",
-  "GitHub CLI could not be started.": "Impossible de démarrer GitHub CLI.",
-  "GitHub CLI request timed out after 60 seconds.": "La requête GitHub CLI a expiré après 60 secondes.",
-  "GitHub CLI request failed (exit code {code}).": "La requête GitHub CLI a échoué (code de sortie {code}).",
-  "GitHub CLI returned invalid JSON.": "GitHub CLI a renvoyé un JSON non valide.",
-  "GitHub CLI returned an invalid API response.": "GitHub CLI a renvoyé une réponse d'API non valide.",
   "{name} must be an absolute path.": "{name} doit être un chemin absolu.",
   "{name} cannot be a filesystem root.": "{name} ne peut pas être la racine d'un système de fichiers.",
   "{name} cannot traverse links: {path}": "{name} ne peut pas traverser de liens : {path}",
@@ -561,16 +489,6 @@ try {
   "Unowned retired backend was preserved; managed update cannot replace it.": "Un backend retiré non possédé a été conservé ; la mise à jour gérée ne peut pas le remplacer.",
   "Managed installation or recovery configuration changed; nothing was replaced.": "La configuration de l'installation gérée ou de la récupération a changé ; rien n'a été remplacé.",
   "Managed recovery configuration changed; migration was not started.": "La configuration de la récupération gérée a changé ; la migration n'a pas été lancée.",
-  "GitHub did not return a valid default branch.": "GitHub n'a pas renvoyé de branche par défaut valide.",
-  "GitHub did not return a published stable release.": "GitHub n'a pas renvoyé de release stable publiée.",
-  "Published release tag is invalid.": "Le tag de la release publiée n'est pas valide.",
-  "Release tag has an invalid object SHA.": "Le tag de la release a un SHA d'objet non valide.",
-  "Release commit is not on the default branch.": "Le commit de la release n'est pas sur la branche par défaut.",
-  "The latest release {tag} has no unique {asset} yet; retry after its release workflow finishes. Nothing was installed.": "La dernière release {tag} n'a pas encore de {asset} unique ; réessayez une fois son workflow de release terminé. Rien n'a été installé.",
-  "Published package digest or size is invalid.": "Le digest ou la taille du paquet publié n'est pas valide.",
-  "Published package identity is invalid.": "L'identité du paquet publié n'est pas valide.",
-  "Release tag does not identify a commit.": "Le tag de la release n'identifie pas un commit.",
-  "Release tag nesting exceeds the supported depth.": "L'imbrication du tag de la release dépasse la profondeur prise en charge.",
   "Unexpected or duplicate package entry: {entry}": "Entrée de paquet inattendue ou en double : {entry}",
   "Package links, directories, or special files are forbidden: {entry}": "Les liens, répertoires et fichiers spéciaux sont interdits dans le paquet : {entry}",
   "Package entry size is invalid: {entry}": "La taille de l'entrée du paquet n'est pas valide : {entry}",
@@ -621,15 +539,12 @@ try {
   "New configuration was changed or replaced; it was preserved.": "La nouvelle configuration a été modifiée ou remplacée ; elle a été conservée.",
   "Installation failed: {error}. Rollback requires recovery from {backup}: {details}": "Échec de l'installation : {error}. L'annulation nécessite une récupération depuis {backup} : {details}",
   "Work directory contains links; automatic cleanup stopped.": "Le répertoire de travail contient des liens ; le nettoyage automatique a été arrêté.",
-  "Temporary files retained at {path}: {error}": "Fichiers temporaires conservés dans {path} : {error}"
+  "Temporary files retained at {path}: {error}": "Fichiers temporaires conservés dans {path} : {error}",
+  "The release manifest was rejected ({reason}); nothing was installed.": "Le manifeste de la version a été refusé ({reason}) ; rien n'a été installé.",
+  "The release manifest could not be retrieved from {url}; nothing was installed.": "Impossible de récupérer le manifeste de la version depuis {url} ; rien n'a été installé.",
+  "The package could not be downloaded from {url}; nothing was installed.": "Impossible de télécharger le paquet depuis {url} ; rien n'a été installé."
  },
  "de": {
-  "GitHub CLI authentication requires an existing gh executable.": "Die GitHub CLI-Authentifizierung erfordert eine vorhandene gh-Programmdatei.",
-  "GitHub CLI could not be started.": "GitHub CLI konnte nicht gestartet werden.",
-  "GitHub CLI request timed out after 60 seconds.": "Die GitHub CLI-Anfrage hat nach 60 Sekunden das Zeitlimit überschritten.",
-  "GitHub CLI request failed (exit code {code}).": "Die GitHub CLI-Anfrage ist fehlgeschlagen (Exitcode {code}).",
-  "GitHub CLI returned invalid JSON.": "GitHub CLI hat ungültiges JSON zurückgegeben.",
-  "GitHub CLI returned an invalid API response.": "GitHub CLI hat eine ungültige API-Antwort zurückgegeben.",
   "{name} must be an absolute path.": "{name} muss ein absoluter Pfad sein.",
   "{name} cannot be a filesystem root.": "{name} darf kein Dateisystemstamm sein.",
   "{name} cannot traverse links: {path}": "{name} darf keine Links durchlaufen: {path}",
@@ -653,16 +568,6 @@ try {
   "Unowned retired backend was preserved; managed update cannot replace it.": "Ein nicht eigenes, eingestelltes Backend wurde beibehalten; die verwaltete Aktualisierung kann es nicht ersetzen.",
   "Managed installation or recovery configuration changed; nothing was replaced.": "Die Konfiguration der verwalteten Installation oder Wiederherstellung hat sich geändert; nichts wurde ersetzt.",
   "Managed recovery configuration changed; migration was not started.": "Die Konfiguration der verwalteten Wiederherstellung hat sich geändert; die Migration wurde nicht gestartet.",
-  "GitHub did not return a valid default branch.": "GitHub hat keinen gültigen Standardbranch zurückgegeben.",
-  "GitHub did not return a published stable release.": "GitHub hat kein veröffentlichtes stabiles Release zurückgegeben.",
-  "Published release tag is invalid.": "Der Tag des veröffentlichten Release ist ungültig.",
-  "Release tag has an invalid object SHA.": "Der Release-Tag hat einen ungültigen Objekt-SHA.",
-  "Release commit is not on the default branch.": "Der Release-Commit liegt nicht auf dem Standardbranch.",
-  "The latest release {tag} has no unique {asset} yet; retry after its release workflow finishes. Nothing was installed.": "Das neueste Release {tag} hat noch kein eindeutiges {asset}; versuchen Sie es erneut, nachdem sein Release-Workflow abgeschlossen ist. Es wurde nichts installiert.",
-  "Published package digest or size is invalid.": "Digest oder Größe des veröffentlichten Pakets ist ungültig.",
-  "Published package identity is invalid.": "Die Identität des veröffentlichten Pakets ist ungültig.",
-  "Release tag does not identify a commit.": "Der Release-Tag verweist auf keinen Commit.",
-  "Release tag nesting exceeds the supported depth.": "Die Verschachtelung des Release-Tags überschreitet die unterstützte Tiefe.",
   "Unexpected or duplicate package entry: {entry}": "Unerwarteter oder doppelter Paketeintrag: {entry}",
   "Package links, directories, or special files are forbidden: {entry}": "Links, Verzeichnisse oder Sonderdateien sind im Paket nicht zulässig: {entry}",
   "Package entry size is invalid: {entry}": "Die Größe des Paketeintrags ist ungültig: {entry}",
@@ -713,15 +618,12 @@ try {
   "New configuration was changed or replaced; it was preserved.": "Die neue Konfiguration wurde geändert oder ersetzt; sie wurde beibehalten.",
   "Installation failed: {error}. Rollback requires recovery from {backup}: {details}": "Installation fehlgeschlagen: {error}. Das Zurücksetzen erfordert eine Wiederherstellung aus {backup}: {details}",
   "Work directory contains links; automatic cleanup stopped.": "Das Arbeitsverzeichnis enthält Links; die automatische Bereinigung wurde angehalten.",
-  "Temporary files retained at {path}: {error}": "Temporäre Dateien wurden in {path} beibehalten: {error}"
+  "Temporary files retained at {path}: {error}": "Temporäre Dateien wurden in {path} beibehalten: {error}",
+  "The release manifest was rejected ({reason}); nothing was installed.": "Das Release-Manifest wurde abgelehnt ({reason}); es wurde nichts installiert.",
+  "The release manifest could not be retrieved from {url}; nothing was installed.": "Das Release-Manifest konnte nicht von {url} abgerufen werden; es wurde nichts installiert.",
+  "The package could not be downloaded from {url}; nothing was installed.": "Das Paket konnte nicht von {url} heruntergeladen werden; es wurde nichts installiert."
  },
  "pt-BR": {
-  "GitHub CLI authentication requires an existing gh executable.": "A autenticação do GitHub CLI requer um executável gh existente.",
-  "GitHub CLI could not be started.": "Não foi possível iniciar o GitHub CLI.",
-  "GitHub CLI request timed out after 60 seconds.": "A solicitação do GitHub CLI expirou após 60 segundos.",
-  "GitHub CLI request failed (exit code {code}).": "A solicitação do GitHub CLI falhou (código de saída {code}).",
-  "GitHub CLI returned invalid JSON.": "O GitHub CLI retornou um JSON inválido.",
-  "GitHub CLI returned an invalid API response.": "O GitHub CLI retornou uma resposta de API inválida.",
   "{name} must be an absolute path.": "{name} deve ser um caminho absoluto.",
   "{name} cannot be a filesystem root.": "{name} não pode ser a raiz de um sistema de arquivos.",
   "{name} cannot traverse links: {path}": "{name} não pode atravessar links: {path}",
@@ -745,16 +647,6 @@ try {
   "Unowned retired backend was preserved; managed update cannot replace it.": "Um backend desativado que não é próprio foi preservado; a atualização gerenciada não pode substituí-lo.",
   "Managed installation or recovery configuration changed; nothing was replaced.": "A configuração da instalação gerenciada ou da recuperação mudou; nada foi substituído.",
   "Managed recovery configuration changed; migration was not started.": "A configuração da recuperação gerenciada mudou; a migração não foi iniciada.",
-  "GitHub did not return a valid default branch.": "O GitHub não retornou uma branch padrão válida.",
-  "GitHub did not return a published stable release.": "O GitHub não retornou uma release estável publicada.",
-  "Published release tag is invalid.": "A tag da release publicada é inválida.",
-  "Release tag has an invalid object SHA.": "A tag da release tem um SHA de objeto inválido.",
-  "Release commit is not on the default branch.": "O commit da release não está na branch padrão.",
-  "The latest release {tag} has no unique {asset} yet; retry after its release workflow finishes. Nothing was installed.": "A release mais recente {tag} ainda não tem um {asset} único; tente novamente depois que o workflow de release terminar. Nada foi instalado.",
-  "Published package digest or size is invalid.": "O digest ou o tamanho do pacote publicado é inválido.",
-  "Published package identity is invalid.": "A identidade do pacote publicado é inválida.",
-  "Release tag does not identify a commit.": "A tag da release não identifica um commit.",
-  "Release tag nesting exceeds the supported depth.": "O aninhamento da tag da release excede a profundidade suportada.",
   "Unexpected or duplicate package entry: {entry}": "Entrada de pacote inesperada ou duplicada: {entry}",
   "Package links, directories, or special files are forbidden: {entry}": "Links, diretórios ou arquivos especiais não são permitidos no pacote: {entry}",
   "Package entry size is invalid: {entry}": "O tamanho da entrada do pacote é inválido: {entry}",
@@ -805,55 +697,217 @@ try {
   "New configuration was changed or replaced; it was preserved.": "A nova configuração foi alterada ou substituída; ela foi preservada.",
   "Installation failed: {error}. Rollback requires recovery from {backup}: {details}": "A instalação falhou: {error}. A reversão requer recuperação a partir de {backup}: {details}",
   "Work directory contains links; automatic cleanup stopped.": "O diretório de trabalho contém links; a limpeza automática foi interrompida.",
-  "Temporary files retained at {path}: {error}": "Arquivos temporários mantidos em {path}: {error}"
+  "Temporary files retained at {path}: {error}": "Arquivos temporários mantidos em {path}: {error}",
+  "The release manifest was rejected ({reason}); nothing was installed.": "O manifesto da versão foi rejeitado ({reason}); nada foi instalado.",
+  "The release manifest could not be retrieved from {url}; nothing was installed.": "Não foi possível obter o manifesto da versão em {url}; nada foi instalado.",
+  "The package could not be downloaded from {url}; nothing was installed.": "Não foi possível baixar o pacote de {url}; nada foi instalado."
  }
 }
 '@
 } catch { $script:PrunletMessages = $null }
 # END PRUNLET INSTALLER MESSAGES
 
-function Invoke-PrunletGitHubCli([string]$Endpoint) {
-    $command = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (!$command) { throw (Format-PrunletMessage 'GitHub CLI authentication requires an existing gh executable.') }
-    $start = [Diagnostics.ProcessStartInfo]::new()
-    $start.FileName = $command.Source
-    $start.UseShellExecute = $false
-    $start.CreateNoWindow = $true
-    $start.RedirectStandardOutput = $true
-    $start.RedirectStandardError = $true
-    foreach ($argument in @('api', '--hostname', 'github.com', '--method', 'GET', $Endpoint)) { $start.ArgumentList.Add($argument) }
-    # 親のデバッグ設定による認証情報の出力と、対話待ちを避ける。
-    [void]$start.Environment.Remove('GH_DEBUG')
-    $start.Environment['GH_PROMPT_DISABLED'] = '1'
-    $start.Environment['GIT_TERMINAL_PROMPT'] = '0'
-    $start.Environment['GH_PAGER'] = 'cat'
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $start
-    try {
-        try { [void]$process.Start() } catch { throw (Format-PrunletMessage 'GitHub CLI could not be started.') }
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
-        if (!$process.WaitForExit(60000)) {
-            try { $process.Kill($true) } catch { }
-            throw (Format-PrunletMessage 'GitHub CLI request timed out after 60 seconds.')
-        }
-        $output = $stdout.GetAwaiter().GetResult()
-        # stderrは回収だけを行い、認証関連の生出力を例外や記録へ転載しない。
-        [void]$stderr.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0) { throw (Format-PrunletMessage 'GitHub CLI request failed (exit code {code}).' @{ code = $process.ExitCode }) }
-        return $output
-    } finally { $process.Dispose() }
-}
-function Get-PrunletGitHubApiResponse([string]$Endpoint) {
-    if (!$UseGitHubCliAuthentication) {
-        return Invoke-RestMethod -Uri ("https://api.github.com/" + $Endpoint) -Headers $headers -TimeoutSec 60
-    }
-    $json = Invoke-PrunletGitHubCli $Endpoint
-    try { $response = ConvertFrom-Json -InputObject $json -ErrorAction Stop } catch { throw (Format-PrunletMessage 'GitHub CLI returned invalid JSON.') }
-    if ($null -eq $response -or $response -isnot [pscustomobject]) { throw (Format-PrunletMessage 'GitHub CLI returned an invalid API response.') }
-    return $response
+# ---- 署名付きマニフェスト（更新・導入の信頼の基点） ----
+# 目的: GitHub Release・タグ・compare APIを使わず、R2（https://prunlet.kagayoi.com）の署名付きマニフェストだけを
+# 信頼の基点にする。固定の公開鍵で署名を検証し、payloadが指す配布物の名前・キー・長さ・SHA-256・版を確かめてから使う。
+# 1つでも外れたら例外にして、呼出し元は何も適用しない（fail-closed）。
+# この区間は integration/start-prunlet-mcp.ps1 と scripts/Install-Prunlet.ps1 に同じ本文で置く（配布物の12ファイル
+# 構成を変えないため共通ファイルにしない）。配信側の正本は scripts/PrunletRelease.Common.ps1 の
+# Read-PrunletReleaseEnvelope で、ここはそれより厳しく、封筒・payloadとも正規形（キー順固定・compact・末尾改行なし）
+# へ再直列化したバイト列と完全一致することを求める。
+# 鍵整合の関門（scripts/Test-PrunletReleaseKeyGate.ps1）は、次の定数の行（識別子とbase64の文字列リテラルが同じ行）を
+# 抽出して配信側の正本と照合する。このファイル内の定義はこの1か所だけにする（検証は写しのこの1行だけをテスト鍵へ置換する）。
+$script:PRUNLET_RELEASE_PUBLIC_KEY_SPKI_B64 = 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEMIbQQg1ZUrL1G3V5sKqnQm74bz087XUrB5+wnCXOfBnP8kREgm960J5b9S/fT0rUgopgPODpO9/PINkkCFhJbA=='
+$script:PrunletReleaseKeyId = 'prunlet-release-1'
+$script:PrunletReleaseOrigin = 'https://prunlet.kagayoi.com/'
+$script:PrunletReleaseRepository = '1llum1n4t1s/Prunlet'
+$script:PrunletReleaseEnvelopeMaxBytes = 16384
+
+# マニフェストの拒否。理由は固定語彙だけにして、取得した本文・鍵の値を例外へ混ぜない。
+function Stop-PrunletReleaseManifest([string]$Reason) {
+    $failure = [InvalidOperationException]::new("Release manifest rejected: $Reason.")
+    $failure.Data['PrunletReleaseManifestReason'] = $Reason
+    throw $failure
 }
 
+# 署名対象と比べるための正規形。配信側（New-PrunletReleaseEnvelopeBytes / New-PrunletReleasePayloadBytes）と同じ
+# Utf8JsonWriter・UnsafeRelaxedJsonEscaping・compactで書く（base64の + / を + 等へ逃がさない）。
+function ConvertTo-PrunletReleaseCanonicalJson([scriptblock]$Write) {
+    $stream = [IO.MemoryStream]::new()
+    $options = [Text.Json.JsonWriterOptions]::new()
+    $options.Encoder = [Text.Encodings.Web.JavaScriptEncoder]::UnsafeRelaxedJsonEscaping
+    $options.Indented = $false
+    $writer = [Text.Json.Utf8JsonWriter]::new($stream, $options)
+    try {
+        & $Write $writer
+        $writer.Flush()
+        return , $stream.ToArray()
+    } finally { $writer.Dispose(); $stream.Dispose() }
+}
+
+# 厳密なUTF-8（BOMなし）のJSONオブジェクトを読み、プロパティを出現順のまま返す。
+# 重複キー・順序違いは呼出し側が名前の並びの完全一致で拒否する。
+function Read-PrunletReleaseJsonObject([byte[]]$Bytes, [string]$Reason) {
+    if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) { Stop-PrunletReleaseManifest $Reason }
+    try {
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes)
+        $options = [Text.Json.JsonDocumentOptions]::new()
+        $options.MaxDepth = 4; $options.AllowTrailingCommas = $false; $options.CommentHandling = [Text.Json.JsonCommentHandling]::Disallow
+        $document = [Text.Json.JsonDocument]::Parse($text, $options)
+    } catch { Stop-PrunletReleaseManifest $Reason }
+    try {
+        if ($document.RootElement.ValueKind -ne [Text.Json.JsonValueKind]::Object) { Stop-PrunletReleaseManifest $Reason }
+        $names = [Collections.Generic.List[string]]::new()
+        $values = @{}
+        foreach ($property in $document.RootElement.EnumerateObject()) {
+            $names.Add($property.Name)
+            # 値は文書の破棄後も使えるよう複製する（JsonElement.Clone）。
+            $values[$property.Name] = $property.Value.Clone()
+        }
+        return @{ names = $names.ToArray(); values = $values }
+    } finally { $document.Dispose() }
+}
+
+function Get-PrunletReleaseJsonString($Values, [string]$Name, [string]$Reason) {
+    $value = $Values[$Name]
+    if ($value.ValueKind -ne [Text.Json.JsonValueKind]::String) { Stop-PrunletReleaseManifest $Reason }
+    return $value.GetString()
+}
+
+# 封筒の取得結果（生バイト）を検証し、payloadの値を返す。
+#   $Runtime: 自分のruntime（win-x64 / win-arm64）。payloadのruntime・固定asset名・キーの組立てに使う。
+#   $Repository: 導入元として指定・記録されたrepository。公式（$script:PrunletReleaseRepository）以外は不一致で止める。
+#   $Version: 版を指定した取得（manifests/<版>/<runtime>.json）では、その版と一致することも求める。
+function Read-PrunletReleaseManifest([byte[]]$Bytes, [string]$Runtime, [string]$Repository, [string]$Version = '') {
+    switch -CaseSensitive ($Runtime) {
+        'win-x64' { $assetName = 'prunlet-update-win-x64.zip'; $maxBytes = [long]536870912 }
+        'win-arm64' { $assetName = 'prunlet-update-win-arm64.zip'; $maxBytes = [long]536870912 }
+        default { Stop-PrunletReleaseManifest 'unsupported-runtime' }
+    }
+    if ($null -eq $Bytes -or $Bytes.Length -lt 2 -or $Bytes.Length -gt $script:PrunletReleaseEnvelopeMaxBytes) { Stop-PrunletReleaseManifest 'envelope-size' }
+    # 封筒: キーは schema, keyId, payload, signature の4つだけをこの順で（重複・追加・順序違いは名前の並びで拒否）。
+    $envelope = Read-PrunletReleaseJsonObject $Bytes 'envelope-malformed'
+    if (($envelope.names -join ',') -cne 'schema,keyId,payload,signature') { Stop-PrunletReleaseManifest 'envelope-keys' }
+    $schema = $envelope.values['schema']
+    if ($schema.ValueKind -ne [Text.Json.JsonValueKind]::Number -or $schema.GetRawText() -cne '1') { Stop-PrunletReleaseManifest 'envelope-schema' }
+    $keyId = Get-PrunletReleaseJsonString $envelope.values 'keyId' 'envelope-malformed'
+    $payloadText = Get-PrunletReleaseJsonString $envelope.values 'payload' 'envelope-malformed'
+    $signatureText = Get-PrunletReleaseJsonString $envelope.values 'signature' 'envelope-malformed'
+    if ($keyId -cne $script:PrunletReleaseKeyId) { Stop-PrunletReleaseManifest 'unknown-key-id' }
+    # base64は標準・パディング付きで、再エンコードが元の文字列と一致する正規形だけを受け付ける（空白・改行も拒否）。
+    try {
+        $payload = [Convert]::FromBase64String($payloadText)
+        $signature = [Convert]::FromBase64String($signatureText)
+    } catch { Stop-PrunletReleaseManifest 'invalid-base64' }
+    if ([Convert]::ToBase64String($payload) -cne $payloadText -or [Convert]::ToBase64String($signature) -cne $signatureText) { Stop-PrunletReleaseManifest 'invalid-base64' }
+    # 封筒全体が正規形（compact・キー順固定・末尾改行なし）と完全一致すること。
+    $canonicalEnvelope = ConvertTo-PrunletReleaseCanonicalJson {
+        param($writer)
+        $writer.WriteStartObject()
+        $writer.WriteNumber('schema', [long]1)
+        $writer.WriteString('keyId', $keyId)
+        $writer.WriteString('payload', $payloadText)
+        $writer.WriteString('signature', $signatureText)
+        $writer.WriteEndObject()
+    }
+    if (![Linq.Enumerable]::SequenceEqual([byte[]]$canonicalEnvelope, [byte[]]$Bytes)) { Stop-PrunletReleaseManifest 'envelope-not-canonical' }
+    # 署名はRFC 3279のDER（SEQUENCE{INTEGER r, INTEGER s}）だけ。r||sの64バイト形式はDERとして読めないので検証で落ちるが、
+    # 形の段階でも明示的に拒否する（P-256のDER署名は8〜72バイト。SEQUENCEの長さが全体と一致し、2つのINTEGERが
+    # 1〜33バイトで隙間なく並ぶこと。乱数の64バイトが偶然この形になることは実質ない）。
+    $derValid = $signature.Length -ge 8 -and $signature.Length -le 72 -and $signature[0] -eq 0x30 -and $signature[1] -eq ($signature.Length - 2)
+    $offset = 2
+    for ($part = 0; $derValid -and $part -lt 2; $part++) {
+        if ($offset + 2 -gt $signature.Length -or $signature[$offset] -ne 0x02) { $derValid = $false; break }
+        $partLength = [int]$signature[$offset + 1]
+        if ($partLength -lt 1 -or $partLength -gt 33) { $derValid = $false; break }
+        $offset += 2 + $partLength
+    }
+    if (!$derValid -or $offset -ne $signature.Length) { Stop-PrunletReleaseManifest 'signature-format' }
+    $ecdsa = [Security.Cryptography.ECDsa]::Create()
+    try {
+        try {
+            $spki = [Convert]::FromBase64String($script:PRUNLET_RELEASE_PUBLIC_KEY_SPKI_B64)
+            $read = 0
+            $ecdsa.ImportSubjectPublicKeyInfo($spki, [ref]$read)
+            if ($read -ne $spki.Length -or $ecdsa.KeySize -ne 256 -or $ecdsa.ExportParameters($false).Curve.Oid.Value -cne '1.2.840.10045.3.1.7') { throw 'not P-256' }
+        } catch { Stop-PrunletReleaseManifest 'invalid-public-key' }
+        $valid = $false
+        try { $valid = $ecdsa.VerifyData($payload, $signature, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.DSASignatureFormat]::Rfc3279DerSequence) } catch { $valid = $false }
+    } finally { $ecdsa.Dispose() }
+    if (!$valid) { Stop-PrunletReleaseManifest 'signature-verification-failed' }
+
+    # payload: 署名済みのバイト列を、キー集合・順序・型・形式まで厳密に読む。
+    $document = Read-PrunletReleaseJsonObject $payload 'payload-malformed'
+    if (($document.names -join ',') -cne 'schema,product,repository,runtime,version,commit,defaultBranch,asset') { Stop-PrunletReleaseManifest 'payload-keys' }
+    $values = $document.values
+    if ($values['schema'].ValueKind -ne [Text.Json.JsonValueKind]::Number -or $values['schema'].GetRawText() -cne '1') { Stop-PrunletReleaseManifest 'payload-schema' }
+    $product = Get-PrunletReleaseJsonString $values 'product' 'payload-malformed'
+    $payloadRepository = Get-PrunletReleaseJsonString $values 'repository' 'payload-malformed'
+    $payloadRuntime = Get-PrunletReleaseJsonString $values 'runtime' 'payload-malformed'
+    $payloadVersion = Get-PrunletReleaseJsonString $values 'version' 'payload-malformed'
+    $commit = Get-PrunletReleaseJsonString $values 'commit' 'payload-malformed'
+    $branch = Get-PrunletReleaseJsonString $values 'defaultBranch' 'payload-malformed'
+    $asset = $values['asset']
+    if ($asset.ValueKind -ne [Text.Json.JsonValueKind]::Object) { Stop-PrunletReleaseManifest 'payload-malformed' }
+    $assetNames = [Collections.Generic.List[string]]::new()
+    $assetValues = @{}
+    foreach ($property in $asset.EnumerateObject()) { $assetNames.Add($property.Name); $assetValues[$property.Name] = $property.Value }
+    if (($assetNames -join ',') -cne 'name,key,bytes,sha256') { Stop-PrunletReleaseManifest 'payload-keys' }
+    $name = Get-PrunletReleaseJsonString $assetValues 'name' 'payload-malformed'
+    $key = Get-PrunletReleaseJsonString $assetValues 'key' 'payload-malformed'
+    $sha256 = Get-PrunletReleaseJsonString $assetValues 'sha256' 'payload-malformed'
+    $length = [long]0
+    if ($assetValues['bytes'].ValueKind -ne [Text.Json.JsonValueKind]::Number -or !$assetValues['bytes'].TryGetInt64([ref]$length)) { Stop-PrunletReleaseManifest 'payload-malformed' }
+    # payloadも正規形と完全一致すること（数値の表記ゆれ・空白・キー順をここで止める）。
+    $canonicalPayload = ConvertTo-PrunletReleaseCanonicalJson {
+        param($writer)
+        $writer.WriteStartObject()
+        $writer.WriteNumber('schema', [long]1)
+        $writer.WriteString('product', $product)
+        $writer.WriteString('repository', $payloadRepository)
+        $writer.WriteString('runtime', $payloadRuntime)
+        $writer.WriteString('version', $payloadVersion)
+        $writer.WriteString('commit', $commit)
+        $writer.WriteString('defaultBranch', $branch)
+        $writer.WriteStartObject('asset')
+        $writer.WriteString('name', $name)
+        $writer.WriteString('key', $key)
+        $writer.WriteNumber('bytes', $length)
+        $writer.WriteString('sha256', $sha256)
+        $writer.WriteEndObject()
+        $writer.WriteEndObject()
+    }
+    if (![Linq.Enumerable]::SequenceEqual([byte[]]$canonicalPayload, [byte[]]$payload)) { Stop-PrunletReleaseManifest 'payload-not-canonical' }
+    # 値の照合。製品・公式repository・自分のruntime・固定asset名・自分で組み立てたキーとの完全一致・上限。
+    if ($product -cne 'Prunlet') { Stop-PrunletReleaseManifest 'product-mismatch' }
+    if ($payloadRepository -cne $script:PrunletReleaseRepository -or ![string]::Equals($Repository, $script:PrunletReleaseRepository, [StringComparison]::OrdinalIgnoreCase)) { Stop-PrunletReleaseManifest 'repository-mismatch' }
+    if ($payloadRuntime -cne $Runtime) { Stop-PrunletReleaseManifest 'runtime-mismatch' }
+    if ($payloadVersion -cnotmatch '\A(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\z') { Stop-PrunletReleaseManifest 'invalid-version' }
+    if ($Version -and $payloadVersion -cne $Version) { Stop-PrunletReleaseManifest 'version-mismatch' }
+    if ($commit -cnotmatch '\A[0-9a-f]{40}\z') { Stop-PrunletReleaseManifest 'invalid-commit' }
+    if ($branch -cnotmatch '\A[A-Za-z0-9._/-]+\z' -or $branch.Contains('..') -or $branch.StartsWith('/') -or $branch.EndsWith('/')) { Stop-PrunletReleaseManifest 'invalid-branch' }
+    if ($name -cne $assetName) { Stop-PrunletReleaseManifest 'asset-name-mismatch' }
+    if ($sha256 -cnotmatch '\A[0-9a-f]{64}\z') { Stop-PrunletReleaseManifest 'invalid-sha256' }
+    if ($length -le 0 -or $length -gt $maxBytes) { Stop-PrunletReleaseManifest 'asset-length' }
+    $expectedKey = 'releases/' + $script:PrunletReleaseRepository.ToLowerInvariant() + '/' + $commit + '/' + $Runtime + '/' + $sha256 + '.zip'
+    if ($key -cne $expectedKey) { Stop-PrunletReleaseManifest 'asset-key-mismatch' }
+    return [ordered]@{
+        version = $payloadVersion; versionValue = [version]$payloadVersion; commit = $commit; branch = $branch
+        assetName = $name; assetKey = $key; assetBytes = $length; assetSha256 = $sha256; downloadUrl = ($script:PrunletReleaseOrigin + $key)
+    }
+}
+
+# R2の公開オブジェクトを生バイトで取得する。リダイレクトは追わず（-MaximumRedirection 0）、200以外・上限超えは拒否する。
+# 取得はInvoke-WebRequestだけで行う（検証スクリプトが同名の関数でfixtureの応答へ置き換えるため。HttpClientを直接使わない）。
+function Get-PrunletReleaseObject([string]$Key, [long]$MaxBytes, [int]$TimeoutSec) {
+    if ($Key -cnotmatch '\A(latest/[a-z0-9-]+\.json|manifests/[0-9]+\.[0-9]+\.[0-9]+/[a-z0-9-]+\.json)\z') { Stop-PrunletReleaseManifest 'invalid-object-key' }
+    $response = Invoke-WebRequest -Uri ($script:PrunletReleaseOrigin + $Key) -Headers @{ 'User-Agent' = 'Prunlet-Latest-Installer' } -MaximumRedirection 0 -TimeoutSec $TimeoutSec
+    if ($null -eq $response -or [int]$response.StatusCode -ne 200 -or $null -eq $response.RawContentStream) { Stop-PrunletReleaseManifest 'unexpected-response' }
+    $bytes = $response.RawContentStream.ToArray()
+    if ($bytes.Length -gt $MaxBytes) { Stop-PrunletReleaseManifest 'envelope-size' }
+    return , $bytes
+}
+# ---- 署名付きマニフェストここまで ----
 function Test-InTree([string]$Path, [string]$Root) {
     $Path.Equals($Root, [StringComparison]::OrdinalIgnoreCase) -or $Path.StartsWith($Root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
 }
@@ -1061,39 +1115,23 @@ function Assert-ManagedRecoveryBinding($Snapshot,[string]$ExpectedConfigHash = $
     $recovery = if (Test-InTree $recoveryPath $Snapshot.root) { Assert-ManagedExistingPath $recoveryPath -RegisteredInstallation:$registered } else { Assert-ExternalPath $recoveryPath 'Configured backupDirectory' }
     if (!$recovery.Equals($Snapshot.recovery,[StringComparison]::OrdinalIgnoreCase)) { throw (Format-PrunletMessage 'Managed recovery configuration changed; migration was not started.') }
 }
-# 公開済み最新releaseを解決する。起動時更新（start-prunlet-mcp.ps1のGet-LatestReleaseInfo）と
-# 同じ条件で、安定版・タグが既定ブランチ上のcommitを指すこと・runtimeの更新ZIPが一意で
-# digestとsizeを持つことを確認する。GitHub Releaseの発行者を信頼する点も同じ。
+# 公開済み最新版を解決する。R2の最新ポインタ（latest/<runtime>.json、署名付きマニフェストの封筒）を取得し、
+# 起動時更新（start-prunlet-mcp.ps1）と同じ Read-PrunletReleaseManifest で、固定公開鍵の署名・製品・公式repository・
+# runtime・固定asset名・自分で組み立てたキーとの完全一致・上限を確認する。GitHubのAPI・Release・タグは使わない。
+# 失敗の理由は固定語彙だけを利用者の言語で示し、取得した本文は表示しない。
 function Get-LatestPrunletRelease {
-    $metadata = Get-PrunletGitHubApiResponse "repos/$Repository"
-    $branch = [string]$metadata.default_branch
-    if (!$branch -or $branch -cnotmatch '^[A-Za-z0-9._/-]+$' -or $branch.Contains('..') -or $branch.StartsWith('/') -or $branch.EndsWith('/')) { throw (Format-PrunletMessage 'GitHub did not return a valid default branch.') }
-    $release = Get-PrunletGitHubApiResponse "repos/$Repository/releases/latest"
-    $tag = [string]$release.tag_name
-    if (!$tag -or $release.draft -or $release.prerelease) { throw (Format-PrunletMessage 'GitHub did not return a published stable release.') }
-    if ($tag -cnotmatch '\Av?[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?\z') { throw (Format-PrunletMessage 'Published release tag is invalid.') }
-    $target = (Get-PrunletGitHubApiResponse "repos/$Repository/git/ref/tags/$tag").object
-    for ($depth = 0; $depth -lt 8; $depth++) {
-        $sha = [string]$target.sha
-        if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw (Format-PrunletMessage 'Release tag has an invalid object SHA.') }
-        if ($target.type -ceq 'commit') {
-            $comparison = Get-PrunletGitHubApiResponse ("repos/$Repository/compare/$sha..." + [Uri]::EscapeDataString($branch) + '?per_page=1')
-            if ($comparison.status -cnotin @('ahead', 'identical')) { throw (Format-PrunletMessage 'Release commit is not on the default branch.') }
-            $name = 'prunlet-update-' + $Runtime + '.zip'
-            $assets = @($release.assets | Where-Object { $_.name -ceq $name -and $_.state -ceq 'uploaded' })
-            # 公開直後は配布workflowの承認・完了前でassetがまだない。何も書き込まずに止める。
-            if ($assets.Count -ne 1) { throw (Format-PrunletMessage 'The latest release {tag} has no unique {asset} yet; retry after its release workflow finishes. Nothing was installed.' @{ tag = $tag; asset = $name }) }
-            $asset = $assets[0]
-            if ([string]$asset.digest -cnotmatch '^sha256:[0-9a-f]{64}$' -or [long]$asset.size -le 0 -or [long]$asset.size -gt 536870912) { throw (Format-PrunletMessage 'Published package digest or size is invalid.') }
-            if ([long]$asset.id -le 0) { throw (Format-PrunletMessage 'Published package identity is invalid.') }
-            return [ordered]@{ branch = $branch; tag = $tag; commit = $sha; assetName = $name; assetId = [long]$asset.id; assetBytes = [long]$asset.size; assetSha256 = ([string]$asset.digest).Substring(7).ToUpperInvariant() }
-        }
-        if ($target.type -cne 'tag') { throw (Format-PrunletMessage 'Release tag does not identify a commit.') }
-        $target = (Get-PrunletGitHubApiResponse "repos/$Repository/git/tags/$sha").object
+    $key = 'latest/' + $Runtime + '.json'
+    try { $bytes = Get-PrunletReleaseObject $key $script:PrunletReleaseEnvelopeMaxBytes 60 }
+    catch {
+        if ($_.Exception.Data.Contains('PrunletReleaseManifestReason')) { throw (Format-PrunletMessage 'The release manifest was rejected ({reason}); nothing was installed.' @{ reason = $_.Exception.Data['PrunletReleaseManifestReason'] }) }
+        throw (Format-PrunletMessage 'The release manifest could not be retrieved from {url}; nothing was installed.' @{ url = ($script:PrunletReleaseOrigin + $key) })
     }
-    throw (Format-PrunletMessage 'Release tag nesting exceeds the supported depth.')
+    try { return Read-PrunletReleaseManifest $bytes $Runtime $Repository }
+    catch {
+        $reason = if ($_.Exception.Data.Contains('PrunletReleaseManifestReason')) { $_.Exception.Data['PrunletReleaseManifestReason'] } else { 'invalid' }
+        throw (Format-PrunletMessage 'The release manifest was rejected ({reason}); nothing was installed.' @{ reason = $reason })
+    }
 }
-
 # 配布ZIPに含まれる12製品。配置先（bin\…）とZIP内の名前（bin/…）は1対1で対応する。
 $script:PackageExecutables = @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')
 $script:PackageAuxiliary = @('Install-Prunlet.ps1', 'start-prunlet-mcp.ps1', 'configuration-common.ps1', 'maintenance-task.ps1', 'uninstall-maintenance.ps1', 'install-codex.ps1', 'uninstall-codex.ps1', 'install-agent-instructions.ps1', 'PRUNLET.md')
@@ -1236,7 +1274,6 @@ foreach ($relative in @($products + $retiredProducts)) {
     if (Test-Path -LiteralPath $target -PathType Container) { throw (Format-PrunletMessage 'Installed product path is a directory: {path}' @{ path = $target }) }
     if ((Test-InTree $effectiveBackup $target) -or (Test-InTree $target $effectiveBackup)) { throw (Format-PrunletMessage 'Product files and recovery backup must be separate.') }
 }
-$headers = @{ 'User-Agent' = 'Prunlet-Latest-Installer'; 'Accept' = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
 $mutexKey = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($InstallDirectory.ToLowerInvariant())))
 $globalInstallationMutex = [Threading.Mutex]::new($false, ('Global\Prunlet-Install-' + $mutexKey))
 $installationMutex = [Threading.Mutex]::new($false, ('Local\Prunlet-Install-' + $mutexKey))
@@ -1281,16 +1318,22 @@ try {
 
     New-Item -ItemType Directory -Path $WorkDirectory | Out-Null
     $createdWork = $true
-    # ZIP本体はREST APIの枠を使わない公開URLから取得し、APIが返したsizeとdigestで照合する（起動時更新と同じ）。
+    # ZIP本体は、署名済みマニフェストが指すR2の不変キー（commit・runtime・SHA-256を含むcreate-onlyのURL）から取得し、
+    # マニフェストのbytes・sha256で照合する。リダイレクトは追わず、200以外は取得失敗として何も導入しない。
     $archive = Join-Path $WorkDirectory $release.assetName
-    Invoke-WebRequest -Uri ("https://github.com/$Repository/releases/download/" + [Uri]::EscapeDataString($release.tag) + '/' + $release.assetName) -Headers @{ 'User-Agent' = 'Prunlet-Latest-Installer' } -OutFile $archive -TimeoutSec 300 | Out-Null
+    try {
+        $downloaded = Invoke-WebRequest -Uri $release.downloadUrl -Headers @{ 'User-Agent' = 'Prunlet-Latest-Installer' } -OutFile $archive -PassThru -MaximumRedirection 0 -TimeoutSec 300
+        if ($null -eq $downloaded -or [int]$downloaded.StatusCode -ne 200) { throw 'unexpected response' }
+    } catch { throw (Format-PrunletMessage 'The package could not be downloaded from {url}; nothing was installed.' @{ url = $release.downloadUrl }) }
     $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
-    if ((Get-Item -LiteralPath $archive).Length -ne $release.assetBytes -or $archiveHash -cne $release.assetSha256) { throw (Format-PrunletMessage 'Downloaded package differs from the published release asset; nothing was installed.') }
+    if ((Get-Item -LiteralPath $archive).Length -ne $release.assetBytes -or $archiveHash.ToLowerInvariant() -cne $release.assetSha256) { throw (Format-PrunletMessage 'Downloaded package differs from the published release asset; nothing was installed.') }
     $packageRoot = Join-Path $WorkDirectory 'package'
     $packageHashes = Expand-VerifiedPackage $archive $packageRoot $release
     $packageBin = Join-Path $packageRoot 'bin'
-    # 起動時更新と同じ形の取得元情報にする（downloadUrlはreleaseのasset API、archiveSha256はZIP全体）。
-    $downloadUrl = "https://api.github.com/repos/$Repository/releases/assets/$($release.assetId)"
+    # 取得元情報のdownloadUrlは、R2の不変URL（https://prunlet.kagayoi.com/releases/<repo>/<commit>/<runtime>/<sha256>.zip）。
+    # archiveSha256はZIP全体（起動時更新と同じ形）。旧版が書いたGitHubのasset API形式も、読取り側（-UpdateManagedInstallation
+    # の照合）は形式を問わず受け付ける。
+    $downloadUrl = $release.downloadUrl
     if ($RegisterAgentInstructions) {
         $instructionParameters = @{ SourceGuidePath = (Join-Path $packageBin 'PRUNLET.md'); CodexHome = $CodexHome; BackupDirectory = $(if ($SettingsBackupDirectory) { $SettingsBackupDirectory } else { $updateBackup }); PreviousGuideSha256 = $previousGuideSha256; ExecutablePath = (Join-Path $InstallDirectory 'bin\prunlet.exe'); ConfigPath = $configPath }
         & (Join-Path $packageBin 'install-agent-instructions.ps1') @instructionParameters -ValidateOnly | Out-Null
@@ -1468,7 +1511,7 @@ try {
         throw (Format-PrunletMessage 'Recovery storage migration is incomplete. Installed products were retained; resume with the installed CLI migrate --apply.')
     }
     if (!$storageMigration.complete) { Write-Warning (Format-PrunletMessage 'Some legacy file recovery data was retained. Review the migration result before retrying migrate --apply; normal maintenance does not scan it.') }
-    [ordered]@{ status = 'installed'; installDirectory = $InstallDirectory; configPath = $configPath; repository = $Repository; defaultBranch = $branch; releaseTag = $release.tag; commitSha = $sha; sourceInfoPath = (Join-Path $InstallDirectory 'source-info.json'); updateBackupDirectory = $updateBackup; maintenanceTaskName = $maintenanceState.name; updateTaskName = $(if ($updateTaskState) { $updateTaskState.name } else { $null }); updateTaskRegistered = [bool]$updateTaskState; retiredProductPaths = @($retiredProductPaths.ToArray()); recoveryMigration = $storageMigration; codexRegistered = [bool]$RegisterCodex; agentInstructionsRegistered = [bool]$RegisterAgentInstructions; requiresHookTrust = [bool]$RegisterCodex } | ConvertTo-Json -Depth 12
+    [ordered]@{ status = 'installed'; installDirectory = $InstallDirectory; configPath = $configPath; repository = $Repository; defaultBranch = $branch; releaseTag = ('v' + $release.version); commitSha = $sha; sourceInfoPath = (Join-Path $InstallDirectory 'source-info.json'); updateBackupDirectory = $updateBackup; maintenanceTaskName = $maintenanceState.name; updateTaskName = $(if ($updateTaskState) { $updateTaskState.name } else { $null }); updateTaskRegistered = [bool]$updateTaskState; retiredProductPaths = @($retiredProductPaths.ToArray()); recoveryMigration = $storageMigration; codexRegistered = [bool]$RegisterCodex; agentInstructionsRegistered = [bool]$RegisterAgentInstructions; requiresHookTrust = [bool]$RegisterCodex } | ConvertTo-Json -Depth 12
 } catch {
     $originalError = $_
     if ($storageMigrationStarted) {

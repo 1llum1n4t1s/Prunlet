@@ -1,0 +1,110 @@
+name: Prunlet Velopack redelivery
+
+# 配信済みの release/<版> のSetup（Velopack: nupkg・Setup・releases.win.json）の配信だけをやり直す。
+# prunlet-release-package.yml のVelopack工程が、検証済みの一式を保存した（artifact `prunlet-velopack-<版>`、
+# 保持30日）後で、R2への配信に失敗したときの再実行用。ZIPは再配布しない。
+#
+# 再ビルドも再署名もしない（Sigiluneは使わない）。保存済みの一式を取得し、再検証
+# （verify-windows.ps1 -RequireSignature）→ R2の署名マニフェストと照合（未作成なら署名して置く）→ R2配信だけを行う。
+# - 手動起動（workflow_dispatch）だけ。起動するrefは再配信する release/<版> のブランチ（ブランチ名とCargo.tomlの版は一致、
+#   commitは既定ブランチの祖先）。入力 `run_id` は、その配布workflowの実行ID。
+# - 保存した実行は、同じcommitに対する「Prunlet release packages」のものだけを受け付ける。
+# - 版付きの成果物と署名マニフェストは新規作成のみ。R2に同名があれば、成果物は内容を、マニフェストは署名と
+#   payload（nupkgの長さ・SHA-256）を照合し、一致しなければ失敗する（上書きしない）。現行のreleases.win.jsonが同じ版なら
+#   固定名は置き換えず、新しい版なら何も置かずに失敗する（後退させない）。
+# - 署名鍵（PRUNLET_RELEASE_SIGNING_KEY）とR2のトークンは、承認者なしのEnvironment `release`（release/* だけを許可）から受け取る。
+#   リリースworkflowと同じconcurrency groupにして、並走を避ける。
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Run id of the "Prunlet release packages" workflow run that saved the Velopack artifact
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prunlet-release-windows
+  cancel-in-progress: false
+
+jobs:
+  velopack:
+    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && github.event_name == 'workflow_dispatch' && github.ref_type == 'branch' && startsWith(github.ref_name, 'release/') }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PRUNLET_RUN_ID: ${{ inputs.run_id }}
+      PRUNLET_R2_BUCKET: ${{ vars.PRUNLET_R2_BUCKET || 'prunlet-updates' }}
+    steps:
+      - name: Checkout the release branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify the release commit
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/Assert-PrunletReleaseRef.ps1
+      - name: Validate the saved run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:PRUNLET_RUN_ID -cnotmatch '^[0-9]{1,20}$') { throw 'run_id must be numeric.' }
+          # 保存した実行が、このcommitに対する配布workflowのものであること。
+          $run = gh run view $env:PRUNLET_RUN_ID --repo $env:GITHUB_REPOSITORY --json workflowName,headSha | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'The run was not found.' }
+          if ($run.workflowName -cne 'Prunlet release packages') { throw 'The run is not a release package run.' }
+          if ($run.headSha -cne $env:PRUNLET_COMMIT) { throw 'The run was not made from this commit.' }
+      - name: Check the signing key against the client public keys
+        # 鍵整合の関門。クライアント側3か所（Rust・Install-Prunlet.ps1・Install-Prunlet.sh）の公開鍵定数のすべてで試験封筒を検証できなければ、R2へ何も書かず止める。
+        env:
+          PRUNLET_RELEASE_SIGNING_KEY: ${{ secrets.PRUNLET_RELEASE_SIGNING_KEY }}
+        run: ./scripts/Test-PrunletReleaseKeyGate.ps1
+      - name: Fetch the saved Velopack packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRUNLET_VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $restore = Join-Path $env:RUNNER_TEMP 'prunlet-velopack-restore'
+          gh run download $env:PRUNLET_RUN_ID --repo $env:GITHUB_REPOSITORY --name ('prunlet-velopack-' + $env:PRUNLET_VERSION) --dir $restore
+          if ($LASTEXITCODE -ne 0) { throw 'The saved Velopack artifact could not be downloaded (it may have expired).' }
+      - name: Verify the saved packages again
+        # 署名者・タイムスタンプ・製品名・版・エントリ集合・フィードを再検証し、.sha256を作り直して保存済みの値と比べる
+        # （保存物が取得後に変わっていないことの確認。信頼の基点はR2の署名マニフェスト）。
+        env:
+          PRUNLET_VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $restore = Join-Path $env:RUNNER_TEMP 'prunlet-velopack-restore'
+          $fresh = Join-Path $env:RUNNER_TEMP 'prunlet-velopack-assets'
+          & ./scripts/velopack/verify-windows.ps1 -PackagesDirectory (Join-Path $restore 'packages') -ExpectedVersion $env:PRUNLET_VERSION -ReleaseAssetsDirectory $fresh -ScratchDirectory $env:RUNNER_TEMP -RequireSignature | Out-Null
+          $name = "PrunletApp-$($env:PRUNLET_VERSION)-full.nupkg.sha256"
+          $saved = [IO.File]::ReadAllBytes((Join-Path $restore "assets/$name"))
+          $again = [IO.File]::ReadAllBytes((Join-Path $fresh $name))
+          if (![Linq.Enumerable]::SequenceEqual([byte[]]$saved, [byte[]]$again)) { throw 'The saved hash file differs from the hash of the saved nupkg.' }
+      - name: Publish the Velopack signed manifest and feed to R2
+        # 署名マニフェスト（create-only。既存なら署名とpayloadで照合）→ nupkg → フィード → 固定名の順。
+        # 書込みの前に、既存マニフェストとの照合と現行フィードの後退判定を、R2の読取りだけで済ませる（publish-r2.ps1本体）。
+        env:
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRUNLET_R2_ACCOUNT_ID: ${{ secrets.PRUNLET_R2_ACCOUNT_ID }}
+          PRUNLET_RELEASE_SIGNING_KEY: ${{ secrets.PRUNLET_RELEASE_SIGNING_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/velopack/publish-r2.ps1 -PackagesDirectory (Join-Path $env:RUNNER_TEMP 'prunlet-velopack-restore/packages') -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH

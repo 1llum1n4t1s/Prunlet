@@ -1,5 +1,10 @@
 // 公開形式のA/B/Cを隔離配置し、同じstdio登録から2回更新する。
-import { createHash } from "node:crypto";
+// 配信は R2（https://prunlet.kagayoi.com）の署名付きマニフェスト。最新ポインタ latest/<runtime>.json の封筒と、
+// それが指す不変キー releases/<repo>/<commit>/<runtime>/<sha256>.<ext> の配布物を、URLのSHA-256名のfixtureで差し替える。
+// 封筒はテスト鍵（scripts/release-test-fixtures）で署名し、keyIdはテスト鍵のID（prunlet-release-test-1）にする。テスト鍵を信頼するのは
+// 応答の置換と同じテスト専用ビルド（prunlet_linux_update_tests / prunlet_macos_race_tests）だけで、通常ビルドは本番鍵だけを信頼する。
+import { createHash, createPrivateKey, generateKeyPairSync, sign, type KeyObject } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { copyFile, chmod, mkdir, readFile, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
@@ -13,13 +18,15 @@ const installation = join(root, "installation");
 await mkdir(fixture, { mode: 0o700 });
 const executable = join(installation, "bin/prunlet");
 const config = join(installation, "config.json");
-const api = "https://api.github.com/repos/1llum1n4t1s/Prunlet/";
-const release = "https://github.com/1llum1n4t1s/Prunlet/releases/download/";
+const origin = "https://prunlet.kagayoi.com/";
 const linux = process.platform === "linux";
 const environment = { ...process.env, [linux ? "PRUNLET_LINUX_UPDATE_FIXTURE" : "PRUNLET_MACOS_UPDATE_FIXTURE"]: fixture };
 const initial = JSON.parse(run([initialExecutable, linux ? "--linux-build-info" : "--macos-build-info"]));
-const name = linux ? `prunlet-${initial.runtime}.tar.gz` : "prunlet-update-osx-arm64.zip";
+const runtime: string = linux ? initial.runtime : "osx-arm64";
+const name = linux ? `prunlet-${runtime}.tar.gz` : "prunlet-update-osx-arm64.zip";
+const extension = linux ? "tar.gz" : "zip";
 const sha = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+const testKey = createPrivateKey(readFileSync(join(import.meta.dir, "release-test-fixtures/test-signing-private.pem"), "utf8"));
 
 function run(command: string[]) {
   const result = Bun.spawnSync(command, { env: environment });
@@ -36,22 +43,37 @@ async function response(url: string, body: object | Uint8Array) {
   await writeFile(join(fixture, sha(url)), data, { mode: 0o600 });
 }
 
-async function announce(archive: string, installed: string, invalid?: "digest" | "trailer" | "ancestry") {
+// 配信側（scripts/PrunletRelease.Common.ps1）と同じ正規形: キー順固定・compact・末尾改行なし。署名はpayloadの生バイトに
+// ECDSA P-256 + SHA-256 の DER。JSON.stringify は "/" を逃がさないので、配信側の UnsafeRelaxedJsonEscaping と同じバイトになる。
+function envelope(payload: object, key: KeyObject = testKey) {
+  const payloadBytes = Buffer.from(JSON.stringify(payload), "utf8");
+  const signature = sign("sha256", payloadBytes, { key, dsaEncoding: "der" });
+  return Buffer.from(JSON.stringify({
+    schema: 1, keyId: "prunlet-release-test-1", payload: payloadBytes.toString("base64"), signature: signature.toString("base64"),
+  }), "utf8");
+}
+
+function payload(version: string, commit: string, digest: string, bytes: number) {
+  return {
+    schema: 1, product: "Prunlet", repository: "1llum1n4t1s/Prunlet", runtime, version, commit, defaultBranch: "main",
+    asset: { name, key: `releases/1llum1n4t1s/prunlet/${commit}/${runtime}/${digest}.${extension}`, bytes, sha256: digest },
+  };
+}
+
+// invalid: digest（マニフェストのsha256が配布物と違う）/ trailer（配布物の末尾に余分なバイト。長さ・sha256は実物どおり）/
+// signature（固定公開鍵以外の鍵で署名）/ older（導入済みより古い版を名乗る。適用しない）。
+async function announce(archive: string, invalid?: "digest" | "trailer" | "signature" | "older") {
   const manifest = JSON.parse(run(linux
     ? ["/usr/bin/tar", "-xOzf", archive, "manifest.json"]
     : ["/usr/bin/unzip", "-p", archive, "manifest.json"]));
-  const tag = `v${manifest.version}`;
-  const url = `${release}${tag}/${name}`;
   const packageBytes = await readFile(archive);
   const assetBytes = invalid === "trailer" ? Buffer.concat([packageBytes, Buffer.from([1])]) : packageBytes;
-  await response(url, assetBytes);
-  await response(`${api}commits/${tag}`, { sha: manifest.commit });
-  await response(`${api}compare/${installed}...${manifest.commit}?per_page=1`, { status: invalid === "ancestry" ? "diverged" : "ahead" });
-  await response(`${api}compare/${manifest.commit}...main?per_page=1`, { status: "identical" });
-  await response(`${api}releases/latest`, {
-    tag_name: tag, draft: false, prerelease: false,
-    assets: [{ name, state: "uploaded", size: assetBytes.length, digest: `sha256:${invalid === "digest" ? "0".repeat(64) : sha(assetBytes)}`, browser_download_url: url }],
-  });
+  const digest = invalid === "digest" ? "0".repeat(64) : sha(assetBytes);
+  const version = invalid === "older" ? "0.0.1" : manifest.version;
+  const signed = payload(version, manifest.commit, digest, assetBytes.length);
+  await response(`${origin}${signed.asset.key}`, assetBytes);
+  const key = invalid === "signature" ? generateKeyPairSync("ec", { namedCurve: "prime256v1" }).privateKey : testKey;
+  await response(`${origin}latest/${runtime}.json`, envelope(signed, key));
   return manifest;
 }
 
@@ -124,11 +146,12 @@ const originalInode = (await stat(executable)).ino;
 const offline = await startMcp();
 assert(offline.version === initial.version && (await offline.close()).includes("deferred"),
   "Offline startup did not preserve the installed MCP.");
-await response(`${api}releases/latest`, { tag_name: `v${initial.version}` });
+// 最新ポインタが導入済みと同じ版を指す（適用しない）。配布物は取得されないので値は形式だけ満たす。
+await response(`${origin}latest/${runtime}.json`, envelope(payload(initial.version, initial.commit, "0".repeat(64), 1)));
 const held = await startMcp();
 let first;
 try {
-  first = await announce(firstPackage, initial.commit);
+  first = await announce(firstPackage);
   const concurrent = await startMcp();
   try {
     assert(concurrent.version === initial.version && (await stat(executable)).ino === originalInode,
@@ -146,21 +169,21 @@ await updated.close();
 const firstInode = (await stat(executable)).ino;
 assert(firstInode !== originalInode, "First update overwrote the original inode.");
 
-const second = await announce(secondPackage, first.commit, "digest");
+const second = await announce(secondPackage, "digest");
 const invalid = await startMcp();
 assert(invalid.version === first.version && (await stat(executable)).ino === firstInode,
   "An archive with the wrong digest was installed.");
 assert((await invalid.close()).includes("deferred"), "Bad digest did not report the deferral.");
-if (linux) {
-  for (const fault of ["trailer", "ancestry"] as const) {
-    await announce(secondPackage, first.commit, fault);
-    const rejected = await startMcp();
-    assert(rejected.version === first.version && (await stat(executable)).ino === firstInode,
-      `Invalid candidate installed: ${fault}`);
-    assert((await rejected.close()).includes("deferred"), `Missing deferral: ${fault}`);
-  }
+// 署名が固定公開鍵で検証できない封筒は延期し、導入済み以下の版は（署名が正しくても）適用しない。
+for (const fault of (linux ? ["trailer", "signature", "older"] : ["signature", "older"]) as ("trailer" | "signature" | "older")[]) {
+  await announce(secondPackage, fault);
+  const rejected = await startMcp();
+  assert(rejected.version === first.version && (await stat(executable)).ino === firstInode,
+    `Invalid candidate installed: ${fault}`);
+  const stderr = await rejected.close();
+  if (fault !== "older") assert(stderr.includes("deferred"), `Missing deferral: ${fault}`);
 }
-await announce(secondPackage, first.commit);
+await announce(secondPackage);
 const stage = join(installation, "bin/.prunlet-next");
 if (linux) {
   await symlink(recovery, stage);
@@ -179,4 +202,4 @@ assert(sha(await readFile(config)) === originalConfig && (await stat(config)).mo
 assert(await readFile(recovery, "utf8") === "isolated preservation check", "Recovery file changed.");
 if (!linux) run(["/usr/bin/codesign", "--verify", "--strict", executable]);
 console.log(JSON.stringify({ passed: true, versions: [initial.version, first.version, second.version],
-  checked: ["offline", "mcp-in-use", "two-inode-replacements", "wrong-digest", "interrupted-stage", "configuration", "recovery", ...(linux ? ["invalid-archive", "diverged-release", "linked-stage"] : ["final-signature"])] }));
+  checked: ["offline", "mcp-in-use", "two-inode-replacements", "wrong-digest", "interrupted-stage", "configuration", "recovery", ...(linux ? ["invalid-archive", "linked-stage"] : ["final-signature"]), "foreign-signature", "older-version"] }));

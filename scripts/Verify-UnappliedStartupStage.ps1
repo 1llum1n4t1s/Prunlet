@@ -138,6 +138,8 @@ function Set-Package([string]$Root, [string]$Commit) {
 }
 function Prepare-Package([string]$Root, [string]$Commit, [switch]$Reject) {
     $package = $packages[$Commit]
+    # 旧名の __prepare-published-package（GitHubのasset ID形式。Rust側で挙動不変）でstageを準備する。新名の
+    # __prepare-release-package はR2の版付きマニフェストを取得するため、通信しないこの検証では使えない。
     $result = Invoke-Cli $Root @('__prepare-published-package', '1llum1n4t1s/Prunlet', 'main', $Commit, 'win-x64', $package.hash, [string]$package.bytes, '1') -Reject:$Reject
     if (!$Reject) { Assert-True ($result.status -eq 'prepared') 'Package preparation did not complete.' }
 }
@@ -189,7 +191,7 @@ function Install-ManualRelease([string]$Root, [string]$Commit, [string]$Tag) {
     }
     $current = Read-Json (Join-Path $Root 'source-info.json')
     $info = [ordered]@{
-        repository = $current.repository; defaultBranch = $current.defaultBranch; commitSha = $Commit; downloadUrl = $(if ($current.ContainsKey('downloadUrl')) { $current.downloadUrl } else { 'https://api.github.com/repos/1llum1n4t1s/Prunlet/releases/assets/1' })
+        repository = $current.repository; defaultBranch = $current.defaultBranch; commitSha = $Commit; downloadUrl = $(if ($current.ContainsKey('downloadUrl')) { $current.downloadUrl } else { 'https://prunlet.kagayoi.com/releases/1llum1n4t1s/prunlet/' + $Commit + '/win-x64/' + ('0' * 64) + '.zip' })
         archiveSha256 = ($Tag.PadRight(64, '9')).ToUpperInvariant(); executableSha256 = $hashes['prunlet.exe']
         maintenanceExecutableSha256 = $hashes['prunlet-maintenance.exe']; hookExecutableSha256 = $hashes['prunlet-hook.exe']
         auxiliarySha256 = $current.auxiliarySha256; runtime = $current.runtime

@@ -12,7 +12,6 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $script:StartupUpdateReady = $true
-$script:UseAuthenticatedUpdateApi = $false
 
 . (Join-Path $PSScriptRoot 'configuration-common.ps1')
 # job handleをPowerShellプロセスの終了まで保持し、入口終了時に子も終了させる。
@@ -108,95 +107,16 @@ function Test-ProductsIdle([string]$Executable) {
     finally { foreach ($handle in $handles) { $handle.Dispose() } }
 }
 
-function Get-UpdateApi([string]$Endpoint) {
-    $headers = @{ 'User-Agent' = 'Prunlet-Latest-Installer'; 'Accept' = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
-    if (!$script:UseAuthenticatedUpdateApi) {
-        try { return Invoke-RestMethod -Uri ('https://api.github.com/' + $Endpoint) -Headers $headers -TimeoutSec 8 }
-        catch [Microsoft.PowerShell.Commands.HttpResponseException] {
-            $response = $_.Exception.Response
-            $remaining = $null
-            # 未認証primary枠切れだけを切り替え、Retry-After付きや通常の権限拒否は再送しない。
-            if ($response.StatusCode -ne 403 -or $response.Headers.Contains('Retry-After') -or
-                !$response.Headers.TryGetValues('X-RateLimit-Remaining', [ref]$remaining) -or
-                (@($remaining) -join ',') -cne '0') { throw }
-            $script:UseAuthenticatedUpdateApi = $true
-        }
-    }
-    $gh = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (!$gh) { throw 'GitHub anonymous API rate limit exceeded and GitHub CLI is unavailable.' }
-    $start = [Diagnostics.ProcessStartInfo]::new($gh.Source)
-    $start.UseShellExecute = $false
-    $start.CreateNoWindow = $true
-    $start.RedirectStandardInput = $true
-    $start.RedirectStandardOutput = $true
-    $start.RedirectStandardError = $true
-    $start.StandardOutputEncoding = [Text.UTF8Encoding]::new($false, $true)
-    foreach ($arg in @('api', '--hostname', 'github.com', '--method', 'GET', '--header', 'Accept: application/vnd.github+json', '--header', 'X-GitHub-Api-Version: 2022-11-28', $Endpoint)) { $start.ArgumentList.Add($arg) }
-    # 既存認証はghの内部だけで使い、対話とデバッグを無効にする。
-    [void]$start.Environment.Remove('GH_DEBUG')
-    [void]$start.Environment.Remove('GH_FORCE_TTY')
-    $start.Environment['GH_PAGER'] = 'cat'
-    $start.Environment['NO_COLOR'] = '1'
-    $start.Environment['GH_PROMPT_DISABLED'] = '1'
-    $start.Environment['GIT_TERMINAL_PROMPT'] = '0'
-    $process = [Diagnostics.Process]::Start($start)
-    try {
-        $process.StandardInput.Close()
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
-        if (!$process.WaitForExit(8000)) {
-            try { $process.Kill($true) } catch { }
-            throw 'GitHub CLI update request timed out.'
-        }
-        [void]$stderr.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0) { throw 'GitHub CLI update request failed; existing authentication may be unavailable.' }
-        try { return ConvertFrom-Json -InputObject $stdout.GetAwaiter().GetResult() -ErrorAction Stop }
-        catch { throw 'GitHub CLI returned invalid update metadata.' }
-    } finally { $process.Dispose() }
-}
 
-function Get-LatestReleaseInfo([string]$Repository, [string]$Runtime) {
-    if ($Repository -cnotmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$') { throw 'Installed repository is invalid.' }
-    if ($Runtime -cnotin @('win-x64', 'win-arm64')) { throw 'Installed runtime is unsupported.' }
-    $metadata = Get-UpdateApi "repos/$Repository"
-    $branch = [string]$metadata.default_branch
-    if (!$branch) { throw 'GitHub did not return a default branch.' }
-    $release = Get-UpdateApi "repos/$Repository/releases/latest"
-    $tag = [string]$release.tag_name
-    if (!$tag -or $release.draft -or $release.prerelease) { throw 'GitHub did not return a published stable release.' }
-    if ($tag -cnotmatch '\Av?[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?\z') { throw 'Published release tag is invalid.' }
-    $reference = Get-UpdateApi "repos/$Repository/git/ref/tags/$tag"
-    $target = $reference.object
-    for ($depth = 0; $depth -lt 8; $depth++) {
-        $sha = [string]$target.sha
-        if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw 'Release tag has an invalid object SHA.' }
-        if ($target.type -ceq 'commit') {
-            $comparison = Get-UpdateApi ("repos/$Repository/compare/$sha..." + [Uri]::EscapeDataString($branch) + '?per_page=1')
-            if ($comparison.status -cnotin @('ahead', 'identical')) { throw 'Release commit is not on the default branch.' }
-            $name = 'prunlet-update-' + $Runtime + '.zip'
-            $assets = @($release.assets | Where-Object { $_.name -ceq $name -and $_.state -ceq 'uploaded' })
-            if ($assets.Count -ne 1) { throw 'A unique published package for this runtime is unavailable.' }
-            $asset = $assets[0]
-            if ([string]$asset.digest -cnotmatch '^sha256:[0-9a-f]{64}$' -or [long]$asset.size -le 0 -or [long]$asset.size -gt 536870912) { throw 'Published package digest or size is invalid.' }
-            if ([long]$asset.id -le 0) { throw 'Published package identity is invalid.' }
-            # GitHub Releaseの発行者を信頼する。digestは転送内容の照合であり、独立したbuild来歴証明ではない。
-            return @{ commit = $sha; branch = $branch; tag = $tag; assetSha256 = ([string]$asset.digest).Substring(7); assetBytes = [long]$asset.size; assetId = [long]$asset.id }
-        }
-        if ($target.type -cne 'tag') { throw 'Release tag does not identify a commit.' }
-        $annotated = Get-UpdateApi "repos/$Repository/git/tags/$sha"
-        $target = $annotated.object
-    }
-    throw 'Release tag nesting exceeds the supported depth.'
-}
+# 配布物の実行ファイルの署名者。scripts/Install-Prunlet.ps1・Signing.Common.ps1と同じ値で、launcher単体でも照合できるよう直接持つ。
+$script:PackageSignerCommonName = 'Open Source Developer Yuichiro Shinozaki'
 
-function Get-LatestCommit([string]$Repository, [string]$Runtime, [string]$InstalledCommit, [hashtable]$ReleaseInfo = $null) {
-    if ($InstalledCommit -cnotmatch '^[0-9a-fA-F]{40}$') { throw 'Installed commit is invalid.' }
-    $release = if ($null -eq $ReleaseInfo) { Get-LatestReleaseInfo $Repository $Runtime } else { $ReleaseInfo }
-    if ($release.commit -ine $InstalledCommit) {
-        $comparison = Get-UpdateApi "repos/$Repository/compare/$InstalledCommit...$($release.commit)?per_page=1"
-        if ($comparison.status -cne 'ahead') { throw 'Published release does not descend from the installed commit.' }
-    }
-    return $release.commit
+# 実行ファイルの版リソース（ProductVersion = "<x.y.z>+<40桁commit>"、build.rsが埋め込む）を読む。
+# 導入済みの版はこの値を正とし（source-info.jsonには版を持たない）、commit部で取得元情報との対応を確かめる。
+function Read-PrunletProductVersion([string]$Path) {
+    $value = [string][Diagnostics.FileVersionInfo]::GetVersionInfo($Path).ProductVersion
+    if ($value -cnotmatch '\A((?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8}))\+([0-9a-f]{40})\z') { throw 'A Prunlet executable has no release product version.' }
+    return @{ text = $value; versionText = $Matches[1]; version = [version]$Matches[1]; commit = $Matches[2] }
 }
 
 function Invoke-CandidateProbe([string]$Executable, [string[]]$Arguments, [int]$ExpectedExit) {
@@ -220,6 +140,26 @@ function Invoke-CandidateProbe([string]$Executable, [string[]]$Arguments, [int]$
         $null = $errorOutput.GetAwaiter().GetResult()
         return $output.GetAwaiter().GetResult()
     } finally { $process.Dispose() }
+}
+
+# 候補のstageにある3つの実行ファイルを、実行する前にAuthenticodeで検査する（Valid・署名者CN・タイムスタンプあり）。
+# マニフェストの鍵の採否と無関係に必ず行う二重の確認で、新規の切替でも中断からの再開でも同じ条件にする。
+# 照合はGet-AuthenticodeSignatureだけで行う（検証スクリプトは未署名のfixtureに対し、このcmdletの結果だけを置換する）。
+function Assert-CandidateSignatures([string]$Stage) {
+    foreach ($name in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
+        $signature = Get-AuthenticodeSignature -LiteralPath (Join-Path $Stage $name)
+        $signer = if ($signature.SignerCertificate) { $signature.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) } else { '' }
+        if ($signature.Status -ne 'Valid' -or $signer -cne $script:PackageSignerCommonName -or !$signature.TimeStamperCertificate) { throw "Candidate executable is not signed by the Prunlet publisher: $name" }
+    }
+}
+
+# 新規の切替では、候補の3つの実行ファイルの版リソースが、署名済みマニフェストの "<version>+<commit>" と一致することを求める。
+# 中断からの再開ではマニフェストを持たないため呼ばない（再開は記録済みの候補commitとhashの照合で続ける）。
+function Assert-CandidateProductVersion([string]$Stage, [string]$Expected) {
+    foreach ($name in @('prunlet.exe', 'prunlet-maintenance.exe', 'prunlet-hook.exe')) {
+        $actual = Read-PrunletProductVersion (Join-Path $Stage $name)
+        if ($actual.text -cne $Expected) { throw "Candidate executable version does not match the published manifest: $name" }
+    }
 }
 
 function Test-CandidateExecutables([string]$Stage) {
@@ -415,13 +355,55 @@ function Invoke-Integration([string]$Candidate, [string]$Stage, [string]$Config,
     }
 }
 
-function Invoke-UpdateCoordinator([string]$Stage, [string]$Config, [string]$Codex, [string]$Executable) {
+# 署名付きマニフェストの検証はRust（src/rust/update/manifest.rs）の1か所に集め、launcherはその内部コマンドのJSON出力だけで
+# 延期・更新を決める（信頼の基点をRustとPowerShellへ二重に持たない）。コマンドは導入済みexeで --config の後に置く。
+#   __check-release-manifest <runtime>: R2の latest/<runtime>.json を取得・署名検証し、実行中exeの版より新しいかを返す。
+#   __download-release-package <runtime> <version> <commit>: 版付きマニフェストを再検証し、R2の不変URLからリダイレクトなしで
+#     取得して長さとSHA-256を照合する（stateへの書込み・容量・ADSの検査もRust側）。
+#   __prepare-release-package <runtime> <version> <commit>: 版付きマニフェストを再検証し、署名済みの値で候補を準備する。
+# 失敗は終了コード1で、呼出し元は更新状態がidleなら延期して現在版を起動する（fail-closed）。
+function Invoke-ReleaseCommand([string]$Executable, [string]$Config, [string]$Failure, [string[]]$Arguments) {
+    $output = & $Executable --config $Config @Arguments
+    if ($LASTEXITCODE -ne 0) { throw ($Failure + (Get-CliFailureDetail $output)) }
+    try { $parsed = $output | Out-String | ConvertFrom-Json -AsHashtable } catch { throw $Failure }
+    if ($parsed -isnot [hashtable]) { throw $Failure }
+    if ($parsed.ContainsKey('warnings')) { foreach ($warning in $parsed.warnings) { [Console]::Error.WriteLine('Prunlet update: ' + $warning) } }
+    return $parsed
+}
+
+# 最新ポインタの確認結果を、Rustの出力の形と値の形式で厳密に読む（不明な状態・形式は延期）。
+function Get-PublishedRelease([string]$Executable, [string]$Config, [string]$Runtime) {
+    if ($Runtime -cnotin @('win-x64', 'win-arm64')) { throw 'Installed runtime is unsupported.' }
+    $release = Invoke-ReleaseCommand $Executable $Config 'Release manifest check did not complete.' @('__check-release-manifest', $Runtime)
+    if ($release.status -cnotin @('available', 'current') -or [string]$release.runtime -cne $Runtime -or
+        [string]$release.version -cnotmatch '\A(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\z' -or
+        [string]$release.commit -cnotmatch '\A[0-9a-f]{40}\z') { throw 'Release manifest check returned an unexpected result.' }
+    $release.versionValue = [version][string]$release.version
+    return $release
+}
+
+# 署名済みの版・commitだけを選択子として渡し、開始・取得・準備を行う。値（URL・長さ・SHA-256・既定ブランチ）は
+# Rustが検証済みのpayloadから導くので、launcherは渡さない。
+function Invoke-PublishedPackageTransfer([string]$Executable, [string]$Config, $SourceInfo, $Release) {
+    $runtime = [string]$SourceInfo.runtime
+    $begin = Invoke-ReleaseCommand $Executable $Config 'Published update state could not be prepared.' @('__begin-published-update', $Release.commit, $SourceInfo.commitSha)
+    if ($begin.status -notin @('ready', 'existing')) { throw 'Published update state could not be prepared.' }
+    $received = Invoke-ReleaseCommand $Executable $Config 'Published package download was not confirmed.' @('__download-release-package', $runtime, $Release.version, $Release.commit)
+    if ($received.status -cne 'downloaded' -or [string]$received.version -cne $Release.version -or [string]$received.commit -cne $Release.commit) { throw 'Published package download was not confirmed.' }
+    return Invoke-ReleaseCommand $Executable $Config 'Published package preparation did not complete.' @('__prepare-release-package', $runtime, $Release.version, $Release.commit)
+}
+
+# $ExpectedProductVersion: 新規の切替では署名済みマニフェストの "<version>+<commit>"。中断からの再開では空にする。
+function Invoke-UpdateCoordinator([string]$Stage, [string]$Config, [string]$Codex, [string]$Executable, [string]$ExpectedProductVersion = '') {
     if (!$script:StartupUpdateReady) { throw 'Prunlet startup updates are disabled until safe stage reuse is implemented and verified.' }
     $candidate = Join-Path $Stage 'prunlet.exe'
     if (!(Test-Path -LiteralPath $candidate -PathType Leaf)) { throw 'The prepared update executable is missing; the update was preserved.' }
     $root = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($Executable))
     $candidateGuards = Open-CandidateGuards $Stage (Join-Path $root '.prunlet-update-state.json')
     try {
+    # 候補のhashを固定するguardの下で、実行する前に署名と版を確かめる（照合した実体と実行する実体を同じにする）。
+    Assert-CandidateSignatures $Stage
+    if ($ExpectedProductVersion) { Assert-CandidateProductVersion $Stage $ExpectedProductVersion }
     Test-CandidateExecutables $Stage
     $guards = Open-RegistrationGuards $Executable $Config $Codex $Stage
     try {
@@ -508,31 +490,30 @@ try {
             } else {
                 $sourceInfo = [IO.File]::ReadAllText((Join-Path $root 'source-info.json')) | ConvertFrom-Json -AsHashtable
                 if ($sourceInfo.runtime -notin @('win-x64', 'win-arm64')) { throw 'Installed Prunlet runtime is unknown.' }
-                # 通信不能時は短い照会期限で現在版へ戻し、同一SHAならビルドを起動しない。
-                $release = Get-LatestReleaseInfo ([string]$sourceInfo.repository) ([string]$sourceInfo.runtime)
-                $latest = Get-LatestCommit ([string]$sourceInfo.repository) ([string]$sourceInfo.runtime) ([string]$sourceInfo.commitSha) $release
-                if ($latest -ieq $sourceInfo.commitSha) {
-                    # 最新を確認できたため、配置内容には触れない。
+                if ([string]$sourceInfo.commitSha -cnotmatch '\A[0-9a-fA-F]{40}\z') { throw 'Installed commit is invalid.' }
+                # 導入済みの版は、導入済みexeの版リソース（<版>+<commit>）から読む。commit部が取得元情報と一致しなければ
+                # 版を確定できないため、更新を判定せずに延期する（取り違えた版で後退・前進の判断をしない）。
+                $installedVersion = Read-PrunletProductVersion $ExecutablePath
+                if ($installedVersion.commit -cne ([string]$sourceInfo.commitSha).ToLowerInvariant()) { throw 'Installed product version does not match its recorded commit.' }
+                # 配信は公式repositoryだけ。取得元情報が別のrepositoryなら、署名済みマニフェストとは一致しないので延期する。
+                if (![string]::Equals([string]$sourceInfo.repository, '1llum1n4t1s/Prunlet', [StringComparison]::OrdinalIgnoreCase)) { throw 'Installed repository is not the published Prunlet repository.' }
+                # 通信不能・署名不正・不一致はRustが終了コード1で返し、下のcatchで現在版のまま起動する（fail-closed）。
+                $release = Get-PublishedRelease $ExecutablePath $ConfigPath ([string]$sourceInfo.runtime)
+                # Rustの判定（実行中exeの版との比較）に加え、版リソースから読んだ導入済みの版より厳密に大きい場合だけ進む。
+                if ($release.status -cne 'available' -or $release.versionValue -le $installedVersion.version) {
+                    # 導入済みより厳密に大きい版だけを適用する（同じ版・古い版へは切り替えない＝後退防止）。
+                    # 同じ版で別commitを指すマニフェストは配信側の不整合なので、適用せずに知らせるだけにする。
+                    if ($release.versionValue -eq $installedVersion.version -and $release.commit -cne $installedVersion.commit) {
+                        [Console]::Error.WriteLine('Prunlet update was deferred: the published manifest names the installed version with a different commit.')
+                    }
                 } elseif (!(Test-ProductsIdle $ExecutablePath)) {
                     [Console]::Error.WriteLine('Prunlet update was deferred while an existing process is active.')
                 } else {
                     if (!$script:StartupUpdateReady) { throw 'Prunlet startup updates are disabled until safe stage reuse is implemented and verified.' }
-                    $begin = & $ExecutablePath --config $ConfigPath __begin-published-update $release.commit $sourceInfo.commitSha
-                    $beginExit = $LASTEXITCODE
-                    if ($beginExit -ne 0) { throw ('Published update state could not be prepared.' + (Get-CliFailureDetail $begin)) }
-                    if (($begin | ConvertFrom-Json -AsHashtable).status -notin @('ready', 'existing')) { throw 'Published update state could not be prepared.' }
-                    $beginResult = $begin | ConvertFrom-Json -AsHashtable
-                    if ($beginResult.ContainsKey('warnings')) { foreach ($warning in $beginResult.warnings) { [Console]::Error.WriteLine('Prunlet update: ' + $warning) } }
-                    $received = & $ExecutablePath --config $ConfigPath __download-published-package $sourceInfo.repository $release.commit $release.assetId $release.assetSha256 $release.assetBytes $release.tag
-                    $receivedExit = $LASTEXITCODE
-                    if ($receivedExit -ne 0) { throw ('Published package download was not confirmed.' + (Get-CliFailureDetail $received)) }
-                    if (($received | ConvertFrom-Json -AsHashtable).status -cne 'downloaded') { throw 'Published package download was not confirmed.' }
-                    $prepared = & $ExecutablePath --config $ConfigPath __prepare-published-package $sourceInfo.repository $release.branch $release.commit $sourceInfo.runtime $release.assetSha256 $release.assetBytes $release.assetId
-                    if ($LASTEXITCODE -ne 0) { throw ('Published package preparation did not complete.' + (Get-CliFailureDetail $prepared)) }
-                    $result = $prepared | ConvertFrom-Json -AsHashtable
-                    if ($result.ContainsKey('warnings')) { foreach ($warning in $result.warnings) { [Console]::Error.WriteLine('Prunlet update: ' + $warning) } }
+                    $result = Invoke-PublishedPackageTransfer $ExecutablePath $ConfigPath $sourceInfo $release
                     if ($result.status -ceq 'prepared') {
-                        $result = Invoke-UpdateCoordinator $stage $ConfigPath $CodexHome $ExecutablePath
+                        # 版の照合は__prepare成功後・切替前に、Invoke-UpdateCoordinatorの中で候補のguardを開いた後に行う。
+                        $result = Invoke-UpdateCoordinator $stage $ConfigPath $CodexHome $ExecutablePath ($release.version + '+' + $release.commit)
                         if ($result.status -notin @('updated', 'cleanup_pending', 'deferred')) { throw 'Prunlet startup update returned an unknown state.' }
                         $state = Read-StartupState $statePath
                         if ($state.phase -cne 'idle') { throw 'Prunlet startup update has not finished.' }

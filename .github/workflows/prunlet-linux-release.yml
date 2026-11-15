@@ -1,44 +1,34 @@
 name: Prunlet Linux release packages
 
-# Linux版の配布tar.gzをGitHub提供ランナーでビルド・検証し、同じReleaseへ添付する。
-# - release published: 公開タグから自動で実行する（Windows・Macの配布と同じ契機）。
-# - workflow_dispatch: 過去タグへの後付け、または添付しない検証（artifact化のみ）に使う。
-#   tagを空にすると起動したrefをそのまま検証し、添付はしない。tagを指定しても、attachがtrueでなければ添付しない。
-# Linux版の起動時自動更新（src/rust/platform/linux/startup.rs・update/github.rs）は、このworkflowが添付する
-# prunlet-linux-{x64,arm64}.tar.gzだけを読む。asset名・tarの中身・manifest・64 MiB上限は
-# scripts/Publish-PrunletLinux.shが作り、起動側（package.rs）が同じ条件で照合する。
+# Linux版の配布tar.gzをGitHub提供ランナーでビルド・検証し、署名付きマニフェストと一緒にCloudflare R2へ配信する。
+# GitHub Release もタグも使わない。R2（https://prunlet.kagayoi.com）が唯一の配布元。
+# - release/<版> ブランチへのpush: ビルド・検証のあと、publish jobがR2へ配信する（Windowsの配布と同じ契機）。
+# - workflow_dispatch: 同じ release/<版> のrefを選んだ再実行、または release/* 以外のrefでの検証だけの実行
+#   （この場合はbuild jobの検証とartifact化のみで、publish jobは動かない）。
+# build jobはSecretsを持たない。publish job（Environment `release`。release/* だけを許可）だけが、
+# R2書込みトークンとマニフェスト署名鍵（PRUNLET_RELEASE_SIGNING_KEY）を受け取る。
+# 公開の順序: tar.gz（create-only）→ 公開URLで照合 → 版マニフェスト（署名・create-only）→ 最新ポインタ →
+# 手動取得用の固定名 download/latest/prunlet-linux-<cpu>.tar.gz と .sha256（最後に置換）。
+# Linux版の起動時自動更新は、このworkflowが配信するtar.gzだけを読む。tarの中身・manifest・64 MiB上限は
+# scripts/Publish-PrunletLinux.shが作り、起動側（package.rs）と配信側（scripts/PrunletPackage.Common.ps1）が同じ条件で照合する。
 
 on:
-  release:
-    types: [published]
+  push:
+    branches:
+      - 'release/**'
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Release tag to build (for example v1.0.47). Empty builds the dispatched ref without attaching.'
-        required: false
-        default: ''
-        type: string
-      attach:
-        description: 'Attach the verified packages to the release of the tag (never overwrites an existing asset).'
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: prunlet-linux-release-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+  group: prunlet-release-linux
   cancel-in-progress: false
-
-env:
-  PRUNLET_TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
   build:
     # ubuntu-latestは26.04へ移りglibc要件が2.39を超えるため、x64もubuntu-24.04へ固定する（arm64のubuntu-24.04-armと揃う）。
-    # 非公開（draft・prerelease）のreleaseは対象外にする。dispatchは実行者の責任で動かす。
-    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && (github.event_name != 'release' || (!github.event.release.prerelease && !github.event.release.draft)) }}
+    if: ${{ github.repository == '1llum1n4t1s/Prunlet' }}
     name: build ${{ matrix.runtime }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -56,10 +46,9 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Checkout the release tag
+      - name: Checkout the ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Verify the source commit
@@ -70,14 +59,13 @@ jobs:
           set -euo pipefail
           commit="$(git rev-parse HEAD)"
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          if [ -n "$PRUNLET_TAG" ]; then
-            # 公開タグ（既定ブランチ上のコミット）だけをビルドする。Windows版のworkflowと同じ検査。
-            [[ "$PRUNLET_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ ]] || { echo 'Unsupported release tag.' >&2; exit 1; }
-            if [ "$GITHUB_EVENT_NAME" = release ] && [ "$commit" != "$GITHUB_SHA" ]; then
-              echo 'Checkout differs from the release event commit.' >&2; exit 1
-            fi
-            tag_commit="$(git rev-list -n 1 "refs/tags/$PRUNLET_TAG")"
-            [ "$tag_commit" = "$commit" ] || { echo 'Checkout does not match the release tag.' >&2; exit 1; }
+          version="$(tr -d '\r' < Cargo.toml | sed -n 's/^version = "\([^"]*\)"$/\1/p' | head -n 1)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [ "$GITHUB_REF_TYPE" = branch ] && [[ "$GITHUB_REF_NAME" == release/* ]]; then
+            # release/<版> のブランチだけが配信の対象。ブランチ名とCargo.tomlの版、HEADとイベントcommit、既定ブランチの祖先を検査する
+            # （Windows版のworkflowと同じ検査。scripts/Assert-PrunletReleaseRef.ps1）。
+            [ "$GITHUB_REF_NAME" = "release/$version" ] || { echo 'The branch name does not match the Cargo.toml version.' >&2; exit 1; }
+            [ "$commit" = "$GITHUB_SHA" ] || { echo 'Checkout differs from the event commit.' >&2; exit 1; }
             branch="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')"
             [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo 'Default branch is invalid.' >&2; exit 1; }
             git merge-base --is-ancestor "$commit" "refs/remotes/origin/$branch" || { echo 'Release commit is not on the default branch.' >&2; exit 1; }
@@ -213,60 +201,71 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  attach:
-    # 検証済みの両CPUのpackageだけを、既存のReleaseへ添付する。既存assetは上書きしない。
-    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && (github.event_name == 'release' || (inputs.attach && inputs.tag != '')) }}
+  publish:
+    # 検証済みの両CPUのpackageだけを、署名付きマニフェストと一緒にR2へ配信する。release/<版> のブランチの実行だけで動き、
+    # それ以外のref（検証だけの実行）ではskipする（Environmentの拒否で失敗させない）。
+    # pwshのR2スクリプト（scripts/Publish-PrunletLinuxR2.ps1）を使うため windows-latest で動かす。
+    # build jobで作った実物は、ここでも中身（ustar・2エントリ・manifest・上限・.sha256）を独立に検査する。
+    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && github.ref_type == 'branch' && startsWith(github.ref_name, 'release/') }}
     needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: windows-latest
+    timeout-minutes: 30
+    environment: release
     permissions:
-      contents: write
+      contents: read
+    env:
+      PRUNLET_R2_BUCKET: ${{ vars.PRUNLET_R2_BUCKET || 'prunlet-updates' }}
     defaults:
       run:
-        shell: bash
+        shell: pwsh
     steps:
+      - name: Checkout the release branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify the release commit
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/Assert-PrunletReleaseRef.ps1
+      - name: Check the signing key against the client public keys
+        # 鍵整合の関門。クライアント側3か所（Rust・Install-Prunlet.ps1・Install-Prunlet.sh）の公開鍵定数のすべてで試験封筒を検証できなければ、R2へ何も書かず止める。
+        env:
+          PRUNLET_RELEASE_SIGNING_KEY: ${{ secrets.PRUNLET_RELEASE_SIGNING_KEY }}
+        run: ./scripts/Test-PrunletReleaseKeyGate.ps1
       - name: Download the verified packages
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: prunlet-linux-*
           path: ${{ runner.temp }}/packages
-      - name: Attach to the release
+      - name: Check the packages against R2 before any write
+        # 両CPUについて、読取りだけで既存の版マニフェスト・最新ポインタ（後退）を検査する。署名鍵は渡さない。
         env:
-          GH_TOKEN: ${{ github.token }}
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          PRUNLET_VERSION: ${{ steps.source.outputs.version }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRUNLET_R2_ACCOUNT_ID: ${{ secrets.PRUNLET_R2_ACCOUNT_ID }}
         run: |
-          set -euo pipefail
-          [[ "$PRUNLET_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ ]]
-          release="$(gh release view "$PRUNLET_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,tagName)"
-          [ "$(jq -r '.isDraft or .isPrerelease' <<< "$release")" = false ] || { echo 'The release is a draft or prerelease.' >&2; exit 1; }
-          # ビルドした実物が、今のタグ（既定ブランチ上のコミット）と同じコミットのものであることを確認する。
-          tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$PRUNLET_TAG" --jq .sha)"
-          for runtime in linux-x64 linux-arm64; do
-            dir="$RUNNER_TEMP/packages/prunlet-$runtime"
-            asset="prunlet-$runtime.tar.gz"
-            [ -f "$dir/$asset" ] && [ -f "$dir/$asset.sha256" ] || { echo "Missing verified package: $runtime" >&2; exit 1; }
-            (cd "$dir" && sha256sum -c "$asset.sha256")
-            [ "$(tar -xOzf "$dir/$asset" manifest.json | jq -r .commit)" = "$tag_commit" ] || { echo "Package commit differs from the tag: $runtime" >&2; exit 1; }
-          done
-          for runtime in linux-x64 linux-arm64; do
-            dir="$RUNNER_TEMP/packages/prunlet-$runtime"
-            for asset in "prunlet-$runtime.tar.gz" "prunlet-$runtime.tar.gz.sha256"; do
-              local_sha="$(sha256sum "$dir/$asset" | cut -d' ' -f1)"
-              existing="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$PRUNLET_TAG" --jq ".assets[] | select(.name == \"$asset\") | .digest")"
-              if [ -n "$existing" ]; then
-                # 既存assetは上書きしない。同一内容ならそのまま使い、異なれば失敗する。
-                [ "$existing" = "sha256:$local_sha" ] || { echo "An existing asset differs and was not overwritten: $asset" >&2; exit 1; }
-                echo "Already attached with identical content: $asset"
-                continue
-              fi
-              gh release upload "$PRUNLET_TAG" "$dir/$asset" --repo "$GITHUB_REPOSITORY"
-            done
-          done
-          # GitHubが返したasset名・サイズ・SHA-256を、手元の実物と照合する。
-          for runtime in linux-x64 linux-arm64; do
-            dir="$RUNNER_TEMP/packages/prunlet-$runtime"
-            for asset in "prunlet-$runtime.tar.gz" "prunlet-$runtime.tar.gz.sha256"; do
-              row="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$PRUNLET_TAG" --jq ".assets[] | select(.name == \"$asset\") | \"\(.state) \(.size) \(.digest)\"")"
-              [ "$row" = "uploaded $(stat -c %s "$dir/$asset") sha256:$(sha256sum "$dir/$asset" | cut -d' ' -f1)" ] || { echo "Attached asset differs from the verified file: $asset ($row)" >&2; exit 1; }
-              echo "Verified: $asset $row"
-            done
-          done
+          $ErrorActionPreference = 'Stop'
+          foreach ($runtime in @('linux-x64', 'linux-arm64')) {
+            $package = Join-Path $env:RUNNER_TEMP "packages/prunlet-$runtime/prunlet-$runtime.tar.gz"
+            & ./scripts/Publish-PrunletLinuxR2.ps1 -PackagePath $package -Runtime $runtime -Version $env:PRUNLET_VERSION -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -CheckOnly
+          }
+      - name: Publish the signed Linux packages to R2
+        # tar.gz（create-only）→ 公開URLで照合 → 版マニフェスト（署名・create-only）→ 最新ポインタ → 固定名（.sha256が最後）。
+        # 公開後に $LASTEXITCODE を見ない（スクリプトは失敗を例外で知らせる）。
+        env:
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          PRUNLET_VERSION: ${{ steps.source.outputs.version }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRUNLET_R2_ACCOUNT_ID: ${{ secrets.PRUNLET_R2_ACCOUNT_ID }}
+          PRUNLET_RELEASE_SIGNING_KEY: ${{ secrets.PRUNLET_RELEASE_SIGNING_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($runtime in @('linux-x64', 'linux-arm64')) {
+            $package = Join-Path $env:RUNNER_TEMP "packages/prunlet-$runtime/prunlet-$runtime.tar.gz"
+            & ./scripts/Publish-PrunletLinuxR2.ps1 -PackagePath $package -Runtime $runtime -Version $env:PRUNLET_VERSION -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH
+          }

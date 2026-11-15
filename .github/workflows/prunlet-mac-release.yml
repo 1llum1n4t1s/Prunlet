@@ -1,0 +1,97 @@
+name: Prunlet Mac release manifest
+
+# Apple Silicon（osx-arm64）の署名付きマニフェストを R2 へ発行する。workflow_dispatch だけ。
+#
+# 重要（信頼の範囲）: このworkflowは Mac のビルドをしない。Mac向けにGitHub Actionsでビルドしたり、GitHubホストのrunnerへ
+# 切り替えたりしない（AGENTS.md）。署名・公証・ZIP生成は、実機のApple Siliconで既存の
+# scripts/Publish-PrunletMac.sh が行い、できた prunlet-update-osx-arm64.zip を手元から
+# scripts/Send-PrunletMacPackage.ps1 で R2 の不変キー
+# releases/1llum1n4t1s/prunlet/<commit>/osx-arm64/<sha256>.zip へ新規作成のみで送る。
+# このworkflowは、入力の sha256・bytes でR2の実物を取得し、ZIPの長さ・SHA-256、ZIPの2項目、manifest.json の
+# 版・commit・runtime を、チェックアウトしたHEADの値と照合してから署名マニフェストを発行する。
+# つまりCIは「自分でビルドしていない物」に署名する。Developer IDの署名と公証の検証（Appleの信頼）は
+# クライアント側（起動時更新）の責任で、ここでは行わない。
+#
+# 手順: 1) release/<版> を切る 2) 実機でビルド・公証・ZIP生成 3) Send-PrunletMacPackage.ps1 で送り、表示された
+# sha256・bytes を控える 4) このworkflowを release/<版> のrefで実行し、sha256・bytes を入力する。
+# 同じsha256での再実行は、既存の版マニフェストを署名とpayloadで照合するだけで置き換えない。
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha256:
+        description: 'SHA-256 (64 lowercase hex) of the ZIP that Send-PrunletMacPackage.ps1 uploaded'
+        required: true
+        type: string
+      bytes:
+        description: 'Length in bytes of the same ZIP'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prunlet-release-mac
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && github.ref_type == 'branch' && startsWith(github.ref_name, 'release/') }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PRUNLET_INPUT_SHA256: ${{ inputs.sha256 }}
+      PRUNLET_INPUT_BYTES: ${{ inputs.bytes }}
+      PRUNLET_R2_BUCKET: ${{ vars.PRUNLET_R2_BUCKET || 'prunlet-updates' }}
+    steps:
+      - name: Checkout the release branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify the release commit
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/Assert-PrunletReleaseRef.ps1
+      - name: Validate the inputs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:PRUNLET_INPUT_SHA256 -cnotmatch '^[0-9a-f]{64}$') { throw 'sha256 must be 64 lowercase hex digits.' }
+          if ($env:PRUNLET_INPUT_BYTES -cnotmatch '^[1-9][0-9]{0,8}$') { throw 'bytes must be a positive integer.' }
+      - name: Check the signing key against the client public keys
+        # 鍵整合の関門。クライアント側3か所（Rust・Install-Prunlet.ps1・Install-Prunlet.sh）の公開鍵定数のすべてで試験封筒を検証できなければ、R2へ何も書かず止める。
+        env:
+          PRUNLET_RELEASE_SIGNING_KEY: ${{ secrets.PRUNLET_RELEASE_SIGNING_KEY }}
+        run: ./scripts/Test-PrunletReleaseKeyGate.ps1
+      - name: Check the uploaded ZIP against R2 before any write
+        # R2の実物の長さ・SHA-256・ZIPの中身、既存の版マニフェスト、最新ポインタ（後退）を、読取りだけで検査する。署名鍵は渡さない。
+        env:
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          PRUNLET_VERSION: ${{ steps.source.outputs.version }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRUNLET_R2_ACCOUNT_ID: ${{ secrets.PRUNLET_R2_ACCOUNT_ID }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/Publish-PrunletMacR2.ps1 -Sha256 $env:PRUNLET_INPUT_SHA256 -Bytes ([long]$env:PRUNLET_INPUT_BYTES) -Version $env:PRUNLET_VERSION -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH -CheckOnly
+      - name: Publish the signed manifest to R2
+        # 版マニフェスト（署名・create-only）→ 最新ポインタ（ETag条件付き）。ZIPは実機から送られた物をそのまま使う。
+        # 公開後に $LASTEXITCODE を見ない（スクリプトは失敗を例外で知らせる）。
+        env:
+          PRUNLET_COMMIT: ${{ steps.source.outputs.commit }}
+          PRUNLET_BRANCH: ${{ steps.source.outputs.branch }}
+          PRUNLET_VERSION: ${{ steps.source.outputs.version }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRUNLET_R2_ACCOUNT_ID: ${{ secrets.PRUNLET_R2_ACCOUNT_ID }}
+          PRUNLET_RELEASE_SIGNING_KEY: ${{ secrets.PRUNLET_RELEASE_SIGNING_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/Publish-PrunletMacR2.ps1 -Sha256 $env:PRUNLET_INPUT_SHA256 -Bytes ([long]$env:PRUNLET_INPUT_BYTES) -Version $env:PRUNLET_VERSION -CommitSha $env:PRUNLET_COMMIT -DefaultBranch $env:PRUNLET_BRANCH
