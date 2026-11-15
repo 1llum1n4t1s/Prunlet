@@ -50,6 +50,22 @@ pub fn run(args: Vec<OsString>, mut host: Host) -> i32 {
     {
         host = Host::Hook;
     }
+    // Velopackのフック（`--veloapp-*`）は、Unicode変換・引数検査より前に処理して終了コード0で終える。
+    // hook名のexeは上でHost::Hookになっているので、Velopackを初期化しない（root外の複製はVelopackに関与しない）。
+    #[cfg(windows)]
+    if host == Host::Cli
+        && args.first().is_some_and(|a| {
+            a.to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("--veloapp-")
+        })
+    {
+        let lossy: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        return crate::app_update::run_velopack_hook(&lossy);
+    }
     let args: Result<Vec<String>> = args
         .into_iter()
         .map(|v| {
@@ -163,6 +179,12 @@ fn run_inner(args: &[String]) -> Result<i32> {
         println!("{}", crate::help::current());
         return Ok(0);
     }
+    // Setup（Velopack）版の更新・状態コマンド。configを必要としないので、`--config`の検査より前に扱う。
+    // 管理外のexeでは `update-apply`は `unmanaged`を返すだけで、何も読み書きしない。
+    #[cfg(windows)]
+    if let Some(code) = crate::app_update::dispatch(args) {
+        return Ok(code);
+    }
     ensure!(
         args.len() >= 3 && args[0] == "--config",
         "Specify --config <absolute-json-path> before the command."
@@ -183,6 +205,16 @@ fn run_inner(args: &[String]) -> Result<i32> {
         let executable = std::env::current_exe()?;
         return Ok(crate::protocol::hook::run(&config_path, &executable));
     }
+    // 管理下（Velopackのcurrent\）の処理は、起動直後に製品ロックの共有ロックを寿命いっぱい保持する。
+    // 適用中マーカーが新しく目標版でなければ、何も実行せず拒否する。管理外（bin\・開発ビルド）では何もしない。
+    // hookは上で分岐済みでロックに参加しない。
+    #[cfg(windows)]
+    let _product_lock = {
+        if let Some(reason) = crate::app_update::legacy_refusal(&config_path) {
+            bail!(reason);
+        }
+        crate::app_update::enter_product().map_err(|reason| anyhow::anyhow!(reason))?
+    };
     #[cfg(windows)]
     if !command.starts_with("__begin-")
         && !matches!(
@@ -190,6 +222,9 @@ fn run_inner(args: &[String]) -> Result<i32> {
             "__check-startup-budget"
                 | "__download-published-package"
                 | "__prepare-published-package"
+                | "__check-release-manifest"
+                | "__download-release-package"
+                | "__prepare-release-package"
                 | "__apply-startup-update"
                 | "__apply-startup-integration"
                 | "__confirm-startup-integration"
@@ -213,6 +248,17 @@ fn run_inner(args: &[String]) -> Result<i32> {
     });
     if command == "mcp" {
         ensure!(tail.is_empty(), "MCP accepts no arguments.");
+        // 管理下（current\から直接起動）では、launcher相当のjobを自分で作って待機キューの寿命を保つ。
+        // 管理外（従来のlauncher経由）では何もしない。確認・取得と導入処理の再試行は別スレッドで行い、適用はしない。
+        #[cfg(windows)]
+        if crate::app_update::is_managed_exe() {
+            if let Err(error) = crate::platform::windows::process::adopt_own_launcher_job() {
+                eprintln!("Prunlet MCP could not create its own launcher job: {error}");
+                // 寿命を保証できないので、待機キューの受付は拒否する（通常の削除は使える）。
+                crate::platform::windows::process::mark_own_launcher_job_failed();
+            }
+            std::thread::spawn(crate::app_update::mcp_background);
+        }
         // Store版PowerShellのlauncherから起動された場合でも、launcherのjobへ入って寿命を揃える。
         // 入れなくてもMCPは起動する（待機キューの受付だけが所属確認で拒否される）。
         #[cfg(windows)]
@@ -240,21 +286,10 @@ fn run_inner(args: &[String]) -> Result<i32> {
     Ok(i32::from(failed))
 }
 
-fn initialize(path: &Path, args: &[String]) -> Result<i32> {
-    let mut roots = Vec::new();
-    let mut backup = None;
-    let mut i = 0;
-    while i < args.len() {
-        ensure!(i + 1 < args.len(), "Init options require values.");
-        match args[i].as_str() {
-            "--allowed-root" => roots.push(args[i + 1].clone()),
-            "--backup-directory" if backup.is_none() => backup = Some(args[i + 1].clone()),
-            other => bail!("Unknown or repeated init option: {other}"),
-        }
-        i += 2;
-    }
-    let backup = backup.ok_or_else(|| anyhow::anyhow!("Specify a backup directory."))?;
-    let actual_backup = platform::path::resolve(Path::new(&backup), false, false)?;
+/// 設定ファイルを新規作成する（`init`の本体）。Setup版のインストール時の自動作成も同じ処理を使う。
+/// 既存の設定は上書きしない（write_new_plain_file）。backupは既存のフォルダーであること。
+pub fn create_config(path: &Path, roots: Vec<String>, backup: &str) -> Result<Config> {
+    let actual_backup = platform::path::resolve(Path::new(backup), false, false)?;
     let config_path = platform::path::resolve(path, true, false)?;
     let data = ConfigData {
         allowed_roots: roots,
@@ -272,8 +307,26 @@ fn initialize(path: &Path, args: &[String]) -> Result<i32> {
     };
     crate::files::validate_config(&config)?;
     platform::write_new_plain_file(&config_path, &serde_json::to_vec(&config.data)?)?;
+    Ok(config)
+}
+
+fn initialize(path: &Path, args: &[String]) -> Result<i32> {
+    let mut roots = Vec::new();
+    let mut backup = None;
+    let mut i = 0;
+    while i < args.len() {
+        ensure!(i + 1 < args.len(), "Init options require values.");
+        match args[i].as_str() {
+            "--allowed-root" => roots.push(args[i + 1].clone()),
+            "--backup-directory" if backup.is_none() => backup = Some(args[i + 1].clone()),
+            other => bail!("Unknown or repeated init option: {other}"),
+        }
+        i += 2;
+    }
+    let backup = backup.ok_or_else(|| anyhow::anyhow!("Specify a backup directory."))?;
+    let config = create_config(path, roots, &backup)?;
     write_json(
-        &json!({"status":"initialized","configPath":config_path,"allowedRoots":config.data.allowed_roots,"backupDirectory":config.data.backup_directory}),
+        &json!({"status":"initialized","configPath":config.path,"allowedRoots":config.data.allowed_roots,"backupDirectory":config.data.backup_directory}),
     )?;
     Ok(0)
 }
@@ -454,6 +507,22 @@ fn parse_command(command: &str, args: &[String]) -> Result<Value> {
             ensure!(
                 args.len() == 7 && nonnegative_i64(&args[5]) && nonnegative_i64(&args[6]),
                 "Published preparation requires repository, branch, commit, runtime, SHA-256, byte length and asset ID."
+            );
+            Ok(json!({"argv":args}))
+        }
+        // R2 の署名付きマニフェストによる起動時更新（launcher 用の内部コマンド）。値は Rust が検証した payload から導き、
+        // 引数は選択子だけにする（使用法の誤りは更新処理の手前でここで拒否する）。
+        "__check-release-manifest" => {
+            ensure!(
+                args.len() == 1,
+                "Release manifest check requires the installed runtime (win-x64 or win-arm64)."
+            );
+            Ok(json!({"argv":args}))
+        }
+        "__download-release-package" | "__prepare-release-package" => {
+            ensure!(
+                args.len() == 3,
+                "Release download and preparation require runtime, version and commit from the signed manifest."
             );
             Ok(json!({"argv":args}))
         }
@@ -662,6 +731,36 @@ mod tests {
                 "__apply-startup-update",
                 &json!({"status":status})
             ));
+        }
+    }
+
+    /// R2 の署名付きマニフェストによる起動時更新の内部コマンド: 引数の個数と、正常応答を失敗扱いしないこと。
+    #[test]
+    fn release_manifest_commands_parse_selectors_and_report_success() {
+        let args = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            parse_command("__check-release-manifest", &args(&["win-x64"])).unwrap(),
+            json!({"argv":["win-x64"]})
+        );
+        assert!(parse_command("__check-release-manifest", &args(&[])).is_err());
+        assert!(parse_command("__check-release-manifest", &args(&["win-x64", "1.0.0"])).is_err());
+        for command in ["__download-release-package", "__prepare-release-package"] {
+            assert!(parse_command(command, &args(&["win-x64", "1.0.48", commit])).is_ok());
+            assert!(parse_command(command, &args(&["win-x64", "1.0.48"])).is_err());
+            assert!(parse_command(command, &args(&["win-x64", "1.0.48", commit, "x"])).is_err());
+        }
+        for (command, status) in [
+            ("__check-release-manifest", "current"),
+            ("__check-release-manifest", "available"),
+            ("__download-release-package", "downloaded"),
+            ("__prepare-release-package", "prepared"),
+            ("__prepare-release-package", "current"),
+        ] {
+            assert!(
+                !command_failed(command, &json!({"status":status})),
+                "{command} {status}"
+            );
         }
     }
 

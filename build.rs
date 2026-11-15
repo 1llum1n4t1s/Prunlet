@@ -28,6 +28,8 @@ fn watch_git_input(name: &str) {
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(prunlet_macos_race_tests)");
     println!("cargo:rustc-check-cfg=cfg(prunlet_linux_update_tests)");
+    // Windows ZIP の起動時更新を通信なしで検証するテスト用ビルド（update/fixture.rs）。配布ビルドでは指定しない。
+    println!("cargo:rustc-check-cfg=cfg(prunlet_windows_update_tests)");
     println!("cargo:rerun-if-env-changed=PRUNLET_SOURCE_COMMIT");
     println!("cargo:rerun-if-env-changed=PRUNLET_MACOS_TEAM_ID");
     println!("cargo:rerun-if-changed=build.rs");

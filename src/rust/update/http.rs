@@ -204,6 +204,11 @@ fn unescape_userinfo(value: &str) -> String {
 pub fn get(url: &str, deadline: Instant) -> Result<Response> {
     get_with_redirects(url, deadline, true)
 }
+/// R2（署名付きマニフェストと、その payload が指す不変キーの配布物）の取得。リダイレクトは辿らず、3xx は失敗にする。
+/// 取得先は呼出し側が固定ベースと検証済みのキーだけから組み立てた URL に限る（任意の URL へ転送されない）。
+pub fn get_without_redirects(url: &str, deadline: Instant) -> Result<Response> {
+    get_with_redirects(url, deadline, false)
+}
 fn get_with_redirects(url: &str, deadline: Instant, allow_redirects: bool) -> Result<Response> {
     let target = Url::parse(url)?;
     validate_target(&target)?;
@@ -957,7 +962,12 @@ impl Read for NativeReader {
             }
             let native = unsafe { (*self.state.buffer.get()).as_mut_ptr() };
             start(unsafe {
-                WinHttpReadData(self.request.0, native.cast(), NATIVE_READ_BUFFER as u32, ptr::null_mut())
+                WinHttpReadData(
+                    self.request.0,
+                    native.cast(),
+                    NATIVE_READ_BUFFER as u32,
+                    ptr::null_mut(),
+                )
             })?;
             match self.wait()? {
                 Event::Data(bytes) => {
@@ -1513,13 +1523,30 @@ mod transport_tests {
             );
         }
     }
-    fn verify_published_asset(url: &str) {
+    /// 明示的に渡す R2 の配布物（URL・長さ・SHA-256）。旧版は実 GitHub Release の固定 asset を使っていたが、
+    /// 配布元を R2 へ移したため、実在の配布物を環境変数で指定させる（既定では実行しない ignore テスト）。
+    /// URL は R2 の不変キー（`releases/`）に限り、任意の外部 URL へは向けない。
+    fn explicit_published_asset() -> (String, u64, String) {
+        let url = std::env::var("PRUNLET_PUBLISHED_ASSET_URL")
+            .expect("PRUNLET_PUBLISHED_ASSET_URL is required for this explicit test");
+        assert!(url.starts_with("https://prunlet.kagayoi.com/releases/"));
+        let bytes = std::env::var("PRUNLET_PUBLISHED_ASSET_BYTES")
+            .expect("PRUNLET_PUBLISHED_ASSET_BYTES is required")
+            .parse::<u64>()
+            .unwrap();
+        let sha256 = std::env::var("PRUNLET_PUBLISHED_ASSET_SHA256")
+            .expect("PRUNLET_PUBLISHED_ASSET_SHA256 is required")
+            .to_ascii_uppercase();
+        assert!(sha256.len() == 64 && sha256.bytes().all(|c| c.is_ascii_hexdigit()));
+        (url, bytes, sha256)
+    }
+    fn verify_published_asset(url: &str, expected: u64, sha256: &str) {
         let _guard = TEST_LOCK.lock().unwrap();
         let mut reader = NativeReader::open_route(
             url,
             Instant::now() + Duration::from_secs(120),
             Route::System,
-            true,
+            false,
             None,
         )
         .unwrap();
@@ -1567,7 +1594,6 @@ mod transport_tests {
             rate_header(reader.request.0, "X-RateLimit-Remaining"),
             rate_header(reader.request.0, "X-RateLimit-Reset")
         );
-        let expected = 99690224u64;
         assert!(reader.length.is_none_or(|length| length == expected));
         use sha2::{Digest, Sha256};
         let mut digest = Sha256::new();
@@ -1583,24 +1609,13 @@ mod transport_tests {
             digest.update(&buffer[..n]);
         }
         assert_eq!(count, expected);
-        assert_eq!(
-            hex::encode_upper(digest.finalize()),
-            "ACE4A47FF8D6775FDA0A54A3850D2D07C2F5A4D0929C596BC4FAEB79B44DC1E4"
-        );
+        assert_eq!(hex::encode_upper(digest.finalize()), sha256);
     }
     #[test]
-    #[ignore = "Public GitHub API transfer is run explicitly, separately from offline unit checks"]
-    fn genuine_published_asset_uses_os_tls_proxy_and_authenticated_hash() {
-        verify_published_asset(
-            "https://api.github.com/repos/1llum1n4t1s/Prunlet/releases/assets/700561676",
-        );
-    }
-    #[test]
-    #[ignore = "Public release transfer checks the same artifact without API rate-limit access"]
-    fn genuine_published_release_url_uses_os_tls_proxy_and_authenticated_hash() {
-        verify_published_asset(
-            "https://github.com/1llum1n4t1s/Prunlet/releases/download/v1.0.29/prunlet-update-win-x64.zip",
-        );
+    #[ignore = "Explicit R2 transfer: set PRUNLET_PUBLISHED_ASSET_URL/BYTES/SHA256 to a published immutable asset"]
+    fn genuine_published_r2_asset_uses_os_tls_proxy_and_authenticated_hash() {
+        let (url, expected, sha256) = explicit_published_asset();
+        verify_published_asset(&url, expected, &sha256);
     }
     #[test]
     #[ignore = "An explicitly launched local SOCKS relay forwards only the known public release artifact"]
@@ -1617,9 +1632,10 @@ mod transport_tests {
             proxy.url.host_str(),
             Some("127.0.0.1" | "localhost")
         ));
-        let mut response = get("https://github.com/1llum1n4t1s/Prunlet/releases/download/v1.0.29/prunlet-update-win-x64.zip", Instant::now()+Duration::from_secs(120)).unwrap();
+        let (url, expected, sha256) = explicit_published_asset();
+        let mut response =
+            get_without_redirects(&url, Instant::now() + Duration::from_secs(120)).unwrap();
         use sha2::{Digest, Sha256};
-        let expected = 99690224u64;
         let mut count = 0u64;
         let mut digest = Sha256::new();
         let mut buffer = [0u8; 131072];
@@ -1632,10 +1648,7 @@ mod transport_tests {
             digest.update(&buffer[..read]);
         }
         assert_eq!(count, expected);
-        assert_eq!(
-            hex::encode_upper(digest.finalize()),
-            "ACE4A47FF8D6775FDA0A54A3850D2D07C2F5A4D0929C596BC4FAEB79B44DC1E4"
-        );
+        assert_eq!(hex::encode_upper(digest.finalize()), sha256);
     }
     #[test]
     #[ignore = "An explicitly launched local proxy fixture supplies the challenge and safe phase report"]

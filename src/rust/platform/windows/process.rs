@@ -17,9 +17,10 @@ use windows_sys::Win32::{
     System::{
         IO::CancelSynchronousIo,
         JobObjects::{
-            AssignProcessToJobObject, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+            JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            OpenJobObjectW, QueryInformationJobObject,
+            OpenJobObjectW, QueryInformationJobObject, SetInformationJobObject,
         },
         Pipes::*,
         SystemServices::{JOB_OBJECT_ASSIGN_PROCESS, JOB_OBJECT_QUERY},
@@ -152,6 +153,51 @@ pub fn join_mcp_launcher_job() -> Result<()> {
     Ok(())
 }
 
+/// 管理下（Velopackの`current\`）のMCPが、launcher相当のjobを自分で作って自分を入れる。
+///
+/// 従来はlauncher（start-prunlet-mcp.ps1）がKILL_ON_JOB_CLOSE|BREAKAWAY_OKのjobを作って環境変数で名前を渡し、
+/// 「MCPの終了で通常の子は止まり、明示キューworkerだけが作成時の離脱で生き残る」を実現していた。
+/// Setup版ではps1を同梱せず、ホストがMCPを`current\prunlet.exe`として直接起動するため、MCP自身が同じjobを
+/// 作り、同じ環境変数名で名前を公開する。以後の`join_mcp_launcher_job`・`mcp_launcher_job`・
+/// `ensure_mcp_queue_lifetime`は、従来のlauncher経由と同じ経路で動く（それらは1バイトも変えない）。
+///
+/// jobのhandleはプロセスの終了まで保持する（閉じるとKILL_ON_JOB_CLOSEで子が止まる）。
+/// launcherが既にjobを渡している場合（環境変数がある場合）は何もしない。
+/// 呼出しは起動直後の単一スレッドの時点に限る（環境変数を書き換えるため）。
+pub fn adopt_own_launcher_job() -> Result<()> {
+    if std::env::var_os(MCP_LAUNCHER_JOB).is_some() {
+        return Ok(());
+    }
+    let name = format!(
+        r"Local\Prunlet.McpLauncher.{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let wide_name = wide(OsStr::new(&name))?;
+    let job = unsafe { OwnedHandle::from_raw(CreateJobObjectW(null(), wide_name.as_ptr()))? };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    if unsafe {
+        SetInformationJobObject(
+            job.raw(),
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if unsafe { AssignProcessToJobObject(job.raw(), GetCurrentProcess()) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // handleをプロセスの終了まで持ち続ける（Dropで閉じない）。
+    std::mem::forget(job);
+    // SAFETY: MCPの起動直後（他のスレッドを作る前）にだけ呼ぶ。
+    unsafe { std::env::set_var(MCP_LAUNCHER_JOB, &name) };
+    Ok(())
+}
+
 fn mcp_launcher_job() -> Result<Option<OwnedHandle>> {
     let Some(name) = launcher_job_name()? else {
         return Ok(None);
@@ -163,7 +209,21 @@ fn mcp_launcher_job() -> Result<Option<OwnedHandle>> {
     Ok(Some(job))
 }
 
+/// 管理下のMCPが自前のlauncher相当jobを作れなかったときに立てる。立っている間は、待機キューの受付を拒否する。
+static OWN_JOB_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `adopt_own_launcher_job`の失敗を記録する（起動直後に1回だけ呼ぶ）。
+pub fn mark_own_launcher_job_failed() {
+    OWN_JOB_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub fn ensure_mcp_queue_lifetime(config: &Path) -> Result<()> {
+    // 自前のjobを作れなかった管理下のMCPは、切断後にworkerの寿命を保証できない。受付を拒否する。
+    if OWN_JOB_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+        bail!(
+            "This Prunlet MCP could not create its own job object, so a queue worker's lifetime cannot be guaranteed; deletion was not started. Restart the MCP server and retry"
+        );
+    }
     if std::env::var_os(MCP_LAUNCHER_JOB).is_some() {
         return Ok(()); // 起動時に名前と親子の所属を照合する。
     }

@@ -7,7 +7,7 @@ use super::{
 use crate::{
     config::Config,
     json::parse_unique,
-    update::{github, package::is_hex},
+    update::{manifest::Runtime, package::is_hex, r2},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -194,12 +194,14 @@ fn request(url: &str, limit: u64, seconds: u32) -> Result<Vec<u8>> {
         let name = hex::encode(Sha256::digest(url.as_bytes()));
         return super::read_plain_file(&PathBuf::from(root).join(name), limit as usize, true);
     }
-    github::request(url, limit, seconds)
+    r2::request(url, limit, seconds)
 }
 
 fn update(root_path: &Path, root: &Dir, bin: &Dir, lock: &File, current: &File) -> Result<()> {
-    let asset = format!("prunlet-{RUNTIME}.tar.gz");
-    let Some(candidate) = github::newer(request, COMMIT, &asset, package::MAX_PACKAGE)? else {
+    // 署名付きマニフェスト（latest/<runtime>.json）で最新と信頼を得る。上限は manifest 側の runtime 別上限
+    // （64MiB）で、展開側の package::MAX_PACKAGE と同じ値。
+    let runtime = Runtime::parse(RUNTIME).context("Unsupported Linux runtime")?;
+    let Some(candidate) = r2::newer(request, COMMIT, runtime)? else {
         return Ok(());
     };
     let bytes = package::executable(

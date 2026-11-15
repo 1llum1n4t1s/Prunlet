@@ -1,3 +1,6 @@
+// Setup（Velopack）版の起動処理・更新・登録。Windows専用で、管理外の実行では何も読み書きしない。
+#[cfg(windows)]
+pub mod app_update;
 pub mod cli;
 pub mod config;
 pub mod files;

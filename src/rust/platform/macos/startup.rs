@@ -3,7 +3,7 @@ use super::{Pinned, path, security};
 use crate::{
     config::ConfigData,
     json::parse_unique,
-    update::{github, package::is_hex},
+    update::{manifest::Runtime, package::is_hex, r2},
 };
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -25,7 +25,6 @@ use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 const LOCK: &str = ".prunlet-macos-update.lock";
 const NEXT: &str = ".prunlet-next";
-const ASSET: &str = "prunlet-update-osx-arm64.zip";
 const COMMIT: &str = env!("PRUNLET_SOURCE_COMMIT");
 const TEAM: Option<&str> = option_env!("PRUNLET_MACOS_TEAM_ID");
 const MAX_PACKAGE: u64 = 64 * 1024 * 1024;
@@ -222,7 +221,7 @@ fn request(url: &str, limit: u64, seconds: u32) -> Result<Vec<u8>> {
         let name = hex::encode(Sha256::digest(url.as_bytes()));
         return super::read_plain_file(&PathBuf::from(root).join(name), limit as usize, true);
     }
-    github::request(url, limit, seconds)
+    r2::request(url, limit, seconds)
 }
 
 #[derive(Deserialize)]
@@ -340,7 +339,9 @@ pub(crate) fn package(output: &Path) -> Result<Value> {
 }
 
 fn update(exe: &Path, ancestors: &path::DirectoryLease, lock: &Pinned) -> Result<bool> {
-    let Some(candidate) = github::newer(request, COMMIT, ASSET, MAX_PACKAGE)? else {
+    // 署名付きマニフェスト（latest/osx-arm64.json）で最新と信頼を得る。asset 名（prunlet-update-osx-arm64.zip）と
+    // 上限（MAX_PACKAGE と同じ 64MiB）は manifest 側の固定値で照合する。
+    let Some(candidate) = r2::newer(request, COMMIT, Runtime::OsxArm64)? else {
         return Ok(false);
     };
     let candidate_version = &candidate.version;

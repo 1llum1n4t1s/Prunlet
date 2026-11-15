@@ -23,5 +23,6 @@
   "Wildcard expansion is unsupported. Links are deleted without following their targets.": "와일드카드 확장은 지원하지 않습니다. 링크는 대상을 따라가지 않고 삭제됩니다.",
   "Registry view is required. Omit value-name for a key; an empty value-name selects the default value.": "레지스트리 view는 필수입니다. 키를 삭제할 때는 value-name을 생략하고, 빈 value-name은 기본값을 선택합니다.",
   "Registry access defaults to normal. backupRestore is explicit per deletion/restoration, requires effective-token privileges, and supports only view 64 in a 64-bit Windows process.": "레지스트리 액세스의 기본값은 normal입니다. backupRestore는 삭제/복원마다 명시해야 하며, 유효 토큰의 권한이 필요하고, 64비트 Windows 프로세스의 view 64만 지원합니다.",
-  "Registry key snapshots require full Owner/Group/DACL/SACL access and SeSecurityPrivilege; no automatic elevation or fallback.": "레지스트리 키 snapshot에는 완전한 Owner/Group/DACL/SACL 액세스와 SeSecurityPrivilege가 필요합니다. 자동 권한 상승이나 대체 경로는 없습니다."
+  "Registry key snapshots require full Owner/Group/DACL/SACL access and SeSecurityPrivilege; no automatic elevation or fallback.": "레지스트리 키 snapshot에는 완전한 Owner/Group/DACL/SACL 액세스와 SeSecurityPrivilege가 필요합니다. 자동 권한 상승이나 대체 경로는 없습니다.",
+  "Setup (Velopack) installs only: update-apply applies a downloaded update at logon only when no Prunlet process is running and never stops a running process; setup repair redoes the installation steps.": "Setup(Velopack) 설치본 전용: update-apply 는 Prunlet 프로세스가 실행 중이 아닐 때만 로그온 시 내려받은 업데이트를 적용하며, 실행 중인 프로세스를 강제로 종료하지 않습니다. setup repair 는 설치 단계를 다시 수행합니다."
 }

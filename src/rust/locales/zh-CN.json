@@ -23,5 +23,6 @@
   "Wildcard expansion is unsupported. Links are deleted without following their targets.": "不支持通配符展开。链接会被删除，而不会追踪其目标。",
   "Registry view is required. Omit value-name for a key; an empty value-name selects the default value.": "必须指定注册表 view。删除键时省略 value-name；空的 value-name 表示默认值。",
   "Registry access defaults to normal. backupRestore is explicit per deletion/restoration, requires effective-token privileges, and supports only view 64 in a 64-bit Windows process.": "注册表访问默认为 normal。backupRestore 需在每次删除/恢复时显式指定，需要有效令牌的特权，且仅支持 64 位 Windows 进程中的 view 64。",
-  "Registry key snapshots require full Owner/Group/DACL/SACL access and SeSecurityPrivilege; no automatic elevation or fallback.": "注册表键快照需要完整的 Owner/Group/DACL/SACL 访问权限和 SeSecurityPrivilege；不会自动提权或回退。"
+  "Registry key snapshots require full Owner/Group/DACL/SACL access and SeSecurityPrivilege; no automatic elevation or fallback.": "注册表键快照需要完整的 Owner/Group/DACL/SACL 访问权限和 SeSecurityPrivilege；不会自动提权或回退。",
+  "Setup (Velopack) installs only: update-apply applies a downloaded update at logon only when no Prunlet process is running and never stops a running process; setup repair redoes the installation steps.": "仅限 Setup（Velopack）安装版：update-apply 只在没有 Prunlet 进程运行时于登录时应用已下载的更新，绝不会强制终止运行中的进程；setup repair 会重新执行安装步骤。"
 }

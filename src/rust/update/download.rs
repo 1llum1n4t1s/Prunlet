@@ -11,6 +11,8 @@ use std::{
 };
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 
+/// 旧 launcher（GitHub Release の照会結果を渡す `__download-published-package`）の取得。互換のためだけに残す。
+/// 新しい launcher は R2 の署名付きマニフェストを使う `__download-release-package`（[`receive_signed`]）を呼ぶ。
 pub(super) fn receive_release(
     root: &Path,
     repository: &str,
@@ -50,6 +52,59 @@ pub(super) fn receive_release(
     receive_with(root, commit, hash, bytes, &url, |url| {
         super::http::get(url, Instant::now() + Duration::from_secs(120))
     })
+}
+
+/// R2 の不変 URL から、署名付きマニフェストで検証済みの配布物を取得する（リダイレクトなし）。
+/// URL・長さ・SHA-256・commit はすべて検証済みの payload（[`super::manifest::Release`]）から取る。
+pub(super) fn receive_signed(root: &Path, release: &super::manifest::Release) -> Result<bool> {
+    ensure!(
+        matches!(
+            release.runtime,
+            super::manifest::Runtime::WinX64 | super::manifest::Runtime::WinArm64
+        ) && release.bytes <= MAX_ARCHIVE_BYTES,
+        "Published asset identity is invalid."
+    );
+    receive_with(
+        root,
+        &release.commit,
+        &release.sha256,
+        release.bytes,
+        &release.asset_url(),
+        |url| {
+            // テスト用ビルド（prunlet_windows_update_tests）で fixture が指定されていれば、R2 へ出ずにファイルの応答を使う。
+            // 長さ・SHA-256 の照合と state・容量・ADS の扱いは、本番と同じ receive_with / transfer が行う。
+            #[cfg(all(debug_assertions, prunlet_windows_update_tests))]
+            if let Some(response) = super::fixture::response(url) {
+                return response;
+            }
+            super::http::get_without_redirects(url, Instant::now() + Duration::from_secs(120))
+        },
+    )
+}
+
+/// 小さな応答（署名付きマニフェスト）を、上限つきで読み切る。リダイレクトは辿らない。
+/// 宣言長・実際の長さのどちらかが上限を超えれば Err（途中で打ち切って成功にしない）。
+pub(crate) fn fetch_bounded(url: &str, limit: u64, timeout: Duration) -> Result<Vec<u8>> {
+    read_bounded(
+        super::http::get_without_redirects(url, Instant::now() + timeout)?,
+        limit,
+    )
+}
+
+pub(super) fn read_bounded(response: super::http::Response, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    ensure!(
+        response.length.is_none_or(|n| n <= limit),
+        "Distribution response exceeds its limit"
+    );
+    let declared = response.length;
+    let mut bytes = Vec::new();
+    response.body.take(limit + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= limit && declared.is_none_or(|n| n == bytes.len() as u64),
+        "Distribution response exceeds its limit or differs from its declared length"
+    );
+    Ok(bytes)
 }
 
 /// 取得先の応答を`fetch`で差し替えられる形にした本体。状態遷移と既存ファイルの扱いを

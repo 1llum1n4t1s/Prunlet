@@ -48,6 +48,11 @@ prunlet --config <absolute-json-path> operations
 prunlet --config <absolute-json-path> migrate [--dry-run | --apply [--if-needed | --retry-legacy-discard]]
 prunlet --config <absolute-json-path> mcp
 prunlet --config <absolute-json-path> hook [--hook-script <legacy-path>]
+prunlet update-apply [--no-maintenance]
+prunlet update-check
+prunlet setup status
+prunlet setup repair
+Setup (Velopack) installs only: update-apply applies a downloaded update at logon only when no Prunlet process is running and never stops a running process; setup repair redoes the installation steps.
 Legacy --allowed-root <directory> options are accepted but do not restrict target directories.
 Metadata and volume recovery directories are protected.
 Files and folders normally move into the Windows Recycle Bin without Prunlet operation records.

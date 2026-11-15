@@ -2545,6 +2545,7 @@ fn inspect(input: &Value, config: &Path, cli: &Path) -> Result<Value> {
             cli_quote(&executable),
             cli_quote(&config)
         ));
+        reason.push_str(setup_hint(cli));
         return Ok(deny(&reason));
     }
     if mode.is_none() && cfg!(windows) && !standalone_encoded {
@@ -2557,7 +2558,17 @@ fn inspect(input: &Value, config: &Path, cli: &Path) -> Result<Value> {
     } else {
         reason.push_str(&format!(" The hook did not execute the command. For explicitly authorized local macOS targets use the installed native Prunlet CLI: {} --config {} delete --paths-file <absolute-json-file>. Files normally go to macOS Trash without Prunlet operation records. On macOS, delete-queue waits only for cooperating processes that hold an advisory flock; merely opening a file or mapping a dylib does not delay deletion. Registry operations are Windows-only and are unsupported on macOS. SSH names and remote script text do not bypass inspection. Existing host approvals and policies still apply. Do not resend failed or ambiguous deletion; inspect the source and Trash.",cli_quote(&executable),cli_quote(&config)));
     }
+    reason.push_str(setup_hint(cli));
     Ok(deny(&reason))
+}
+/// 案内したCLIが実在しないWindowsの導入（Setup版を更新中・アンインストール後など）にだけ、再実行の案内を足す。
+/// CLIが存在する通常の導入では空で、従来の拒否理由を1バイトも変えない。
+fn setup_hint(cli: &Path) -> &'static str {
+    if cfg!(windows) && !cli.exists() {
+        " If that CLI is missing: retry in a minute (it may be mid-update), then rerun Setup."
+    } else {
+        ""
+    }
 }
 /// 拒否理由へ添えるCLIパスの引用規則。各OSの完全な案内と同じ規則にそろえる。
 /// Windowsは空白を含むときだけ二重引用し、他OSは常にPOSIXの単一引用にする。

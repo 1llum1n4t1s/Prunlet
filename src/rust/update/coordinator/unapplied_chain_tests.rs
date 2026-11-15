@@ -129,7 +129,8 @@ fn prepare(root: &Path, rel: &Rel) -> Result<Value> {
         "win-x64",
         &rel.hash,
         rel.zip.len() as u64,
-        1,
+        // 旧 launcher 経路（GitHub の asset API URL）の来歴。R2 の不変 URL の受理は release_manifest_tests で確認する。
+        "https://api.github.com/repos/owner/repo/releases/assets/1",
     )
 }
 fn state_of(root: &Path) -> UpdateState {

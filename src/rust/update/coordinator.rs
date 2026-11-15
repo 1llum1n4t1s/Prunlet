@@ -622,6 +622,12 @@ pub fn execute(config: &Config, command: &str, args: &Value) -> Result<Value> {
                 argv.len() == 7,
                 "Published preparation requires repository, branch, commit, runtime, SHA-256, byte length and asset ID."
             );
+            // 旧 launcher（GitHub Release 経由）からの呼出し形を維持する。来歴の downloadUrl は旧形式のまま。
+            let asset = number(argv[6])?;
+            ensure!(
+                asset > 0,
+                "Valid authenticated release repository and asset ID required"
+            );
             prepare_from(
                 &root,
                 argv[0],
@@ -630,7 +636,48 @@ pub fn execute(config: &Config, command: &str, args: &Value) -> Result<Value> {
                 argv[3],
                 argv[4],
                 number(argv[5])?,
-                number(argv[6])?,
+                &format!(
+                    "https://api.github.com/repos/{}/releases/assets/{asset}",
+                    argv[0]
+                ),
+            )
+        }
+        // ── R2 の署名付きマニフェストによる更新（GitHub Release を使わない新経路） ──
+        // 引数は選択子（runtime・版・commit）だけで、URL・長さ・SHA-256・既定ブランチは Rust が検証した
+        // payload から導く。呼出し元（launcher）が渡す値を信頼の基点にしない。
+        "__check-release-manifest" => {
+            ensure!(
+                argv.len() == 1,
+                "Release manifest check requires the installed runtime (win-x64 or win-arm64)."
+            );
+            check_release_manifest(argv[0], &fetch_manifest)
+        }
+        "__download-release-package" => {
+            ensure!(
+                argv.len() == 3,
+                "Release download requires runtime, version and commit from the signed manifest."
+            );
+            let release = signed_release(argv[0], argv[1], argv[2], &fetch_manifest)?;
+            super::download::receive_signed(&root, &release)?;
+            Ok(
+                json!({"status":"downloaded","version":release.version,"commit":release.commit,"sha256":release.sha256,"bytes":release.bytes}),
+            )
+        }
+        "__prepare-release-package" => {
+            ensure!(
+                argv.len() == 3,
+                "Release preparation requires runtime, version and commit from the signed manifest."
+            );
+            let release = signed_release(argv[0], argv[1], argv[2], &fetch_manifest)?;
+            prepare_from(
+                &root,
+                super::manifest::REPOSITORY,
+                &release.default_branch,
+                &release.commit,
+                release.runtime.as_str(),
+                &release.sha256,
+                release.bytes,
+                &release.asset_url(),
             )
         }
         "__apply-startup-update" => {
@@ -655,6 +702,131 @@ pub fn execute(config: &Config, command: &str, args: &Value) -> Result<Value> {
         _ => bail!("Unknown startup update command"),
     }
 }
+/// source-info.json の downloadUrl が、R2 の不変 URL（`releases/<repo小文字>/<commit>/<runtime>/<sha256>.zip`）として
+/// 記録済みの commit・SHA-256・runtime と完全一致するか。リポジトリは製品の固定値だけを受ける。
+fn r2_download_url_matches(
+    url: &str,
+    repository: &str,
+    runtime: &str,
+    commit: &str,
+    sha256: &str,
+) -> bool {
+    use super::manifest::{self, Runtime};
+    let Some(kind) =
+        Runtime::parse(runtime).filter(|r| matches!(r, Runtime::WinX64 | Runtime::WinArm64))
+    else {
+        return false;
+    };
+    if !repository.eq_ignore_ascii_case(manifest::REPOSITORY)
+        || !is_hex(commit, 40)
+        || !is_hex(sha256, 64)
+    {
+        return false;
+    }
+    let key = manifest::asset_key(
+        kind,
+        &commit.to_ascii_lowercase(),
+        &sha256.to_ascii_lowercase(),
+        &kind.asset_name("", ""),
+    );
+    url == format!("{}/{key}", manifest::DISTRIBUTION_BASE)
+}
+
+/// この exe が動く CPU の Windows runtime 名。別 CPU 向けの配布物を選ばせない。
+fn current_windows_runtime() -> Result<&'static str> {
+    Ok(match std::env::consts::ARCH {
+        "x86_64" => "win-x64",
+        "aarch64" => "win-arm64",
+        _ => bail!("Published Windows runtime is unsupported."),
+    })
+}
+
+/// R2 の小さな応答（署名付きマニフェスト）を上限つきで取得する。リダイレクトは辿らない。
+fn fetch_manifest(url: &str, limit: u64) -> Result<Vec<u8>> {
+    // テスト用ビルド（prunlet_windows_update_tests）で fixture が指定されていれば、R2 へ出ずにファイルの応答を使う。
+    // 上限・宣言長の照合は本番と同じ read_bounded で行う。Velopack と共用の fetch_bounded 自体には差し替えを入れない。
+    #[cfg(all(debug_assertions, prunlet_windows_update_tests))]
+    if let Some(response) = super::fixture::response(url) {
+        return super::download::read_bounded(response?, limit);
+    }
+    super::download::fetch_bounded(url, limit, std::time::Duration::from_secs(15))
+}
+
+/// 版の新旧の判定に使う導入済みの版。配布ビルドでは常にこの exe の版（`crate::VERSION`）。
+/// テスト用ビルド（prunlet_windows_update_tests）だけは、fixture が指定した版で上書きできる
+/// （検証の製品は1つのビルドの版リソースだけを書き換えた写しで、launcher が読む版と揃えるため）。
+fn installed_version() -> Result<String> {
+    #[cfg(all(debug_assertions, prunlet_windows_update_tests))]
+    if let Some(version) = super::fixture::installed_version()? {
+        return Ok(version);
+    }
+    Ok(crate::VERSION.into())
+}
+
+/// launcher が渡した runtime を検査する（この exe の CPU と一致する Windows ZIP の runtime だけ）。
+fn windows_runtime_argument(runtime: &str) -> Result<super::manifest::Runtime> {
+    use super::manifest::Runtime;
+    let parsed = Runtime::parse(runtime)
+        .filter(|r| matches!(r, Runtime::WinX64 | Runtime::WinArm64))
+        .context("Release runtime must be win-x64 or win-arm64.")?;
+    ensure!(
+        runtime == current_windows_runtime()?,
+        "Release runtime differs from this executable's CPU architecture."
+    );
+    Ok(parsed)
+}
+
+/// `__check-release-manifest`: `latest/<runtime>.json` を取得・署名検証し、導入済み（この exe の版）より新しいかを返す。
+/// 出力: 新しければ `{"status":"available",...}`、同版・旧版なら `{"status":"current",...}`。取得・検証の失敗は Err
+/// （終了コード 1。launcher は延期する）。
+fn check_release_manifest(runtime: &str, fetch: &super::manifest::Fetch<'_>) -> Result<Value> {
+    let runtime = windows_runtime_argument(runtime)?;
+    let envelope = fetch(
+        &super::manifest::latest_url(runtime)?,
+        super::manifest::MAX_ENVELOPE_BYTES,
+    )?;
+    let release =
+        super::manifest::verify_release(&envelope, &super::manifest::Expected::runtime(runtime))?;
+    let installed = installed_version()?;
+    let newer = super::manifest::is_newer(&release.version, &installed)?;
+    Ok(json!({
+        "status": if newer { "available" } else { "current" },
+        "installedVersion": installed,
+        "runtime": release.runtime.as_str(),
+        "version": release.version,
+        "commit": release.commit,
+        "defaultBranch": release.default_branch,
+        "bytes": release.bytes,
+        "sha256": release.sha256,
+        "assetUrl": release.asset_url(),
+    }))
+}
+
+/// `__download-release-package`・`__prepare-release-package`: 版付きマニフェスト（`manifests/<版>/<runtime>.json`）を
+/// 取得・署名検証し、runtime・版・commit が引数と一致し、導入済みより厳密に新しいものだけを返す（後退防止）。
+fn signed_release(
+    runtime: &str,
+    version: &str,
+    commit: &str,
+    fetch: &super::manifest::Fetch<'_>,
+) -> Result<super::manifest::Release> {
+    let runtime = windows_runtime_argument(runtime)?;
+    ensure!(
+        is_hex(commit, 40),
+        "Release commit must be a 40-digit hexadecimal SHA."
+    );
+    super::manifest::versioned_newer(
+        fetch,
+        &super::manifest::Expected {
+            runtime,
+            package_id: "PrunletApp",
+            version: Some(version),
+            commit: Some(commit),
+        },
+        &installed_version()?,
+    )
+}
+
 fn number(text: &str) -> Result<u64> {
     ensure!(
         !text.is_empty() && text.bytes().all(|c| c.is_ascii_digit()),
@@ -1020,6 +1192,7 @@ fn unapplied_info_matches(
     let branch = info["defaultBranch"].as_str().context("Missing branch")?;
     let runtime = info["runtime"].as_str().context("Missing runtime")?;
     let url = info["downloadUrl"].as_str().context("Missing URL")?;
+    // 旧形式（GitHub の asset API URL）。R2 へ移る前に導入・準備された stage の来歴を読めるよう残す。
     let prefix = format!("https://api.github.com/repos/{repository}/releases/assets/");
     let asset = url.strip_prefix(&prefix).and_then(|s| {
         if !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()) {
@@ -1028,10 +1201,18 @@ fn unapplied_info_matches(
             None
         }
     });
+    // 新形式（R2 の不変 URL）。commit・SHA-256 は state が記録した値から組み立て、完全一致だけを受ける。
+    let r2 = r2_download_url_matches(
+        url,
+        repository,
+        runtime,
+        &state.candidate_commit,
+        &state.package_previous_sha256,
+    );
     ensure!(
         regex::Regex::new(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z")?.is_match(repository)
             && valid_branch(branch)
-            && asset.is_some_and(|n| n > 0)
+            && (asset.is_some_and(|n| n > 0) || r2)
             && matches!(runtime, "win-x64" | "win-arm64")
             && repository.eq_ignore_ascii_case(&package.repository)
             && runtime == package.runtime,
@@ -1628,11 +1809,13 @@ fn prepare_from(
     runtime: &str,
     hash: &str,
     bytes: u64,
-    asset: u64,
+    download_url: &str,
 ) -> Result<Value> {
+    // download_url は source-info.json の downloadUrl に記録する来歴（旧: GitHub の asset API URL、
+    // 新: R2 の不変 URL）。取得は済んでいるので、ここでは辿らない。
     ensure!(
-        asset > 0
-            && regex::Regex::new(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z")?.is_match(repository),
+        regex::Regex::new(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z")?.is_match(repository)
+            && download_url.starts_with("https://"),
         "Valid authenticated release repository and asset ID required"
     );
     let _mutex = InstallationMutexes::acquire(root)?;
@@ -1648,7 +1831,6 @@ fn prepare_from(
     let stage = stage_path(root);
     let _parents = path::pin_directories(&stage)?;
     verify_stage_owner(&stage, root, commit)?;
-    let download_url = format!("https://api.github.com/repos/{repository}/releases/assets/{asset}");
     let package_path = stage.join(&state.package_name);
     let pin = plain(&package_path, GENERIC_READ, FILE_SHARE_READ)?;
     native::reject_named_streams(&package_path)?;
@@ -1817,7 +1999,7 @@ fn prepare_from(
         commit,
         runtime,
         hash,
-        &download_url,
+        download_url,
     )?;
     let new_hash = hex::encode_upper(Sha256::digest(&bytes));
     let old = if let Some(cache) = &state.cache_baseline {
@@ -2921,3 +3103,185 @@ mod manual_install_tests {
 
 #[cfg(test)]
 mod unapplied_chain_tests;
+
+/// R2 の署名付きマニフェストによる新経路（`__check-release-manifest`・`__download-release-package`・
+/// `__prepare-release-package`）の判定部。取得は差し替え、実ネットワークへは出ない。
+#[cfg(test)]
+mod release_manifest_tests {
+    use super::super::manifest::{MAX_ENVELOPE_BYTES, Runtime, test_support};
+    use super::*;
+
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn runtime() -> &'static str {
+        current_windows_runtime().unwrap()
+    }
+
+    fn kind() -> Runtime {
+        Runtime::parse(runtime()).unwrap()
+    }
+
+    #[test]
+    fn check_reports_available_only_for_a_strictly_newer_signed_release() {
+        let newer = test_support::envelope(kind(), "999.0.0", COMMIT, b"zip");
+        let fetch = |url: &str, limit: u64| -> Result<Vec<u8>> {
+            assert_eq!(
+                url,
+                format!("https://prunlet.kagayoi.com/latest/{}.json", runtime())
+            );
+            assert_eq!(limit, MAX_ENVELOPE_BYTES);
+            Ok(newer.clone())
+        };
+        let value = check_release_manifest(runtime(), &fetch).unwrap();
+        assert_eq!(value["status"], "available");
+        assert_eq!(value["version"], "999.0.0");
+        assert_eq!(value["commit"], COMMIT);
+        assert_eq!(value["defaultBranch"], "main");
+        assert_eq!(value["installedVersion"], crate::VERSION);
+        let sha = hex::encode(Sha256::digest(b"zip"));
+        assert_eq!(
+            value["assetUrl"],
+            format!(
+                "https://prunlet.kagayoi.com/releases/1llum1n4t1s/prunlet/{COMMIT}/{}/{sha}.zip",
+                runtime()
+            )
+        );
+        // 同版・旧版は current（適用しない）。
+        for version in [crate::VERSION, "0.0.1"] {
+            let same = test_support::envelope(kind(), version, COMMIT, b"zip");
+            let fetch = |_: &str, _: u64| -> Result<Vec<u8>> { Ok(same.clone()) };
+            assert_eq!(
+                check_release_manifest(runtime(), &fetch).unwrap()["status"],
+                "current"
+            );
+        }
+        // 取得失敗・署名不正・別 CPU の runtime は Err（launcher は延期する）。
+        let offline = |_: &str, _: u64| -> Result<Vec<u8>> { bail!("offline") };
+        assert!(check_release_manifest(runtime(), &offline).is_err());
+        let mut broken = newer.clone();
+        let index = broken.len() - 5;
+        broken[index] ^= 1;
+        let tampered = |_: &str, _: u64| -> Result<Vec<u8>> { Ok(broken.clone()) };
+        assert!(check_release_manifest(runtime(), &tampered).is_err());
+        let other = if runtime() == "win-x64" {
+            "win-arm64"
+        } else {
+            "win-x64"
+        };
+        let never = |_: &str, _: u64| -> Result<Vec<u8>> { panic!("must not fetch") };
+        assert!(check_release_manifest(other, &never).is_err());
+        assert!(check_release_manifest("linux-x64", &never).is_err());
+        assert!(check_release_manifest("velopack-win-x64", &never).is_err());
+    }
+
+    #[test]
+    fn signed_release_requires_matching_version_commit_and_no_rollback() {
+        let good = test_support::envelope(kind(), "999.0.0", COMMIT, b"zip");
+        let fetch = |url: &str, _: u64| -> Result<Vec<u8>> {
+            assert_eq!(
+                url,
+                format!(
+                    "https://prunlet.kagayoi.com/manifests/999.0.0/{}.json",
+                    runtime()
+                )
+            );
+            Ok(good.clone())
+        };
+        let release = signed_release(runtime(), "999.0.0", COMMIT, &fetch).unwrap();
+        assert_eq!(release.bytes, 3);
+        // 大文字の commit 引数も同じ commit として受ける（payload 側は小文字のみ）。
+        assert!(signed_release(runtime(), "999.0.0", &COMMIT.to_ascii_uppercase(), &fetch).is_ok());
+        assert!(signed_release(runtime(), "999.0.0", &"f".repeat(40), &fetch).is_err());
+        assert!(signed_release(runtime(), "999.0.0", "short", &fetch).is_err());
+        let never = |_: &str, _: u64| -> Result<Vec<u8>> { panic!("must not fetch") };
+        assert!(signed_release(runtime(), "999.0.0/../x", COMMIT, &never).is_err());
+        // 署名済みでも、導入済みと同じ版・古い版は拒否する（後退防止）。
+        let same = test_support::envelope(kind(), crate::VERSION, COMMIT, b"zip");
+        let fetch_same = |_: &str, _: u64| -> Result<Vec<u8>> { Ok(same.clone()) };
+        assert!(signed_release(runtime(), crate::VERSION, COMMIT, &fetch_same).is_err());
+    }
+
+    #[test]
+    fn source_info_accepts_r2_and_legacy_github_download_urls() {
+        let sha = "AB".repeat(32);
+        let upper_commit = COMMIT.to_ascii_uppercase();
+        let url = format!(
+            "https://prunlet.kagayoi.com/releases/1llum1n4t1s/prunlet/{COMMIT}/win-x64/{}.zip",
+            sha.to_ascii_lowercase()
+        );
+        assert!(r2_download_url_matches(
+            &url,
+            "1llum1n4t1s/Prunlet",
+            "win-x64",
+            &upper_commit,
+            &sha
+        ));
+        // commit・hash・runtime・リポジトリ・ベースが記録と違えば受けない。
+        assert!(!r2_download_url_matches(
+            &url,
+            "1llum1n4t1s/Prunlet",
+            "win-x64",
+            &"f".repeat(40),
+            &sha
+        ));
+        assert!(!r2_download_url_matches(
+            &url,
+            "1llum1n4t1s/Prunlet",
+            "win-x64",
+            COMMIT,
+            &"cd".repeat(32)
+        ));
+        assert!(!r2_download_url_matches(
+            &url,
+            "1llum1n4t1s/Prunlet",
+            "win-arm64",
+            COMMIT,
+            &sha
+        ));
+        assert!(!r2_download_url_matches(
+            &url,
+            "owner/repo",
+            "win-x64",
+            COMMIT,
+            &sha
+        ));
+        assert!(!r2_download_url_matches(
+            &url.replace("https://prunlet.kagayoi.com", "https://evil.example"),
+            "1llum1n4t1s/Prunlet",
+            "win-x64",
+            COMMIT,
+            &sha
+        ));
+        assert!(!r2_download_url_matches(
+            &format!("{url}?x"),
+            "1llum1n4t1s/Prunlet",
+            "win-x64",
+            COMMIT,
+            &sha
+        ));
+        assert!(!r2_download_url_matches(
+            &url,
+            "1llum1n4t1s/Prunlet",
+            "linux-x64",
+            COMMIT,
+            &sha
+        ));
+    }
+
+    #[test]
+    fn bounded_reads_reject_oversized_or_mismatched_responses() {
+        use std::io::Cursor;
+        let response = |length: Option<u64>, body: &[u8]| super::super::http::Response {
+            length,
+            body: Box::new(Cursor::new(body.to_vec())),
+        };
+        assert_eq!(
+            super::super::download::read_bounded(response(Some(3), b"abc"), 3).unwrap(),
+            b"abc"
+        );
+        assert!(super::super::download::read_bounded(response(None, b"abc"), 3).is_ok());
+        assert!(super::super::download::read_bounded(response(Some(4), b"abcd"), 3).is_err());
+        assert!(super::super::download::read_bounded(response(None, b"abcd"), 3).is_err());
+        assert!(super::super::download::read_bounded(response(Some(2), b"abc"), 3).is_err());
+    }
+}

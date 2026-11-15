@@ -34,12 +34,29 @@ serde_json = "1"
 sha2 = "0.11"
 uuid = { version = "1", features = ["v4", "serde"] }
 zip = { version = "9.2", default-features = false, features = ["deflate"] }
+# 更新の署名付きマニフェスト（src/rust/update/manifest.rs）の検証。ECDSA P-256 + SHA-256、DER署名、SPKI公開鍵。
+# 0.14 系は sha2 0.11 / digest 0.11 を使い、既存の sha2 と同じ版に揃う。既定機能（pem・std・getrandom 等）は使わず、
+# 検証に要る ecdsa（署名アルゴリズム）と pkcs8（SPKIの復号・DER署名型）だけを有効にする。
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8"] }
+
+[dev-dependencies]
+# テストだけでテスト鍵（PKCS8 PEM）を読み、封筒に署名する。配布ビルドのグラフには pem を入れない。
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8", "pem"] }
+
+# Velopack（Setup版）の隔離E2E専用。ローカルフィード・署名省略・状態/設定フォルダーの差し替えを環境変数で読む。
+# 配布ビルドでは有効にしない（この機能を付けたexeは配布しない）。
+[features]
+velopack-test = []
 
 [build-dependencies]
 embed-resource = "3"
 
 [target.'cfg(windows)'.dependencies]
 bytes = "1"
+# Setup（Velopack）版の起動処理・確認と取得・適用。版は固定し、Dependabotでは動かさない（.github/dependabot.yml）。
+# 既定の機能（file-logging）は使わない。HTTPは内蔵のureq（blocking）で、tokioは引き込まない。
+# macOS・Linuxのビルドグラフには入れない（Windows依存のみ）。
+velopack = { version = "=1.2.161", default-features = false }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -47,7 +64,7 @@ native-tls = "0.2"
 tokio = { version = "1", features = ["net", "rt", "time", "io-util", "sync"] }
 tokio-native-tls = "0.3"
 url = "2.5.8"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_Networking_WinHttp", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_RestartManager", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_Networking_WinHttp", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Security_WinTrust", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_RestartManager", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
 
 [profile.release]
 lto = "thin"
