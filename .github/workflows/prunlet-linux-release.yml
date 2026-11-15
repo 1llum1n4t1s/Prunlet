@@ -38,6 +38,7 @@ env:
 
 jobs:
   build:
+    # ubuntu-latestは26.04へ移りglibc要件が2.39を超えるため、x64もubuntu-24.04へ固定する（arm64のubuntu-24.04-armと揃う）。
     # 非公開（draft・prerelease）のreleaseは対象外にする。dispatchは実行者の責任で動かす。
     if: ${{ github.repository == '1llum1n4t1s/Prunlet' && (github.event_name != 'release' || (!github.event.release.prerelease && !github.event.release.draft)) }}
     name: build ${{ matrix.runtime }}
@@ -48,7 +49,7 @@ jobs:
       matrix:
         include:
           - runtime: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - runtime: linux-arm64
             runner: ubuntu-24.04-arm
