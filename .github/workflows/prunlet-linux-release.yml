@@ -9,8 +9,6 @@ name: Prunlet Linux release packages
 # scripts/Publish-PrunletLinux.shが作り、起動側（package.rs）が同じ条件で照合する。
 
 on:
-  push:
-    branches: [validate/linux-release]
   release:
     types: [published]
   workflow_dispatch:

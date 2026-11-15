@@ -44,10 +44,14 @@ bucket・DNS・資源の作成や削除は公開処理に含めない。
 
 ## Linux版の公開手順
 
-GitHub ActionsのGitHub提供ランナー（x64は `ubuntu-latest`、ARM64は `ubuntu-24.04-arm`）に、固定済みリリースSHAのクリーンなチェックアウトと新規の外部出力先を用意する。各ランナーで、`rust-toolchain.toml` が指定するRustと対象CPUの `x86_64-unknown-linux-gnu`・`aarch64-unknown-linux-gnu` を使う。ARM64上でx64をクロスビルドする場合は、`x86_64-linux-gnu-gcc` と対象のglibc開発環境を使う。
+Linux版は、Releaseの公開（`published`）で `.github/workflows/prunlet-linux-release.yml` が自動で動く。手作業での添付はしない。公開タグを固定済みリリースSHAとしてクリーンにチェックアウトし、既定ブランチ上のコミットであることを確認してから、x64は `ubuntu-24.04`、ARM64は `ubuntu-24.04-arm` の各ランナー（`ubuntu-latest` はglibc要件が `docs/linux.md` の2.39を超える版へ移ったため使わない）で次を行う。
 
-ARM64のランナーで `bash scripts/Publish-PrunletLinux.sh <新規の絶対出力先> <40桁SHA> linux-arm64` を、x64のランナーで別出力先への `linux-x64` を実行する。生成するtar.gzには `prunlet` と、版・コミット・対象・実行体サイズ・SHA-256を記録した `manifest.json` を収録する。スクリプトがELFのアーキテクチャと梱包内容を照合し、配布実物のチェックサムを `.tar.gz.sha256` へ保存する。 `--preview` で生成したファイルは公開対象外とする。
+1. `rust-toolchain.toml` が指定するRustで `cargo test --locked --lib` と `cargo test --locked --test localization` を実行する。
+2. `bash scripts/Publish-PrunletLinux.sh <新規の絶対出力先> <40桁SHA> <linux-x64|linux-arm64>` でビルドする。生成するtar.gzには `prunlet` と、版・コミット・対象・実行体サイズ・SHA-256を記録した `manifest.json` を収録する。スクリプトがELFのアーキテクチャと梱包内容を照合し、配布実物のチェックサムを `.tar.gz.sha256` へ保存する。
+3. 成果物から、tarの内容・manifest・上限・チェックサムを再確認し、実行体が要求するglibcのシンボル版が2.39以下であることを確認する。
+4. 配布tar.gzから取り出した実行体で `scripts/Verify-LinuxFiles.ts` を、版とコミットが異なる3世代のデバッグビルド（`prunlet_linux_update_tests`）で `scripts/Verify-UnixStartupUpdate.ts` を実行する。
+5. 両CPUの検証が成功した場合だけ、同じGitHub Releaseへ各アーカイブとチェックサムを添付する。既存のassetは上書きせず、同一内容なら再利用し、異なれば失敗する。GitHubが返したasset名・サイズ・SHA-256を手元の実物と照合する。
 
-転送後にチェックサムを再照合し、Mac版と同じGitHub Release下書きへ各アーカイブとチェックサムを添付する。GitHubが返したasset名・サイズ・SHA-256を確認してから公開する。
+過去タグへの後付けと、添付しない検証は `workflow_dispatch` で行う。`tag` に対象のタグ（例 `v1.0.47`）を指定し、`attach` をtrueにすると添付する。`tag` を空にすると起動したrefをビルド・検証するだけで、成果物はartifactにだけ残す。検証用のブランチでは、一時的に `push` トリガーを足して同じjobを回し、添付しない状態で両CPUの成功を確認してから、トリガーを戻す。後付けのときは、タグのツリーのスクリプトとworkflowを使うため、タグ側にも `Publish-PrunletLinux.sh` と検証スクリプトが必要になる。
 
 Linuxの起動時更新はこのtar.gzを直接使う。対象assetは `prunlet-linux-arm64.tar.gz`・`prunlet-linux-x64.tar.gz` とし、GNU tarのustar形式で `prunlet`、`manifest.json` の順に収録する。展開前と実行ファイルの上限は各64 MiB。起動側はGitHub APIのasset SHA-256とサイズを照合し、ローカルのチェックサムファイルは手動取得時に使う。
