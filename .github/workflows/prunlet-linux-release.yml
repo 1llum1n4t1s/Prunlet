@@ -9,6 +9,8 @@ name: Prunlet Linux release packages
 # scripts/Publish-PrunletLinux.shが作り、起動側（package.rs）が同じ条件で照合する。
 
 on:
+  push:
+    branches: [validate/linux-release]
   release:
     types: [published]
   workflow_dispatch:
@@ -37,7 +39,7 @@ env:
 jobs:
   build:
     # 非公開（draft・prerelease）のreleaseは対象外にする。dispatchは実行者の責任で動かす。
-    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && (github.event_name == 'workflow_dispatch' || (!github.event.release.prerelease && !github.event.release.draft)) }}
+    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && (github.event_name != 'release' || (!github.event.release.prerelease && !github.event.release.draft)) }}
     name: build ${{ matrix.runtime }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
