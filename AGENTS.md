@@ -20,13 +20,13 @@ native sessionはscopeの明示選択を必要とする。検証起動は固定�
 
 使用中の対象を待つ場合は、削除開始前にCLIの`delete-queue`またはMCPの`delete_files`の`action: "enqueue"`へ明示登録する。通常削除と同じshell・設定・権限境界を守り、拒否・失敗・不明結果の再試行先にしない。受付だけで完了とせず、`delete-queue-status <job-id>`またはMCPの`action: "status"`と`jobId`で最終結果を確認する。取消は`pending`の間だけで、結果不明なら元対象とWindowsゴミ箱を確認し、自動再送しない。設計は[明示的な削除待機キュー](DESIGN.md#明示的な削除待機キュー)を参照する。
 
-保持制御はレジストリschema 5専用で、既定7日・合計1 GiB、事前容量走査・整理前後再走査・共通ロック・単一超過時だけの予算を維持する。Windowsゴミ箱のファイルと未移行旧ファイルは容量・期限・purgeに含めず、ファイル削除・通常一覧・通常保守は旧ファイル操作ディレクトリを走査しない。手動整理はCLI明示適用のみで、MCPへpurgeを追加しない。更新・導入が残した自分の一時物（旧`.prunlet-mcp-generations`・古い`.pending`・Backupsの`install-*`/`integration-*`）は`src/rust/housekeeping.rs`が`maintain`時にだけ整理する。名前・所有印の完全一致、リンク・`backupDirectory`の除外、Core削除への委譲、失敗は結果へ記録のみ、の境界を広げない（[設計](DESIGN.md#更新導入後の一時物の自動整理)）。
+保持制御はレジストリschema 5専用で、既定7日・合計1 GiB、事前容量走査・整理前後再走査・共通ロック・単一超過時だけの予算を維持する。Windowsゴミ箱のファイルと未移行旧ファイルは容量・期限・purgeに含めず、ファイル削除・通常一覧・通常保守は旧ファイル操作ディレクトリを走査しない。手動整理はCLI明示適用のみで、MCPへpurgeを追加しない。更新・導入が残した自アプリの一時物は`src/rust/housekeeping.rs`が`maintain`時にだけ整理し、名前・所有印の完全一致とCore削除への委譲を保つ（[設計](DESIGN.md#更新導入後の一時物の自動整理)）。
 
 旧ファイルの復元互換を維持せず、明示`migrate`で所有確認済みの旧退避root・操作記録をWindowsゴミ箱へ破棄する。旧schemaのparser・decode・内容hash・ACL snapshot・コピー・bundle・sidecar・復元helperは追加しない。専用StoreKey rootと小marker、中央の正規file marker、typed root layoutで所有を確認し、registry signals・共通基点・他config/privateBase・未知の非所有領域を保護する。ファイル別の恒久一覧を作らず、固定private空gate `.legacy-file-discard-in-progress` だけで中断の自動再送を止める。正規gateの明示ackは`migrate --apply --retry-legacy-discard`のみで、installerは指定しない。fileの未完了はregistry利用を塞がない。policy 2評価済みの`--apply --if-needed`は中央旧GUID再走査を省き、更新時のonline owned store固定位置・小marker確認だけを続ける。
 
 Codexの`exec_command`が正式なsandbox権限要求に対応し、実効設定で要求が必要かつ許可される場合は、ファイル・フォルダーの実削除を初回から`sandbox_permissions: "require_escalated"`で申請する。要求が不要・未対応・禁止の場合は実効設定と正式な承認経路に従う。dry-runをゴミ箱アクセス許可の証拠にしない。
 
-Windowsの管理者起動はsandbox権限申請と区別する。許可済みの削除に管理者権限が必要なら、手動実行を依頼する前に、ホストの許可範囲でエージェントが管理者CMDを起動し、同じ配置済みCLI・設定を直接使い、起動先の実トークン・privilege・CLIの終了コード・JSON・対象状態を確認する。Prunlet自身の自動昇格禁止と区別し、本人のUAC同意を代行せず、拒否・結果不明を迂回しない。再実行条件は[sandboxとゴミ箱へのアクセス](docs/integration.md#sandboxとゴミ箱へのアクセス)に従う。
+Windowsの管理者起動はsandbox権限申請と区別する。許可済みの削除に管理者権限が必要なら、手動実行を依頼する前に、ホストの許可範囲でエージェントが管理者CMDを起動し、同じ配置済みCLI・設定を直接使い、実トークン・privilege・終了コード・JSON・対象状態を確認する。Prunlet自身の自動昇格禁止と区別し、UAC同意を代行せず、拒否・不明結果を迂回しない。再実行条件は[sandboxとゴミ箱へのアクセス](docs/integration.md#sandboxとゴミ箱へのアクセス)に従う。
 
 ## Apple Silicon版の実装
 
@@ -51,22 +51,22 @@ pwsh -NoProfile -File .\scripts\Publish-Prunlet.ps1 -OutputDirectory $buildRoot
 
 検証時は`-IncludeVerificationProbe`で`publish/prunlet-verification.exe`・`publish/prunlet_fixtures.dll`・`publish/prunlet-support.exe`を同時に生成し、`build-manifest.json`で製品と検証用出力を照合する。Coreプローブを使う検証には`-RustProbePath`・`-BuildManifestPath`・`-ExpectedBuildManifestSha256`を一組で渡す。検証用出力は製品ZIPに含めない。
 
-実装後は[検証手順](docs/verification.md)の記録なしファイルE2Eと、影響に応じたレジストリ・旧データ移行・導入検証を行う。CLI・stdio MCP・hookの実プロセス、終了コード・passed/failed・外部JSONを読んで判定する。skip・CaseFilterだけの成功や未実行を全件合格にしない。
+実装後は[検証手順](docs/verification.md)の記録なしファイルE2Eと、影響に応じたレジストリ・旧データ移行・導入検証を行う。CLI・stdio MCP・hookの実プロセスの終了コード・passed/failed・外部JSONで判定する。skip・CaseFilterだけの成功や未実行を全件合格にしない。
 
 - ファイル: `scripts/Verify-RecordlessFiles.ps1`へ今回のexe、上記のプローブ・manifest・SHA-256、および新しい外部出力・reportを渡す。プローブを省略した場合は該当するCoreケースを未検証とする。結果DTO、操作記録不作成、dry-run不変更、Windowsゴミ箱往復、内容/ID/属性/ACL/ADS、リンク先保全・ハードリンク共有、再帰・拒否・不明状態を確認する。再帰固定削除の診断では、CLI・MCPのロード中DLLケースで要求rootの結果DTOと失敗entry・保持元の診断を区別する。Shell返却パスの照合を変更した場合は`Verify-LongPathFiles.ps1`のPrepare・VerifyDryRun・VerifyDeleteも行う。渡し方は[通常E2Eの検証範囲](docs/verification.md#通常e2eの検証範囲)に従う。
 - フック解析: shell選択・文字列解析・拒否理由を変更した場合は`scripts/Verify-HookParsing.ps1 -ExecutablePath <今回のexe絶対パス> -OutputDirectory <未使用の外部絶対パス> -ReportPath <外部JSON絶対パス> -ConfigPath <設定絶対パス>`を実行する。検査用コマンド文字列を直接実行せず、hookへのJSON入力で許可・拒否とfixture不変更を確認し、拒否理由の`reasonValid`（検知命令・shell解釈または検査不能の原因、shell不明時の候補判定の説明）も検証する。範囲は同節に従う。
 - 旧データ移行: `scripts/Verify-FileRecordMigration.ps1`へ今回のexe・同じビルドのプローブ照合用3引数と、真正な旧版exeを渡す。旧schema fixtureを新版で捏造せず、所有済み旧rootの直接Bin破棄、壊れたfile本文の非読取、registry混在/他config/未知非所有領域の保護、dry-run不変更・gate不作成、中断後の自動再送拒否・明示ack、policy 0→2と更新時の後online store回収を確認する。旧file復元・bundle・sidecar・copy・履歴圧縮は成功条件へ残さない。
-- 並行・待機: `scripts/Verify-ConcurrentDeletion.ps1`へ今回のexe・同じビルドのプローブ照合用3引数・新しい外部出力とreportを渡し、Coreのclaimと実CLI/MCPのロック待機・MCP進捗の分離を確認する。全preflight失敗時の保全、共有ハードリンク、worker上限、入力順、60秒超の待機・解放後続行・EOF後完了は、記録なしファイルE2Eの該当ケースも確認する。
-- 削除待機キュー: キュー・実体照合・CLI/MCP入口を変更した場合は`scripts/Verify-DeferredDeleteQueue.ps1 -ExecutablePath <今回のexe絶対パス> -ConfigPath <設定絶対パス> -OutputDirectory <未使用の外部絶対パス> -ReportPath <外部JSON絶対パス>`を実行する。待機・取消・解放後の削除・stdio切断後の継続を確認し、追加範囲は[検証手順](docs/verification.md#一時的なロックとロード中dll)と照合する。同期削除の検証で代替しない。
+- 並行・待機: `scripts/Verify-ConcurrentDeletion.ps1`へ今回のexe・同じビルドのプローブ照合用3引数・新しい外部出力とreportを渡し、Coreのclaimと実CLI/MCPのロック待機・MCP進捗の分離を確認する。全preflight失敗時の保全・共有ハードリンク・worker上限・入力順・60秒超の待機は、記録なしファイルE2Eの該当ケースも確認する。
+- 削除待機キュー: キュー・実体照合・CLI/MCP入口を変更した場合は`scripts/Verify-DeferredDeleteQueue.ps1 -ExecutablePath <今回のexe絶対パス> -ConfigPath <設定絶対パス> -OutputDirectory <未使用の外部絶対パス> -ReportPath <外部JSON絶対パス>`を実行し、待機・取消・解放後の削除・stdio切断後の継続を[検証手順](docs/verification.md#一時的なロックとロード中dll)と照合する。同期削除の検証で代替しない。
 - 再帰永久削除: 子の実体・時刻照合を変更した場合は`scripts/Verify-HardlinkEntryTimes.ps1`へ`-ExecutablePath`・`-RustProbePath`・`-BuildManifestPath`・`-ExpectedBuildManifestSha256`・外部の未使用`-OutputDirectory`・外部JSONの`-ReportPath`を渡す（プローブは今回のexeと同じビルド）。CLI/MCPのハードリンク削除と別名の保全、Core境界での変更検知と診断値を区別して確認する。
 - レジストリ: `scripts/Verify-RegistryRecovery.ps1`と、native sessionの`Verify-RegistrySession.ps1`のPrepare・Start（`-AssertNativeWindows`）・Current・Runを使う。完全ACL/raw bytes・競合・transaction・snapshot保全・専用namespace/予算を確認し、current側6801拒否保全と明示native側の正常往復、実token・view/scopeを区別する。権限・KTM・viewの未検証を成功に数えない。
-- 保護アクセス・診断: 保護レジストリのopen・privilege・viewの変更では`Verify-ProtectedRegistryAccess.ps1`と`Verify-ProtectedRegistryViews.ps1`、ファイルのアクセス拒否・削除後確認の診断の変更では`Verify-AccessDeniedFiles.ps1`も実行する。API適合性probeとCLI/MCP E2Eの結果を区別する（[検証手順](docs/verification.md)）。
+- 保護アクセス・診断: 保護レジストリのopen・privilege・viewの変更では`Verify-ProtectedRegistryAccess.ps1`と`Verify-ProtectedRegistryViews.ps1`、ファイルのアクセス拒否・削除後確認の診断の変更では`Verify-AccessDeniedFiles.ps1`も実行する。API適合性probeとCLI/MCP E2Eを区別する（[検証手順](docs/verification.md)）。
 - snapshot公開: 容量予約・シリアライズ・公開処理の変更では`scripts/Verify-RegistrySnapshotPublication.ps1`も実行し、実レジストリの往復検証と区別する（[レジストリ検証](docs/verification.md#レジストリの削除と復元)）。
 - 導入: installer・共通指示・登録解除変更では`scripts/Verify-LatestInstall.ps1`を実行する。fixtureと実R2、保存内容と実ホストhook読込・承認・guide遵守を区別する。移行開始後の失敗で旧binaryへrollbackせず新exe/設定/登録を保全し、同じCLIで再開できることを確認する。
 - 起動時更新: `integration/start-prunlet-mcp.ps1`・`src/rust/update/`・公開ZIPの生成や登録を変更した場合は、[導入検証](docs/verification.md#latestインストーラー)の起動時更新の範囲も確認する。公開と同じZIPによる複数回更新、使用中の延期、独立hook、途中再開、登録改変の保全、ADSを含む容量上限を検証し、通常の導入検証だけで代替しない。署名付きマニフェストの照会・取得を変更した場合は、失敗時に何も適用せず現行版で起動すること、固定公開鍵以外の署名・非正規形・他runtime・キー不一致・導入済み以下の版・ZIPのサイズ/SHA-256不一致の拒否を確認する。Windowsの起動時更新のR2応答の置換とテスト鍵の受理は`all(windows, debug_assertions, prunlet_windows_update_tests)`のビルドに限定する。この検証用ビルドは`RUSTFLAGS='--cfg prunlet_windows_update_tests -C debug-assertions=on'`を付けて`Publish-Prunlet.ps1 -IncludeVerificationProbe`で作り、製品ZIP・公開には使わない。`Verify-LatestInstall.ps1`はこのビルドでだけ起動時更新のケースを実行し、通常ビルドは未検証として不合格にする。共通指示の照合を変更した場合は、CRLF/LF差だけなら登録済み`PRUNLET.md`のバイト列を保持して更新でき、本文が異なれば保留することを確認する。未適用stageの認定・再利用を変更した場合は同節の`Verify-UnappliedStartupStage.ps1`も実行し、完全更新との検証範囲の違いを明示する。
-- 配信: 署名付きマニフェスト・R2への公開順序・鍵整合の関門・配信workflowを変更した場合は、[配信の検証](docs/verification.md#配信署名付きマニフェストr2の検証)の`scripts/Verify-ReleasePublication.ps1`と`cargo test --locked --lib`を実行する。偽のR2・テスト鍵での成功を、本番鍵での署名・実R2への公開の確認の代わりにしない。
+- 配信: 署名付きマニフェスト・R2への公開順序・鍵整合の関門・配信workflowを変更した場合は、[配信の検証](docs/verification.md#配信署名付きマニフェストr2の検証)の`scripts/Verify-ReleasePublication.ps1`と`cargo test --locked --lib`を実行する。偽のR2・テスト鍵での成功を、本番鍵・実R2の確認の代わりにしない。
 
-ゴミ箱全体の空化・既存項目の清掃は行わず、今回fixtureだけを扱う。検証後の清掃は[検証手順](docs/verification.md#検証後の保持と清掃)に従い、未清掃パス・理由・再開条件を返す。
+ゴミ箱全体の空化・既存項目の清掃は行わず、今回fixtureだけを扱う。検証後の清掃は[検証手順](docs/verification.md#検証後の保持と清掃)に従う。
 
 ### Apple Silicon
 
@@ -88,15 +88,15 @@ Prunletの `vava` で新しいリリースを公開するときは、`main`をpu
 
 Apple Silicon版のビルド・署名・公証・ZIP生成は `ssh mac` の実機で行う。[Apple Silicon版の公開手順](docs/distribution.md#apple-silicon版の公開手順)に従い、検証済みZIPを`scripts/Send-PrunletMacPackage.ps1`でR2の不変キーへ送ってから、`release/<版>`のrefで`prunlet-mac-release.yml`を実行して署名付きマニフェストを発行する。Macのビルド・署名・公証をGitHub Actionsで行ったり、GitHubホストのrunnerへ切り替えたりしない。このworkflowは自分でビルドしていないZIPをR2上で照合して署名するだけで、Developer ID・公証の検証はクライアント側の責任である。
 
-Linux版は`release/<版>`のpushで`.github/workflows/prunlet-linux-release.yml`が自動で動き、上記のランナーでビルド・検証・glibc 2.39以下の確認を行ってから、Environment `release`のpublish jobが検証済みtar.gzをR2へ置き、署名付きマニフェストを発行する。手作業での配置はしない。配信しない検証は`release/*`以外のrefでの`workflow_dispatch`で行う。手順は[Linux版の公開手順](docs/distribution.md#linux版の公開手順)に従う。ubuntu-latestはglibc要件が2.39を超えたため使わない。
+Linux版は`release/<版>`のpushで`.github/workflows/prunlet-linux-release.yml`が自動で動き、上記のランナーでビルド・検証・glibc 2.39以下の確認を行ってから、Environment `release`のpublish jobが検証済みtar.gzをR2へ置き、署名付きマニフェストを発行する。手作業での配置はしない。配信しない検証は`release/*`以外のrefでの`workflow_dispatch`で行う。手順は[Linux版の公開手順](docs/distribution.md#linux版の公開手順)に従う。
 
 WindowsにはSetup（Velopack。packId `PrunletApp`、x64のみ）の配信も併存する。梱包・検証・配信は`scripts/velopack/`（vpk 1.2.161固定）で、署名のログインを1回に保つため既存のrelease workflowの`package` job内に足している。クライアントの信頼の基点は署名付きマニフェスト`manifests/<版>/velopack-win-x64.json`（nupkgより先に新規作成のみ）で、nupkgの`.sha256`は保存物の整合確認だけに使う。vpkの失敗はZIPの配布を止めず、jobは最後に失敗にする。実装は`src/rust/app_update/`に集約し、取得はVelopackの`download_updates`を使わず検査後にだけ`packages\`へ置く。配信だけをやり直すときは`prunlet-velopack-redo.yml`（再配信する`release/<版>`のrefでの`workflow_dispatch`、入力は保存した実行のrun_id）を使う。`src/rust/update/`・launcher・`Install-Prunlet.ps1`のZIP経路はSetup版の導入が完了するまで残す。手順は[Windowsの Setup（Velopack）](docs/distribution.md#windowsの-setupvelopack)、検証は[Setup（Velopack）の梱包・配信の検証](docs/verification.md#setupvelopackの梱包配信の検証)、設計は[DESIGN.md](DESIGN.md#windows-setupvelopack版の更新)に従い、実R2・実署名・Setupの実機導入は依頼に含まれる場合だけ行う。
 
-Dependabotと依存検証のworkflowは[依存更新の境界](DESIGN.md#依存更新の境界)の検証条件と読取り権限を維持する。依存検証CIの成功は、上記の追加E2Eを代替しない。
+Dependabotと依存検証のworkflowは[依存更新の境界](DESIGN.md#依存更新の境界)の検証条件と読取り権限を維持する。依存検証CIは上記の追加E2Eの代替にならない。
 
 対外表記ではREADME冒頭の副題を併記し、X告知の本文・紹介画像とGitHubの説明欄も同じ表記に揃える。X告知本文にはREADME冒頭に沿った紹介文を毎回1文入れ、`blocked by policy`による清掃の停止を減らす目的と、AIエージェントの削除を専用CLI・MCPへ集約する使い方を含める。
 
-Windowsのlatest導入の検証は`scripts/Install-Prunlet.ps1`の[導入契約](DESIGN.md#導入と検証の境界)に従い、開発クローンやローカルビルドで代用しない。インストーラーは署名付きマニフェストが指す最新版の署名済み更新ZIPだけを起動時更新と同じ条件で配置し、ソースをビルドしない。照合を緩めるスイッチ・環境変数やGitHubの資格情報を受け取る入口をインストーラーへ追加せず、検証ではAuthenticode判定・HTTP取得・公開鍵定数のテスト鍵への置換を検証スクリプトとその写しの側に限る。更新タスク（`start-prunlet-mcp.ps1 -UpdateOnly`）は配布物の12ファイル構成を変えない。[容量上限の一度だけの移行](DESIGN.md#容量上限の一度だけの移行)、既存設定とACLの保持、再更新時の冪等性、失敗時の原本保全と復旧も確認する。
+Windowsのlatest導入の検証は`scripts/Install-Prunlet.ps1`の[導入契約](DESIGN.md#導入と検証の境界)に従い、開発クローンやローカルビルドで代用しない。インストーラーは署名付きマニフェストが指す最新版の署名済み更新ZIPだけを起動時更新と同じ条件で配置し、ソースをビルドしない。照合を緩めるスイッチ・環境変数やGitHubの資格情報の入口を追加せず、検証ではAuthenticode判定・HTTP取得・公開鍵定数のテスト鍵への置換を検証スクリプトとその写しの側に限る。更新タスク（`start-prunlet-mcp.ps1 -UpdateOnly`）は配布物の12ファイル構成を変えない。[容量上限の一度だけの移行](DESIGN.md#容量上限の一度だけの移行)、既存設定とACLの保持、再更新の冪等性、失敗時の原本保全と復旧も確認する。
 
 WindowsのMCP起動時自動更新は手動導入とは別の経路である。[更新の設計](DESIGN.md#起動時自動更新)に従い、更新状態・製品排他・配布検証・容量検査を迂回しない。Windowsの配布物は`scripts/Package-PrunletUpdate.ps1`で生成し、`release/<版>`から生成・署名するrelease workflowとの形式の一致を維持する。署名は`scripts/Sign-PrunletBuild.ps1`（Sigilune）で行う。Windowsの公開ZIPは`scripts/Verify-ReleasePackage.ps1`へ`-PackagePath`・`-SourceRoot`・`-PublishDirectory`・`-CommitSha`・`-DefaultBranch`・`-Runtime <win-x64|win-arm64>`・`-Repository`・`-RequireSignature`を渡して生成元・署名と照合し、返されたZIP全体のSHA-256がR2への送信直前にも一致することを確認する。署名・ZIP生成・R2配置を変更した場合は、Sigiluneで実際に署名したビルドで`Sign-PrunletBuild.ps1`・梱包・`-RequireSignature`の検証を確認する。本番の署名は最小限にし、対象は外部の一時ビルドだけにする。
 
