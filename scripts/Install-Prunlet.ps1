@@ -711,8 +711,9 @@ try {
 # 目的: GitHub Release・タグ・compare APIを使わず、R2（https://prunlet.kagayoi.com）の署名付きマニフェストだけを
 # 信頼の基点にする。固定の公開鍵で署名を検証し、payloadが指す配布物の名前・キー・長さ・SHA-256・版を確かめてから使う。
 # 1つでも外れたら例外にして、呼出し元は何も適用しない（fail-closed）。
-# この区間は integration/start-prunlet-mcp.ps1 と scripts/Install-Prunlet.ps1 に同じ本文で置く（配布物の12ファイル
-# 構成を変えないため共通ファイルにしない）。配信側の正本は scripts/PrunletRelease.Common.ps1 の
+# 導入時の検証はこのインストーラー内で完結させる（配布物の12ファイル構成を変えないため共通ファイルにしない）。
+# 起動時更新の launcher（integration/start-prunlet-mcp.ps1）は、検証を Rust の内部コマンド（__check-release-manifest 等）
+# に任せるので、この区間を持たない。配信側の正本は scripts/PrunletRelease.Common.ps1 の
 # Read-PrunletReleaseEnvelope で、ここはそれより厳しく、封筒・payloadとも正規形（キー順固定・compact・末尾改行なし）
 # へ再直列化したバイト列と完全一致することを求める。
 # 鍵整合の関門（scripts/Test-PrunletReleaseKeyGate.ps1）は、次の定数の行（識別子とbase64の文字列リテラルが同じ行）を
