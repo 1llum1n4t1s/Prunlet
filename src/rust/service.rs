@@ -85,7 +85,29 @@ impl Backend for Runtime {
                 .gate
                 .write()
                 .map_err(|_| anyhow::anyhow!("Execution gate is unavailable."))?;
-            crate::registry::execute(&self.config, command, args, progress)
+            let result = crate::registry::execute(&self.config, command, args, progress);
+            // 定期保守（maintain）では、更新・導入が残した自アプリの一時物も整理する。レジストリ保守の
+            // 共通ロックは上の呼び出しが返った時点で解放済みなので、Coreの削除がロックで詰まらない。
+            // 整理の失敗・拒否は結果へ記録するだけで、maintain本体の成否には影響させない。
+            #[cfg(windows)]
+            if command == "maintain" {
+                let apply = args.get("apply").and_then(Value::as_bool).unwrap_or(false);
+                let report = crate::housekeeping::run_for_config(&self.config, apply);
+                return match result {
+                    Ok(mut value) => {
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert("housekeeping".into(), report);
+                        }
+                        Ok(value)
+                    }
+                    // レジストリ側が未準備などで失敗しても整理は済ませ、元のエラーをそのまま返す。
+                    Err(error) => {
+                        let _ = writeln!(std::io::stderr().lock(), "housekeeping: {report}");
+                        Err(error)
+                    }
+                };
+            }
+            result
         }
     }
 }

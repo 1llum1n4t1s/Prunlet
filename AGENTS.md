@@ -10,7 +10,7 @@ Windowsのファイル・フォルダー・レジストリ削除は、配置済�
 
 ファイル結果のDTO・状態・dry-runの契約は[削除のデータフロー](DESIGN.md#削除と復元のデータフロー)を維持し、`failed`と`ambiguous`を非成功として返す。不明な削除を自動再送せず、元対象とWindowsゴミ箱を確認する。
 
-レジストリは[専用設計](DESIGN.md#レジストリの削除と復元)のstage・snapshot・永続化・commit順、完全security bytes照合、schema 5の作成時からの非公開ACL、曖昧状態の保全を維持する。非トランザクション削除へのfallbackを追加しない。`restore`（`registry-restore`の別名）・`operations`・`purge`・`maintain`はレジストリ専用で、MCPは5ツールを維持する。レジストリ記録は`backupDirectory/.registry-records-v1/{id}`へ置き、manifestの`MetadataRoot`は共通基点を保持する。
+レジストリは[専用設計](DESIGN.md#レジストリの削除と復元)のstage・snapshot・永続化・commit順、完全security bytes照合、schema 5の作成時からの非公開ACL、曖昧状態の保全を維持する。非トランザクション削除へのfallbackを追加しない。`restore`（`registry-restore`の別名）・`operations`・`purge`・`maintain`はレジストリ専用（`maintain`の末尾の自アプリ一時物の整理を除く）で、MCPは5ツールを維持する。レジストリ記録は`backupDirectory/.registry-records-v1/{id}`へ置き、manifestの`MetadataRoot`は共通基点を保持する。
 
 保護アクセスは削除・dry-run・復元ごとに`--access-mode backupRestore`（MCPは`accessMode`）を明示し、64bit OS・64bitプロセス・view 64の制約と要求別token隔離を維持する。権限不足から自動選択せず、ACL・Ownerを書き換えない。実効ユーザーのClasses別名の例外は[専用設計](DESIGN.md#レジストリの削除と復元)の検証・競合検出に限り、任意リンクの追跡へ広げない。Windows管理情報の参照整合の修復に汎用削除を流用しない。
 
@@ -20,7 +20,7 @@ native sessionはscopeの明示選択を必要とする。検証起動は固定�
 
 使用中の対象を待つ場合は、削除開始前にCLIの`delete-queue`またはMCPの`delete_files`の`action: "enqueue"`へ明示登録する。通常削除と同じshell・設定・権限境界を守り、拒否・失敗・不明結果の再試行先にしない。受付だけで完了とせず、`delete-queue-status <job-id>`またはMCPの`action: "status"`と`jobId`で最終結果を確認する。取消は`pending`の間だけで、結果不明なら元対象とWindowsゴミ箱を確認し、自動再送しない。設計は[明示的な削除待機キュー](DESIGN.md#明示的な削除待機キュー)を参照する。
 
-保持制御はレジストリschema 5専用で、既定7日・合計1 GiB、事前容量走査・整理前後再走査・共通ロック・単一超過時だけの予算を維持する。Windowsゴミ箱のファイルと未移行旧ファイルは容量・期限・purgeに含めず、ファイル削除・通常一覧・通常保守は旧ファイル操作ディレクトリを走査しない。手動整理はCLI明示適用のみで、MCPへpurgeを追加しない。
+保持制御はレジストリschema 5専用で、既定7日・合計1 GiB、事前容量走査・整理前後再走査・共通ロック・単一超過時だけの予算を維持する。Windowsゴミ箱のファイルと未移行旧ファイルは容量・期限・purgeに含めず、ファイル削除・通常一覧・通常保守は旧ファイル操作ディレクトリを走査しない。手動整理はCLI明示適用のみで、MCPへpurgeを追加しない。更新・導入が残した自分の一時物（旧`.prunlet-mcp-generations`・古い`.pending`・Backupsの`install-*`/`integration-*`）は`src/rust/housekeeping.rs`が`maintain`時にだけ整理する。名前・所有印の完全一致、リンク・`backupDirectory`の除外、Core削除への委譲、失敗は結果へ記録のみ、の境界を広げない（[設計](DESIGN.md#更新導入後の一時物の自動整理)）。
 
 旧ファイルの復元互換を維持せず、明示`migrate`で所有確認済みの旧退避root・操作記録をWindowsゴミ箱へ破棄する。旧schemaのparser・decode・内容hash・ACL snapshot・コピー・bundle・sidecar・復元helperは追加しない。専用StoreKey rootと小marker、中央の正規file marker、typed root layoutで所有を確認し、registry signals・共通基点・他config/privateBase・未知の非所有領域を保護する。ファイル別の恒久一覧を作らず、固定private空gate `.legacy-file-discard-in-progress` だけで中断の自動再送を止める。正規gateの明示ackは`migrate --apply --retry-legacy-discard`のみで、installerは指定しない。fileの未完了はregistry利用を塞がない。policy 2評価済みの`--apply --if-needed`は中央旧GUID再走査を省き、更新時のonline owned store固定位置・小marker確認だけを続ける。
 

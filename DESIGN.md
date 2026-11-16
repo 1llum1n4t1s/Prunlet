@@ -154,13 +154,23 @@ registryの旧記録は専用namespaceへ移し、ID・snapshot・完全ACL・sc
 
 保持制御はレジストリschema 5専用で、既定7日・合計1 GiBである。事前容量走査・整理前後の再走査・共通ロック・単一超過時だけの予算を維持する。Windowsゴミ箱のファイル実体と移行待ちの旧ファイルは容量・期限・purgeの対象に含めない。
 
-レジストリ削除前・明示`maintain`・非表示の定期保守でレジストリ復元データを整理する。ファイル削除はレジストリの容量保守や旧root走査を起動しない。`operations`とMCPの`list_operations`はレジストリ一覧、`purge`と`maintain`もレジストリ専用である。手動整理はCLIの明示適用だけとし、MCPへpurgeを追加しない。
+レジストリ削除前・明示`maintain`・非表示の定期保守でレジストリ復元データを整理する。ファイル削除はレジストリの容量保守や旧root走査を起動しない。`operations`とMCPの`list_operations`はレジストリ一覧、`purge`と`maintain`もレジストリ専用である（`maintain`は末尾で[自アプリの一時物の整理](#更新導入後の一時物の自動整理)も行うが、ファイルの復元データや容量には関与しない）。手動整理はCLIの明示適用だけとし、MCPへpurgeを追加しない。
 
 検証できないACL・snapshot・未確定commitは保全し、自動整理で捨てない。`maintain --audit-records`の完全監査と通常容量走査を区別する。旧ファイルの型別index・終了履歴・外部不在判定を、新しいファイル通常経路の管理機構として復活させない。
 
 レジストリの復元・purge完了後は、snapshotが消費済みで正式完了receiptがある記録から、残存memberのidentity・security bytes・長さ・hashを束縛する`<id>.terminal.json`を作る。完了時点から保持期間を過ぎた記録だけを整理し、先にterminalのhashに結び付けた`<id>.terminal-cleanup.json`を永続化する。途中でmanifestが消えても保存済みinventoryで残存memberを検証して再開し、未知memberや差替えは保全する。これらはレジストリ専用であり、ファイルの終了履歴を作る機構ではない。
 
 移行・terminal・terminal-cleanupの制御記録の公開は`registry::storage`が扱う。中断したpendingの再公開には、呼出元が同じ記録の証拠から本文を再構成し、既存prefixとの一致を検証する必要がある。pending本文だけを権威にせず、正式名との共存や不一致は保全する。この再構成方式はsnapshot・receiptの公開には一般化しない。
+
+### 更新・導入後の一時物の自動整理
+
+`src/rust/housekeeping.rs`（Windows）が、定期保守`maintain`（`--apply`で削除、無指定は`housekeeping.planned`に計画だけを返す）の末尾で、更新・導入が残した自アプリの一時物を整理する。レジストリの共通ロックを解放した後に実行し、削除は通常のファイル削除と同じCore（ゴミ箱経由・操作記録なし）へ渡す。独自の永久削除・退避は持たない。失敗・拒否・結果不明は`housekeeping.failures`へ記録するだけで再送せず、`maintain`の成否・終了コードに影響させない（レジストリ側が未準備で失敗した場合も整理は行い、元のエラーを返す）。1回の削除は64件までで、残りは次回へ回す。実行契機は毎日・ログオン時の保守タスクで、独自の状態ファイルは持たない。
+
+- `<configのフォルダー>\.prunlet-mcp-generations`: 旧設計（77c535bで追加、d121fd3で廃止）の世代キャッシュで、現行コードは作成も参照もしない。直下の所有印`.prunlet-mcp-owner.json`（product・purpose・schema・`installationRoot`がこの導入と一致）を照合でき、配下から動くプロセスがおらず（列挙できなければ使用中扱い）、中身の最終更新から24時間を過ぎている場合だけ対象にする。
+- `<configのフォルダー>\.prunlet-update-state.<32桁hex>.pending`: 状態が`idle`で読め、公開済みの状態より古く、30日を過ぎたものだけ。更新が途中の間や状態を確認できない間は、新しい状態の唯一の写しの可能性があるため残す。
+- `%LOCALAPPDATA%\Prunlet\Backups\install-<guid>`・`integration-<yyyyMMdd>-<HHmmss>`: 種別ごとに新しい方から3件と、30日以内のものを残す。中身の所有印も照合し、`install-*`は`backup-info.json`の`purpose`と`installDirectory`（この導入先と一致）、`integration-*`は直下が退避記録（`<32桁hex>.json`に`target`・`restore`・`retention`の定型文）と退避した写し（`*.<32桁hex>.bak`）だけであることを確かめる。別の導入先の退避、印のないもの、他のファイルを含むものは名前が合っても残す。configが管理済み導入のもの（`source-info.json`がある、または`%LOCALAPPDATA%\Prunlet`直下）と確認できる場合だけ扱い、検証用fixtureのconfigでは利用者のBackupsに触れない。`agent-instructions-*`など他の名前は対象外。
+
+どの対象も、名前の完全一致・通常のフォルダー/ファイル（reparse pointは除外）に限り、`backupDirectory`の祖先・配下と重なるものは除外する。更新のstage・slotと旧`previous`など更新が所有する固定cacheは対象にしない。
 
 ### 容量上限の一度だけの移行
 

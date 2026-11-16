@@ -5,6 +5,9 @@ pub mod cli;
 pub mod config;
 pub mod files;
 pub mod help;
+// 更新・導入後に残る自アプリの一時物の自動整理（`maintain`から呼ぶ）。レジストリ保守と同じくWindows専用。
+#[cfg(windows)]
+pub mod housekeeping;
 pub mod json;
 pub mod locale;
 pub mod migration;
