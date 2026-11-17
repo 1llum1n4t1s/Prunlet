@@ -58,7 +58,7 @@ runtimeは`win-x64`・`win-arm64`・`linux-x64`・`linux-arm64`・`osx-arm64`・
 
 `release/<版>`ブランチへのpush（`/vava`が`main`をpushしてから同じcommitで`release/<版>`をpushする）をきっかけに、`.github/workflows/prunlet-release-package.yml`が1つのjobで次を行う。jobは承認待ちなしで始まる（Environment `release`は承認者なし・ブランチ制限だけ）。
 
-1. `Assert-PrunletReleaseRef.ps1`がブランチ名と`Cargo.toml`の版、HEADとイベントのcommit、既定ブランチの祖先であることを確認し、鍵整合の関門を通す。
+1. `Assert-PrunletReleaseRef.ps1`がブランチ名と`Cargo.toml`の版、HEADとイベントのcommit、既定ブランチの祖先であることを確認し、鍵整合の関門を通す。続けて`scripts/Invoke-PrunletTests.ps1 -Mode Standard`（`cargo test --locked`）を実行し、失敗したら署名・R2配置へ進まない。起動時更新の検証用cfg（`prunlet_windows_update_tests`）のテストは、`main`のpushとPRで動く`.github/workflows/prunlet-tests.yml`の`update-cfg` jobが担う（配信jobでは動かさない）。
 2. win-x64・win-arm64を`Publish-Prunlet.ps1`でビルドし、製品の版を照合する。
 3. Sigiluneを導入し、`Sign-PrunletBuild.ps1`で両runtimeの実行ファイルを署名する。署名後のhashと署名者・署名前hashを`build-manifest.json`へ記録する。
 4. `Package-PrunletUpdate.ps1`で梱包し、`Verify-ReleasePackage.ps1 -RequireSignature`が同梱物・版・machine・metadata・hashと署名を検証する。
@@ -120,7 +120,7 @@ Linux版は、`release/<版>`ブランチへのpushで `.github/workflows/prunle
 1. `rust-toolchain.toml` が指定するRustで `cargo test --locked --lib` と `cargo test --locked --test localization` を実行する。
 2. `bash scripts/Publish-PrunletLinux.sh <新規の絶対出力先> <40桁SHA> <linux-x64|linux-arm64>` でビルドする。生成するtar.gzには `prunlet` と、版・コミット・対象・実行体サイズ・SHA-256を記録した `manifest.json` を収録する。スクリプトがELFのアーキテクチャと梱包内容を照合し、配布実物のチェックサムを `.tar.gz.sha256` へ保存する。
 3. 成果物から、tarの内容・manifest・上限・チェックサムを再確認し、実行体が要求するglibcのシンボル版が2.39以下であることを確認する。
-4. 配布tar.gzから取り出した実行体で `scripts/Verify-LinuxFiles.ts` を、版とコミットが異なる3世代のデバッグビルド（`prunlet_linux_update_tests`）で `scripts/Verify-UnixStartupUpdate.ts` を実行する。Windowsの起動時更新に相当する検証は配信workflowでは行わず、`all(windows, debug_assertions, prunlet_windows_update_tests)`の検証用ビルド（`RUSTFLAGS='--cfg prunlet_windows_update_tests -C debug-assertions=on'`で`Publish-Prunlet.ps1 -IncludeVerificationProbe`）を`Verify-LatestInstall.ps1`へ渡して手元で行う（[latestインストーラー](verification.md#latestインストーラー)）。
+4. 配布tar.gzから取り出した実行体で `scripts/Verify-LinuxFiles.ts` を、版とコミットが異なる3世代のデバッグビルド（`prunlet_linux_update_tests`）で `scripts/Verify-UnixStartupUpdate.ts` を実行する。Windowsの起動時更新に相当する実プロセスの検証（E2E）は配信workflowでは行わず（cfg付きの`cargo test --lib`だけは`prunlet-tests.yml`で行う）、`all(windows, debug_assertions, prunlet_windows_update_tests)`の検証用ビルド（`RUSTFLAGS='--cfg prunlet_windows_update_tests -C debug-assertions=on'`で`Publish-Prunlet.ps1 -IncludeVerificationProbe`）を`Verify-LatestInstall.ps1`へ渡して手元で行う（[latestインストーラー](verification.md#latestインストーラー)）。
 5. 検証済みのtar.gzとチェックサムをartifactへ保存する。
 
 publish job（Environment `release`。`release/*`の実行だけで動く）は、両CPUのbuildが成功した場合だけ、同じref検査と鍵整合の関門を通し、artifactの中身（ustar・2エントリ・manifest・上限・`.sha256`）を`scripts/Publish-PrunletLinuxR2.ps1`で独立に再検査する。`-CheckOnly`で既存の版マニフェストと最新ポインタを読取りだけで検査してから、tar.gz（新規作成）→公開URLでの照合→版マニフェスト（新規作成）→最新ポインタ→手動取得用の固定名（`download/latest/`。`.sha256`が最後）の順に置く。

@@ -1,0 +1,67 @@
+name: Prunlet tests
+
+# main への push とすべての PR で、Windows の Rust テストを動かす（配信 workflow にも同じ cargo test を入れてある）。
+# - unit: 通常の cargo test --locked（lib・bin・結合テスト）。
+# - update-cfg: 起動時更新の検証用 cfg（prunlet_windows_update_tests）付きの debug ビルドの cargo test --lib。
+#   この cfg でだけ有効になる fixture 入口・テスト鍵のテスト（src/rust/update/fixture.rs ほか）は、通常の
+#   cargo test では対象外のため、別 job にして更新経路のテストを CI で動かす。
+# どちらも自分で作る一意の fixture（ゴミ箱への移動を含む）とプロセス専用のレジストリだけを扱い、
+# ランナーの既存データには触れない（scripts/Invoke-PrunletTests.ps1）。
+# ここに含めない検証: scripts/Verify-*.ps1 の E2E（実プロセスのCLI・MCP・hook、レジストリ・UAC・導入・署名・R2）は、
+# 実行時間が長く特権・実機・外部サービスを要するものがあるため、Dependabot の PR と手動実行（dependency-validation.yml）、
+# または手元の検証（AGENTS.md「ビルドと検証」）で行う。この workflow はその代わりにならない。
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prunlet-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: cargo test (windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare Rust
+        # rust-toolchain.toml が指定する版を導入する（target 追加が導入の契機になる）。
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run the Rust tests
+        run: ./scripts/Invoke-PrunletTests.ps1 -Mode Standard
+
+  update-cfg:
+    name: cargo test (windows, update cfg)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare Rust
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run the update-path tests with the verification cfg
+        run: ./scripts/Invoke-PrunletTests.ps1 -Mode UpdateCfg

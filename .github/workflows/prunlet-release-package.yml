@@ -71,6 +71,12 @@ jobs:
         env:
           PRUNLET_RELEASE_SIGNING_KEY: ${{ secrets.PRUNLET_RELEASE_SIGNING_KEY }}
         run: ./scripts/Test-PrunletReleaseKeyGate.ps1
+      - name: Run the Rust tests
+        # 署名・ビルド成果物の配信より前に cargo test --locked を通す。失敗したらこのjobは以降のstep（署名・R2）へ進まない。
+        # 依存crateのbuild scriptとテストコードが動くため、このstepにも署名用・R2用のSecretsは渡さない。
+        # 起動時更新の検証用cfg（prunlet_windows_update_tests）のテストは、同じcommitがmainで通っている
+        # prunlet-tests.ymlのupdate-cfg jobで行い、配信の所要時間を伸ばさない。
+        run: ./scripts/Invoke-PrunletTests.ps1 -Mode Standard
       - name: Build the release commit
         # 依存crateのbuild scriptも動くため、このstepには署名用Secretsを渡さない。
         env:
