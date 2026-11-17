@@ -1,6 +1,6 @@
 //! Setup（Velopack）版が読み書きする場所の解決。
 //!
-//! # 置き場の契約（`D:\tmp\prunlet-velopack\design.md` のパス契約）
+//! # 置き場の契約（設計メモは削除済み。この契約が正本）
 //! - 状態（ロック・適用中マーカー・設定・ログ・導入記録）: `%LOCALAPPDATA%\Prunlet\state\`
 //! - フックの複製: `%LOCALAPPDATA%\Prunlet\hook\prunlet-hook.exe`
 //! - 新規利用者の config: `%LOCALAPPDATA%\Prunlet\config.json`

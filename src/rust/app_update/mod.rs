@@ -1,6 +1,6 @@
 //! Setup（Velopack）版の起動処理・確認と取得・適用・登録（Windows 専用。第1段）。
 //!
-//! 確定設計は `D:\tmp\prunlet-velopack\design.md`。Prunlet は削除ガードなので、参照実装（Scriptura・Plumivox）より
+//! 設計メモは削除済みで参照できない。契約は本ファイルと `paths.rs` を正とする。Prunlet は削除ガードなので、参照実装（Scriptura・Plumivox）より
 //! 厳しく、ロック・マーカー・hook を Velopack の root の外（`%LOCALAPPDATA%\Prunlet`）に置く。
 //!
 //! # 管理外のビルドでは何もしない

@@ -5,7 +5,7 @@
 # 見せないよう、ビルドとは別のstepでこのスクリプトだけへSIGILUNE_EMAIL・SIGILUNE_TOTP_URIを渡す。
 # 全runtimeを同じSigiluneセッションで署名し、ログイン（TOTP）を1回にする。
 #
-# 例: pwsh -NoProfile -File .\scripts\Sign-PrunletBuild.ps1 -BuildDirectory D:\tmp\build-win-x64, D:\tmp\build-win-arm64
+# 例: pwsh -NoProfile -File .\scripts\Sign-PrunletBuild.ps1 -BuildDirectory $env:TEMP\build-win-x64, $env:TEMP\build-win-arm64
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string[]]$BuildDirectory
