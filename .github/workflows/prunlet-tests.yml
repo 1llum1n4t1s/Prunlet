@@ -45,6 +45,12 @@ jobs:
           rustup target add x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run the Rust tests
+        # GitHub ランナーの既定 TEMP は 8.3 短縮名（例: RUNNER~1 を含むパス）を含み、Prunlet は祖先パスの短縮名を
+        # 「固定名が変わる」として拒否するため、テストの fixture が作れない。長い名前の runner.temp を TEMP/TMP にする。
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          RUST_BACKTRACE: '1'
         run: ./scripts/Invoke-PrunletTests.ps1 -Mode Standard
 
   update-cfg:
@@ -64,4 +70,10 @@ jobs:
           rustup target add x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run the update-path tests with the verification cfg
+        # GitHub ランナーの既定 TEMP は 8.3 短縮名（例: RUNNER~1 を含むパス）を含み、Prunlet は祖先パスの短縮名を
+        # 「固定名が変わる」として拒否するため、テストの fixture が作れない。長い名前の runner.temp を TEMP/TMP にする。
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          RUST_BACKTRACE: '1'
         run: ./scripts/Invoke-PrunletTests.ps1 -Mode UpdateCfg

@@ -76,6 +76,11 @@ jobs:
         # 依存crateのbuild scriptとテストコードが動くため、このstepにも署名用・R2用のSecretsは渡さない。
         # 起動時更新の検証用cfg（prunlet_windows_update_tests）のテストは、同じcommitがmainで通っている
         # prunlet-tests.ymlのupdate-cfg jobで行い、配信の所要時間を伸ばさない。
+        # GitHub ランナーの既定 TEMP は 8.3 短縮名（例: RUNNER~1 を含むパス）を含み、Prunlet は祖先パスの短縮名を
+        # 「固定名が変わる」として拒否するため、テストの fixture が作れない。長い名前の runner.temp を TEMP/TMP にする。
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: ./scripts/Invoke-PrunletTests.ps1 -Mode Standard
       - name: Build the release commit
         # 依存crateのbuild scriptも動くため、このstepには署名用Secretsを渡さない。

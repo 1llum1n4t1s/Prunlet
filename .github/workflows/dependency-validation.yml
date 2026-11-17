@@ -44,5 +44,15 @@ jobs:
           if (Test-Path -LiteralPath $report) {
             $verification = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
             $verification.results | Select-Object name, passed, skipped, note, error | ConvertTo-Json -Depth 4
+            # 失敗した case は、原因の切り分けに必要な stack と観測値（ACL の前後・失敗項目など）も出す。
+            # 観測値は大きくなり得るため、1 case あたり 8000 文字で切る。失敗の判定は変えない。
+            foreach ($failed in @($verification.results | Where-Object { $_.passed -eq $false })) {
+              $observed = if ($null -ne $failed.observed) { $failed.observed | ConvertTo-Json -Depth 8 -Compress } else { '' }
+              if ($observed.Length -gt 8000) { $observed = $observed.Substring(0, 8000) + '...(truncated)' }
+              Write-Host ("::group::failed case detail: " + $failed.name)
+              Write-Host ("stack: " + $failed.stack)
+              Write-Host ("observed: " + $observed)
+              Write-Host '::endgroup::'
+            }
           }
           if ($verificationExitCode -ne 0) { exit $verificationExitCode }
