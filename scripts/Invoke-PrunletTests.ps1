@@ -12,6 +12,8 @@ param(
 # - Cargo の出力先はリポジトリの外へ隔離する。TEMP/TMP は上書きしない（ランナー・開発機の既定の一時フォルダーを使う）。
 # - テストが扱うのは、自分で作った一意の fixture（ゴミ箱への移動を含む）と、プロセス専用のレジストリ
 #   ハイブ・自分の揮発キーだけ。ランナーの既存ファイル・ゴミ箱全体・永続的なレジストリは対象にしない。
+#   例外として、レジストリのリンクの検証テストは、E2Eスクリプトと共通の名前空間キー HKCU\Software\PrunletE2E
+#   （値を持たない非揮発の1キー。揮発で作るとE2Eの永続的な作成が失敗する）が無ければ作る。その下のfixtureは揮発キーだけ。
 # - 失敗は終了コードで返す。リトライ・skip・continue-on-error で隠さない。
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))

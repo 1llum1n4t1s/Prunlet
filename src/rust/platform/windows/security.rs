@@ -20,6 +20,33 @@ impl Drop for LocalAllocation {
         }
     }
 }
+/// 作成用のセキュリティ記述子。所有者だけを実効ユーザーに固定し、DACLは指定しない（親から継承させる）。
+/// 解放は`LocalAllocation`が行うため、`as_ptr`の値はこの値が生きている間だけ有効。
+pub struct OwnerOnlyDescriptor(LocalAllocation);
+impl OwnerOnlyDescriptor {
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.0.0
+    }
+}
+/// 所有者だけを実効ユーザーに明示した作成用の記述子（SDDL `O:{sid}`）を返す。
+/// 管理者トークンのプロセスは、所有者を指定せずに作ったファイルの所有者が既定でAdministratorsになる。
+/// 他の私的metadataと同じく実効ユーザーを所有者にするために使う。
+pub fn owner_only_descriptor() -> Result<OwnerOnlyDescriptor> {
+    let sddl = wide(std::ffi::OsStr::new(&format!("O:{}", current_user_sid()?)))?;
+    let mut descriptor = null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(OwnerOnlyDescriptor(LocalAllocation(descriptor)))
+}
 pub fn current_user_sid() -> Result<String> {
     let token = open_effective_token()?;
     user_sid(token.raw())

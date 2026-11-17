@@ -540,6 +540,7 @@ mod verification {
     }
     #[test]
     fn real_incomplete_link_is_not_an_absent_ordinary_target() -> Result<()> {
+        ensure_namespace_key()?;
         let owner = Target::new(
             "HKEY_CURRENT_USER\\Software\\PrunletE2E",
             "64",
@@ -591,6 +592,60 @@ mod verification {
             "Actual ordinary-open refusal: {error:#}; production traversal refusal: {traversal:#}"
         );
         Ok(())
+    }
+    /// E2Eスクリプト（Verify-RegistryRecovery.ps1）が使う名前空間キー`HKCU\Software\PrunletE2E`を、無ければ作る。
+    /// このテストの前提だが、ランナーにはE2Eスクリプトを動かさない限り存在しない。値を持たない名前空間キー
+    /// 1つだけを非揮発で作る（揮発で作ると、E2Eの永続的なCreateSubKeyがERROR_CHILD_MUST_BE_VOLATILEで失敗する）。
+    /// 既にあれば（E2E実行後の開発機など）そのまま使う。リンクは辿らず、リンクなら拒否する。
+    /// この下のfixtureは従来どおり揮発キーだけで、他の既存キーは変更しない。
+    fn ensure_namespace_key() -> Result<()> {
+        let target = Target::new(
+            "HKEY_CURRENT_USER\\Software\\PrunletE2E",
+            "64",
+            None,
+            "normal",
+        )?;
+        let software = traverse(None, &target, true, CREATE, false, false, false)?;
+        match open(
+            None,
+            Some(&software),
+            "PrunletE2E",
+            0xf003f | 0x100,
+            false,
+            true,
+            false,
+        ) {
+            Ok(key) => reject_link(&key),
+            Err(e) if missing(&e) => {
+                let mut raw = null_mut();
+                let mut disposition = 0;
+                check(
+                    unsafe {
+                        RegCreateKeyExW(
+                            software.0,
+                            wide("PrunletE2E")?.as_ptr(),
+                            0,
+                            null(),
+                            // REG_OPTION_OPEN_LINK: 競合で同名のリンクが現れても辿らない。
+                            0x8,
+                            0xf003f | 0x100,
+                            null(),
+                            &mut raw,
+                            &mut disposition,
+                        )
+                    },
+                    "Cannot create the PrunletE2E namespace key",
+                )?;
+                let key = Key(raw);
+                // 1（新規作成）と2（競合で先に作られていた）のどちらも許す。
+                ensure!(
+                    disposition == 1 || disposition == 2,
+                    "Unexpected registry disposition for the PrunletE2E namespace key"
+                );
+                reject_link(&key)
+            }
+            Err(e) => Err(e),
+        }
     }
     fn create(parent: &Key, name: &str, link: bool) -> Result<Arc<Key>> {
         let mut raw = null_mut();

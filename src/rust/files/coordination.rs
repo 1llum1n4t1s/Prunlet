@@ -15,7 +15,9 @@ use std::{
     sync::{Condvar, Mutex},
     time::{Duration, Instant},
 };
-use windows_sys::Win32::{Foundation::*, Storage::FileSystem::*, System::IO::OVERLAPPED};
+use windows_sys::Win32::{
+    Foundation::*, Security::SECURITY_ATTRIBUTES, Storage::FileSystem::*, System::IO::OVERLAPPED,
+};
 pub struct Coordination {
     _parents: DirectoryLease,
     _handle: Option<OwnedHandle>,
@@ -43,6 +45,19 @@ fn acquire_core(
     }
     let lock = root.join("maintenance.lock");
     let name = native::win32_path(&lock)?;
+    // 作成する場合（OPEN_ALWAYS）だけ、所有者を実効ユーザーに明示する。管理者トークンでは既定の所有者が
+    // Administratorsになり、他の私的metadataと食い違うため。DACLは親から継承させる。既存のロックを開く場合
+    // （OPEN_EXISTING）は記述子を渡さず、所有者も検査しない（既存のAdministrators所有のロックを拒否しない）。
+    let owner = if create {
+        Some(native::security::owner_only_descriptor()?)
+    } else {
+        None
+    };
+    let attributes = owner.as_ref().map(|descriptor| SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.as_ptr(),
+        bInheritHandle: 0,
+    });
     let started = Instant::now();
     let mut next_report = Duration::from_secs(1);
     let mut reported = false;
@@ -77,7 +92,7 @@ fn acquire_core(
                 } else {
                     0
                 },
-                null(),
+                attributes.as_ref().map_or(null(), |a| a as *const _),
                 if create { OPEN_ALWAYS } else { OPEN_EXISTING },
                 FILE_FLAG_OPEN_REPARSE_POINT,
                 null_mut(),
