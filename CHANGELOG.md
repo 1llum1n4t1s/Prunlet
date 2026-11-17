@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.51 - 2026-11-18
+
+- 動作の変更はない。依存crate（zip・uuid・zeroize・mio・cc・bumpalo）を更新した。また、管理者権限で動くCI環境でも`maintenance.lock`の所有者が実効ユーザーになるよう、作成時に所有者を明示するようにした（既存のロックの扱いは変えない）。
+
 ## 1.0.50 - 2026-11-16
 
 - 定期保守（`maintain --apply`）が、更新・導入のたびに残る自分の一時物を整理するようにした。対象は、旧設計の`.prunlet-mcp-generations`（所有印を照合でき、実行中のプロセスがない場合だけ）、公開済みの状態より古い`.prunlet-update-state.*.pending`（30日超）、`%LOCALAPPDATA%\Prunlet\Backups`の`install-*`・`integration-*`（種別ごとに新しい3件と30日以内は残す）。リンク・名前違い・`backupDirectory`と重なるものには触れず、削除は通常のファイル削除（ゴミ箱経由）で行い、失敗しても`maintain`の結果は変えず`housekeeping`へ記録する。`maintain --dry-run`は計画だけを返す。
