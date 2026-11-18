@@ -613,7 +613,7 @@ $cases += @(
     @{ name='quoted-search-powershell'; command="rg -n 'item|rmdir|tail' sample.txt"; shell='pwsh'; pass=$true; bashPass=$false }
 )
 # POSIX hookケース集（このスクリプトだけが読む）。期待値は`windowsPass ?? pass`で、Windowsでも`pass`を使う
-# （`windowsPass`を持つケースは現在1件だけで、残りは`pass`がそのままWindowsの期待値になる）。非Windowsの`pass`は`hook.rs`の単体テスト
+# （`windowsPass`を持つケースは現在1件だけで、残りは`pass`がそのままWindowsの期待値になる）。非Windowsの`pass`は`src/rust/protocol/hook/tests/posix_json.rs`の単体テスト
 # （`hook_posix_json_cases_hold_under_the_posix_rules_alone`）と`Verify-LinuxFiles.ts`がこのJSONを読んで検証し、このスクリプトはWindows上の実プロセスだけを担う。
 # 拒否期待のケースはJSONの`reason`（POSIX規則が出す検知理由と検知token）を拒否理由に含むことまで確認する。Windowsのhookは`shell`名`sh`を不明扱いにして
 # 候補解釈（CMD→PowerShell→POSIX）で検査するため、先頭規則が先に拒否するケースは`windowsOtherRule`で、`reason`の照合を省き（POSIX規則単独の確認は単体テストが担う）、
