@@ -35,11 +35,19 @@ jobs:
       - name: Run CLI MCP and hook E2E
         run: |
           $report = Join-Path $env:RUNNER_TEMP "prunlet-dependency-verification.json"
-          $runRoot = Join-Path $env:RUNNER_TEMP ("prunlet-e2e-" + [guid]::NewGuid().ToString("N"))
+          # 出力先は使い捨ての即時削除ボリューム、ゴミ箱往復の fixture は C: の長い名前のプロファイル配下（ゴミ箱有効）に分ける。
+          # RUNNER_TEMP 配下の fixture は CREATOR OWNER の継承で ACL の並びがゴミ箱往復後に変わるため使わない。
+          $immediate = & ./scripts/New-CIImmediateVolume.ps1
+          $runRoot = $immediate.OutputDirectory
+          $fixture = Join-Path $env:USERPROFILE 'Prunlet-CI-Fixture'
+          New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+          Write-Host ('immediate volume: ' + $immediate.VolumeGuid + ' NukeOnDelete=' + $immediate.NukeOnDelete + ' output=' + $runRoot)
+          Write-Host ('fixture root SDDL: ' + (Get-Acl -LiteralPath $fixture).Sddl)
+          Write-Host ('output volume root SDDL: ' + (Get-Acl -LiteralPath ([IO.Path]::GetPathRoot($runRoot))).Sddl)
           $build = Join-Path $env:RUNNER_TEMP 'prunlet-build'
           $manifest = Join-Path $build 'build-manifest.json'
           $manifestHash = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash
-          & ./scripts/Verify-RecordlessFiles.ps1 -ExecutablePath (Join-Path $build 'publish/prunlet.exe') -RustProbePath (Join-Path $build 'publish/prunlet-verification.exe') -BuildManifestPath $manifest -ExpectedBuildManifestSha256 $manifestHash -OutputDirectory $runRoot -ReportPath $report
+          & ./scripts/Verify-RecordlessFiles.ps1 -ExecutablePath (Join-Path $build 'publish/prunlet.exe') -RustProbePath (Join-Path $build 'publish/prunlet-verification.exe') -BuildManifestPath $manifest -ExpectedBuildManifestSha256 $manifestHash -FixtureRoot $fixture -OutputDirectory $runRoot -ReportPath $report
           $verificationExitCode = $LASTEXITCODE
           if (Test-Path -LiteralPath $report) {
             $verification = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
@@ -56,3 +64,5 @@ jobs:
             }
           }
           if ($verificationExitCode -ne 0) { exit $verificationExitCode }
+          if (!(Test-Path -LiteralPath $report -PathType Leaf)) { throw 'Required E2E report was not produced.' }
+          if ($verification.failed -ne 0 -or $verification.skipped -ne 0 -or $verification.executedCount -ne $verification.selectedExpectedCount) { throw 'E2E requires zero failures, zero skips and every selected case executed.' }

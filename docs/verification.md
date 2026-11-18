@@ -12,6 +12,8 @@ Windowsの`cargo test --locked --lib`では、`files::recordless`の`native_*`�
 
 通常のゴミ箱往復にはゴミ箱が有効なボリュームを指定する。即時削除設定のボリュームで`recycled`の期待値を永久削除へ緩和しない。Recordlessの即時削除とボリューム不一致の専用ケースは、`-FixtureRoot`の指定にかかわらず出力先（`-OutputDirectory`）のボリュームで実行する。巨大ファイルの並行検証は実Shell通知2回を要求し、Coreの既知baseline通知は対象境界を検証して区別する。
 
+CI（`dependency-validation.yml`）は、`scripts/New-CIImmediateVolume.ps1`で作る使い捨てのVHDXボリューム（そのボリュームだけに即時削除設定を付ける）を`-OutputDirectory`に、Cドライブのプロファイル配下の長い名前のディレクトリを`-FixtureRoot`に渡す。runnerの一時領域配下のfixtureはCREATOR OWNER由来のACEが明示ACEになり、ゴミ箱往復後にACLの並びが変わる。合格は失敗0件・skip 0件・選択した全ケースの実行を要求する。
+
 即時削除設定のボリューム（Dドライブなど）を`-OutputDirectory`に使った場合の挙動はスクリプトごとに異なる。いずれも`-FixtureRoot`を持たず、fixtureを出力先へ置く。`Verify-MaintenanceTask.ps1`・`Verify-MaintenancePerformance.ps1`は`recycled`を厳密に要求し（後者は退避先が`$Recycle.Bin`配下であることも検査する）、ゴミ箱が有効なボリュームの`-OutputDirectory`が必要である。即時削除ボリュームでは事前検査ではなく該当assertionの失敗になる。`Verify-ConcurrentDeletion.ps1`はclaim・待機の境界を検証し、`recycled`と`permanently_deleted`の両方を受理するため、ゴミ箱往復は主張しない。`Verify-DeferredDeleteQueue.ps1`は一部ケースが`permanently_deleted`も受理し、ディレクトリの往復ケースは`permanently_deleted`だと合格にせず未検証（`unverifiedCases`）として記録する。
 
 `Verify-LargeOperations.ps1`の既定経路は、現行の`Verify-RecordlessFiles.ps1`の大規模ケースだけを呼ぶ。`-FixtureRoot`でゴミ箱が有効な検証先を渡せる。現行の`-FileCount`は32,769〜65,535件で、通常の全件検証とは区別する。`-ProcessTimeoutSeconds`は従来と同じく既定1,800秒・委譲時の上限3,600秒で、削除CLIの待機へ引き継ぐ。`-LegacyCopyVerification`は廃止され、指定すると拒否する。真正な旧版exeを使う検証は`Verify-FileRecordMigration.ps1`の明示移行に限定する。
