@@ -736,7 +736,18 @@ impl Inspector {
         } else {
             vec![Mode::Posix]
         };
+        // shell不明のWindowsでは、POSIX規則がdataと確定したヒアドキュメント本文をCMD・PowerShell規則の
+        // 文として検査しない（本文の`rm`・`del`等の行を削除命令と誤判定するため）。
+        let without_data_heredocs = if mode.is_none() && cfg!(windows) {
+            posix_data_heredocs_removed(script)
+        } else {
+            None
+        };
         for m in modes {
+            let script = match (&without_data_heredocs, m) {
+                (Some(stripped), Mode::Cmd | Mode::PowerShell) => stripped.as_str(),
+                _ => script,
+            };
             let previous = self.mode;
             let previous_semicolon = self.cmd_semicolon;
             let previous_explicit = self.explicit;
@@ -2066,7 +2077,7 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
                 (word, 1)
             };
             let target_text = if operator.is_empty() { target.text.as_str() } else { operator };
-            if target.dynamic || target.boundary || target_text.is_empty() {
+            if target.boundary || !data_sink_path(target, target_text) {
                 return Ok(false);
             }
             if &text[..digits] != "2" {
@@ -2097,9 +2108,78 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
     let static_option = |w: &&Token| !w.quoted && !w.dynamic && w.text.starts_with('-');
     Ok(match leaf(&first.text).as_str() {
         "cat" => command.len() == 1 && stdout_to_file,
+        "tee" => tee_writes_only_files(&command[1..]),
         "python" | "python3" | "py" | "node" => command[1..].iter().all(static_option),
         _ => false,
     })
+}
+/// `tee [-a] <path>...`が、静的なオプションと1つ以上の書き出し先だけを取る形か。
+/// 書き出し先の条件は`cat >`の出力先と同じ（`data_sink_path`）。
+fn tee_writes_only_files(args: &[&Token]) -> bool {
+    let mut options_done = false;
+    let mut paths = 0;
+    for word in args {
+        let text = word.text.as_str();
+        if !options_done && !word.quoted && !word.dynamic && text.starts_with('-') {
+            match text {
+                "--" => options_done = true,
+                "-a" | "-i" | "-p" | "--append" | "--ignore-interrupts" => {}
+                _ => return false,
+            }
+            continue;
+        }
+        let lower = text.to_ascii_lowercase();
+        if word.boundary
+            || text.is_empty()
+            || lower.starts_with("/dev/")
+            || lower.starts_with("/proc/")
+            || !data_sink_path(word, text)
+        {
+            return false;
+        }
+        paths += 1;
+    }
+    paths > 0
+}
+/// データの書き出し先として扱える語か。静的な語はそのまま、動的な語は単純な変数展開
+/// （`$NAME`・`${NAME}`）と静的な文字の連結だけを認める。コマンド置換・逆引用符・算術展開・
+/// 位置/特殊パラメータ・修飾付き展開・グロブを含む語は、実行や対象が静的に確定しないため認めない。
+fn data_sink_path(word: &Token, text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    if word.backticks > 0 || word.subexpression {
+        return false;
+    }
+    if !word.dynamic {
+        return true;
+    }
+    if text.contains(['*', '?', '[', '`']) {
+        return false;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            i += 1;
+            continue;
+        }
+        let braced = chars.get(i + 1) == Some(&'{');
+        let mut j = i + if braced { 2 } else { 1 };
+        let name_start = j;
+        while j < chars.len()
+            && (chars[j] == '_'
+                || chars[j].is_ascii_alphabetic()
+                || (j > name_start && chars[j].is_ascii_digit()))
+        {
+            j += 1;
+        }
+        if j == name_start || (braced && chars.get(j) != Some(&'}')) {
+            return false;
+        }
+        i = if braced { j + 1 } else { j };
+    }
+    true
 }
 /// PowerShell strict検査で、`s[i]`の単独の`.`がdot-sourcingではなく、前のコマンドへ渡す
 /// 引数（カレントディレクトリ）かを判定する。`rg -n x .`・`Get-ChildItem -Path .`・
@@ -2146,7 +2226,62 @@ fn powershell_dot_argument(s: &[char], i: usize, out: &[Token]) -> bool {
     }
     true
 }
+/// `s[start..]`が`NAME}`（識別子だけ）で始まるとき、`}`の位置を返す。
+fn braced_name_end(s: &[char], start: usize) -> Option<usize> {
+    let mut j = start;
+    while j < s.len()
+        && (s[j] == '_' || s[j].is_ascii_alphabetic() || (j > start && s[j].is_ascii_digit()))
+    {
+        j += 1;
+    }
+    (j > start && s.get(j) == Some(&'}')).then_some(j)
+}
+/// shell不明のWindows検査で、POSIX規則がデータと確定した引用付きヒアドキュメント本文を取り除いた文字列。
+///
+/// ClaudeのBash toolはGit Bashで実行されるが、Codexのexec_commandも同じ`Bash`名でshellを渡さず、
+/// PowerShell・CMDで実行される。tool名だけではPOSIX実行と確定できないため、CMD・PowerShell規則は
+/// 全文を検査し続け、POSIX規則が`cat >`・`tee`・インタプリタのdataとして読み飛ばした本文だけを除く
+/// （PowerShellは`<`のリダイレクトを構文エラーにし、`cmd /c`は最初の改行以降を実行しないため、
+/// 本文は他のshellでも実行されない）。取り除くのは、そこまでの文章の引用が両規則でそろっている
+/// ことが明らかな範囲だけで、判断できなければ元の文字列を使う。
+fn posix_data_heredocs_removed(script: &str) -> Option<String> {
+    let mut ranges = Vec::new();
+    tokens_collecting(script, Mode::Posix, false, &mut ranges).ok()?;
+    if ranges.is_empty() {
+        return None;
+    }
+    let s: Vec<char> = script.chars().collect();
+    let mut out = String::new();
+    let mut position = 0;
+    for (start, end) in ranges {
+        out.extend(&s[position..start]);
+        // 本文より前に、規則ごとに引用の読み方が分かれうる文字がある場合は、以降を取り除かない。
+        let neutral = out.matches('"').count().is_multiple_of(2)
+            && out.matches('\'').count().is_multiple_of(2)
+            && !out.contains(['`', '^'])
+            && !out.contains("@'")
+            && !out.contains("@\"")
+            && !out.contains("<#");
+        if !neutral {
+            out.extend(&s[start..]);
+            return Some(out);
+        }
+        position = end;
+    }
+    out.extend(&s[position..]);
+    Some(out)
+}
 fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
+    tokens_collecting(script, mode, strict, &mut Vec::new())
+}
+/// `tokens`と同じ字句解析で、POSIX規則が読み飛ばしたヒアドキュメント本文の文字範囲
+/// （`script`の文字位置、本文の先頭と末尾の次）も`skipped`へ追加する。
+fn tokens_collecting(
+    script: &str,
+    mode: Mode,
+    strict: bool,
+    skipped: &mut Vec<(usize, usize)>,
+) -> Result<Vec<Token>> {
     let s: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
     let mut t = Token::new("");
@@ -2415,6 +2550,20 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             }
             c = '\n';
         }
+        // 引用外の`${NAME}`（`NAME`は識別子だけ）は、`{`・`}`で語を割らず1つの動的な語にする。
+        // それ以外の`${`は従来どおり（`{`が境界になる）。
+        if mode == Mode::Posix
+            && c == '$'
+            && s.get(i + 1) == Some(&'{')
+            && let Some(end) = braced_name_end(&s, i + 2)
+        {
+            for &ch in &s[i..=end] {
+                t.bare_chars += 1;
+                append(&mut t, ch, &mut previous_equal);
+            }
+            i = end + 1;
+            continue;
+        }
         let is_boundary = matches!(c, ';' | '|' | '&' | '\r' | '\n' | '(' | ')' | '{' | '}');
         if c.is_whitespace() || is_boundary {
             flush(&mut t, &mut out);
@@ -2425,6 +2574,7 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
                 heredocs.clear();
                 heredoc_boundary_after = false;
                 if let Some(next) = skip {
+                    skipped.push((i + 1, next));
                     boundary(&mut out);
                     statement_start = out.len();
                     i = next;
@@ -3689,7 +3839,6 @@ mod tests {
             "{ cat > /tmp/f <<'EOF'\nrm -rf /tmp/y\nEOF\n} | sh",
             "cat > /dev/stdout <<'EOF'\nrm -rf /tmp/y\nEOF",
             "cat > /proc/self/fd/1 <<'EOF'\nrm -rf /tmp/y\nEOF",
-            "cat > \"$out\" <<'EOF'\nrm -rf /tmp/y\nEOF",
             "cat <<'EOF'\nrm -rf /tmp/y\nEOF",
             "bash <<'EOF'\nrm -rf /tmp/y\nEOF",
             "sh -s <<'EOF'\nrm -rf /tmp/y\nEOF",
@@ -3709,6 +3858,142 @@ mod tests {
             "cat > f <<<'EOF'\nrm -rf /tmp/y\nEOF",
         ] {
             assert!(posix_denied(denied), "{denied:?}");
+        }
+    }
+
+    const JS_BODY: &str = "for (const f of files) {\n  if (f) { rm(f) }\n}\nrm -rf /tmp/y\ndel x\nri y";
+
+    /// 出力先が単純な変数展開（`$VAR`・`${VAR}`と静的な文字の連結）の`cat >`・`tee`は、本文をdataとして読む。
+    /// 出力先がコード実行や不定な対象を含む形、パイプ・同じ行の後続文がある形は従来どおり本文を文として検査する。
+    #[test]
+    fn heredoc_data_sinks_accept_simple_variable_targets_and_tee() {
+        for head in [
+            "cat > \"$TEMP/x/y.ts\" <<'EOF'",
+            "cat > $TEMP/x/y.ts <<'EOF'",
+            "cat > ${TEMP}/x/y.ts <<'EOF'",
+            "cat >> \"${TEMP}/x_$NAME.ts\" <<'EOF'",
+            "cat > \"$A\"\"$B\" <<'EOF'",
+            "tee \"$TEMP/x\" <<'EOF'",
+            "tee -a \"$TEMP/x\" /tmp/y <<'EOF'",
+            "tee -- ${OUT} <<'EOF'",
+            "tee /tmp/x <<'EOF'",
+        ] {
+            let command = format!("{head}\n{JS_BODY}\nEOF\necho done");
+            assert!(!posix_denied(&command), "{command:?}");
+        }
+        for head in [
+            "cat > \"$(echo x)\" <<'EOF'",
+            "cat > $(echo x) <<'EOF'",
+            "cat > `echo x` <<'EOF'",
+            "cat > \"`echo x`\" <<'EOF'",
+            "cat > \"$((1+1))\" <<'EOF'",
+            "cat > \"${x:-/tmp/y}\" <<'EOF'",
+            "cat > \"${!x}\" <<'EOF'",
+            "cat > \"$1\" <<'EOF'",
+            "cat > \"$@\" <<'EOF'",
+            "cat > /tmp/*.x <<'EOF'",
+            "cat > \"$TEMP\"/*.x <<'EOF'",
+            "cat > >(sh) <<'EOF'",
+            "cat > /dev/$x <<'EOF'",
+            "cat > /dev/stdout <<'EOF'",
+            "cat > $'\\x2fdev/x' <<'EOF'",
+            "tee >(sh) <<'EOF'",
+            "tee \"$(echo x)\" <<'EOF'",
+            "tee `echo x` <<'EOF'",
+            "tee /dev/stdout <<'EOF'",
+            "tee /proc/self/fd/1 <<'EOF'",
+            "tee /tmp/x >/dev/null <<'EOF'",
+            "tee <<'EOF'",
+            "tee -z x <<'EOF'",
+            "tee x | sh <<'EOF'",
+            "tee x && sh x <<'EOF'",
+            "tee x y z; sh <<'EOF'",
+            "tee x | cat | sh <<'EOF'",
+        ] {
+            let command = format!("{head}\nrm -rf /tmp/y\nEOF");
+            assert!(posix_denied(&command), "{command:?}");
+        }
+        // 本文の外の削除、引用なしの終端語、shellが読む形は拒否する。
+        for command in [
+            "cat > \"$TEMP/x\" <<'EOF'\nx\nEOF\nrm -rf /tmp/y",
+            "tee \"$TEMP/x\" <<'EOF'\nx\nEOF\nrm -rf /tmp/y",
+            "cat > \"$TEMP/x\" <<EOF\nrm -rf /tmp/y\nEOF",
+            "tee \"$TEMP/x\" <<EOF\nrm -rf /tmp/y\nEOF",
+            "tee \"$TEMP/x\" <<'EOF' | sh\nrm -rf /tmp/y\nEOF",
+            "tee \"$TEMP/x\" <<'EOF'; sh x\nrm -rf /tmp/y\nEOF",
+            "bash <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "sh -s <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "ssh host <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "$X <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "${X} <<'EOF'\nrm -rf /tmp/y\nEOF",
+        ] {
+            assert!(posix_denied(command), "{command:?}");
+        }
+    }
+
+    /// shell不明（Claude Codeの`Bash`・Codexの`exec_command`）のWindows検査では、POSIX規則がdataと確定した
+    /// ヒアドキュメント本文をCMD・PowerShell規則の文として拾わない。本文の外や、dataと確定しない形の削除は拒否する。
+    /// `Bash`をPOSIXと決めない理由はDESIGN.mdの「hookのshell選択」を参照する。
+    #[test]
+    fn unknown_shell_inspection_skips_posix_confirmed_heredoc_data() {
+        if !cfg!(windows) {
+            return;
+        }
+        for head in [
+            "cat > \"$TEMP/x/y.ts\" <<'EOF'",
+            "cat > ${TEMP}/x/y.ts <<'EOF'",
+            "tee -a \"$TEMP/x\" <<'EOF'",
+            "cat > /tmp/x.js <<'EOF'",
+            "python - <<'EOF'",
+        ] {
+            let command = format!("{head}\n{JS_BODY}\nEOF\necho done");
+            assert_eq!(reason(&command, "Bash", None), None, "{command:?}");
+            // 本文を取り除くのはshell不明のときだけで、明示したCMD・PowerShellは全文を検査する。
+            assert!(reason(&command, "exec_command", Some("cmd.exe")).is_some(), "{command:?}");
+            assert!(reason(&command, "exec_command", Some("pwsh")).is_some(), "{command:?}");
+        }
+        for command in [
+            "cat > \"$TEMP/x\" <<'EOF'\nx\nEOF\nrm -rf /tmp/y",
+            "cat > \"$TEMP/x\" <<'EOF'\nx\nEOF\ndel x",
+            "cat > \"$TEMP/x\" <<'EOF'\nx\nEOF\nRemove-Item x",
+            "cat > \"$(echo x)\" <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "cat > `echo x` <<'EOF'\ndel x\nEOF",
+            "tee >(sh) <<'EOF'\ndel x\nEOF",
+            "tee x | sh <<'EOF'\ndel x\nEOF",
+            "cat > x <<EOF\ndel x\nEOF",
+            "bash <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "sh -s <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "ssh host <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "rm -rf x",
+            "del x",
+            // 本文より前の引用が規則ごとに読み分かれうる形は、本文を取り除かず全文を検査する。
+            "echo 'a\ncat > x <<'EOF'\ndel x\nEOF",
+            "echo @'\ncat > x <<'EOF'\ndel x\nEOF",
+            "echo ^\ncat > x <<'EOF'\ndel x\nEOF",
+            // 内側のshellの呼び出し（POSIX規則でも対応する規則で再帰検査する）。
+            "cmd //c del x",
+            "cmd /c del x",
+            "cmd.exe /c rd /s /q x",
+            "powershell -c Remove-Item x",
+            "pwsh -c Remove-Item x",
+            "pwsh -Command \"Remove-Item x\"",
+        ] {
+            assert!(reason(command, "Bash", None).is_some(), "{command:?}");
+        }
+        let encoded = encoded_command("Remove-Item x");
+        assert!(reason(&encoded, "Bash", None).is_some());
+        // POSIX規則だけでも、cmd・powershell・pwshの呼び出しは本文を対応する規則で検査して拒否する。
+        for command in [
+            "cmd //c del x",
+            "cmd /c del x",
+            "cmd.exe /c rd /s /q x",
+            "powershell -c Remove-Item x",
+            "pwsh -c Remove-Item x",
+            "pwsh -Command \"Remove-Item x\"",
+            "pwsh -NoProfile -EncodedCommand AAAA",
+            encoded.as_str(),
+        ] {
+            assert!(posix_denied(command), "{command:?}");
         }
     }
 

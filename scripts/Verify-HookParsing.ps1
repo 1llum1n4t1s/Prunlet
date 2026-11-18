@@ -482,7 +482,18 @@ $cases += @(
     @{ name='posix-heredoc-file-sink-body'; command="cat > /d/example/loop.sh <<'EOF'`nwhile true; do echo x; done`nEOF"; pass=$true },
     @{ name='posix-heredoc-delete-after-body'; command="cat > /d/example/a.txt <<'EOF'`nx`nEOF`nrm -f `"<FILE>`""; pass=$false },
     @{ name='posix-heredoc-piped-to-shell'; command="cat <<'EOF' | sh`nrm -f `"<FILE>`"`nEOF"; pass=$false },
-    @{ name='posix-loop-assignment-and-test'; command='for f in a b; do n=$(basename $f); if [ -f "$f" ]; then echo $n; fi; done 2>&1'; pass=$true }
+    @{ name='posix-loop-assignment-and-test'; command='for f in a b; do n=$(basename $f); if [ -f "$f" ]; then echo $n; fi; done 2>&1'; pass=$true },
+    # 出力先が単純な変数展開のcat・teeも本文をdataとして読み、shell不明でもCMD・PowerShell規則が本文の行を文として拾わない。
+    @{ name='posix-heredoc-variable-target-body'; command=('cat > "$TEMP/x/y.ts" <<''EOF''|for (const f of files) {|  if (f) { rm(f) }|}|rm -f x|del x|ri y|EOF').Replace('|', "`n"); pass=$true },
+    @{ name='posix-heredoc-braced-variable-target-body'; command=('cat > ${TEMP}/x/y.ts <<''EOF''|for (const f of files) {|rm -f x|del x|EOF').Replace('|', "`n"); pass=$true },
+    @{ name='posix-heredoc-tee-body'; command=('tee -a "$TEMP/x/y.ts" <<''EOF''|for (const f of files) {|rm -f x|del x|EOF').Replace('|', "`n"); pass=$true },
+    @{ name='posix-heredoc-command-substitution-target'; command=('cat > "$(echo x)" <<''EOF''|rm -f "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
+    @{ name='posix-heredoc-process-substitution-tee'; command=('tee >(sh) <<''EOF''|rm -f "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
+    @{ name='posix-heredoc-tee-piped-to-shell'; command=('tee "$TEMP/x" <<''EOF'' | sh' + "`n" + 'rm -f "<FILE>"' + "`n" + 'EOF'); pass=$false },
+    @{ name='posix-heredoc-unquoted-delimiter-body'; command=('cat > "$TEMP/x" <<EOF|del "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
+    @{ name='posix-heredoc-bash-body'; command=('bash <<''EOF''|rm -f "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
+    @{ name='posix-heredoc-delete-after-variable-target-body'; command=('cat > "$TEMP/x" <<''EOF''|x|EOF|rm -f "<FILE>"').Replace('|', "`n"); pass=$false },
+    @{ name='posix-cmd-wrapper-delete'; command='cmd //c del "<FILE>"'; pass=$false }
 )
 
 $results = [Collections.Generic.List[object]]::new()
