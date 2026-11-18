@@ -511,6 +511,17 @@ $cases += @(
     @{ name='leading-redirect-close-stdin-unlink'; command='<&- unlink "<FILE>"'; pass=$false },
     @{ name='leading-redirect-harmless'; command='2>/dev/null ls /tmp'; pass=$true },
     @{ name='leading-redirect-echo'; command='>/tmp/z echo hi'; pass=$true },
+    # `&`と数字・`-`の間の空白、`&-`に直結した名前も、リダイレクトの後の実行名として検査する。
+    @{ name='leading-redirect-dup-space-unlink'; command='2>& 1 unlink "<FILE>"'; pass=$false },
+    @{ name='leading-redirect-dup-space-rm'; command='>& 1 rm -f "<FILE>"'; pass=$false },
+    @{ name='leading-redirect-close-space-rm'; command='>& - rm -f "<FILE>"'; pass=$false },
+    @{ name='leading-redirect-close-attached-unlink'; command='2>&-unlink "<FILE>"'; pass=$false },
+    @{ name='leading-redirect-close-attached-rm'; command='>&-rm -f "<FILE>"'; pass=$false },
+    @{ name='leading-redirect-close-stdin-attached-unlink'; command='<&-unlink "<FILE>"'; pass=$false },
+    @{ name='cmd-dup-space-del'; command='2>& 1 del "<FILE>"'; pass=$false },
+    @{ name='redirect-dup-harmless'; command='ls 2>&1'; pass=$true },
+    @{ name='redirect-dup-stderr-echo'; command='echo hi >&2'; pass=$true },
+    @{ name='redirect-dup-leading-echo'; command='2>&1 echo ok'; pass=$true },
     # CMD規則で`>&`の後に名前が続く形は、`&`で文を割って`del`を検査する。
     @{ name='cmd-redirect-amp-name-del'; command='echo a >&del "<FILE>"'; pass=$false },
     @{ name='cmd-redirect-amp-quoted-del'; command='>&"del" "<FILE>"'; pass=$false },

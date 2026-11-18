@@ -826,7 +826,7 @@ impl Inspector {
         }
         // 先頭のリダイレクト（`2>/dev/null rm x`・`>out rm x`）は実行名ではない。対象語まで読み飛ばし、
         // 次の語を実行名として検査する（飛ばさないと、リダイレクトの語が実行名になり削除名が隠れる）。
-        let redirects = leading_redirect_words(w);
+        let redirects = leading_redirect_words(w, self.mode == Some(Mode::PowerShell));
         if redirects > 0 {
             return if redirects >= w.len() {
                 Ok(false)
@@ -2206,13 +2206,16 @@ fn powershell_dot_argument(s: &[char], i: usize, out: &[Token]) -> bool {
     true
 }
 /// 文頭に並ぶリダイレクト（演算子と対象）が占める語数。`>f`・`2>&1`は1語、`>`・`<`・`2>`・`<<`は対象の次の語まで2語。
-/// 先頭が引用で始まる語（`">"`）はリダイレクトではない。
-fn leading_redirect_words(words: &[Token]) -> usize {
+/// 先頭が引用で始まる語（`">"`）と、PowerShell規則のブロックコメント開始`<#`はリダイレクトではない。
+fn leading_redirect_words(words: &[Token], powershell: bool) -> usize {
     let mut k = 0;
     while let Some(word) = words.get(k) {
         let text = word.text.as_str();
         let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-        if word.quote_start == Some(0) || !text[digits..].starts_with(['<', '>']) {
+        if word.quote_start == Some(0)
+            || !text[digits..].starts_with(['<', '>'])
+            || (powershell && text.starts_with("<#"))
+        {
             break;
         }
         let operator = &text[digits..];
@@ -2498,20 +2501,33 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
         }
         // fdの複製・閉じ（`2>&1`・`>&2`・`<&0`・`>&-`）の`&`は文の区切りではなく、リダイレクト演算子の一部。
         // 語を割ると、後ろの`1 rm x`が別の文になり、リダイレクトの後の実行名を検査できない。
-        // 直後が数字か`-`のときだけ結合する。`>&del x`・`>&"del" x`は従来どおり`&`で文を割り、`del x`を検査する。
+        // 直後（空白を除く）が数字か`-`のときだけ結合する。`>&del x`・`>&"del" x`・`>& del x`は従来どおり`&`で文を割り、`del x`を検査する。
+        // `&`と数字・`-`の間の空白（`2>& 1`）も飛ばして結合する（bashもcmdも`2>&1`と同じ複製として読む）。
+        // `>& del x`は名前が続くので結合しない。
         if matches!(mode, Mode::Posix | Mode::Cmd)
             && c == '&'
-            && s.get(i + 1).is_some_and(|d| d.is_ascii_digit() || *d == '-')
             && t.quote_start.is_none()
             && (t.text.ends_with('>') || t.text.ends_with('<'))
             && t.text
                 .trim_end_matches(['<', '>'])
                 .chars()
                 .all(|d| d.is_ascii_digit())
+            && let Some(offset) = s[i + 1..].iter().position(|d| !matches!(d, ' ' | '\t'))
+            && (s[i + 1 + offset].is_ascii_digit() || s[i + 1 + offset] == '-')
         {
+            let next = s[i + 1 + offset];
             t.bare_chars += 1;
             append(&mut t, c, &mut previous_equal);
-            i += 1;
+            if next == '-' && mode == Mode::Posix {
+                // POSIX規則では`&-`（fdを閉じる）で演算子が完結し、直結した語（`>&-rm x`）は別の語。
+                t.bare_chars += 1;
+                append(&mut t, next, &mut previous_equal);
+                flush(&mut t, &mut out);
+                previous_equal = false;
+                i += offset + 2;
+            } else {
+                i += 1 + offset;
+            }
             continue;
         }
         let is_boundary = matches!(c, ';' | '|' | '&' | '\r' | '\n' | '(' | ')' | '{' | '}');
@@ -3883,7 +3899,7 @@ mod tests {
             let command = format!("{head}\nrm -rf /tmp/y\nEOF");
             assert!(posix_denied(&command), "{command:?}");
         }
-        // 本文の外の削除、引用なしの終端語、shellが読む形、動的な出力先と制御構文・入れ子の組み合わせは拒否する。
+        // 本文の外の削除、引用なしの終端語、shellが読む形、動的な出力先（制御構文・`{`・`$(…)`・`bash -c`の中でも）は拒否する。
         for command in [
             "tee /d/x >/dev/null <<'EOF'\nx\nEOF\nrm -rf /tmp/y",
             "tee /d/x >/dev/null <<EOF\nrm -rf /tmp/y\nEOF",
@@ -3904,7 +3920,9 @@ mod tests {
             "if true; then ${X}rm -rf /tmp/y; fi",
             ">\"f\" ${X}unlink /tmp/y",
             ">\"f\" ${X} unlink /tmp/y",
-            // 動的な出力先は制御構文の内側でも、閉じ数えを誤らせる形でも、入れ子の本文でも読み飛ばさない。
+            // 出力先が動的な語（変数）の`cat`・`tee`は、周りに制御構文・`{`・`(`・入れ子があるかを問わず読み飛ばさない。
+            "cat >& 2 <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "cat >& 1 <<'EOF'\nrm -rf /tmp/y\nEOF",
             "while true\ndo\ntee /tmp/x <<'EOF'\nrm -rf /tmp/y\nEOF\nbreak\ndone | sh",
             "if true\nthen\ntee /tmp/x <<'EOF'\nrm -rf /tmp/y\nEOF\nfi | bash",
             "X=/dev/stdout\nwhile true\ndo\ncat > \"$X\" <<'EOF'\nrm -rf /tmp/y\nEOF\nbreak\ndone | sh",
@@ -3921,6 +3939,8 @@ mod tests {
         }
         // 静的な出力先は、制御構文の内側・閉じた後でも従来どおり読み飛ばす（標準出力が他へ流れない）。
         for command in [
+            "x=\"$(python - <<'EOF'\nfor i in range(3):\n    print(i)\nEOF\n)\"",
+            "x=\"$(cat > /tmp/f <<'EOF'\nfor (const f of files) {\n}\nEOF\n)\"",
             "for i in 1; do echo; done\ncat > f <<'EOF'\nrm -rf /tmp/y\nEOF",
             "if true; then echo; fi\ntee f >/dev/null <<'EOF'\nrm -rf /tmp/y\nEOF",
             "echo {x}\ncat > /tmp/f <<'EOF'\nrm -rf /tmp/y\nEOF",
@@ -3940,6 +3960,8 @@ mod tests {
             "echo a >&del x",
             ">&del x",
             "echo a 2>&del x",
+            "echo a >& del x",
+            "echo a 2>& del x",
             "echo a >&\"del\" x",
             ">&\"del\" x",
             "echo a 2>&\"del\" x",
@@ -4027,10 +4049,17 @@ mod tests {
             "<&- unlink /tmp/y",
             // `<<-`は終端語を取る。
             "<<- EOF rm x\nEOF",
-            // 入れ子の再検査では、出力先が変数の`cat`・`tee`の本文を読み飛ばさない。
-            "X=/dev/stdout\necho \"$(\ncat > $X <<'EOF'\nunlink /tmp/y\nEOF\n)\" | sh",
-            "X=/dev/stdout bash -c 'cat > $X <<\\EOF\nunlink /tmp/y\nEOF' | sh",
-            "X=/dev/stdout bash -c \"cat > \\$X <<'EOF'\nunlink /tmp/y\nEOF\" | sh",
+            // `&`と数字・`-`の間に空白がある形、`&-`に名前が直結する形（bash・cmdとも後ろのコマンドを実行する）。
+            "2>& 1 unlink /tmp/y",
+            ">& 1 rm -rf /tmp/y",
+            ">& - rm -rf /tmp/y",
+            "2>&-unlink /tmp/y",
+            ">&-rm -rf /tmp/y",
+            "<&-unlink /tmp/y",
+            "2>&\t1 rm x",
+            // `>& del x`は名前が続くので、`&`で文を割って`del x`を検査する。
+            ">& rm -rf /tmp/y",
+            "echo a >& rm x",
         ] {
             assert!(posix_denied(denied), "{denied:?}");
             if cfg!(windows) {
@@ -4041,9 +4070,11 @@ mod tests {
         assert!(posix_denied("cmd 2>/dev/null"));
         for allowed in [
             "ls 2>/dev/null",
+            "ls 2>&1",
+            "echo hi >&2",
+            "echo hi >& 2",
+            "ls 2>& 1 | head",
             "<<- EOF cat\nEOF",
-            "x=\"$(python - <<'EOF'\nfor i in range(3):\n    print(i)\nEOF\n)\"",
-            "x=\"$(cat > /tmp/f <<'EOF'\nfor (const f of files) {\n}\nEOF\n)\"",
             ">out echo hi",
             "2>/dev/null ls /tmp",
             "</dev/null cat",
@@ -4057,13 +4088,25 @@ mod tests {
             }
         }
         if cfg!(windows) {
-            for denied in ["2>nul del x", ">out del x", "<nul del x", "2>&1 del x"] {
+            for denied in [
+                "2>nul del x",
+                ">out del x",
+                "<nul del x",
+                "2>&1 del x",
+                "2>& 1 del x",
+                ">& 1 del x",
+            ] {
                 assert!(reason(denied, "exec_command", Some("cmd.exe")).is_some(), "{denied:?}");
                 assert!(reason(denied, "Bash", None).is_some(), "{denied:?}");
             }
             assert!(reason("2>$null Remove-Item x", "exec_command", Some("pwsh")).is_some());
             assert!(reason(">out Remove-Item x", "exec_command", Some("pwsh")).is_some());
             assert_eq!(reason("2>nul echo hi", "exec_command", Some("cmd.exe")), None);
+            // PowerShellのブロックコメント開始`<#`はリダイレクトではなく、本文は実行されない。
+            assert_eq!(
+                reason("<# del old #>\nGet-Date", "exec_command", Some("pwsh")),
+                None
+            );
         }
     }
 
