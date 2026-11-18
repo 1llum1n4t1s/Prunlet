@@ -48,6 +48,9 @@ struct Token {
     bare_chars: usize,
     /// 引用外で退避文字（PowerShellの`` ` ``）を含むか。字句解析後は元の綴りを失うため、静的値として扱わない。
     escaped: bool,
+    /// POSIX規則で、語の途中に行継続（`\`＋改行）を挟んだか。退避した文字（`escaped`）とは区別し、
+    /// リダイレクト演算子・コメントの判定を行継続の無い形と同じにする（bashは行継続を語の分割前に取り除く）。
+    continued: bool,
     /// POSIX規則で、語が引用外のブレース展開（`r{m,}`・`{a,b}`・`{1..3}`）を含むか。
     /// bashは展開後の最初の語を実行名にするため、実行名の位置では検査不能として扱う。
     brace: bool,
@@ -69,6 +72,7 @@ impl Token {
             non_single_quote: false,
             bare_chars: 0,
             escaped: false,
+            continued: false,
             brace: false,
         }
     }
@@ -681,6 +685,9 @@ struct Inspector {
     /// 最初の検知が削除命令（ファイル・レジストリ）か。検査不能による拒否と区別し、
     /// 拒否理由に付ける案内の長さを変えるのに使う。
     deletion: bool,
+    /// 字句解析の読みの系統（`LexOptions::legacy`）。`None`は最上位で、新しい読みと従来の読みの両方で検査する。
+    /// 入れ子の本文（`$(…)`・wrapperの本文）は外側の読みの系統を引き継ぎ、読みの数を深さごとに増やさない。
+    reading: Option<bool>,
 }
 impl Inspector {
     fn detected(&mut self, reason: &str, token: &str) -> bool {
@@ -748,50 +755,49 @@ impl Inspector {
             let previous_explicit = self.explicit;
             self.mode = Some(m);
             self.explicit = mode.is_some();
+            let previous_reading = self.reading;
             let result = (|| -> Result<bool> {
                 // POSIX規則で解釈が分かれる箇所は、別の読みでも検査する（LexOptions参照）。
                 // `>& 名前`があれば名前をリダイレクト対象としてつなぐ読み、引用しない終端語のヒアドキュメント
                 // 本文があれば本文の`'`・`"`を引用としない読みでも検査し、どれかで検知すれば拒否する。
+                // POSIX規則と非strictのPowerShell規則では、新しい読みに加えて従来の読み（`legacy`）でも検査する。
+                // 新しい読みが置き換えた解釈の誤りで、従来の読みなら検知できた削除を見逃さないため。
+                let legacy_applies = m == Mode::Posix || (m == Mode::PowerShell && !strict);
+                let readings: &[bool] = match previous_reading {
+                    _ if !legacy_applies => &[false],
+                    None => &[false, true],
+                    Some(false) => &[false],
+                    Some(true) => &[true],
+                };
                 let mut found = LexFound::default();
-                for (attach, literal) in [(false, false), (true, false), (false, true), (true, true)]
-                {
-                    if (attach && !found.ampersand_name)
-                        || (literal && !found.unquoted_heredoc_body)
+                for &legacy in readings {
+                    for (attach, literal) in
+                        [(false, false), (true, false), (false, true), (true, true)]
                     {
-                        continue;
-                    }
-                    let options = LexOptions {
-                        attach_ampersand_name: attach,
-                        literal_heredoc_body: literal,
-                    };
-                    let tokens = tokens_with(script, m, strict, options, &mut found)?;
-                    let mut words = Vec::new();
-                    let mut control = self.posix_script;
-                    // CMD規則で、いま集めている文が`(`の直後から始まったか（`for /f … in ('del x')`）。
-                    let mut after_paren = false;
-                    for token in tokens {
-                        if token.boundary {
-                            // CMD規則の字句解析だけが`;`・`(`の境界に";"・"("を載せる。直前の文の末尾が`;`かを伝える。
-                            self.cmd_semicolon = token.text == ";";
-                            if self.statement_with(&words, depth, strict, &mut control, after_paren)? {
-                                return Ok(true);
-                            }
-                            after_paren = token.text == "(";
-                            words.clear();
-                        } else {
-                            words.push(token);
+                        if (attach && !found.ampersand_name)
+                            || (literal && (legacy || !found.unquoted_heredoc_body))
+                        {
+                            continue;
                         }
-                    }
-                    // 最後の文の後ろは、入れ子の本文ならそれを含む外側の文の終端を引き継ぐ。
-                    // cmd.exeは`cmd /c cmd;/c del x`の本文を`;`以降まで含めて渡すため、本文末尾の`cmd`も
-                    // `;`に続く引数を受ける。最上位（previous_semicolon=false）では終端なしになる。
-                    self.cmd_semicolon = previous_semicolon;
-                    if self.statement_with(&words, depth, strict, &mut control, after_paren)? {
-                        return Ok(true);
+                        let options = LexOptions {
+                            attach_ampersand_name: attach,
+                            literal_heredoc_body: literal,
+                            legacy,
+                        };
+                        // 入れ子の本文はこの読みの系統で検査する。CMD規則など読みの区別のない規則では外側の系統を保つ。
+                        self.reading = if legacy_applies {
+                            Some(legacy)
+                        } else {
+                            previous_reading
+                        };
+                        if self.lexed(script, m, depth, strict, options, &mut found)? {
+                            return Ok(true);
+                        }
                     }
                 }
                 Ok(false)
             })();
+            self.reading = previous_reading;
             self.mode = previous;
             self.cmd_semicolon = previous_semicolon;
             self.explicit = previous_explicit;
@@ -800,6 +806,47 @@ impl Inspector {
             }
         }
         Ok(false)
+    }
+    /// 1つの読み（`options`）で字句解析し、文ごとに検査する。
+    fn lexed(
+        &mut self,
+        script: &str,
+        m: Mode,
+        depth: usize,
+        strict: bool,
+        options: LexOptions,
+        found: &mut LexFound,
+    ) -> Result<bool> {
+        // 外側の文の終端（呼出し時点の値）。各読みの最後の文で引き継ぐ。
+        let previous_semicolon = self.cmd_semicolon;
+        found.uninspectable = None;
+        let tokens = tokens_with(script, m, strict, options, found)?;
+        // 新しい読みで終わりを確定できない構文（閉じない`"$(`・終端語を確定できないヒアドキュメント）は拒否する。
+        if let Some((reason, token)) = found.uninspectable.take() {
+            return Ok(self.detected(reason, &token));
+        }
+        let mut words = Vec::new();
+        let mut control = self.posix_script;
+        // CMD規則で、いま集めている文が`(`の直後から始まったか（`for /f … in ('del x')`）。
+        let mut after_paren = false;
+        for token in tokens {
+            if token.boundary {
+                // CMD規則の字句解析だけが`;`・`(`の境界に";"・"("を載せる。直前の文の末尾が`;`かを伝える。
+                self.cmd_semicolon = token.text == ";";
+                if self.statement_with(&words, depth, strict, &mut control, after_paren)? {
+                    return Ok(true);
+                }
+                after_paren = token.text == "(";
+                words.clear();
+            } else {
+                words.push(token);
+            }
+        }
+        // 最後の文の後ろは、入れ子の本文ならそれを含む外側の文の終端を引き継ぐ。
+        // cmd.exeは`cmd /c cmd;/c del x`の本文を`;`以降まで含めて渡すため、本文末尾の`cmd`も
+        // `;`に続く引数を受ける。最上位（previous_semicolon=false）では終端なしになる。
+        self.cmd_semicolon = previous_semicolon;
+        self.statement_with(&words, depth, strict, &mut control, after_paren)
     }
     /// 文を検査する。CMD規則で`(`の直後から始まる文（`for /f … in ('del x')`・usebackqの`` (`del x`) ``の
     /// コマンド集合）は、先頭語の語頭・語末の`'`・`` ` ``を外して実行名を判定する。CMD規則の字句解析は
@@ -907,6 +954,37 @@ impl Inspector {
                     "POSIX brace expansion in the command name cannot be inspected",
                     &w[0].text,
                 ));
+            }
+            // 添字に空白を含む配列代入（`a[1 + 1]=5 unlink y`）は、bashは添字の中の空白ごと1語の代入として読むが、
+            // 字句解析は空白で語を割る。実行名の位置で`名前[`が同じ語の中で閉じないまま終わる形は検査不能として拒否する。
+            if posix_unclosed_subscript(&w[0]) {
+                return Ok(self.detected(
+                    "POSIX array subscript with blanks cannot be inspected",
+                    &w[0].text,
+                ));
+            }
+            // 実行名の位置の`${…}`（パラメーター展開）は、空に展開されると語の残りや後続の語が実行名になる
+            // （`${X}rm -rf y`・`${X} rm -rf y`）。展開の後ろの残り（空なら後続の語）を実行名として検査する。
+            if !compiled(&ASSIGNMENT)?.is_match(&w[0].text)
+                && let Some(rest) = posix_parameter_rest(&w[0].text)
+            {
+                // 語全体が引用なしの展開だけ（`${X}`）なら、空に展開されて次の語が実行名になりうる。
+                let found = if rest.is_empty() {
+                    w.len() > 1
+                        && w[0].quote_start.is_none()
+                        && w[0].text.starts_with("${")
+                        && self.command(&w[1..], depth, strict)?
+                } else {
+                    let mut copy = Vec::with_capacity(w.len());
+                    let mut head = Token::new(rest);
+                    head.dynamic = rest.contains(['$', '`', '*', '?', '[']);
+                    copy.push(head);
+                    copy.extend_from_slice(&w[1..]);
+                    self.command(&copy, depth, strict)?
+                };
+                if found {
+                    return Ok(true);
+                }
             }
             if let Some(result) = self.posix_prefix(w, depth, strict)? {
                 return Ok(result);
@@ -1236,16 +1314,41 @@ impl Inspector {
             if j + 1 >= w.len() {
                 return Ok(false);
             }
-            let body = if w.len() == j + 2 && w[j + 1].quoted {
-                w[j + 1].text.clone()
+            let cmd = name == "cmd";
+            return self.wrapper_body(&w[j + 1..], depth, shell(&name), strict, cmd);
+        }
+        Ok(false)
+    }
+    /// wrapperの本文（`-Command`・`-c`・位置引数の後ろの語列）を組み立てて検査する。
+    ///
+    /// 本文の後ろのリダイレクト（`pwsh -Command "Remove-Item y" > out.txt`・`2>&1`）は外側のshellが処理し、
+    /// wrapperへ渡らない。除かずに連結すると引用した本文が1つの実行名として引用し直され、中の削除名を見落とすため、
+    /// リダイレクトを除いた語列で検査する。除いた場合は、従来どおり除かない語列でも検査する（検知範囲を狭めない）。
+    fn wrapper_body(
+        &mut self,
+        rest: &[Token],
+        depth: usize,
+        body_mode: Option<Mode>,
+        strict: bool,
+        cmd: bool,
+    ) -> Result<bool> {
+        let build = |words: &[Token]| {
+            if words.len() == 1 && words[0].quoted {
+                words[0].text.clone()
             } else {
-                w[j + 1..]
+                words
                     .iter()
-                    .map(|t| quote_token(t, name == "cmd"))
+                    .map(|t| quote_token(t, cmd))
                     .collect::<Vec<_>>()
                     .join(" ")
-            };
-            return self.contains(&body, depth + 1, shell(&name), strict);
+            }
+        };
+        let stripped = without_redirect_words(rest, self.mode == Some(Mode::PowerShell));
+        if self.contains(&build(&stripped), depth + 1, body_mode, strict)? {
+            return Ok(true);
+        }
+        if stripped.len() != rest.len() {
+            return self.contains(&build(rest), depth + 1, body_mode, strict);
         }
         Ok(false)
     }
@@ -1320,6 +1423,12 @@ impl Inspector {
         ) {
             return Ok(None);
         }
+        // option・値の位置にあるリダイレクト（`env -u >/dev/null FOO unlink y`）は前置コマンドの引数ではない。
+        // 先に除いてからoptionを解析し、リダイレクトの語を値と取り違えて実行名の位置をずらさない。
+        let stripped: Vec<Token> = std::iter::once(words[0].clone())
+            .chain(without_redirect_words(&words[1..], false))
+            .collect();
+        let words = stripped.as_slice();
         let mut index = 1;
         let mut options = true;
         while index < words.len() {
@@ -1574,17 +1683,14 @@ impl Inspector {
             let text = w[j].text.as_str();
             let dashed = text.starts_with(['-', '/', '\u{2013}', '\u{2014}', '\u{2015}']);
             if !dashed {
-                // 位置引数。以降すべてが本文。
-                let rest = &w[j..];
-                let body = if rest.len() == 1 && rest[0].quoted {
-                    rest[0].text.clone()
-                } else {
-                    rest.iter()
-                        .map(|t| quote_token(t, false))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                };
-                return Some(self.contains(&body, depth + 1, Some(Mode::PowerShell), strict));
+                // 位置引数。以降すべてが本文（後ろのリダイレクトはwrapper_bodyが除く）。
+                return Some(self.wrapper_body(
+                    &w[j..],
+                    depth,
+                    Some(Mode::PowerShell),
+                    strict,
+                    false,
+                ));
             }
             if encoded(text) || file_option(text) || command_option(text) {
                 return None;
@@ -1633,6 +1739,12 @@ impl Inspector {
         if !matches!(leaf(&words[0].text).as_str(), "sh" | "bash" | "zsh") {
             return Ok(None);
         }
+        // リダイレクト（`>/dev/null`・`2>&1`・`> f`）はshellの引数ではない。位置を問わず先に除き、
+        // 値を取るoption（`-o >/dev/null posix`）の値や本文と取り違えない。
+        let stripped: Vec<Token> = std::iter::once(words[0].clone())
+            .chain(without_redirect_words(&words[1..], false))
+            .collect();
+        let words = stripped.as_slice();
         // `-c`を含むoption語（本文欠落時の拒否理由に使う）。
         let mut command: Option<&str> = None;
         let mut index = 1;
@@ -1793,8 +1905,12 @@ impl Inspector {
                 start += 1;
                 continue;
             }
-            // 閉じていない`$(`は入力の終わりまでを本文として検査する。
-            let close = subexpression_close(&chars, start, chars.len());
+            // 閉じていない`$(`は入力の終わりまでを本文として検査する。従来の読みでは従来の閉じ探索を使う。
+            let close = if self.reading == Some(true) {
+                subexpression_close_legacy(&chars, start)
+            } else {
+                subexpression_close(&chars, start, chars.len(), self.mode == Some(Mode::Posix))
+            };
             let body_end = close.map_or(chars.len(), |end| end - 1);
             if self.contains(
                 &chars[start + 2..body_end].iter().collect::<String>(),
@@ -2020,7 +2136,16 @@ fn quote_token(t: &Token, cmd: bool) -> String {
     }
     if t.quoted { q(&t.text) } else { t.text.clone() }
 }
-fn here_string(s: &[char], position: &mut usize, quote: char) -> Result<String> {
+/// `smart`は非strictのPowerShell規則の新しい読みで、スマート引用符を同じ種類のASCII引用符と同じに扱う
+/// （`@‘`で開いて`'@`・`’@`で閉じる）。`quote`は見出しの引用符の種類（`'`か`"`）。
+fn here_string(s: &[char], position: &mut usize, quote: char, smart: bool) -> Result<String> {
+    let same_kind = |c: char| {
+        if smart {
+            powershell_quote_kind(c) == Some(quote)
+        } else {
+            c == quote
+        }
+    };
     let mut start = *position + 2;
     while start < s.len() && matches!(s[start], ' ' | '\t') {
         start += 1;
@@ -2035,7 +2160,7 @@ fn here_string(s: &[char], position: &mut usize, quote: char) -> Result<String> 
     }
     for end in start..s.len().saturating_sub(1) {
         if (end == start || matches!(s[end - 1], '\r' | '\n'))
-            && s[end] == quote
+            && same_kind(s[end])
             && s[end + 1] == '@'
         {
             // 終端の直前の行終端（`\n`か`\r\n`）は本文に含まれない（言語仕様）。空の本文では何も除かない。
@@ -2125,7 +2250,8 @@ fn heredoc_skippable(heredocs: &[Heredoc], out: &[Token], boundary_after: bool) 
     Ok(true)
 }
 /// `start`から始まるヒアドキュメント本文の範囲を、bashと同じ規則（終端語と行全体の完全一致。`<<-`は先頭のタブだけを除く）で求める。
-/// 戻り値は（本文の終わり＝終端行の先頭, 終端行の次の位置）。CRLFの入力に合わせ、行末の`\r`を除いた一致も終端とみなす。
+/// 戻り値は（本文の終わり＝終端行の先頭, 終端行の次の位置）。行末の`\r`も行の一部として比べる
+/// （CRLFの入力では、見出しの終端語の直後の`\r`を終端語に含めて記録するため、`EOF\r`の行で終わる）。
 /// 終端が見つからない、または終端語を確定できない場合は入力の終わりまでを本文とする（bashも入力の終わりで本文を閉じる）。
 fn heredoc_body_end(s: &[char], start: usize, heredoc: &Heredoc) -> (usize, usize) {
     let Some(delimiter) = heredoc.delimiter.as_deref() else {
@@ -2144,8 +2270,7 @@ fn heredoc_body_end(s: &[char], start: usize, heredoc: &Heredoc) -> (usize, usiz
                 line = rest;
             }
         }
-        let without_cr = line.strip_suffix(&['\r'][..]).unwrap_or(line);
-        if line == delimiter.as_slice() || without_cr == delimiter.as_slice() {
+        if line == delimiter.as_slice() {
             return (position, (end + 1).min(s.len()));
         }
         position = end + 1;
@@ -2153,14 +2278,117 @@ fn heredoc_body_end(s: &[char], start: usize, heredoc: &Heredoc) -> (usize, usiz
     (s.len(), s.len())
 }
 /// `chars[start]`が`$`、`chars[start + 1]`が`(`のとき、対応する`)`の次の位置を返す。`limit`までに閉じなければ`None`。
-/// 入れ子の括弧・`'`・`"`（二重引用の中の`$(…)`を含む）・退避（`\`と逆引用の次の1文字）を読む。
+/// 入れ子の括弧・`'`・`"`（二重引用の中の`$(…)`を含む）・`\`の退避を読む。
+/// `posix`はPOSIX規則で、逆引用を閉じる逆引用までの入れ子のコマンド置換（中の`\`は次の1文字を退避）として、
+/// `$'…'`をANSI-C引用（`\`は次の1文字を退避）として、`$$`を2文字の対として読む。
+/// PowerShell規則では逆引用は次の1文字を退避する文字で、`$'`・`$$`は特別に扱わない。
 /// `Inspector::expanded`と字句解析が同じ範囲を使う。入れ子は明示のスタックで追い、深い入れ子でも再帰しない。
-fn subexpression_close(chars: &[char], start: usize, limit: usize) -> Option<usize> {
+fn subexpression_close(chars: &[char], start: usize, limit: usize, posix: bool) -> Option<usize> {
+    // 閉じる逆引用の次の位置。`i`は開く逆引用の位置。
+    let backtick_close = |i: usize| -> Option<usize> {
+        let mut k = i + 1;
+        while k < limit {
+            match chars[k] {
+                '\\' => k += 2,
+                '`' => return Some(k + 1),
+                _ => k += 1,
+            }
+        }
+        None
+    };
     // 文脈のスタック。`(`は括弧の中、`"`は二重引用の中。
     let mut stack = vec!['('];
+    // POSIX規則で、置換の直下（入れ子の括弧・算術の外）に書いたヒアドキュメントの（終端語, `<<-`か）。
+    // 行末で本文を読み飛ばす（`"$(cat <<'EOF'`…`EOF`改行`)"`の本文の`'`を引用として数えない）。
+    let mut heredocs: Vec<(Vec<char>, bool)> = Vec::new();
     let mut i = start + 2;
     while i < limit {
         let c = chars[i];
+        if posix && c == '`' {
+            i = backtick_close(i)?;
+            continue;
+        }
+        if posix && stack.len() == 1 && c == '\n' && !heredocs.is_empty() {
+            // 記録した順に、終端語と行全体が一致する行まで（`<<-`は先頭のタブを除いて比べる）を本文として読み飛ばす。
+            let mut position = i + 1;
+            for (delimiter, strip_tabs) in heredocs.drain(..) {
+                loop {
+                    if position >= limit {
+                        return None;
+                    }
+                    let end = chars[position..limit]
+                        .iter()
+                        .position(|&d| d == '\n')
+                        .map_or(limit, |offset| position + offset);
+                    let mut line = &chars[position..end];
+                    if strip_tabs {
+                        while let ['\t', rest @ ..] = line {
+                            line = rest;
+                        }
+                    }
+                    position = end + 1;
+                    if line == delimiter.as_slice() {
+                        break;
+                    }
+                }
+            }
+            i = position;
+            continue;
+        }
+        if posix
+            && stack.len() == 1
+            && c == '<'
+            && chars.get(i + 1) == Some(&'<')
+            && chars.get(i + 2) != Some(&'<')
+        {
+            // 終端語を読む。引用は外し、ANSI-C引用・展開を含む終端語は範囲を確定できないため`None`。
+            let mut j = i + 2;
+            let strip_tabs = chars.get(j) == Some(&'-');
+            if strip_tabs {
+                j += 1;
+            }
+            while j < limit && matches!(chars[j], ' ' | '\t') {
+                j += 1;
+            }
+            let mut delimiter = Vec::new();
+            while j < limit
+                && !chars[j].is_whitespace()
+                && !matches!(chars[j], ';' | '|' | '&' | '(' | ')' | '<' | '>')
+            {
+                match chars[j] {
+                    '\'' | '"' => {
+                        let close = chars[j];
+                        j += 1;
+                        while j < limit && chars[j] != close {
+                            if close == '"' && matches!(chars[j], '\\' | '$' | '`') {
+                                return None;
+                            }
+                            delimiter.push(chars[j]);
+                            j += 1;
+                        }
+                        if j >= limit {
+                            return None;
+                        }
+                        j += 1;
+                    }
+                    '\\' => {
+                        delimiter.push(*chars.get(j + 1)?);
+                        j += 2;
+                    }
+                    '$' | '`' => return None,
+                    other => {
+                        delimiter.push(other);
+                        j += 1;
+                    }
+                }
+            }
+            if chars.get(j) == Some(&'\r') && chars.get(j + 1) == Some(&'\n') {
+                delimiter.push('\r');
+            }
+            heredocs.push((delimiter, strip_tabs));
+            i = j;
+            continue;
+        }
         if stack.last() == Some(&'"') {
             match c {
                 '\\' | '`' => i += 2,
@@ -2178,6 +2406,20 @@ fn subexpression_close(chars: &[char], start: usize, limit: usize) -> Option<usi
         }
         match c {
             '\\' | '`' => i += 2,
+            '$' if posix && chars.get(i + 1) == Some(&'$') => i += 2,
+            // ANSI-C引用の中は`\`が次の1文字を退避し、非退避の`'`で閉じる。
+            '$' if posix && chars.get(i + 1) == Some(&'\'') => {
+                let mut k = i + 2;
+                loop {
+                    match chars[..limit].get(k) {
+                        None => return None,
+                        Some('\\') => k += 2,
+                        Some('\'') => break,
+                        Some(_) => k += 1,
+                    }
+                }
+                i = k + 1;
+            }
             // 単一引用の中は退避を含めて文字どおり。
             '\'' => match chars[i + 1..limit].iter().position(|&d| d == '\'') {
                 Some(offset) => i += offset + 2,
@@ -2198,6 +2440,36 @@ fn subexpression_close(chars: &[char], start: usize, limit: usize) -> Option<usi
         }
     }
     None
+}
+/// 従来の読みで、`chars[start]`の`$(`に対応する`)`の次の位置を返す（閉じなければ`None`）。
+/// 括弧の数と`'`・`"`の引用だけを数え、`\`・逆引用は次の1文字を退避する（入れ子の引用文脈は追わない）。
+fn subexpression_close_legacy(chars: &[char], start: usize) -> Option<usize> {
+    let mut level = 1;
+    let mut end = start + 2;
+    let mut quote = '\0';
+    while end < chars.len() && level > 0 {
+        let c = chars[end];
+        if c == '\\' || c == '`' {
+            end += 2;
+            continue;
+        }
+        if quote != '\0' {
+            if c == quote {
+                quote = '\0';
+            }
+            end += 1;
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            quote = c;
+        } else if c == '(' {
+            level += 1;
+        } else if c == ')' {
+            level -= 1;
+        }
+        end += 1;
+    }
+    (level == 0).then_some(end)
 }
 /// 書き出し先のPOSIXパスが、通常のファイルと確定できない先（`/dev/`・`/proc/`の配下、`..`区間を含む先）か。
 /// 連続する`/`をまとめ、`.`区間を除いた字句上の正規形で判定する（`//dev/stdout`・`/./dev/stdout`を見逃さない）。
@@ -2411,6 +2683,23 @@ fn leading_redirect_words(words: &[Token], powershell: bool) -> usize {
     }
     k.min(words.len())
 }
+/// 語列から、位置を問わずリダイレクト（演算子と対象。数え方は`leading_redirect_words`と同じ）を除いた複製を返す。
+/// 前置コマンド・wrapperのoption解析と本文の再構成で、リダイレクトの語をoptionの値や本文と取り違えないために使う
+/// （リダイレクトは外側のshellが処理し、前置コマンド・wrapperへ引数として渡らない）。
+fn without_redirect_words(words: &[Token], powershell: bool) -> Vec<Token> {
+    let mut out = Vec::with_capacity(words.len());
+    let mut k = 0;
+    while k < words.len() {
+        let redirects = leading_redirect_words(&words[k..], powershell);
+        if redirects > 0 {
+            k += redirects;
+            continue;
+        }
+        out.push(words[k].clone());
+        k += 1;
+    }
+    out
+}
 /// 語がリダイレクト演算子の途中か（引用・退避・展開がなく、数字だけ、または先頭の数字に`<`・`>`だけが続く）。
 /// POSIX・CMD規則で`<`・`>`の手前で語を切るかの判定に使う（`2>`・`>>`・`<<`・`2>>`は1つの演算子のまま）。
 fn redirect_operator_prefix(t: &Token) -> bool {
@@ -2451,6 +2740,13 @@ struct LexOptions {
     /// 終端語を引用しないヒアドキュメント（`<<EOF`）の本文を、bashと同じく`'`・`"`を引用として扱わず
     /// （`$(…)`・逆引用の中を除く）、`#`もコメントにしない読み方。falseは本文を通常の文として読む従来の読み方。
     literal_heredoc_body: bool,
+    /// 従来の読み。新しい読みが従来の解釈を置き換えた次の機能を無効にし、従来と同じ解釈で読む。
+    /// - POSIX: 語頭判定のコメント（従来は語が空なら`#`以降をコメント）、ANSI-C引用（`$'…'`）と`$$`の対、
+    ///   二重引用内の`$(…)`の取り込み、`${…}`の1語化、ヒアドキュメント本文・終端行の独立した字句解析と状態の初期化
+    ///   （従来どおり本文も通常の文として続けて読む。dataとして読み飛ばす判定は新しい読みと同じ）。
+    /// - 非strictのPowerShell: スマート引用符を引用符として読むこと、ブロックコメント（`<#…#>`）。
+    ///   ヒアストリングの開始条件（見出しが行末で終わる）は両方の読みで同じ。
+    legacy: bool,
 }
 /// 字句解析で見つけた、別の読み方（`LexOptions`）でも検査すべき箇所。
 #[derive(Default)]
@@ -2459,7 +2755,18 @@ struct LexFound {
     ampersand_name: bool,
     /// 文として検査する、終端語を引用しないヒアドキュメント本文があった。
     unquoted_heredoc_body: bool,
+    /// 新しい読みで、終わりを確定できず検査不能な構文（拒否理由と語）。最初の1つだけを持つ。
+    uninspectable: Option<(&'static str, String)>,
 }
+impl LexFound {
+    fn uninspectable(&mut self, reason: &'static str, token: &str) {
+        if self.uninspectable.is_none() {
+            self.uninspectable = Some((reason, token.to_owned()));
+        }
+    }
+}
+/// 新しい読みの既定の字句解析（単体テストで語の分け方を確認するのに使う）。
+#[cfg(test)]
 fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
     let mut found = LexFound::default();
     tokens_with(script, mode, strict, LexOptions::default(), &mut found)
@@ -2534,6 +2841,99 @@ fn brace_word_scan(s: &[char], start: usize) -> (usize, bool) {
     }
     (j.min(s.len()), found)
 }
+/// POSIX規則の語が`名前[`で始まり、引用外の`[`が語の中で`]`に閉じないまま終わるか（`a[1 + 1]=5`の`a[1`）。
+fn posix_unclosed_subscript(word: &Token) -> bool {
+    let text = word.text.as_str();
+    let name = text
+        .char_indices()
+        .take_while(|&(k, d)| d == '_' || d.is_ascii_alphabetic() || (k > 0 && d.is_ascii_digit()))
+        .count();
+    name > 0
+        && text[name..].starts_with('[')
+        && word.quote_start.is_none_or(|q| q > name)
+        && !text[name..].contains(']')
+}
+/// POSIX規則の語に含まれる最後の`${…}`（パラメーター展開）の後ろの残りを返す（`${X}rm`は`rm`、`${X}`は空）。
+/// `${`を含まない、または対応する`}`が無い語は`None`。
+fn posix_parameter_rest(text: &str) -> Option<&str> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let plain: Vec<char> = chars.iter().map(|&(_, d)| d).collect();
+    let mut rest = None;
+    let mut k = 0;
+    while k + 1 < plain.len() {
+        if plain[k] == '$' && plain[k + 1] == '{' {
+            if let Some(end) = parameter_expansion_end(&plain, k) {
+                rest = Some(chars.get(end).map_or(text.len(), |&(byte, _)| byte));
+                k = end;
+                continue;
+            }
+            break;
+        }
+        k += 1;
+    }
+    rest.map(|byte| &text[byte..])
+}
+/// POSIX規則で、`s[start]`の`$`に続く`${…}`（パラメーター展開）の、対応する`}`の次の位置を返す。
+/// 入れ子の`{`・`}`を数え、`\`の退避・`'`・`"`の引用・`$(…)`・逆引用の中の`}`は数えない。
+/// 改行を含む・閉じない形は`None`（呼出し側は従来どおり`{`・`}`で語を割って読む）。
+fn parameter_expansion_end(s: &[char], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut j = start + 1;
+    while j < s.len() {
+        match s[j] {
+            '\r' | '\n' => return None,
+            '\\' => {
+                j += 2;
+                continue;
+            }
+            '\'' => {
+                let offset = s[j + 1..].iter().position(|&d| matches!(d, '\'' | '\n'))?;
+                j += offset + 1;
+                if s[j] != '\'' {
+                    return None;
+                }
+            }
+            '"' => {
+                j += 1;
+                while j < s.len() && s[j] != '"' {
+                    match s[j] {
+                        '\n' => return None,
+                        '\\' => j += 2,
+                        _ => j += 1,
+                    }
+                }
+                if j >= s.len() {
+                    return None;
+                }
+            }
+            '$' if s.get(j + 1) == Some(&'(') => {
+                let end = subexpression_close(s, j, s.len(), true)?;
+                if s[j..end].contains(&'\n') {
+                    return None;
+                }
+                j = end;
+                continue;
+            }
+            '`' => {
+                let offset = s[j + 1..].iter().position(|&d| matches!(d, '`' | '\n'))?;
+                j += offset + 1;
+                if s[j] != '`' {
+                    return None;
+                }
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
 /// 字句解析の本体。
 ///
 /// `options`で読み方を選び（`LexOptions`参照）、別の読み方でも検査すべき箇所があれば`found`へ記録する。
@@ -2551,16 +2951,27 @@ fn tokens_with(
     let mut quote = '\0';
     let mut previous_equal = false;
     let mut i = 0;
-    // 非strictのPowerShell規則では、スマート引用符もASCIIと同じ種類の引用符として読む。
-    let smart_quotes = mode == Mode::PowerShell && !strict;
+    // 非strictのPowerShell規則では、スマート引用符もASCIIと同じ種類の引用符として読む（従来の読みを除く）。
+    let smart_quotes = mode == Mode::PowerShell && !strict && !options.legacy;
+    // POSIX規則の新しい読み（LexOptions::legacy参照）。
+    let posix_new = mode == Mode::Posix && !options.legacy;
+    // 直前の行継続（`\`＋改行）の次の位置と、その行継続の直前の文字。コメントの語頭判定で行継続を読み飛ばす。
+    let mut continuation_end = usize::MAX;
+    let mut continuation_previous: Option<char> = None;
+    // `${…}`の走査が閉じなかった行の終わり（この位置までは`${`を1語として読まない）。
+    let mut parameter_unclosed_until = 0usize;
     // POSIX規則のヒアドキュメント追跡（heredoc_skippable参照）。
     let mut heredocs: Vec<Heredoc> = Vec::new();
     let mut statement_start = 0usize;
     let mut group_depth = 0i32;
+    // 従来の読みのヒアドキュメント読み飛ばし判定に使う、下限を切らない括弧の深さ。
+    let mut legacy_group_depth = 0i32;
     let mut line_start = 0usize;
     let mut heredoc_boundary_after = false;
     // 単一引用・ANSI-C引用の外で開いたままの逆引用があるか。行をまたいで追う。
     let mut backtick_open = false;
+    // 最後に逆引用を開閉した位置（開いたままなら開いた位置）。同じ行で開いた逆引用の中かの判定に使う。
+    let mut backtick_opened_at = 0usize;
     // 読み飛ばさないヒアドキュメントの本文・終端行を検査している間の区切り位置（降順。末尾が次の区切り）。
     // 本文と終端行はそれぞれ独立に字句解析し、区切りで引用・括弧・逆引用の状態を本文の前へ戻す。
     // 2つ目の値は、その区切りで終わる区間が終端語を引用しないヒアドキュメントの本文か。
@@ -2598,11 +3009,15 @@ fn tokens_with(
             && s.get(i + 1) == Some(&'(')
         {
             let limit = body_cuts.last().map_or(s.len(), |&(cut, _)| cut);
-            literal_until = subexpression_close(&s, i, limit).unwrap_or(limit);
+            literal_until = subexpression_close(&s, i, limit, true).unwrap_or(limit);
         }
         let literal_text = literal_body && i >= literal_until && !backtick_open;
         // 引用外の`<<`（`<<<`を除く）を見つけたら終端語を読み取って記録する。字句解析は通常どおり続ける。
         // 本文の中の`<<`は追跡しない（本文はbashにとってdataで、読み飛ばすと展開される`$(…)`を見落とすため）。
+        // 新しい読みでは、ヒアドキュメントでありうるか不確かな文脈（同じ行の`((`・`$((`・`$[`の後ろの算術、
+        // 同じ行で開いた逆引用の中）の`<<`を記録しない。記録すると終端行の一致で引用状態を初期化し、
+        // 以降の引用を反転させうるため。記録しなければ本文も通常の文として続けて読む（従来の読みと同じ）。
+        // 前の行で開いた逆引用の中は従来どおり記録し、本文を読み飛ばさずに区切って検査する。
         if mode == Mode::Posix
             && !in_body
             && quote == '\0'
@@ -2610,6 +3025,11 @@ fn tokens_with(
             && s.get(i + 1) == Some(&'<')
             && s.get(i + 2) != Some(&'<')
             && (i == 0 || s[i - 1] != '<')
+            && !(posix_new
+                && ((backtick_open && backtick_opened_at >= line_start)
+                    || s[line_start..i]
+                        .windows(2)
+                        .any(|w| w == ['(', '('] || w == ['$', '['])))
         {
             let mut j = i + 2;
             let strip_tabs = s.get(j) == Some(&'-');
@@ -2703,16 +3123,34 @@ fn tokens_with(
                 && delimiter
                     .chars()
                     .all(|d| d.is_ascii_alphanumeric() || matches!(d, '_' | '-' | '.'));
+            // bashは`\r`を語の文字として読む。終端語の直後が`\r\n`（CRLFの入力）なら、`\r`も終端語の一部になり、
+            // 終端行は`EOF\r`と完全一致する行に限る（`\r`を除いて比べると、`EOF\r`でない行で早く終わりうる）。
+            if s.get(j) == Some(&'\r') && s.get(j + 1) == Some(&'\n') {
+                delimiter.push('\r');
+            }
+            let determined = complete && !ansi_escape;
+            // 新しい読みでは、終端語を確定できないヒアドキュメントの本文の範囲を推測せず、検査不能として拒否する。
+            if posix_new && !determined {
+                found.uninspectable(
+                    "POSIX here-document delimiter cannot be determined",
+                    &s[i..j.min(s.len())].iter().collect::<String>(),
+                );
+            }
             let before: String = s[line_start..i].iter().collect();
             heredocs.push(Heredoc {
-                delimiter: (complete && !ansi_escape).then_some(delimiter),
+                delimiter: determined.then_some(delimiter),
                 strip_tabs,
                 quoted: quoted && complete,
                 simple,
                 statement_start,
-                context_ok: group_depth == 0
-                    && !backtick_open
-                    && !before.contains("((")
+                // 従来の読みは従来の判定（下限を切らない括弧の深さ、前の行で開いた逆引用を数えない）で読み飛ばす。
+                // 従来の読みは本文を区切らないため、読み飛ばさないと本文の引用を後ろへ持ち越し、従来なら検知できた
+                // 終端の後ろの削除を見落としうる。shellが読む形の本文の検査は、区切って読む新しい読みが担う。
+                context_ok: if options.legacy {
+                    legacy_group_depth == 0
+                } else {
+                    group_depth == 0 && !backtick_open
+                } && !before.contains("((")
                     && !before.contains("[[")
                     && !before.contains('`')
                     && !before.contains("$("),
@@ -2820,6 +3258,7 @@ fn tokens_with(
         if mode == Mode::Posix && c == '`' && !literal_quote {
             t.backticks += 1;
             backtick_open = !backtick_open;
+            backtick_opened_at = i;
         }
         if matches!(mode, Mode::Posix | Mode::PowerShell)
             && quote == '"'
@@ -2851,11 +3290,19 @@ fn tokens_with(
             }
             // 二重引用内の`$(…)`は外側と独立した引用文脈を持つ（`"$(echo '"')"`の内側の`"`で外側を閉じない）。
             // 対応する`)`まで生のまま語へ取り込み、本文は`Inspector::expanded`が再帰検査する。
-            if mode == Mode::Posix && quote == '"' && c == '$' && s.get(i + 1) == Some(&'(') {
+            // 従来の読みでは取り込まず、二重引用の中を1文字ずつ読む。
+            if posix_new && quote == '"' && c == '$' && s.get(i + 1) == Some(&'(') {
                 let limit = body_cuts.last().map_or(s.len(), |&(cut, _)| cut);
-                // 閉じていない`$(`は、expandedと同じく入力の終わりまで（ヒアドキュメント本文の中では
-                // 次の区切りまで）を本文として取り込む。取り込んだ本文はexpandedが再帰検査する。
-                let end = subexpression_close(&s, i, limit).unwrap_or(limit);
+                // ヒアドキュメント本文の中で閉じていない`$(`は、次の区切りまでを本文として取り込む（expandedが再帰検査する）。
+                // 本文の外で閉じていない`$(`は、どこまでが置換かを確定できないため検査不能として拒否する。
+                let close = subexpression_close(&s, i, limit, true);
+                if close.is_none() && body_cuts.is_empty() {
+                    found.uninspectable(
+                        "unterminated POSIX command substitution cannot be inspected",
+                        "$(",
+                    );
+                }
+                let end = close.unwrap_or(limit);
                 t.text.extend(&s[i..end]);
                 i = end;
                 continue;
@@ -2897,43 +3344,63 @@ fn tokens_with(
             || (mode == Mode::Posix && c == '\\'))
             && i + 1 < s.len()
         {
+            let escape_start = i;
             i += 1;
             c = s[i];
-            // 行継続でつないだ語も、shellによって語の割れ方が変わりうるため退避ありとして扱う。
-            t.escaped = true;
             if matches!(c, '\r' | '\n') {
                 if c == '\r' && s.get(i + 1) == Some(&'\n') {
                     i += 1;
                 }
+                if mode == Mode::Posix {
+                    // bashは行継続を語の分割前に取り除く。退避した文字とは区別し、語頭・演算子の判定を変えない。
+                    t.continued = true;
+                    if escape_start != continuation_end {
+                        continuation_previous = escape_start.checked_sub(1).map(|k| s[k]);
+                    }
+                    continuation_end = i + 1;
+                } else {
+                    // CMD・PowerShellの行継続でつないだ語は、静的な値の判定から外すため退避ありとして扱う。
+                    t.escaped = true;
+                }
             } else {
+                t.escaped = true;
                 t.bare_chars += 1;
                 append(&mut t, c, &mut previous_equal);
             }
             i += 1;
             continue;
         }
-        // 非strictのPowerShell規則のブロックコメント。語頭の`<#`から最初の`#>`までを空白として読み飛ばす
-        // （閉じがなければ残り全体がコメント）。行コメントと誤認して`#>`以降の行を捨てない。
-        if smart_quotes && c == '<' && s.get(i + 1) == Some(&'#') && t.text.is_empty() && !t.quoted {
+        // 非strictのPowerShell規則のブロックコメント（従来の読みを除く）。語頭か代入の直後（`$x=<# c #>`）の`<#`から
+        // 最初の`#>`までを空白として読み飛ばす（閉じがなければ残り全体がコメント）。行コメントと誤認して`#>`以降の行を捨てない。
+        if smart_quotes
+            && c == '<'
+            && s.get(i + 1) == Some(&'#')
+            && ((t.text.is_empty() && !t.quoted) || t.text.ends_with('='))
+        {
             let close = (i + 2..s.len().saturating_sub(1)).find(|&k| s[k] == '#' && s[k + 1] == '>');
             i = close.map_or(s.len(), |k| k + 2);
             previous_equal = false;
             continue;
         }
-        // ヒアストリングは語頭か代入の直後（`$x=@'`）で、見出しが行末で終わる場合だけ。非strictでは、語の途中の
-        // `@"`・`@'`（`ssh user@"host"`）や見出しの後ろが行末でない形を、通常の`@`と引用として読む。
+        // ヒアストリングは見出し（`@'`・`@"`、新しい読みではスマート引用符の同等形も）の後ろが行末で終わる場合だけ。
+        // PowerShellは語頭・代入の直後に限らず`,`や演算子の後ろでも開始する（`Write-Output 1,@'`）。
+        // 非strictでは、見出しの後ろが行末でない形（`ssh user@"host" ls`）を、通常の`@`と引用として読む。
+        let here_kind = s.get(i + 1).and_then(|&q| {
+            if smart_quotes {
+                powershell_quote_kind(q)
+            } else {
+                matches!(q, '\'' | '"').then_some(q)
+            }
+        });
         if mode == Mode::PowerShell
             && c == '@'
-            && matches!(s.get(i + 1), Some('\'' | '"'))
-            && (strict
-                || (((t.text.is_empty() && !t.quoted) || t.text.ends_with('='))
-                    && here_string_header(&s, i)))
+            && let Some(here_quote) = here_kind
+            && (strict || here_string_header(&s, i))
         {
             if t.quote_start.is_none() {
                 t.quote_start = Some(t.text.len());
             }
-            let here_quote = s[i + 1];
-            let body = here_string(&s, &mut i, here_quote)?;
+            let body = here_string(&s, &mut i, here_quote, smart_quotes)?;
             t.text.push_str(&body);
             t.quoted = true;
             t.quote_segments += 1;
@@ -2941,9 +3408,57 @@ fn tokens_with(
             i += 1;
             continue;
         }
+        // POSIX規則の新しい読みで、引用外の`$$`（シェルのPID）は2文字の対。続く`'`は通常の単一引用で、
+        // `$'…'`（ANSI-C引用）の開始ではない（`echo $$'\'`）。
+        if posix_new && c == '$' && s.get(i + 1) == Some(&'$') && !literal_text {
+            t.bare_chars += 2;
+            append(&mut t, '$', &mut previous_equal);
+            append(&mut t, '$', &mut previous_equal);
+            i += 2;
+            continue;
+        }
+        // POSIX規則の新しい読みで、引用外の`${…}`（パラメーター展開）は対応する`}`までを1語の一部として読み、
+        // 中の`#`・`{`・`}`・空白で語を割らない（`${#arr[@]}`・`${x:- #}`）。行をまたぐ・閉じない形は従来どおり読む。
+        // 中の`$(…)`・逆引用は語の印（subexpression・backticks）を付け、`Inspector::noncanonical`が再帰検査する。
+        // 閉じなかった走査の行の終わりまでは再走査しない（同じ行に`${`が多数並んでも線形に保つ）。
+        let parameter_end = if posix_new
+            && c == '$'
+            && s.get(i + 1) == Some(&'{')
+            && !literal_text
+            && i >= parameter_unclosed_until
+        {
+            let end = parameter_expansion_end(&s, i);
+            if end.is_none() {
+                parameter_unclosed_until = s[i..]
+                    .iter()
+                    .position(|&d| d == '\n')
+                    .map_or(s.len(), |offset| i + offset);
+            }
+            end
+        } else {
+            None
+        };
+        if let Some(end) = parameter_end {
+            for (k, &d) in s[i..end].iter().enumerate() {
+                if d == '`' {
+                    t.backticks += 1;
+                    backtick_open = !backtick_open;
+                    backtick_opened_at = i + k;
+                }
+                t.bare_chars += 1;
+                t.text.push(d);
+            }
+            if s[i..end].windows(2).any(|w| w == ['$', '(']) {
+                t.subexpression = true;
+            }
+            t.dynamic = true;
+            previous_equal = false;
+            i = end;
+            continue;
+        }
         // POSIX規則のANSI-C引用（`$'…'`）。`\'`は引用を閉じない。語は`$`を含むため従来どおり動的として扱う。
-        // 引用しない終端語の本文を文字どおりに読む区間では、`$'`も引用ではない。
-        if mode == Mode::Posix && c == '$' && s.get(i + 1) == Some(&'\'') && !literal_text {
+        // 引用しない終端語の本文を文字どおりに読む区間と、従来の読みでは、`$'`も引用ではない。
+        if posix_new && c == '$' && s.get(i + 1) == Some(&'\'') && !literal_text {
             t.bare_chars += 1;
             append(&mut t, c, &mut previous_equal);
             if t.quote_start.is_none() {
@@ -2986,29 +3501,42 @@ fn tokens_with(
             i += 1;
             continue;
         }
-        // 行コメント。POSIX規則では、語の先頭（直前の生の文字が空白・改行・`;|&()`か入力の先頭）で、
-        // 語に引用・退避を含まない`#`だけをコメントにする（`${#x}`・`""#`の`#`は語の一部）。
+        // 行コメント。POSIX規則の新しい読みでは、語の先頭（行継続を除いた直前の生の文字が空白・改行・`;|&()`か
+        // 入力の先頭）で、語に引用・退避を含まない`#`だけをコメントにする（`${#x}`・`""#`・`{\`改行`#`の`#`は語の一部）。
+        // 従来の読みでは、語がまだ空なら`#`以降をコメントにする。
         let comment = c == '#'
             && t.text.is_empty()
             && match mode {
                 Mode::Cmd => false,
                 Mode::PowerShell => true,
+                Mode::Posix if options.legacy => true,
                 // 引用しない終端語の本文を文字どおりに読む区間では、`#`もコメントにしない（bashは本文を展開して渡すだけ）。
                 Mode::Posix => {
+                    let previous = if i == continuation_end {
+                        continuation_previous
+                    } else {
+                        i.checked_sub(1).map(|k| s[k])
+                    };
                     !literal_body
                         && !t.quoted
                         && !t.escaped
-                        && (i == 0
-                            || s[i - 1].is_whitespace()
-                            || matches!(s[i - 1], ';' | '|' | '&' | '(' | ')'))
+                        && previous.is_none_or(|p| {
+                            p.is_whitespace() || matches!(p, ';' | '|' | '&' | '(' | ')')
+                        })
                 }
             };
         if comment {
-            while i < s.len() && !matches!(s[i], '\r' | '\n') {
+            // 新しい読みで、開いた逆引用の中のコメントは閉じる逆引用で終わる（bashは逆引用の範囲を先に決める）。
+            let backtick_comment = posix_new && backtick_open;
+            while i < s.len() && !matches!(s[i], '\r' | '\n') && !(backtick_comment && s[i] == '`')
+            {
                 i += 1;
             }
             if i == s.len() {
                 break;
+            }
+            if s[i] == '`' {
+                continue;
             }
             c = s[i];
         }
@@ -3113,15 +3641,18 @@ fn tokens_with(
                         line_start = position;
                         continue;
                     }
-                    // 引用しない終端語の本文は、呼出し側が`literal_heredoc_body`の読みでも検査する。
-                    found.unquoted_heredoc_body |= unquoted_body;
-                    // 読み飛ばさない本文と終端行は、それぞれ独立に文として検査する。本文の引用状態を
-                    // 終端の後ろへ持ち越さず、終端行の次からは通常の状態で読み直す。
-                    // 同じ位置の区切り（終端のない本文）は、本文側の印を残して1つにまとめる。
-                    cuts.dedup_by_key(|cut| cut.0);
-                    cuts.reverse();
-                    body_cuts = cuts;
-                    body_saved = (group_depth, backtick_open);
+                    // 従来の読みでは、読み飛ばさない本文も区切らず、通常の文として続けて読む。
+                    if !options.legacy {
+                        // 引用しない終端語の本文は、呼出し側が`literal_heredoc_body`の読みでも検査する。
+                        found.unquoted_heredoc_body |= unquoted_body;
+                        // 読み飛ばさない本文と終端行は、それぞれ独立に文として検査する。本文の引用状態を
+                        // 終端の後ろへ持ち越さず、終端行の次からは通常の状態で読み直す。
+                        // 同じ位置の区切り（終端のない本文）は、本文側の印を残して1つにまとめる。
+                        cuts.dedup_by_key(|cut| cut.0);
+                        cuts.reverse();
+                        body_cuts = cuts;
+                        body_saved = (group_depth, backtick_open);
+                    }
                 }
                 line_start = i + 1;
             }
@@ -3130,10 +3661,16 @@ fn tokens_with(
                     heredoc_boundary_after = true;
                 }
                 match c {
-                    '(' | '{' => group_depth += 1,
+                    '(' | '{' => {
+                        group_depth += 1;
+                        legacy_group_depth += 1;
+                    }
                     // 引数の`}`（`echo }`）で負にならないよう0で下限を切る。負のまま`{`で0へ戻ると、
-                    // グループの中のヒアドキュメントを外側と誤認するため。
-                    ')' | '}' => group_depth = (group_depth - 1).max(0),
+                    // グループの中のヒアドキュメントを外側と誤認するため。従来の読みの判定用には下限を切らない値も持つ。
+                    ')' | '}' => {
+                        group_depth = (group_depth - 1).max(0);
+                        legacy_group_depth -= 1;
+                    }
                     _ => {}
                 }
             }
@@ -5069,6 +5606,150 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 1つの読みの系統（`reading`）だけで、POSIX規則として検査した結果。
+    fn posix_reading_denied(command: &str, legacy: bool) -> bool {
+        let mut inspector = Inspector {
+            reading: Some(legacy),
+            ..Inspector::default()
+        };
+        let result = inspector.contains(command, 0, Some(Mode::Posix), false);
+        result.is_err() || result.unwrap()
+    }
+
+    /// 新しい読みが従来の解釈を置き換えた箇所（コメント・ANSI-C引用・二重引用内の`$(…)`・ヒアドキュメント本文）で、
+    /// 従来の読みなら検知できた削除を見逃さない。新しい読み単独でも、終わりを確定できない形は拒否し、
+    /// 行継続・`$$`・算術の`<<`・`${…}`の読みをbashに合わせる。
+    #[test]
+    fn new_and_legacy_readings_both_inspect_the_command() {
+        let unterminated = "echo \"$(echo ')'\"";
+        for denied in [
+            // A-1: 二重引用内の`$(…)`の中の逆引用・ANSI-C引用。
+            "echo \"$(basename `pwd`)\"; unlink /tmp/y",
+            "echo \"$(echo $'\\'')\"; unlink /tmp/y",
+            "echo \"$(echo `echo ')'`)\"; unlink /tmp/y",
+            // A-2: 行継続の後の`#`はコメント、`>|`・`>&`・fd番号付きのリダイレクトは行継続の無い形と同じ。
+            "echo a \\\n# it's\nunlink /tmp/y\necho 'ok'",
+            "\\\n>| /tmp/z unlink /tmp/y",
+            "\\\n>& /tmp/z unlink /tmp/y",
+            "\\\n2>/dev/null unlink /tmp/y",
+            "2\\\n>/dev/null unlink /tmp/y",
+            // A-3: `$$`の後の`'`は通常の単一引用。
+            "echo $$'\\'\nunlink /tmp/y\necho 'ok'",
+            // A-4: 算術・同じ行の逆引用の中の`<<`はヒアドキュメントとして状態を初期化しない。
+            "echo $((1<<2))\necho '\n2\n'; unlink /tmp/y; echo '\n'",
+            "((a<<2))\necho '\n2\n'; unlink /tmp/y; echo '\n'",
+            "echo $[1<<2]\necho '\n2\n'; unlink /tmp/y; echo '\n'",
+            "echo `echo <<2`\necho '\n2\n'; unlink /tmp/y; echo '\n'",
+            // B-1: 逆引用・`${…}`の中の`#`。
+            "echo `echo a # c`; unlink /tmp/y",
+            "echo ${x:- #}; unlink /tmp/y",
+            // B-2: 終端語を確定できないヒアドキュメントと、`\r`を含む行の完全一致。
+            "cat <<$'E\\x4fF'\nit's\nEOF\nunlink /tmp/y\necho 'ok'",
+            "cat <<'EOF'\nEOF\r\nit's\nEOF\nunlink /tmp/y\necho 'ok'",
+            // 閉じない`"$(`。
+            unterminated,
+            // `${…}`を1語として読んでも、空に展開されうる実行名の後ろを検査する。
+            "echo ${#x}; ${X} rm -rf /tmp/y",
+            "${X}rm -rf /tmp/y",
+            ">\"f\" ${X} unlink /tmp/y",
+            "echo ${x:-$(unlink /tmp/y)}",
+            "echo ${x:-`unlink /tmp/y`}",
+            // 前の行で開いた逆引用の中のヒアドキュメントは記録し、本文を区切って終端の後ろを検査する。
+            "echo `\ncat > /tmp/f <<'EOF'\nit's\nEOF\nunlink /tmp/y",
+        ] {
+            assert!(posix_denied(denied), "{denied:?}");
+            assert!(
+                posix_reading_denied(denied, false),
+                "new reading: {denied:?}"
+            );
+            if cfg!(windows) {
+                assert!(reason(denied, "Bash", None).is_some(), "{denied:?}");
+            }
+        }
+        let mut inspector = Inspector::default();
+        assert!(
+            inspector
+                .contains(unterminated, 0, Some(Mode::Posix), false)
+                .unwrap()
+        );
+        assert!(
+            inspector
+                .detection
+                .unwrap()
+                .contains("unterminated POSIX command substitution cannot be inspected")
+        );
+        // 従来の読みの検知は、新しい読みが置き換えた解釈の誤りがあっても残る（新しい読み単独の結果に依らない）。
+        for denied in [
+            "echo a \\\n# it's\nunlink /tmp/y\necho 'ok'",
+            "echo $((1<<2))\necho '\n2\n'; unlink /tmp/y; echo '\n'",
+            "echo \"$(basename `pwd`)\"; unlink /tmp/y",
+            "${X} rm -rf /tmp/y",
+            // 従来の読みは従来の判定でデータの本文を読み飛ばす（前の行で開いた逆引用を数えない）。
+            "echo `\ncat > /tmp/f <<'EOF'\nit's\nEOF\nunlink /tmp/y",
+        ] {
+            assert!(
+                posix_reading_denied(denied, true),
+                "legacy reading: {denied:?}"
+            );
+        }
+        for allowed in [
+            // A-6: `${#arr[@]}`の`#`・`[`はパラメーター展開の一部。
+            "if [ ${#arr[@]} -eq 0 ]; then echo none; fi",
+            "n=${#arr[@]}; echo \"$n\"",
+            "echo \"${#arr[@]}\" ${x:-a b}",
+            "echo \"$(basename `pwd`)\"",
+            "echo $$ $((1<<2))",
+            // `$(…)`の中のヒアドキュメントは従来どおり記録する（本文の`'`を後ろへ持ち越さない）。
+            "git commit -m \"$(cat <<'EOF'\nIt's fine\nEOF\n)\"",
+            "x=$(cat <<'EOF'\nIt's fine\nEOF\n)\necho \"$x\"",
+            "cat > f <<'EOF'\r\nx\r\nEOF\r\necho ok",
+        ] {
+            assert!(!posix_denied(allowed), "{allowed:?}");
+            if cfg!(windows) {
+                assert_eq!(reason(allowed, "Bash", None), None, "{allowed:?}");
+            }
+        }
+        // C-1: wrapperの本文の後ろのリダイレクトを本文と連結しない。B-4: 前置コマンド・shellのoption値の位置のリダイレクト。
+        for denied in [
+            "pwsh -Command \"Remove-Item y\" > out.txt",
+            "pwsh -Command \"Remove-Item y\" 2>&1",
+            "powershell -NoProfile \"Remove-Item y\" 2>&1",
+            "env -u >/dev/null FOO unlink /tmp/y",
+            "bash -o >/dev/null posix -c 'unlink /tmp/y'",
+            // P-5: 添字に空白を含む配列代入は検査不能。
+            "a[1 + 1]=5 unlink /tmp/y",
+        ] {
+            assert!(posix_denied(denied), "{denied:?}");
+            if cfg!(windows) {
+                assert!(reason(denied, "Bash", None).is_some(), "{denied:?}");
+            }
+        }
+        // 非strictのPowerShell規則: `,`の後のヒアストリング、代入直後のブロックコメント、スマート引用符のヒアストリング。
+        // 従来の読み（ASCII引用符・行コメントだけ）で検知できた形も拒否のまま。
+        for command in [
+            "Write-Output 1,@'\nit's\n'@; Remove-Item y; Write-Output 'ok'",
+            "$x=<# c #> Remove-Item y",
+            "$a = @\u{2018}\nit's\n\u{2019}@; Remove-Item y; Write-Output 'ok'",
+            "Write-Output \u{2018}; Remove-Item y; Write-Output '",
+            "Write-Output \u{201c}; Remove-Item y; Write-Output \"",
+            "<# note\nRemove-Item y\n#>\nWrite-Output ok",
+        ] {
+            assert!(denied(command, "pwsh"), "{command:?}");
+        }
+        for allowed in [
+            "Write-Output 1,@'\nit's\n'@",
+            "$a = @\u{2018}\nit's\n\u{2019}@",
+            "$x=<# c #> Get-Date",
+        ] {
+            assert!(!denied(allowed, "pwsh"), "{allowed:?}");
+        }
+        // `${`・`"$(`・`$(`の閉じない形が大量に並んでも線形時間で終わる。
+        let many = format!("echo {}", "${ ".repeat(200_000));
+        let _ = posix_denied(&many);
+        let many = format!("echo \"$(echo {}\"", "${x:-`".repeat(100_000));
+        let _ = posix_denied(&many);
     }
 
     /// EncodedCommand内の`"$(...)"`は参照だけの形、pwshは静的な`.ps1`の`-File`実行だけを許可する。

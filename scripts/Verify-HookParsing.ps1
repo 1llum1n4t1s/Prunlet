@@ -569,7 +569,30 @@ $cases += @(
     @{ name='pwsh-block-comment-mid-line-delete'; command='Get-Date <# c #> ; Remove-Item -LiteralPath "<FILE>"'; shell='pwsh'; pass=$false; bashPass=$false },
     @{ name='pwsh-smart-quote-command-name'; command=('& ' + [char]0x2018 + 'Remove-Item' + [char]0x2019 + ' -LiteralPath "<FILE>"'); shell='pwsh'; pass=$false; bashPass=$false },
     @{ name='pwsh-here-string-command-name'; command=("& @'`nRemove-Item`n'@ -LiteralPath `"<FILE>`""); shell='pwsh'; pass=$false; bashPass=$false },
-    @{ name='pwsh-at-quote-inside-word'; command='ssh user@"host" ls'; pass=$true }
+    @{ name='pwsh-at-quote-inside-word'; command='ssh user@"host" ls'; pass=$true },
+    # 新しい読みと従来の読みの両方で検査し、行継続・`$$`・算術の`<<`・二重引用内の`$(…)`の逆引用・逆引用と`${…}`の中の`#`で
+    # 後続の削除を隠さない。終わりを確定できない`"$(`・終端語は拒否し、`${#arr[@]}`・`$(…)`の中のヒアドキュメントは誤拒否しない。
+    @{ name='posix-continuation-then-comment'; command=("echo a \`n# it's`nunlink `"<FILE>`"`necho 'ok'"); pass=$false },
+    @{ name='posix-continuation-then-clobber'; command=("\`n>| /tmp/z unlink `"<FILE>`""); pass=$false },
+    @{ name='posix-dollar-dollar-then-quote'; command=('echo $$''\''' + "`n" + 'unlink "<FILE>"' + "`n" + 'echo ''ok'''); pass=$false },
+    @{ name='posix-arithmetic-shift-not-heredoc'; command=('echo $((1<<2))' + "`n" + 'echo ''' + "`n2`n" + '''; unlink "<FILE>"; echo ''' + "`n" + ''''); pass=$false },
+    @{ name='posix-quoted-substitution-backtick'; command='echo "$(basename `pwd`)"; unlink "<FILE>"'; pass=$false },
+    @{ name='posix-quoted-substitution-unterminated'; command='echo "$(echo '')''"'; pass=$false },
+    @{ name='posix-backtick-comment'; command='echo `echo a # c`; unlink "<FILE>"'; pass=$false },
+    @{ name='posix-parameter-default-hash'; command='echo ${x:- #}; unlink "<FILE>"'; pass=$false },
+    @{ name='posix-heredoc-undetermined-delimiter'; command=('cat <<$''E\x4fF''' + "`nit's`nEOF`n" + 'unlink "<FILE>"' + "`n" + 'echo ''ok'''); pass=$false },
+    @{ name='posix-heredoc-carriage-return-body'; command=("cat <<'EOF'`nEOF`r`nit's`nEOF`nunlink `"<FILE>`"`necho 'ok'"); pass=$false },
+    @{ name='posix-prefix-option-redirect'; command='env -u >/dev/null FOO unlink "<FILE>"'; pass=$false },
+    @{ name='posix-array-subscript-blank'; command='a[1 + 1]=5 unlink "<FILE>"'; pass=$false },
+    @{ name='wrapper-body-trailing-redirect'; command='pwsh -Command "Remove-Item -LiteralPath ''<FILE>''" > out.txt'; pass=$false },
+    @{ name='wrapper-body-trailing-dup'; command='pwsh -Command "Remove-Item -LiteralPath ''<FILE>''" 2>&1'; pass=$false },
+    @{ name='posix-parameter-array-length'; command='if [ ${#arr[@]} -eq 0 ]; then echo none; fi'; pass=$true },
+    @{ name='posix-quoted-substitution-heredoc'; command=('git commit -m "$(cat <<''EOF''' + "`nIt's fine`nEOF`n" + ')"'); pass=$true },
+    @{ name='pwsh-here-string-after-comma'; command=("Write-Output 1,@'`nit's`n'@; Remove-Item -LiteralPath `"<FILE>`"; Write-Output 'ok'"); shell='pwsh'; pass=$false; bashPass=$false },
+    @{ name='pwsh-block-comment-after-assignment'; command='$x=<# c #> Remove-Item -LiteralPath "<FILE>"'; shell='pwsh'; pass=$false; bashPass=$false },
+    @{ name='pwsh-smart-quote-here-string'; command=('$a = @' + [char]0x2018 + "`nit's`n" + [char]0x2019 + '@; Remove-Item -LiteralPath "<FILE>"; Write-Output ''ok'''); shell='pwsh'; pass=$false; bashPass=$false },
+    @{ name='pwsh-smart-quote-legacy-reading'; command=('Write-Output ' + [char]0x2018 + '; Remove-Item -LiteralPath "<FILE>"; Write-Output '''); shell='pwsh'; pass=$false; bashPass=$false },
+    @{ name='pwsh-here-string-after-comma-harmless'; command=("Write-Output 1,@'`nit's`n'@"); shell='pwsh'; pass=$true }
 )
 
 $results = [Collections.Generic.List[object]]::new()

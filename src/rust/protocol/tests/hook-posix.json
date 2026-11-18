@@ -125,5 +125,20 @@
  {"name":"exec-close-fd-then-delete","command":"exec 3>&- unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
  {"name":"exec-redirect-then-delete","command":"exec >/tmp/prunlet-log rm -- <FILE>","pass":false,"reason":"deletion command; detected token \"rm\"; interpretation=POSIX"},
  {"name":"unquoted-heredoc-apostrophe-substitution","command":"cat <<EOF\nDon't $(unlink <FILE>)\nEOF","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
- {"name":"unquoted-heredoc-hash-substitution","command":"cat <<EOF\n# $(unlink <FILE>)\nEOF","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"}
+ {"name":"unquoted-heredoc-hash-substitution","command":"cat <<EOF\n# $(unlink <FILE>)\nEOF","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"continuation-then-comment","command":"echo a \\\n# it's\nunlink <FILE>\necho 'ok'","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"continuation-then-clobber-redirect","command":"\\\n>| /tmp/z unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"dollar-dollar-then-single-quote","command":"echo $$'\\'\nunlink <FILE>\necho 'ok'","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"arithmetic-shift-is-not-heredoc","command":"echo $((1<<2))\necho '\n2\n'; unlink <FILE>; echo '\n'","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"quoted-substitution-backtick","command":"echo \"$(basename `pwd`)\"; unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"quoted-substitution-unterminated","command":"echo \"$(echo ')'\"","pass":false,"reason":"unterminated POSIX command substitution cannot be inspected"},
+ {"name":"quoted-substitution-heredoc-apostrophe","command":"git commit -m \"$(cat <<'EOF'\nIt's fine\nEOF\n)\"","pass":true},
+ {"name":"parameter-array-length","command":"if [ ${#arr[@]} -eq 0 ]; then echo none; fi","pass":true},
+ {"name":"parameter-default-with-hash","command":"echo ${x:- #}; unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"parameter-command-name-may-be-empty","command":"echo ${#x}; ${X} unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"backtick-comment-ends-at-backtick","command":"echo `echo a # c`; unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"heredoc-undetermined-delimiter","command":"cat <<$'E\\x4fF'\nit's\nEOF\nunlink <FILE>\necho 'ok'","pass":false,"reason":"POSIX here-document delimiter cannot be determined"},
+ {"name":"heredoc-carriage-return-line-is-body","command":"cat <<'EOF'\nEOF\r\nit's\nEOF\nunlink <FILE>\necho 'ok'","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"prefix-option-value-redirect","command":"env -u >/dev/null FOO unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"array-subscript-with-blank","command":"a[1 + 1]=5 unlink <FILE>","pass":false,"reason":"POSIX array subscript with blanks cannot be inspected"}
 ]
