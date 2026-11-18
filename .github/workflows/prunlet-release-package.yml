@@ -113,7 +113,7 @@ jobs:
         # 他のactionと同じくcommit SHAで固定する。導入する版は、そのcommitのSigiluneのCargo.tomlの版から
         # action自身が決める（SHA固定がそのまま版固定になる）。version入力で別の版を指定しない
         # （R2には各版の配布物しか無く、古い版を指定すると導入に失敗する。1.0.48の初回runで発生）。
-        uses: 1llum1n4t1s/Sigilune@05006dcad019e5e863a08985b9208d72004f1b5f # v1.1.3
+        uses: 1llum1n4t1s/Sigilune@b2142b4d1084ec2a5b0a18e83cea7e886406b389 # v1.1.4
       - name: Sign the executables and pack the Velopack Setup
         # 署名用Secretsはこのstepだけへ渡す（Sigiluneのログインは1回のまま、別jobに分けない）。全runtimeを同じ
         # セッションで1ファイルずつ署名し、hookを署名済みCLIの複製へ置き換え、署名者・タイムスタンプを確認する。
