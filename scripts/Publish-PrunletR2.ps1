@@ -15,7 +15,7 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$CommitSha,
     [Parameter(Mandatory)][string]$DefaultBranch,
     [Parameter(Mandatory)][ValidateSet('win-x64', 'win-arm64')][string]$Runtime,
-    # 配信する版（Cargo.toml の版。release/<版> のブランチ名と一致していること）。
+    # 配信する版（Cargo.toml の版。タグ v<版> の名前と一致していること）。
     [Parameter(Mandatory)][ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+$')][string]$Version,
     [string]$Repository = '1llum1n4t1s/Prunlet',
     [string]$AccountId = $env:PRUNLET_R2_ACCOUNT_ID,

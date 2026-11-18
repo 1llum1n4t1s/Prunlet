@@ -1,6 +1,6 @@
 # 配布
 
-Prunletの配布物（WindowsのZIP・Setup、Apple SiliconのZIP、Linuxのtar.gz）は、Cloudflare R2（`https://prunlet.kagayoi.com`）だけから配る。GitHub Release・タグ・GitHub APIの最新版照会とブランチ比較は、配布にも更新の判定にも使わない。信頼の基点は、専用の鍵で署名したマニフェスト（下記）だけで、クライアントはR2の応答そのものを信頼しない。タグとGitHub Releaseは作らない（公開の告知は別の操作として扱う）。Windows ZIPのschema 1と同梱12ファイルの構成は従来どおり保つ。
+Prunletの配布物（WindowsのZIP・Setup、Apple SiliconのZIP、Linuxのtar.gz）は、Cloudflare R2（`https://prunlet.kagayoi.com`）だけから配る。GitHub Release・GitHub APIの最新版照会・タグ・ブランチ比較は、配布にも更新の判定にも使わない（タグは配信workflowの起点にだけ使う）。信頼の基点は、専用の鍵で署名したマニフェスト（下記）だけで、クライアントはR2の応答そのものを信頼しない。GitHub Releaseは作らない（公開の告知は別の操作として扱う）。配信の起点になる軽量タグ`v<版>`は、配布物ではなく起動条件である。Windows ZIPのschema 1と同梱12ファイルの構成は従来どおり保つ。
 
 ## 署名付きマニフェスト
 
@@ -22,7 +22,7 @@ Prunletの配布物（WindowsのZIP・Setup、Apple SiliconのZIP、Linuxのtar.
 - `bytes`がruntimeの上限（Windows ZIP・Setupは512 MiB、macOS・Linuxは64 MiB）以下で、取得した実物の長さとSHA-256が一致すること。
 - 版が厳密な`x.y.z`で、導入済みの版より厳密に大きいこと（後退・同版の再適用を防ぐ）。
 
-どのcommitを配ってよいかはCIが決める。配信workflowは、起動したブランチが`release/<版>`でその版が`Cargo.toml`と一致すること、チェックアウトしたHEADがイベントのcommitであること、そのcommitが既定ブランチ（`main`）の祖先であることを`scripts/Assert-PrunletReleaseRef.ps1`で確かめてから署名する。クライアントは`main`の子孫判定を自分では行わず、署名済みマニフェストを信頼する。運用の前提は「`main`をpushしてから、同じcommitで`release/<版>`を切る」こと。
+どのcommitを配ってよいかはCIが決める。配信workflowは、起動したrefがタグで、名前が厳密に`v<x.y.z>`かつその版が`Cargo.toml`と一致すること、タグが軽量タグでいまもイベントのcommitを指すこと、チェックアウトしたHEADがイベントのcommitであること、そのcommitが既定ブランチ（`main`）の祖先であることを`scripts/Assert-PrunletReleaseRef.ps1`で確かめてから署名する（タグ以外のref・注釈付きタグ・`v1.2.3-rc1`のような版は拒否する）。クライアントは`main`の子孫判定を自分では行わず、署名済みマニフェストを信頼する。運用の前提は「`main`をpushしてから、同じcommitに軽量タグ`v<版>`を付けてそのタグだけをpushする」こと（`git push --tags`は使わない）。タグの作成・更新・削除はタグ保護のルールセットで管理者だけに限る。
 
 署名鍵はPrunletの配信専用で、秘密鍵（PKCS8 PEM）はGitHub Environment `release`のSecret `PRUNLET_RELEASE_SIGNING_KEY`にだけ置く。workflowは鍵整合の関門とR2へ書くstepだけへ渡し、ビルドstepには渡さない。署名やR2への書込みの前に、`scripts/Test-PrunletReleaseKeyGate.ps1`が本番鍵で試験封筒に署名し、配信側の正本とクライアント側3か所の定数のすべてで検証できることを確かめる。一致しない・定数が無い・重複している場合は、R2へ何も書かずに止まる。関門は各ファイルから「識別子と同じ行の100文字以上のbase64リテラル」をちょうど1件抽出するので、定数は各場所で1か所だけに、識別子と同じ行で定義する。
 
@@ -48,7 +48,7 @@ runtimeは`win-x64`・`win-arm64`・`linux-x64`・`linux-arm64`・`osx-arm64`・
 
 `prunlet.exe`・`prunlet-maintenance.exe`・`prunlet-hook.exe`はCertumのコード署名証明書でAuthenticode署名し、RFC 3161タイムスタンプを付ける。署名はrelease workflowで[Sigilune](https://github.com/1llum1n4t1s/Sigilune)を使い、SimplySignのクラウド鍵へ直接接続して行う（SimplySign Desktop・手入力のワンタイムコードは不要）。hookはCLIと同一hashである必要があるので、CLIを署名してからhookへ複製する。同梱の`.ps1`・`PRUNLET.md`はsourceと同一bytesで照合するため署名しない。`Install-Prunlet.ps1`による手動導入もソースをビルドせず、署名付きマニフェストが指す署名済み更新ZIPを起動時更新と同じ条件で照合して配置する。未署名・署名者違い・タイムスタンプなしの実行ファイルは配置しない。そのため、配信workflowが最新ポインタを更新するまでの間は、手動導入も前の版を導入する。
 
-- 署名用のSecrets `SIGILUNE_EMAIL`・`SIGILUNE_TOTP_URI` は、Environment `release`（承認者なし。`release/*`ブランチだけ許可）にだけ置く。workflowは署名stepだけへ渡し、Rustのビルド（依存crateのbuild scriptを含む）には渡さない。同じEnvironmentに`PRUNLET_RELEASE_SIGNING_KEY`と`CLOUDFLARE_API_TOKEN`も置き、それぞれ関門・R2の各stepだけへ渡す。
+- 署名用のSecrets `SIGILUNE_EMAIL`・`SIGILUNE_TOTP_URI` は、Environment `release`（承認者なし。タグ`v<x.y.z>`だけ許可）にだけ置く。workflowは署名stepだけへ渡し、Rustのビルド（依存crateのbuild scriptを含む）には渡さない。同じEnvironmentに`PRUNLET_RELEASE_SIGNING_KEY`と`CLOUDFLARE_API_TOKEN`も置き、それぞれ関門・R2の各stepだけへ渡す。
 - 別マシンの並列jobが同じTOTP時間枠を使うとCertumが後者を拒否するため、win-x64・win-arm64を1つのjobで扱い、同じSigiluneセッションで署名してログインを1回にする。v1.0.0公開前のSigiluneで1回の呼出しに複数ファイルを渡すと、signtoolの異常終了やdlibのpanicが観測されたため、1ファイルずつ呼び出す。失敗時に自動再試行しない。
 - 署名・検証の処理は`scripts/Signing.Common.ps1`と`scripts/Sign-PrunletBuild.ps1`に集約する。署名後はSigiluneの検証に加えて、Windowsの判定が`Valid`であること、署名者の共通名、タイムスタンプの存在を独立に確認する。タイムスタンプがないと証明書の期限切れ後に`Valid`でなくなり、公開済みクライアント（NotSigned・Valid以外を拒否する）が更新を受け付けなくなる。
 
@@ -56,19 +56,19 @@ runtimeは`win-x64`・`win-arm64`・`linux-x64`・`linux-arm64`・`osx-arm64`・
 
 送信前には、公開済みWindowsクライアントと同じZIP 512 MiB・実行ファイル各256 MiB・補助ファイル各4 MiBの上限、PE offset・machine、リンク属性の禁止、Authenticodeが署名者・タイムスタンプ付きのValidであることも照合する。
 
-`release/<版>`ブランチへのpush（`/vava`が`main`をpushしてから同じcommitで`release/<版>`をpushする）をきっかけに、`.github/workflows/prunlet-release-package.yml`が1つのjobで次を行う。jobは承認待ちなしで始まる（Environment `release`は承認者なし・ブランチ制限だけ）。
+`v<版>`タグのpush（`/vava`が`main`をpushしてから同じcommitに軽量タグ`v<版>`を付けてpushする）をきっかけに、`.github/workflows/prunlet-release-package.yml`が1つのjobで次を行う。jobは承認待ちなしで始まる（Environment `release`は承認者なし・タグ制限だけ）。
 
-1. `Assert-PrunletReleaseRef.ps1`がブランチ名と`Cargo.toml`の版、HEADとイベントのcommit、既定ブランチの祖先であることを確認し、鍵整合の関門を通す。続けて`scripts/Invoke-PrunletTests.ps1 -Mode Standard`（`cargo test --locked`）を実行し、失敗したら署名・R2配置へ進まない。起動時更新の検証用cfg（`prunlet_windows_update_tests`）のテストは、`main`のpushとPRで動く`.github/workflows/prunlet-tests.yml`の`update-cfg` jobが担う（配信jobでは動かさない）。
+1. `Assert-PrunletReleaseRef.ps1`がタグ名と`Cargo.toml`の版、軽量タグがイベントのcommitを指すこと、HEADとイベントのcommit、既定ブランチの祖先であることを確認し、鍵整合の関門を通す。続けて`scripts/Invoke-PrunletTests.ps1 -Mode Standard`（`cargo test --locked`）を実行し、失敗したら署名・R2配置へ進まない。起動時更新の検証用cfg（`prunlet_windows_update_tests`）のテストは、`main`のpushとPRで動く`.github/workflows/prunlet-tests.yml`の`update-cfg` jobが担う（配信jobでは動かさない）。
 2. win-x64・win-arm64を`Publish-Prunlet.ps1`でビルドし、製品の版を照合する。
 3. Sigiluneを導入し、`Sign-PrunletBuild.ps1`で両runtimeの実行ファイルを署名する。署名後のhashと署名者・署名前hashを`build-manifest.json`へ記録する。
 4. `Package-PrunletUpdate.ps1`で梱包し、`Verify-ReleasePackage.ps1 -RequireSignature`が同梱物・版・machine・metadata・hashと署名を検証する。
 5. `Publish-PrunletR2.ps1 -CheckOnly`が全runtimeの既存マニフェストと最新ポインタを読取りだけで検査し、続けて`Publish-PrunletR2.ps1`が署名を含めて再検証したZIPを、上の順序でR2へ置いて署名付きマニフェストを発行する。R2 SDK連携は`R2Distribution.Common.ps1`に置く。
 
-再実行は、原因を確認してから同じ`release/<版>`のrefで`workflow_dispatch`する。署名の失敗を自動で再実行しない。同じ版を再ビルドするとZIPのhashが変わるため、配信済みの版の再配信はpayloadの不一致で失敗する（patchを上げて新しい`release/<版>`を切る）。
+再実行は、原因を確認してから同じタグ`v<版>`のrefで`workflow_dispatch`する（`gh workflow run prunlet-release-package.yml --ref v<版>`）。署名の失敗を自動で再実行しない。同じ版を再ビルドするとZIPのhashが変わるため、配信済みの版の再配信はpayloadの不一致で失敗する（patchを上げて新しいタグ`v<版>`を切る）。
 
 ## Windowsの Setup（Velopack）
 
-Windows x64には、更新ZIPとは別に Velopack の Setup（ユーザー単位・管理者不要・署名付き）を配る。ZIP（上記）と併存し、同じ`release/<版>`の同じ`prunlet.exe`・`prunlet-maintenance.exe`を使う。win-arm64はZIPのままで、Velopackには含めない。ZIPと旧更新コードの廃止は別の変更で行う。
+Windows x64には、更新ZIPとは別に Velopack の Setup（ユーザー単位・管理者不要・署名付き）を配る。ZIP（上記）と併存し、同じタグ`v<版>`の同じ`prunlet.exe`・`prunlet-maintenance.exe`を使う。win-arm64はZIPのままで、Velopackには含めない。ZIPと旧更新コードの廃止は別の変更で行う。
 
 契約:
 
@@ -98,7 +98,7 @@ secrets・variables: R2は上記ZIPと同じ資格情報と`PRUNLET_R2_BUCKET`�
 - 差分更新（Delta）は使わない。梱包は`--delta None`で、フィードにDeltaの資産があっても取得・適用しない（full nupkgだけ）。
 - この挙動は、隔離E2Eの悪性フィードの検査（[検証手順](verification.md#setupvelopackの梱包配信の検証)）で、`update-check`が`failed`、`<root>\Update.exe`が不変、`packages\`が空、Deltaが無いことを確かめる。
 
-配信（マニフェスト・R2）だけが失敗したときは、`.github/workflows/prunlet-velopack-redo.yml`を、再配信する`release/<版>`のrefで`workflow_dispatch`し、保存した配布workflowの実行ID（`run_id`）を指定する。保存した実行が同じcommitに対する「Prunlet release packages」のものであることを確かめ、再ビルド・再署名はせず（Sigiluneは使わない）、保存済みの一式を取得して`verify-windows.ps1 -RequireSignature`で再検証し、`.sha256`が保存時と一致することを確かめてから、署名付きマニフェスト（未作成なら署名して置き、既存なら照合する）とR2配信だけを行う。ZIPは再配布しない。artifactの期限切れ、または梱包・検証・保存より前の失敗（vpkの導入・署名・検証）には使えない。その場合は配布workflowの修正と、本人の判断による新しい版での公開が要る。R2のnupkgとマニフェストは新規作成のみで、既存と内容が違えば失敗する。署名の失敗は自動で再実行しない。
+配信（マニフェスト・R2）だけが失敗したときは、`.github/workflows/prunlet-velopack-redo.yml`を、再配信するタグ`v<版>`のrefで`workflow_dispatch`し（`gh workflow run prunlet-velopack-redo.yml --ref v<版>`）、保存した配布workflowの実行ID（`run_id`）を指定する。保存した実行が同じcommitに対する「Prunlet release packages」のものであることを確かめ、再ビルド・再署名はせず（Sigiluneは使わない）、保存済みの一式を取得して`verify-windows.ps1 -RequireSignature`で再検証し、`.sha256`が保存時と一致することを確かめてから、署名付きマニフェスト（未作成なら署名して置き、既存なら照合する）とR2配信だけを行う。ZIPは再配布しない。artifactの期限切れ、または梱包・検証・保存より前の失敗（vpkの導入・署名・検証）には使えない。その場合は配布workflowの修正と、本人の判断による新しい版での公開が要る。R2のnupkgとマニフェストは新規作成のみで、既存と内容が違えば失敗する。署名の失敗は自動で再実行しない。
 
 手元の確認は、未署名のテスト用packId（`PrunletVelopackTest`）で`pack-windows.ps1`・`verify-windows.ps1`を実行し、`publish-r2.ps1 -DryRun`で配信計画を確かめる（[検証手順](verification.md#setupvelopackの梱包配信の検証)）。実R2・実署名はこの確認に含めない。
 
@@ -110,12 +110,12 @@ secrets・variables: R2は上記ZIPと同じ資格情報と`PRUNLET_R2_BUCKET`�
 2. [Macのリリースビルド](macos.md#リリースビルド)に従い、同じSSHセッションでDeveloper ID Applicationの署名鍵と `notarytool` のプロファイルを使う。資格情報が未配置なら、管理者の署名用正本から今回専用のキーチェーンを準備する。鍵やパスワードをソース・ログ・GitHubへ渡さず、一時キーチェーンと鍵の作業コピーは作業後に清掃する。
 3. 公証の `Accepted` と `package.json` の版・SHA・`osx-arm64`・ZIPのサイズとSHA-256を確認する。Macから転送した同じ `prunlet-update-osx-arm64.zip` を、送信直前に再度照合する。
 4. `scripts/Send-PrunletMacPackage.ps1 -PackagePath <ZIP絶対パス> -CommitSha <40桁SHA> -Version <版>`で、R2の不変キー`releases/1llum1n4t1s/prunlet/<commit>/osx-arm64/<sha256>.zip`へ新規作成のみで送る。ZIPの2項目・`manifest.json`の版・commit・runtime・実行体の長さとSHA-256を送信前に独立に検査する。R2の資格情報だけを使い、Macの資格情報やマニフェストの署名鍵は使わない。同じsha256の再送は既存objectを照合するだけで上書きしない。
-5. 表示された`sha256`・`bytes`を入力にして、`release/<版>`のrefで`prunlet-mac-release.yml`を`workflow_dispatch`する。workflowはR2の実物の長さ・SHA-256・ZIPの中身・`manifest.json`をチェックアウトしたHEADの版・commitと照合し、既存の版マニフェストと最新ポインタを読取りだけで検査してから、版マニフェスト（新規作成）→最新ポインタの順に発行する。
+5. 表示された`sha256`・`bytes`を入力にして、タグ`v<版>`のrefで`prunlet-mac-release.yml`を`workflow_dispatch`する（`gh workflow run prunlet-mac-release.yml --ref v<版>`）。workflowはR2の実物の長さ・SHA-256・ZIPの中身・`manifest.json`をチェックアウトしたHEADの版・commitと照合し、既存の版マニフェストと最新ポインタを読取りだけで検査してから、版マニフェスト（新規作成）→最新ポインタの順に発行する。
 6. 再開時は、R2の不変キーと版マニフェストの状態を確認し、一致済みのZIPを再ビルド・再送しない。不一致や結果不明のobjectを上書きしない。
 
 ## Linux版の公開手順
 
-Linux版は、`release/<版>`ブランチへのpushで `.github/workflows/prunlet-linux-release.yml` が自動で動く。手作業での配信はしない。build jobは、x64は `ubuntu-24.04`、ARM64は `ubuntu-24.04-arm` の各ランナー（`ubuntu-latest` はglibc要件が `docs/linux.md` の2.39を超える版へ移ったため使わない）で、起動したrefをクリーンにチェックアウトし、`release/*`ではWindows版と同じ検査（ブランチ名と版、HEADとイベントのcommit、既定ブランチの祖先）を通してから次を行う。build jobはSecretsを持たない。
+Linux版は、`v<版>`タグのpushで `.github/workflows/prunlet-linux-release.yml` が自動で動く。手作業での配信はしない。build jobは、x64は `ubuntu-24.04`、ARM64は `ubuntu-24.04-arm` の各ランナー（`ubuntu-latest` はglibc要件が `docs/linux.md` の2.39を超える版へ移ったため使わない）で、起動したrefをクリーンにチェックアウトし、タグのrefではWindows版と同じ検査（タグ名と版、軽量タグ、HEADとイベントのcommit、既定ブランチの祖先）を通してから次を行う。build jobはSecretsを持たない。
 
 1. `rust-toolchain.toml` が指定するRustで `cargo test --locked --lib` と `cargo test --locked --test localization` を実行する。
 2. `bash scripts/Publish-PrunletLinux.sh <新規の絶対出力先> <40桁SHA> <linux-x64|linux-arm64>` でビルドする。生成するtar.gzには `prunlet` と、版・コミット・対象・実行体サイズ・SHA-256を記録した `manifest.json` を収録する。スクリプトがELFのアーキテクチャと梱包内容を照合し、配布実物のチェックサムを `.tar.gz.sha256` へ保存する。
@@ -123,8 +123,8 @@ Linux版は、`release/<版>`ブランチへのpushで `.github/workflows/prunle
 4. 配布tar.gzから取り出した実行体で `scripts/Verify-LinuxFiles.ts` を、版とコミットが異なる3世代のデバッグビルド（`prunlet_linux_update_tests`）で `scripts/Verify-UnixStartupUpdate.ts` を実行する。Windowsの起動時更新に相当する実プロセスの検証（E2E）は配信workflowでは行わず（cfg付きの`cargo test --lib`だけは`prunlet-tests.yml`で行う）、`all(windows, debug_assertions, prunlet_windows_update_tests)`の検証用ビルド（`RUSTFLAGS='--cfg prunlet_windows_update_tests -C debug-assertions=on'`で`Publish-Prunlet.ps1 -IncludeVerificationProbe`）を`Verify-LatestInstall.ps1`へ渡して手元で行う（[latestインストーラー](verification.md#latestインストーラー)）。
 5. 検証済みのtar.gzとチェックサムをartifactへ保存する。
 
-publish job（Environment `release`。`release/*`の実行だけで動く）は、両CPUのbuildが成功した場合だけ、同じref検査と鍵整合の関門を通し、artifactの中身（ustar・2エントリ・manifest・上限・`.sha256`）を`scripts/Publish-PrunletLinuxR2.ps1`で独立に再検査する。`-CheckOnly`で既存の版マニフェストと最新ポインタを読取りだけで検査してから、tar.gz（新規作成）→公開URLでの照合→版マニフェスト（新規作成）→最新ポインタ→手動取得用の固定名（`download/latest/`。`.sha256`が最後）の順に置く。
+publish job（Environment `release`。タグ`v<版>`の実行だけで動く）は、両CPUのbuildが成功した場合だけ、同じref検査と鍵整合の関門を通し、artifactの中身（ustar・2エントリ・manifest・上限・`.sha256`）を`scripts/Publish-PrunletLinuxR2.ps1`で独立に再検査する。`-CheckOnly`で既存の版マニフェストと最新ポインタを読取りだけで検査してから、tar.gz（新規作成）→公開URLでの照合→版マニフェスト（新規作成）→最新ポインタ→手動取得用の固定名（`download/latest/`。`.sha256`が最後）の順に置く。
 
-`release/*`以外のrefで`workflow_dispatch`すると、build jobのビルド・検証とartifact化だけを行い、publish jobは動かない。検証用のブランチでの確認に使う。
+タグ以外のrefで`workflow_dispatch`すると、build jobのビルド・検証とartifact化だけを行い、publish jobは動かない。検証用のブランチでの確認に使う（Environmentの制限により、配信はタグからだけ動く）。
 
 Linuxの起動時更新はこのtar.gzを直接使う。対象assetは `prunlet-linux-arm64.tar.gz`・`prunlet-linux-x64.tar.gz` とし、GNU tarのustar形式で `prunlet`、`manifest.json` の順に収録する。展開前と実行ファイルの上限は各64 MiB。起動側は署名付きマニフェストの長さとSHA-256で照合し、固定名の`.sha256`は手動取得時の転送確認に使う。

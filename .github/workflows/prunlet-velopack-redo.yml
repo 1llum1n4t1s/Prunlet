@@ -1,18 +1,18 @@
 name: Prunlet Velopack redelivery
 
-# 配信済みの release/<版> のSetup（Velopack: nupkg・Setup・releases.win.json）の配信だけをやり直す。
+# 配信済みのタグ v<版> のSetup（Velopack: nupkg・Setup・releases.win.json）の配信だけをやり直す。
 # prunlet-release-package.yml のVelopack工程が、検証済みの一式を保存した（artifact `prunlet-velopack-<版>`、
 # 保持30日）後で、R2への配信に失敗したときの再実行用。ZIPは再配布しない。
 #
 # 再ビルドも再署名もしない（Sigiluneは使わない）。保存済みの一式を取得し、再検証
 # （verify-windows.ps1 -RequireSignature）→ R2の署名マニフェストと照合（未作成なら署名して置く）→ R2配信だけを行う。
-# - 手動起動（workflow_dispatch）だけ。起動するrefは再配信する release/<版> のブランチ（ブランチ名とCargo.tomlの版は一致、
-#   commitは既定ブランチの祖先）。入力 `run_id` は、その配布workflowの実行ID。
+# - 手動起動（workflow_dispatch）だけ。起動するrefは再配信するタグ v<版>（gh workflow run prunlet-velopack-redo.yml --ref v<版>。タグ名とCargo.tomlの版は一致、
+#   軽量タグで、commitは既定ブランチの祖先）。入力 `run_id` は、その配布workflowの実行ID。
 # - 保存した実行は、同じcommitに対する「Prunlet release packages」のものだけを受け付ける。
 # - 版付きの成果物と署名マニフェストは新規作成のみ。R2に同名があれば、成果物は内容を、マニフェストは署名と
 #   payload（nupkgの長さ・SHA-256）を照合し、一致しなければ失敗する（上書きしない）。現行のreleases.win.jsonが同じ版なら
 #   固定名は置き換えず、新しい版なら何も置かずに失敗する（後退させない）。
-# - 署名鍵（PRUNLET_RELEASE_SIGNING_KEY）とR2のトークンは、承認者なしのEnvironment `release`（release/* だけを許可）から受け取る。
+# - 署名鍵（PRUNLET_RELEASE_SIGNING_KEY）とR2のトークンは、承認者なしのEnvironment `release`（タグ v<x.y.z> だけを許可）から受け取る。
 #   リリースworkflowと同じconcurrency groupにして、並走を避ける。
 
 on:
@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
   velopack:
-    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && github.event_name == 'workflow_dispatch' && github.ref_type == 'branch' && startsWith(github.ref_name, 'release/') }}
+    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && github.event_name == 'workflow_dispatch' && github.ref_type == 'tag' }}
     runs-on: windows-latest
     timeout-minutes: 30
     environment: release
@@ -46,7 +46,7 @@ jobs:
       PRUNLET_RUN_ID: ${{ inputs.run_id }}
       PRUNLET_R2_BUCKET: ${{ vars.PRUNLET_R2_BUCKET || 'prunlet-updates' }}
     steps:
-      - name: Checkout the release branch
+      - name: Checkout the release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0

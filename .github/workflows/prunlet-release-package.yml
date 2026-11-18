@@ -1,24 +1,25 @@
 name: Prunlet release packages
 
-# release/<版> ブランチの push で、Windows（win-x64・win-arm64）の更新ZIPとSetup（Velopack）をビルド・署名し、
+# main のコミットに付けた軽量タグ v<版> の push で、Windows（win-x64・win-arm64）の更新ZIPとSetup（Velopack）をビルド・署名し、
 # 署名付きマニフェストと一緒に Cloudflare R2（https://prunlet.kagayoi.com）へ配信する。
 # GitHub Release もタグも使わない。R2 が唯一の配布元で、クライアントは固定の公開鍵でマニフェストの署名を検証する。
-# - 起動: release/** ブランチへの push（/vava が release/<版> を push すると始まる）。workflow_dispatch は、
-#   同じ release/<版> の ref を選んだ再実行にだけ使う（ブランチ名と Cargo.toml の版は一致させる）。
+# - 起動: タグ v<x.y.z> の push（/vava が main をpushしてから同じcommitの軽量タグ v<版> をpushすると始まる）。
+#   workflow_dispatch は、同じタグ v<版> の ref を選んだ再実行（gh workflow run <workflow> --ref v<版>）にだけ使う
+#   （タグ名と Cargo.toml の版は一致させる）。
 # - 公開の順序: ZIP（create-only）→ 公開URLで照合 → 版マニフェスト（create-only）→ 最新ポインタ。
 #   Setupは 署名マニフェスト → nupkg → フィード → 固定名。いずれも書込みの前に、鍵の整合・既存マニフェスト・
 #   最新ポインタ（後退）の検査を、読取りだけで全runtime分済ませる。
 # - 署名用Secrets（SIGILUNE_*）はSigiluneの署名stepだけへ、マニフェスト署名鍵（PRUNLET_RELEASE_SIGNING_KEY）は
 #   鍵整合の関門とR2へ書くstepだけへ渡す。ビルドstepには何も渡さない。承認者なし・ブランチ制限付きの
-#   Environment `release`（release/* だけを許可）にだけ置く。
+#   Environment `release`（タグ v<x.y.z> だけを許可）にだけ置く。
 # - 署名の失敗を自動で再実行しない。原因を確認してから、同じrefで workflow_dispatch する。同じ版のZIPは再ビルドで
-#   hashが変わるため、配信済みの版の再配信はpayload不一致で失敗する（patchを上げて新しい release/<版> を切る）。
+#   hashが変わるため、配信済みの版の再配信はpayload不一致で失敗する（patchを上げて新しいタグ v<版> を切る）。
 #   Setupだけをやり直すときは prunlet-velopack-redo.yml を使う。
 
 on:
   push:
-    branches:
-      - 'release/**'
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
 
 permissions:
@@ -31,7 +32,7 @@ concurrency:
 
 jobs:
   package:
-    # release/<版> のブランチからwin-x64・win-arm64をビルドし、Sigilune（Certum SimplySignのクラウド鍵）で
+    # タグ v<版> のcommitからwin-x64・win-arm64をビルドし、Sigilune（Certum SimplySignのクラウド鍵）で
     # 署名した実物だけをR2へ配置する。
     # 別マシンの並列jobが同じTOTP時間枠を使うとCertumが後者を拒否するため、両runtimeを1つのjobで扱い、
     # 同じSigiluneセッションでログインを1回にする。
@@ -49,7 +50,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - name: Checkout the release branch
+      - name: Checkout the release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -59,7 +60,8 @@ jobs:
           rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify the release commit
-        # ref名 release/<版> とCargo.tomlの版の一致、HEADとイベントcommitの一致、既定ブランチの祖先であることを検査する。
+        # タグであること・ref名 v<版> とCargo.tomlの版の一致・軽量タグがイベントcommitを指すこと・HEADとイベントcommitの一致・
+        # 既定ブランチの祖先であることを、無条件に検査する。
         id: source
         env:
           GH_TOKEN: ${{ github.token }}
@@ -110,10 +112,10 @@ jobs:
           $help = (vpk --help 2>&1 | Out-String) -replace "`e\[[0-9;]*m", ''
           if ($help -notmatch '\bVelopack CLI 1\.2\.161\b') { throw 'vpk 1.2.161 could not start.' }
       - name: Set up Sigilune
-        # 他のactionと同じくcommit SHAで固定する。導入する版は、そのcommitのSigiluneのCargo.tomlの版から
-        # action自身が決める（SHA固定がそのまま版固定になる）。version入力で別の版を指定しない
+        # 自作のSigiluneは移動タグ @v1 で使う（v1はその版のR2配信が成功したcommitへだけ動かす）。導入する版は、
+        # actionが指すcommitのSigiluneのCargo.tomlの版から決まる。version入力で別の版を指定しない
         # （R2には各版の配布物しか無く、古い版を指定すると導入に失敗する。1.0.48の初回runで発生）。
-        uses: 1llum1n4t1s/Sigilune@b2142b4d1084ec2a5b0a18e83cea7e886406b389 # v1.1.4
+        uses: 1llum1n4t1s/Sigilune@v1
       - name: Sign the executables and pack the Velopack Setup
         # 署名用Secretsはこのstepだけへ渡す（Sigiluneのログインは1回のまま、別jobに分けない）。全runtimeを同じ
         # セッションで1ファイルずつ署名し、hookを署名済みCLIの複製へ置き換え、署名者・タイムスタンプを確認する。

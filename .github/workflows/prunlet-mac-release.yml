@@ -12,8 +12,8 @@ name: Prunlet Mac release manifest
 # つまりCIは「自分でビルドしていない物」に署名する。Developer IDの署名と公証の検証（Appleの信頼）は
 # クライアント側（起動時更新）の責任で、ここでは行わない。
 #
-# 手順: 1) release/<版> を切る 2) 実機でビルド・公証・ZIP生成 3) Send-PrunletMacPackage.ps1 で送り、表示された
-# sha256・bytes を控える 4) このworkflowを release/<版> のrefで実行し、sha256・bytes を入力する。
+# 手順: 1) main のcommitへ軽量タグ v<版> を切る 2) 実機でビルド・公証・ZIP生成 3) Send-PrunletMacPackage.ps1 で送り、表示された
+# sha256・bytes を控える 4) このworkflowをタグ v<版> のrefで実行し（gh workflow run prunlet-mac-release.yml --ref v<版>）、sha256・bytes を入力する。
 # 同じsha256での再実行は、既存の版マニフェストを署名とpayloadで照合するだけで置き換えない。
 
 on:
@@ -37,7 +37,7 @@ concurrency:
 
 jobs:
   publish:
-    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && github.ref_type == 'branch' && startsWith(github.ref_name, 'release/') }}
+    if: ${{ github.repository == '1llum1n4t1s/Prunlet' && github.ref_type == 'tag' }}
     runs-on: windows-latest
     timeout-minutes: 20
     environment: release
@@ -51,7 +51,7 @@ jobs:
       PRUNLET_INPUT_BYTES: ${{ inputs.bytes }}
       PRUNLET_R2_BUCKET: ${{ vars.PRUNLET_R2_BUCKET || 'prunlet-updates' }}
     steps:
-      - name: Checkout the release branch
+      - name: Checkout the release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0

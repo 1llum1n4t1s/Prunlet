@@ -2,7 +2,7 @@
 # 実機の Mac で作った署名・公証済みの ZIP（scripts/Publish-PrunletMac.sh の出力 prunlet-update-osx-arm64.zip）を、
 # R2 の不変キー releases/1llum1n4t1s/prunlet/<commit>/osx-arm64/<sha256>.zip へ「新規作成のみ」で送る。
 # 署名付きマニフェストはここでは発行しない。送信後に表示される sha256・bytes を入力にして、prunlet-mac-release.yml
-# （workflow_dispatch、release/<版> の ref）を実行する（CI が R2 の実物を照合して署名マニフェストを発行する）。
+# （workflow_dispatch、タグ v<版> の ref）を実行する（CI が R2 の実物を照合して署名マニフェストを発行する）。
 #
 # Mac の資格情報や署名鍵は不要（R2 への書込みだけ）。認証は CLOUDFLARE_API_TOKEN（R2 書込み権限）または
 # S3 互換キー（PRUNLET_R2_ACCESS_KEY_ID / PRUNLET_R2_SECRET_ACCESS_KEY）と PRUNLET_R2_ACCOUNT_ID。値はログへ出さない。

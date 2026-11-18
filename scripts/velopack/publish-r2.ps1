@@ -25,7 +25,7 @@ param(
     # releases.<channel>.json の <channel>。
     [string]$Channel = 'win',
     [string]$PackId = 'PrunletApp',
-    # 署名マニフェストに入れる、release/<版> の commit（40桁小文字hex）と既定ブランチ。
+    # 署名マニフェストに入れる、タグ v<版> の commit（40桁小文字hex）と既定ブランチ。
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$CommitSha,
     [string]$DefaultBranch = 'main',
     [switch]$DryRun,

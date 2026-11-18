@@ -611,7 +611,7 @@ Invoke-Case 'publish: a non-404 read failure of the pointer, the manifest or the
         Assert-True ($w.Handler.Puts().Count -eq 0) 'no write after an unreadable Velopack feed'
     } finally { Remove-World $w }
 }
-Invoke-Case 'ref: Assert-PrunletReleaseRef accepts only release/<version> at a commit on the default branch' {
+Invoke-Case 'ref: Assert-PrunletReleaseRef accepts only a lightweight tag v<version> at a commit on the default branch' {
     $repo = Join-Path $OutputDirectory 'ref-repo'; New-Item -ItemType Directory -Path $repo | Out-Null
     function Invoke-TestGit([string[]]$GitArguments) {
         $out = & git -C $repo -c user.name=test -c user.email=test@example.invalid @GitArguments 2>&1
@@ -624,23 +624,31 @@ Invoke-Case 'ref: Assert-PrunletReleaseRef accepts only release/<version> at a c
     $head = Invoke-TestGit @('rev-parse', 'HEAD')
     $null = Invoke-TestGit @('update-ref', 'refs/remotes/origin/main', 'HEAD')
     $script = Join-Path $PSScriptRoot 'Assert-PrunletReleaseRef.ps1'
-    function Invoke-TestRef([string]$RefType, [string]$RefName, [string]$Sha, [string[]]$Extra = @()) {
+    # -TagObject は gh api の照会結果（軽量タグなら `commit <sha>`、注釈付きタグなら `tag <sha>`）の代わりに渡す。
+    function Invoke-TestRef([string]$RefType, [string]$RefName, [string]$Sha, [string[]]$Extra = @(), [string]$TagObject = $null) {
+        if ([string]::IsNullOrEmpty($TagObject)) { $TagObject = "commit $Sha" }
         $env:GITHUB_REF_TYPE = $RefType; $env:GITHUB_REF_NAME = $RefName; $env:GITHUB_SHA = $Sha; $env:GITHUB_OUTPUT = ''
-        try { $out = & pwsh -NoProfile -File $script -SourceRoot $repo -DefaultBranch main @Extra 2>&1; return [pscustomobject]@{ Code = $LASTEXITCODE; Out = ($out | Out-String) } }
+        try { $out = & pwsh -NoProfile -File $script -SourceRoot $repo -DefaultBranch main -TagObject $TagObject @Extra 2>&1; return [pscustomobject]@{ Code = $LASTEXITCODE; Out = ($out | Out-String) } }
         finally { Remove-Item Env:GITHUB_REF_TYPE, Env:GITHUB_REF_NAME, Env:GITHUB_SHA, Env:GITHUB_OUTPUT -ErrorAction SilentlyContinue }
     }
-    $ok = Invoke-TestRef 'branch' 'release/1.2.3' $head
-    Assert-True ($ok.Code -eq 0 -and $ok.Out -match '"release":"true"' -and $ok.Out -match '"version":"1.2.3"') "release branch passes: $($ok.Out)"
-    Assert-True ((Invoke-TestRef 'branch' 'release/1.2.4' $head).Code -ne 0) 'a branch name that differs from the Cargo.toml version fails'
-    Assert-True ((Invoke-TestRef 'tag' 'v1.2.3' $head).Code -ne 0) 'a tag ref fails'
-    Assert-True ((Invoke-TestRef 'branch' 'main' $head).Code -ne 0) 'a non-release branch fails'
-    Assert-True ((Invoke-TestRef 'branch' 'release/1.2.3' ('0' * 40)).Code -ne 0) 'a different event commit fails'
+    $ok = Invoke-TestRef 'tag' 'v1.2.3' $head
+    Assert-True ($ok.Code -eq 0 -and $ok.Out -match '"release":"true"' -and $ok.Out -match '"version":"1.2.3"') "version tag passes: $($ok.Out)"
+    Assert-True ((Invoke-TestRef 'tag' 'v1.2.4' $head).Code -ne 0) 'a tag name that differs from the Cargo.toml version fails'
+    Assert-True ((Invoke-TestRef 'tag' '1.2.3' $head).Code -ne 0) 'a tag without the v prefix fails'
+    Assert-True ((Invoke-TestRef 'tag' 'v1.2.3-rc1' $head).Code -ne 0) 'a pre-release tag fails'
+    Assert-True ((Invoke-TestRef 'branch' 'release/1.2.3' $head).Code -ne 0) 'a release branch fails'
+    Assert-True ((Invoke-TestRef 'branch' 'v1.2.3' $head).Code -ne 0) 'a branch named like a version tag fails'
+    Assert-True ((Invoke-TestRef 'branch' 'main' $head).Code -ne 0) 'a non-tag ref fails'
+    Assert-True ((Invoke-TestRef 'tag' 'v1.2.3' ('0' * 40)).Code -ne 0) 'a different event commit fails'
+    Assert-True ((Invoke-TestRef 'tag' 'v1.2.3' $head @() "tag $head").Code -ne 0) 'an annotated tag fails'
+    Assert-True ((Invoke-TestRef 'tag' 'v1.2.3' $head @() ('commit ' + ('1' * 40))).Code -ne 0) 'a tag that points at another commit fails'
     $verifyOnly = Invoke-TestRef 'branch' 'main' $head @('-AllowNonRelease')
-    Assert-True ($verifyOnly.Code -eq 0 -and $verifyOnly.Out -match '"release":"false"') 'a non-release ref is verification-only with -AllowNonRelease'
+    Assert-True ($verifyOnly.Code -eq 0 -and $verifyOnly.Out -match '"release":"false"') 'a non-tag ref is verification-only with -AllowNonRelease'
+    Assert-True ((Invoke-TestRef 'tag' 'v1.2.4' $head @('-AllowNonRelease')).Code -ne 0) 'a mismatched tag still fails with -AllowNonRelease'
     # 既定ブランチに取り込まれていない commit（main の先にある commit）は配信できない。
     [IO.File]::WriteAllText((Join-Path $repo 'extra.txt'), 'x'); $null = Invoke-TestGit @('add', 'extra.txt'); $null = Invoke-TestGit @('commit', '-q', '-m', 'ahead', '--no-gpg-sign')
     $ahead = Invoke-TestGit @('rev-parse', 'HEAD')
-    Assert-True ((Invoke-TestRef 'branch' 'release/1.2.3' $ahead).Code -ne 0) 'a commit that is not an ancestor of the default branch fails'
+    Assert-True ((Invoke-TestRef 'tag' 'v1.2.3' $ahead).Code -ne 0) 'a commit that is not an ancestor of the default branch fails'
 }
 
 Write-Host "passed=$script:passed failed=$script:failed skipped=$script:skipped"
