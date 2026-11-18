@@ -76,7 +76,7 @@
  {"name":"until-do-delete","command":"until false; do rm -- <FILE>; done","pass":false,"reason":"deletion command; detected token \"rm\"; interpretation=POSIX","windowsOtherRule":true},
  {"name":"while-safe-body","command":"while false; do echo rm; done","pass":true},
  {"name":"negated-delete","command":"! rm -- <FILE>","pass":false,"reason":"deletion command; detected token \"rm\"; interpretation=POSIX"},
- {"name":"control-redirection-refused","command":"if true; then > /tmp/out rm -- <FILE>; fi","pass":false,"reason":"POSIX redirection prefix cannot be inspected; detected token \">\"; interpretation=POSIX"},
+ {"name":"control-redirection-refused","command":"if true; then > /tmp/out rm -- <FILE>; fi","pass":false,"reason":"deletion command; detected token \"rm\"; interpretation=POSIX"},
  {"name":"unknown-case-syntax-refused","command":"case a in a) echo ok;; esac","pass":false,"reason":"unsupported POSIX control syntax cannot be inspected; detected token \"case\"; interpretation=POSIX"},
  {"name":"posix-unlink-command","command":"unlink -- <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
  {"name":"posix-control-unlink-command","command":"if true; then /usr/bin/unlink -- <FILE>; fi","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
@@ -112,5 +112,18 @@
  {"name":"heredoc-delimiter-with-space","command":"cat > /tmp/f <<'EOF '\nnote\nEOF \nunlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
  {"name":"heredoc-indented-delimiter-is-body","command":"cat > /tmp/f <<'EOF'\n  EOF\nit's\nEOF\nunlink <FILE>\necho '","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
  {"name":"heredoc-glued-cat-sink","command":"cat>/tmp/f <<'EOF'\nunlink <FILE>\nEOF","pass":true},
- {"name":"heredoc-tee-double-slash-dev-stdout","command":"tee //dev/stdout >/dev/null <<'EOF'\nunlink <FILE>\nEOF","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"}
+ {"name":"heredoc-tee-double-slash-dev-stdout","command":"tee //dev/stdout >/dev/null <<'EOF'\nunlink <FILE>\nEOF","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"append-assignment-prefix","command":"a+=1 rm -- <FILE>","pass":false,"reason":"deletion command; detected token \"rm\"; interpretation=POSIX"},
+ {"name":"subscript-assignment-prefix","command":"a[0]=1 unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"append-assignment-only","command":"a+=1; echo ok","pass":true},
+ {"name":"brace-expansion-command-name","command":"r{m,} -- <FILE>","pass":false,"reason":"POSIX brace expansion in the command name cannot be inspected; detected token \"r{m,}\"; interpretation=POSIX"},
+ {"name":"brace-expansion-whole-command","command":"{unlink,<FILE>}","pass":false,"reason":"POSIX brace expansion in the command name cannot be inspected"},
+ {"name":"brace-expansion-argument","command":"mkdir -p /tmp/prunlet-x/{a,b}","pass":true},
+ {"name":"exec-close-fd-only","command":"exec 3>&-","pass":true},
+ {"name":"exec-redirect-only","command":"exec >/tmp/prunlet-log 2>&1","pass":true},
+ {"name":"assignment-redirect-only","command":"FOO=1 >/tmp/prunlet-out","pass":true},
+ {"name":"exec-close-fd-then-delete","command":"exec 3>&- unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"exec-redirect-then-delete","command":"exec >/tmp/prunlet-log rm -- <FILE>","pass":false,"reason":"deletion command; detected token \"rm\"; interpretation=POSIX"},
+ {"name":"unquoted-heredoc-apostrophe-substitution","command":"cat <<EOF\nDon't $(unlink <FILE>)\nEOF","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"unquoted-heredoc-hash-substitution","command":"cat <<EOF\n# $(unlink <FILE>)\nEOF","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"}
 ]

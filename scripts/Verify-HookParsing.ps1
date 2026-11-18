@@ -227,7 +227,21 @@ $cases += @(
     @{ name='cmd-type-comma-files'; command='type a.txt,b.txt'; shell='cmd.exe'; pass=$true },
     @{ name='cmd-call-comma-echo'; command='call,echo ok'; shell='cmd.exe'; pass=$true },
     @{ name='cmd-for-semicolon-list'; command='for %i in (a;b) do echo %i'; shell='cmd.exe'; pass=$true; bashPass=$false },
-    @{ name='cmd-set-path-semicolon'; command='set PATH=C:\x;%PATH%'; shell='cmd.exe'; pass=$true }
+    @{ name='cmd-set-path-semicolon'; command='set PATH=C:\x;%PATH%'; shell='cmd.exe'; pass=$true },
+    # 制御語・callを外した後や接頭辞だけの語の後のリダイレクト、`for /f`のコマンド集合（'…'）、
+    # 本文が`"`で始まる`cmd /c "…" 引数`（cmd.exeは最初と最後の`"`を外す）も実行名を隠さない。
+    @{ name='cmd-call-redirect-delete'; command='call >nul del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-for-do-redirect-delete'; command='for %i in ("<FILE>") do >nul del %i'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-else-redirect-delete'; command='if exist "<FILE>" (echo keep) else >nul del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-at-redirect-delete'; command='@>nul del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-at-space-delete'; command='@ del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-call-call-delete'; command='call call del "<FILE>"'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-for-f-command-set-delete'; command='for /f %i in (''del "<FILE>"'') do rem'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-wrapper-outer-quotes-delete'; command='cmd /d /c "del <FILE>" x'; shell='cmd.exe'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-wrapper-outer-quotes-delete-bash'; command='cmd //d //c "del <FILE>" x'; pass=$false; reason='detected token "del"' },
+    @{ name='cmd-at-echo-off'; command='@echo off'; shell='cmd.exe'; pass=$true },
+    @{ name='cmd-for-f-command-set-data'; command='for /f %i in (''dir /b'') do echo %i'; shell='cmd.exe'; pass=$true; bashPass=$false },
+    @{ name='cmd-wrapper-quoted-program-path'; command='cmd /d /c "C:\Program Files\Tool\tool.exe" --flag value'; shell='cmd.exe'; pass=$true }
 )
 
 # 非strictのPowerShell規則でも代入右辺・dot呼出しの後続をコマンドとして検査する。

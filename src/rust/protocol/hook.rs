@@ -7,8 +7,10 @@ use std::{borrow::Cow, io, path::Path, sync::LazyLock};
 
 static REDIRECTION: LazyLock<std::result::Result<Regex, regex::Error>> =
     LazyLock::new(|| Regex::new(r"\A[0-9]*[<>]"));
+/// POSIXの代入語。追記代入（`a+=1`）と添字付き代入（`a[0]=1`・`a[$i]+=x`）も含める。
+/// 添字に動的な要素があっても代入語であり、実行名ではない（右辺・添字の展開は字句検査で別に調べる）。
 static ASSIGNMENT: LazyLock<std::result::Result<Regex, regex::Error>> =
-    LazyLock::new(|| Regex::new(r"\A[A-Za-z_][A-Za-z0-9_]*="));
+    LazyLock::new(|| Regex::new(r"\A[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?="));
 
 fn compiled(
     pattern: &'static LazyLock<std::result::Result<Regex, regex::Error>>,
@@ -46,6 +48,9 @@ struct Token {
     bare_chars: usize,
     /// 引用外で退避文字（PowerShellの`` ` ``）を含むか。字句解析後は元の綴りを失うため、静的値として扱わない。
     escaped: bool,
+    /// POSIX規則で、語が引用外のブレース展開（`r{m,}`・`{a,b}`・`{1..3}`）を含むか。
+    /// bashは展開後の最初の語を実行名にするため、実行名の位置では検査不能として扱う。
+    brace: bool,
 }
 impl Token {
     fn new(text: impl Into<String>) -> Self {
@@ -64,6 +69,7 @@ impl Token {
             non_single_quote: false,
             bare_chars: 0,
             escaped: false,
+            brace: false,
         }
     }
     /// 語全体が1つの単一引用だけでできたPowerShellの静的リテラルか（`'...'`、`''`は`'`）。
@@ -743,22 +749,34 @@ impl Inspector {
             self.mode = Some(m);
             self.explicit = mode.is_some();
             let result = (|| -> Result<bool> {
-                // POSIX規則で`>& 名前`があれば、名前をリダイレクト対象としてつなぐ読みでも検査する（tokens_with参照）。
-                let mut ampersand_name = false;
-                for attach in [false, true] {
-                    if attach && !ampersand_name {
-                        break;
+                // POSIX規則で解釈が分かれる箇所は、別の読みでも検査する（LexOptions参照）。
+                // `>& 名前`があれば名前をリダイレクト対象としてつなぐ読み、引用しない終端語のヒアドキュメント
+                // 本文があれば本文の`'`・`"`を引用としない読みでも検査し、どれかで検知すれば拒否する。
+                let mut found = LexFound::default();
+                for (attach, literal) in [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    if (attach && !found.ampersand_name)
+                        || (literal && !found.unquoted_heredoc_body)
+                    {
+                        continue;
                     }
-                    let tokens = tokens_with(script, m, strict, attach, &mut ampersand_name)?;
+                    let options = LexOptions {
+                        attach_ampersand_name: attach,
+                        literal_heredoc_body: literal,
+                    };
+                    let tokens = tokens_with(script, m, strict, options, &mut found)?;
                     let mut words = Vec::new();
                     let mut control = self.posix_script;
+                    // CMD規則で、いま集めている文が`(`の直後から始まったか（`for /f … in ('del x')`）。
+                    let mut after_paren = false;
                     for token in tokens {
                         if token.boundary {
-                            // CMD規則の字句解析だけが`;`の境界に";"を載せる。直前の文の末尾が`;`かを伝える。
+                            // CMD規則の字句解析だけが`;`・`(`の境界に";"・"("を載せる。直前の文の末尾が`;`かを伝える。
                             self.cmd_semicolon = token.text == ";";
-                            if self.statement(&words, depth, strict, &mut control)? {
+                            if self.statement_with(&words, depth, strict, &mut control, after_paren)? {
                                 return Ok(true);
                             }
+                            after_paren = token.text == "(";
                             words.clear();
                         } else {
                             words.push(token);
@@ -768,7 +786,7 @@ impl Inspector {
                     // cmd.exeは`cmd /c cmd;/c del x`の本文を`;`以降まで含めて渡すため、本文末尾の`cmd`も
                     // `;`に続く引数を受ける。最上位（previous_semicolon=false）では終端なしになる。
                     self.cmd_semicolon = previous_semicolon;
-                    if self.statement(&words, depth, strict, &mut control)? {
+                    if self.statement_with(&words, depth, strict, &mut control, after_paren)? {
                         return Ok(true);
                     }
                 }
@@ -782,6 +800,38 @@ impl Inspector {
             }
         }
         Ok(false)
+    }
+    /// 文を検査する。CMD規則で`(`の直後から始まる文（`for /f … in ('del x')`・usebackqの`` (`del x`) ``の
+    /// コマンド集合）は、先頭語の語頭・語末の`'`・`` ` ``を外して実行名を判定する。CMD規則の字句解析は
+    /// `'`・`` ` ``を引用符として読まないため、外さないと`'del`が実行名になり削除名が隠れる。
+    /// 外して空になった語（`(' del x')`の`'`）は取り除き、次の語を実行名として読む。
+    fn statement_with(
+        &mut self,
+        words: &[Token],
+        depth: usize,
+        strict: bool,
+        control: &mut bool,
+        after_paren: bool,
+    ) -> Result<bool> {
+        if after_paren
+            && self.mode == Some(Mode::Cmd)
+            && let Some(first) = words.first()
+        {
+            let trimmed = first
+                .text
+                .trim_start_matches(['\'', '`'])
+                .trim_end_matches(['\'', '`']);
+            if trimmed.len() != first.text.len() {
+                let mut copy = words.to_vec();
+                if trimmed.is_empty() {
+                    copy.remove(0);
+                } else {
+                    copy[0].text = trimmed.to_owned();
+                }
+                return self.statement(&copy, depth, strict, control);
+            }
+        }
+        self.statement(words, depth, strict, control)
     }
     fn statement(
         &mut self,
@@ -805,18 +855,22 @@ impl Inspector {
                         | "case"
                         | "coproc"
                 );
+            }
+            // 文頭のリダイレクトと対象語（`>out`・`2>&1`）は実行名ではないため、読み飛ばした先の語を判定する。
+            // 飛ばした先が無ければ（`>out`だけの文）コマンドを実行しない。
+            if let Some(head) = words.get(leading_redirect_words(words, false)) {
                 // 代入（`b=$(basename $f)`）の右辺は実行名ではないため、制御構文の中でも
                 // posix_prefixで代入を剥がした後の実行名だけを動的かどうか判定する。
                 // `[`・`[[`はtest組込みで、`[`単独はglobとして展開されない。
-                let static_head = compiled(&ASSIGNMENT)?.is_match(&first.text)
-                    || posix_test_builtin(first);
+                let static_head =
+                    compiled(&ASSIGNMENT)?.is_match(&head.text) || posix_test_builtin(head);
                 if *control
-                    && ((first.dynamic && !static_head)
-                        || compiled(&REDIRECTION)?.is_match(&first.text))
+                    && ((head.dynamic && !static_head)
+                        || compiled(&REDIRECTION)?.is_match(&head.text))
                 {
                     return Ok(self.detected(
                         "dynamic or unsupported POSIX control body cannot be inspected",
-                        &first.text,
+                        &head.text,
                     ));
                 }
             }
@@ -845,6 +899,15 @@ impl Inspector {
             };
         }
         if self.mode == Some(Mode::Posix) {
+            // bashはブレース展開の後で実行名を決める（`r{m,} x`は`rm r x`、`{unlink,x}`は`unlink x`）。
+            // 実行名の位置の語にブレース展開があれば、展開後の名前を推測せず検査不能として拒否する。
+            // 代入語（`a={x,y}`）はbashが展開しないため、posix_prefixで剥がしてから後続を同じく判定する。
+            if w[0].brace && !compiled(&ASSIGNMENT)?.is_match(&w[0].text) {
+                return Ok(self.detected(
+                    "POSIX brace expansion in the command name cannot be inspected",
+                    &w[0].text,
+                ));
+            }
             if let Some(result) = self.posix_prefix(w, depth, strict)? {
                 return Ok(result);
             }
@@ -855,41 +918,54 @@ impl Inspector {
         let mut i = 0;
         // CMD規則では先頭の`, ; =`も落とし、`cmd`直結の`/c`等を分離する（exec_name参照）。
         let mut current = exec_name_in(&w[0].text, self.mode, self.explicit);
-        // CMDの`for ... do <cmd>`・`... else <cmd>`は括弧なしでも後続をコマンドとして実行する。
-        // 字句解析で括弧は文の境界になるため、先頭に残った`do`/`else`を剥がして残りを検査する。
+        // CMDの実行名の位置を、変化がなくなるまで1つのループで整理する。
+        // - リダイレクトと対象語（`call >out del x`・`do >nul del %i`）は実行名ではないので読み飛ばす。
+        // - 接頭辞の記号だけの語（`@ del x`・`, del x`・`@>nul del x`の`@`）は実行名ではないので読み飛ばす。
+        // - `for ... do <cmd>`・`... else <cmd>`の`do`/`else`と`call`を剥がし、後続を実行名として読む
+        //   （字句解析で括弧は文の境界になるため、先頭に残った制御語を剥がす）。
         // `do,del %i`・`else=del x`・`call,del x`のように区切りで直結した残りも、cmd.exeは
         // 次の実行名として実行するため、同じ語の位置のまま残りを評価し直す（残りは`w`を借用するだけで複製しない）。
-        // 再帰でなくループで剥がし、大量に並んだ入力でも深さや計算量を増やさない。
+        // 再帰でなくループで剥がし、大量に並んだ入力でも深さや計算量を増やさない。語を進める処理は語数で、
+        // 同じ語の中で直結した残りを評価し直す処理は`CMD_GLUED_PREFIX_LIMIT`で回数が抑えられる。
         // POSIXの制御語はposix_prefixが別に扱うため、ここではCMD規則に限定する。
-        // 直結のない`call`は従来どおり下の`call|command|exec`分岐で扱い、正規CLI呼出しの判定を変えない。
         if self.mode == Some(Mode::Cmd) {
             // いま実行名として評価している文字列（語全体か、制御語に直結した残り）。
             let mut text = w[0].text.as_str();
+            // `text`が語全体か（制御語に直結した残りでないか）。リダイレクトは語単位でだけ読み飛ばす。
+            let mut whole = true;
             // 同じ語の中で直結した残りを評価し直した回数。各評価は残りの長さに比例するため、
             // `do,do,do,…`のような1語の連鎖で計算量が二乗にならないよう上限を設け、超えたら拒否する。
             let mut glued_steps = 0usize;
             loop {
-                let control = match current.glued {
-                    // 区切りで切れた名前（cmd_prefix_word）。語の引用の有無は問わない（`call,"del" x`）。
-                    Some(_) => cmd_prefix_word(&current.name),
-                    // 引用されていない語全体が`do`/`else`（先頭の`@ , ; =`は落として比べる）。
-                    // 経路形式（`x/do`）や引用された`"do"`は従来どおり制御語とみなさない。
-                    None => {
-                        let bare = text.trim_start_matches(CMD_NAME_PREFIX);
-                        !w[i].quoted
-                            && (bare.eq_ignore_ascii_case("do")
-                                || bare.eq_ignore_ascii_case("else"))
+                // 次の語へ進む語数（0なら今の位置で制御語を判定する）。
+                let skip = if whole && leading_redirect_words(&w[i..i + 1], false) > 0 {
+                    leading_redirect_words(&w[i..], false)
+                } else if (!whole || !w[i].quoted)
+                    && text.trim_start_matches(CMD_NAME_PREFIX).is_empty()
+                {
+                    1
+                } else {
+                    let control = match current.glued {
+                        // 区切りで切れた名前（cmd_prefix_word）。語の引用の有無は問わない（`call,"del" x`）。
+                        Some(_) => cmd_prefix_word(&current.name),
+                        // 引用されていない語全体が`do`/`else`/`call`（先頭の`@ , ; =`は落として比べる）。
+                        // 経路形式（`x/do`）や引用された`"do"`は従来どおり制御語とみなさない。
+                        None => {
+                            let bare = text.trim_start_matches(CMD_NAME_PREFIX);
+                            !w[i].quoted
+                                && (bare.eq_ignore_ascii_case("do")
+                                    || bare.eq_ignore_ascii_case("else")
+                                    || bare.eq_ignore_ascii_case("call"))
+                        }
+                    };
+                    if !control {
+                        break;
                     }
-                };
-                if !control {
-                    break;
-                }
-                let rest = current
-                    .glued
-                    .map(|tail| tail.trim_start_matches([',', ';', '=']))
-                    .filter(|tail| !tail.is_empty());
-                text = match rest {
-                    Some(rest) => {
+                    let rest = current
+                        .glued
+                        .map(|tail| tail.trim_start_matches([',', ';', '=']))
+                        .filter(|tail| !tail.is_empty());
+                    if let Some(rest) = rest {
                         glued_steps += 1;
                         if glued_steps > CMD_GLUED_PREFIX_LIMIT {
                             return Ok(self.detected(
@@ -897,16 +973,19 @@ impl Inspector {
                                 &current.name,
                             ));
                         }
-                        rest
+                        text = rest;
+                        whole = false;
+                        current = exec_name_in(text, self.mode, self.explicit);
+                        continue;
                     }
-                    None => {
-                        i += 1;
-                        if i == w.len() {
-                            return Ok(false);
-                        }
-                        &w[i].text
-                    }
+                    1
                 };
+                i += skip;
+                if i >= w.len() {
+                    return Ok(false);
+                }
+                text = &w[i].text;
+                whole = true;
                 current = exec_name_in(text, self.mode, self.explicit);
             }
         }
@@ -1100,7 +1179,23 @@ impl Inspector {
                             .collect::<Vec<_>>()
                             .join(" ")
                     };
-                    self.contains(&body, depth + 1, Some(Mode::Cmd), strict)
+                    if self.contains(&body, depth + 1, Some(Mode::Cmd), strict)? {
+                        return Ok(true);
+                    }
+                    // cmd.exeは本文が`"`で始まると、`/s`なし・引用符がちょうど2つ・間に特殊文字なし・空白あり・
+                    // 引用内が実行ファイル名の全てを満たす場合を除き、最初の`"`と最後の`"`を外して実行する
+                    // （`cmd /c "del x" y`は`del x y`）。実行ファイルの有無は判定できないため、外した形も同じ深さで
+                    // 追加検査し、どちらかで検知すれば拒否する（空白入りパスの実行ファイルを引用する形は両方で通る）。
+                    match body.strip_prefix('"') {
+                        Some(inner) => {
+                            let unquoted = match inner.rfind('"') {
+                                Some(last) => format!("{}{}", &inner[..last], &inner[last + 1..]),
+                                None => inner.to_owned(),
+                            };
+                            self.contains(&unquoted, depth + 1, Some(Mode::Cmd), strict)
+                        }
+                        None => Ok(false),
+                    }
                 }
             };
         }
@@ -1230,7 +1325,8 @@ impl Inspector {
         while index < words.len() {
             let word = &words[index];
             let value = word.text.as_str();
-            if word.dynamic {
+            // ブレース展開は語の数を変え、option・値・実行名の位置をずらしうるため動的な語と同じく扱う。
+            if word.dynamic || word.brace {
                 return Ok(Some(self.detected(
                     "dynamic POSIX prefix arguments cannot be inspected",
                     &word.text,
@@ -1394,7 +1490,7 @@ impl Inspector {
             }
             index += 1;
             if takes_value {
-                if index == words.len() || words[index].dynamic {
+                if index == words.len() || words[index].dynamic || words[index].brace {
                     return Ok(Some(self.detected(
                         "missing or dynamic POSIX prefix option value cannot be inspected",
                         value,
@@ -1415,8 +1511,15 @@ impl Inspector {
                 &words[0].text,
             ));
         }
+        // prefix・代入の後ろのリダイレクトと対象語（`exec 3>&-`・`exec >log 2>&1`・`FOO=1 >out`）は実行名ではない。
+        // 読み飛ばして何も残らなければコマンドを実行しない。残れば、その先頭語に対して下の判定をやり直す
+        // （リダイレクト1語の前置きで動的名・削除名の判定を外さない）。
+        let words = &words[leading_redirect_words(words, false).min(words.len())..];
+        let Some(first) = words.first() else {
+            return Ok(false);
+        };
         // `[`・`[[`はtest組込み（引数の評価だけでコマンドを実行しない）。
-        if posix_test_builtin(&words[0]) {
+        if posix_test_builtin(first) {
             return Ok(false);
         }
         if words[0].dynamic {
@@ -2155,7 +2258,8 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
                 (word, 1)
             };
             let target_text = if operator.is_empty() { target.text.as_str() } else { operator };
-            if target.dynamic || target.boundary || target_text.is_empty() {
+            // ブレース展開（`> f{a,b}`）も出力先を静的に確定できない。
+            if target.dynamic || target.brace || target.boundary || target_text.is_empty() {
                 return Ok(false);
             }
             // `>&2`・`>&-`などのfd複製は書き出し先として扱わない。
@@ -2193,10 +2297,11 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
     let Some(first) = command.first() else {
         return Ok(false);
     };
-    if first.quoted || first.dynamic {
+    if first.quoted || first.dynamic || first.brace {
         return Ok(false);
     }
-    let static_option = |w: &&Token| !w.quoted && !w.dynamic && w.text.starts_with('-');
+    let static_option =
+        |w: &&Token| !w.quoted && !w.dynamic && !w.brace && w.text.starts_with('-');
     Ok(match leaf(&first.text).as_str() {
         "cat" => command.len() == 1 && stdout_to_file,
         // `tee`は本文を標準出力へも流すため、標準出力がファイルか`/dev/null`へ向く場合だけdataとして扱う。
@@ -2214,7 +2319,7 @@ fn tee_writes_only_files(args: &[&Token]) -> bool {
         let text = word.text.as_str();
         if !options_done && text.starts_with('-') {
             // 引用・展開を含む語は静的なoptionと確定できない（`tee "-a"`）。
-            if word.quoted || word.dynamic {
+            if word.quoted || word.dynamic || word.brace {
                 return false;
             }
             match text {
@@ -2224,7 +2329,12 @@ fn tee_writes_only_files(args: &[&Token]) -> bool {
             }
             continue;
         }
-        if word.boundary || word.dynamic || text.is_empty() || posix_device_path(text) {
+        if word.boundary
+            || word.dynamic
+            || word.brace
+            || text.is_empty()
+            || posix_device_path(text)
+        {
             return false;
         }
         paths += 1;
@@ -2331,22 +2441,109 @@ fn here_string_header(s: &[char], position: usize) -> bool {
 }
 /// POSIX規則のANSI-C引用（`$'…'`）を読んでいる間の`quote`の値。`\`は次の1文字を退避し、非退避の`'`で閉じる。
 const ANSI_C_QUOTE: char = '\u{1}';
+/// 字句解析の読み方の選択。POSIX規則で解釈が分かれる箇所を、呼出し側が両方の読みで検査するために使う。
+#[derive(Clone, Copy, Default)]
+struct LexOptions {
+    /// `>&`・`<&`の後ろに数字でも`-`でもない語が続く形（`>& /tmp/z unlink y`）の読み方。
+    /// falseは従来どおり`&`で文を割って次の語を実行名として読み、trueは次の語をリダイレクト対象として
+    /// 同じ語へつなぐ（bashの`>&word`は`&>word`と同じ出力先の指定）。
+    attach_ampersand_name: bool,
+    /// 終端語を引用しないヒアドキュメント（`<<EOF`）の本文を、bashと同じく`'`・`"`を引用として扱わず
+    /// （`$(…)`・逆引用の中を除く）、`#`もコメントにしない読み方。falseは本文を通常の文として読む従来の読み方。
+    literal_heredoc_body: bool,
+}
+/// 字句解析で見つけた、別の読み方（`LexOptions`）でも検査すべき箇所。
+#[derive(Default)]
+struct LexFound {
+    /// `>&`・`<&`の後ろに名前が続く形があった。
+    ampersand_name: bool,
+    /// 文として検査する、終端語を引用しないヒアドキュメント本文があった。
+    unquoted_heredoc_body: bool,
+}
 fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
-    let mut ampersand_name = false;
-    tokens_with(script, mode, strict, false, &mut ampersand_name)
+    let mut found = LexFound::default();
+    tokens_with(script, mode, strict, LexOptions::default(), &mut found)
+}
+/// POSIX規則で、`s[start]`の`{`から、bashの1語の終わり（引用外の空白・`;|&()<>`・逆引用）までを走査し、
+/// 語の終わりの位置と、語が引用外のブレース展開（`,`か`..`を含む対応した`{…}`）を含むかを返す。
+/// `${…}`はパラメーター展開として数えない。呼出し側は返した位置までを再走査しないため、全体は線形に保たれる。
+fn brace_word_scan(s: &[char], start: usize) -> (usize, bool) {
+    // 開いている`{`ごとの（パラメーター展開か, 同じ階層に区切りを含むか）。
+    let mut stack: Vec<(bool, bool)> = Vec::new();
+    let mut found = false;
+    let mut j = start;
+    while j < s.len() {
+        let c = s[j];
+        if c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '<' | '>' | '`') {
+            break;
+        }
+        match c {
+            '\\' => {
+                j += 2;
+                continue;
+            }
+            '\'' => {
+                j = s[j + 1..]
+                    .iter()
+                    .position(|&d| d == '\'')
+                    .map_or(s.len(), |offset| j + offset + 2);
+                continue;
+            }
+            '"' => {
+                let mut k = j + 1;
+                while k < s.len() && s[k] != '"' {
+                    if s[k] == '\\' {
+                        k += 1;
+                    }
+                    k += 1;
+                }
+                j = k + 1;
+                continue;
+            }
+            '$' if s.get(j + 1) == Some(&'{') => {
+                stack.push((true, false));
+                j += 2;
+                continue;
+            }
+            '{' => stack.push((false, false)),
+            '}' => {
+                if let Some((param, separated)) = stack.pop()
+                    && !param
+                    && separated
+                {
+                    found = true;
+                }
+            }
+            ',' => {
+                if let Some(top) = stack.last_mut()
+                    && !top.0
+                {
+                    top.1 = true;
+                }
+            }
+            '.' if s.get(j + 1) == Some(&'.') => {
+                if let Some(top) = stack.last_mut()
+                    && !top.0
+                {
+                    top.1 = true;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    (j.min(s.len()), found)
 }
 /// 字句解析の本体。
 ///
-/// `attach_ampersand_name`は、POSIX規則で`>&`・`<&`の後ろに数字でも`-`でもない語が続く形（`>& /tmp/z unlink y`）の
-/// 読み方を選ぶ。falseは従来どおり`&`で文を割って次の語を実行名として読み、trueは次の語をリダイレクト対象として
-/// 同じ語へつなぐ（bashの`>&word`は`&>word`と同じ出力先の指定）。該当箇所があれば`ampersand_name`をtrueにし、
-/// 呼出し側は両方の読みで検査する。
+/// `options`で読み方を選び（`LexOptions`参照）、別の読み方でも検査すべき箇所があれば`found`へ記録する。
+/// 呼出し側は`found`に応じて両方の読みで検査する。
 fn tokens_with(
     script: &str,
     mode: Mode,
     strict: bool,
-    attach_ampersand_name: bool,
-    ampersand_name: &mut bool,
+    options: LexOptions,
+    found: &mut LexFound,
 ) -> Result<Vec<Token>> {
     let s: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
@@ -2366,11 +2563,17 @@ fn tokens_with(
     let mut backtick_open = false;
     // 読み飛ばさないヒアドキュメントの本文・終端行を検査している間の区切り位置（降順。末尾が次の区切り）。
     // 本文と終端行はそれぞれ独立に字句解析し、区切りで引用・括弧・逆引用の状態を本文の前へ戻す。
-    let mut body_cuts: Vec<usize> = Vec::new();
+    // 2つ目の値は、その区切りで終わる区間が終端語を引用しないヒアドキュメントの本文か。
+    let mut body_cuts: Vec<(usize, bool)> = Vec::new();
     let mut body_saved = (0i32, false);
+    // `literal_heredoc_body`の読みで、引用を有効に戻す`$(…)`の終わり（この位置より前は通常の引用規則）。
+    let mut literal_until = 0usize;
+    // POSIX規則のブレース展開。`brace_scanned`まではブレースの走査済み、`brace_until`までの`{`・`}`は語の一部。
+    let mut brace_scanned = 0usize;
+    let mut brace_until = 0usize;
     while i < s.len() {
         // 本文・終端行の区切りでは、引用状態を持ち越さずに語と文を閉じる。
-        while let Some(&cut) = body_cuts.last()
+        while let Some(&(cut, _)) = body_cuts.last()
             && i >= cut
         {
             body_cuts.pop();
@@ -2384,6 +2587,20 @@ fn tokens_with(
         }
         let in_body = !body_cuts.is_empty();
         let mut c = s[i];
+        // 引用しない終端語の本文を`literal_heredoc_body`で読む区間か。`$(…)`と逆引用の中では引用が有効なので、
+        // `$(`を見つけたら対応する`)`まで（閉じなければ次の区切りまで）は通常の引用規則に戻す。
+        let literal_body = options.literal_heredoc_body
+            && body_cuts.last().is_some_and(|&(_, unquoted)| unquoted);
+        if literal_body
+            && quote == '\0'
+            && i >= literal_until
+            && c == '$'
+            && s.get(i + 1) == Some(&'(')
+        {
+            let limit = body_cuts.last().map_or(s.len(), |&(cut, _)| cut);
+            literal_until = subexpression_close(&s, i, limit).unwrap_or(limit);
+        }
+        let literal_text = literal_body && i >= literal_until && !backtick_open;
         // 引用外の`<<`（`<<<`を除く）を見つけたら終端語を読み取って記録する。字句解析は通常どおり続ける。
         // 本文の中の`<<`は追跡しない（本文はbashにとってdataで、読み飛ばすと展開される`$(…)`を見落とすため）。
         if mode == Mode::Posix
@@ -2635,7 +2852,7 @@ fn tokens_with(
             // 二重引用内の`$(…)`は外側と独立した引用文脈を持つ（`"$(echo '"')"`の内側の`"`で外側を閉じない）。
             // 対応する`)`まで生のまま語へ取り込み、本文は`Inspector::expanded`が再帰検査する。
             if mode == Mode::Posix && quote == '"' && c == '$' && s.get(i + 1) == Some(&'(') {
-                let limit = body_cuts.last().copied().unwrap_or(s.len());
+                let limit = body_cuts.last().map_or(s.len(), |&(cut, _)| cut);
                 // 閉じていない`$(`は、expandedと同じく入力の終わりまで（ヒアドキュメント本文の中では
                 // 次の区切りまで）を本文として取り込む。取り込んだ本文はexpandedが再帰検査する。
                 let end = subexpression_close(&s, i, limit).unwrap_or(limit);
@@ -2725,7 +2942,8 @@ fn tokens_with(
             continue;
         }
         // POSIX規則のANSI-C引用（`$'…'`）。`\'`は引用を閉じない。語は`$`を含むため従来どおり動的として扱う。
-        if mode == Mode::Posix && c == '$' && s.get(i + 1) == Some(&'\'') {
+        // 引用しない終端語の本文を文字どおりに読む区間では、`$'`も引用ではない。
+        if mode == Mode::Posix && c == '$' && s.get(i + 1) == Some(&'\'') && !literal_text {
             t.bare_chars += 1;
             append(&mut t, c, &mut previous_equal);
             if t.quote_start.is_none() {
@@ -2743,6 +2961,9 @@ fn tokens_with(
         }
         let opening = if smart_quotes {
             powershell_quote_kind(c)
+        } else if literal_text {
+            // 引用しない終端語の本文では、`'`・`"`は通常の文字（bashは本文の引用を解釈しない）。
+            None
         } else if c == '"' || (c == '\'' && mode != Mode::Cmd) {
             Some(c)
         } else {
@@ -2772,8 +2993,10 @@ fn tokens_with(
             && match mode {
                 Mode::Cmd => false,
                 Mode::PowerShell => true,
+                // 引用しない終端語の本文を文字どおりに読む区間では、`#`もコメントにしない（bashは本文を展開して渡すだけ）。
                 Mode::Posix => {
-                    !t.quoted
+                    !literal_body
+                        && !t.quoted
                         && !t.escaped
                         && (i == 0
                             || s[i - 1].is_whitespace()
@@ -2827,8 +3050,8 @@ fn tokens_with(
             && (t.text.ends_with('>') || t.text.ends_with('<'))
             && redirect_operator_prefix(&t)
         {
-            *ampersand_name = true;
-            if attach_ampersand_name {
+            found.ampersand_name = true;
+            if options.attach_ampersand_name {
                 t.bare_chars += 1;
                 append(&mut t, c, &mut previous_equal);
                 i += 1;
@@ -2849,7 +3072,20 @@ fn tokens_with(
             i += 1;
             continue;
         }
-        let is_boundary = matches!(c, ';' | '|' | '&' | '\r' | '\n' | '(' | ')' | '{' | '}');
+        // POSIX規則のブレース展開（`r{m,}`・`{unlink,x}`・`{1..3}`）。`$`直後の`{`（`${…}`）と、空白を伴うグループ
+        // （`{ …; }`）・`{}`・区切りのない`{x}`は従来どおり文の境界として読む。展開を含む語は`{`・`}`で割らずに
+        // 1語のまま印を付け、実行名の位置では`Inspector::command`が検査不能として拒否する。
+        if mode == Mode::Posix && c == '{' && i >= brace_scanned && (i == 0 || s[i - 1] != '$') {
+            let (end, expansion) = brace_word_scan(&s, i);
+            brace_scanned = end;
+            if expansion {
+                brace_until = end;
+                t.brace = true;
+            }
+        }
+        let in_brace = i < brace_until && matches!(c, '{' | '}');
+        let is_boundary =
+            !in_brace && matches!(c, ';' | '|' | '&' | '\r' | '\n' | '(' | ')' | '{' | '}');
         if c.is_whitespace() || is_boundary {
             flush(&mut t, &mut out);
             previous_equal = false;
@@ -2859,10 +3095,13 @@ fn tokens_with(
                     let skip = heredoc_skippable(&heredocs, &out, heredoc_boundary_after)?;
                     let mut cuts = Vec::new();
                     let mut position = i + 1;
+                    let mut unquoted_body = false;
                     for heredoc in &heredocs {
                         let (body_end, next) = heredoc_body_end(&s, position, heredoc);
-                        cuts.push(body_end);
-                        cuts.push(next);
+                        // 本文の区間には、終端語を引用しない（bashが本文を展開する）かを持たせる。終端行は持たない。
+                        cuts.push((body_end, !heredoc.quoted));
+                        cuts.push((next, false));
+                        unquoted_body |= !heredoc.quoted;
                         position = next;
                     }
                     heredocs.clear();
@@ -2874,9 +3113,12 @@ fn tokens_with(
                         line_start = position;
                         continue;
                     }
+                    // 引用しない終端語の本文は、呼出し側が`literal_heredoc_body`の読みでも検査する。
+                    found.unquoted_heredoc_body |= unquoted_body;
                     // 読み飛ばさない本文と終端行は、それぞれ独立に文として検査する。本文の引用状態を
                     // 終端の後ろへ持ち越さず、終端行の次からは通常の状態で読み直す。
-                    cuts.dedup();
+                    // 同じ位置の区切り（終端のない本文）は、本文側の印を残して1つにまとめる。
+                    cuts.dedup_by_key(|cut| cut.0);
                     cuts.reverse();
                     body_cuts = cuts;
                     body_saved = (group_depth, backtick_open);
@@ -2900,11 +3142,12 @@ fn tokens_with(
                 statement_start = out.len();
                 // CMDでは`;`は空白相当の区切りで文の境界ではない。検査のため文は割るが、
                 // 境界が`;`だったことを残し、`cmd`wrapperの引数列が割れた形を呼出し側で拒否できるようにする。
+                // `(`の境界も印を残し、`for /f … in ('del x')`のコマンド集合の先頭語を呼出し側が判定できるようにする。
                 if mode == Mode::Cmd
-                    && c == ';'
+                    && matches!(c, ';' | '(')
                     && let Some(last) = out.last_mut()
                 {
-                    last.text = ";".into();
+                    last.text = c.to_string();
                 }
             }
         } else {
@@ -3072,11 +3315,25 @@ mod tests {
             "A=1 rm -- /tmp/owned-fixture",
             "env A=1 rm -- /tmp/owned-fixture",
             "if true; then 2>/tmp/owned-output rm -- /tmp/owned-fixture; fi",
+            // 追記代入（`+=`）と添字付き代入（`a[0]=`・動的な添字）も代入として剥がし、後続の実行名を検査する。
+            "a+=1 rm -rf /tmp/y",
+            "a[0]=1 unlink /tmp/y",
+            "a[$i]+=x rm -rf /tmp/y",
+            "for f in a; do a[$f]=1 unlink /tmp/y; done",
         ] {
             let result = Inspector::default().contains(command, 0, Some(Mode::Posix), false);
             assert!(result.is_err() || result.unwrap(), "{command}");
+            if cfg!(windows) {
+                assert!(reason(command, "Bash", None).is_some(), "{command}");
+            }
         }
-        for command in ["A=1 printf '%s' rm", "env A=1 printf '%s' safe"] {
+        for command in [
+            "A=1 printf '%s' rm",
+            "env A=1 printf '%s' safe",
+            "a+=1; echo ok",
+            "a[0]=1",
+            "for f in a b; do a[$f]=1; done",
+        ] {
             assert!(
                 !Inspector::default()
                     .contains(command, 0, Some(Mode::Posix), false)
@@ -3152,9 +3409,29 @@ mod tests {
             r"cmd /d /c reg delete HKCU\Software\PrunletHookProbe /f",
             r#"cmd /c "echo ok & del C:\fixture\file.txt""#,
             r"cmd -c del C:\fixture\file.txt",
+            // 本文が`"`で始まると、cmd.exeは最初と最後の`"`を外して実行する（`del x y`）。
+            r#"cmd /c "del C:\fixture\file.txt" y"#,
+            r#"cmd /d /c "del" C:\fixture\file.txt"#,
         ] {
             for shell in ["cmd.exe", "pwsh"] {
                 assert!(denied(command, shell), "{shell}: {command}");
+            }
+        }
+        // 退避した`^"`もCMD規則では外側の引用として剥がされる。
+        assert!(denied(r#"cmd /c ^"del C:\fixture\file.txt^""#, "cmd.exe"));
+        if cfg!(windows) {
+            assert!(reason(r#"cmd //c "del C:\fixture\file.txt" y"#, "Bash", None).is_some());
+        }
+        // 空白を含む実行ファイルのパスを引用して引数を続ける形は通す。
+        for command in [
+            r#"cmd /c "C:\Program Files\Tool\tool.exe" --flag value"#,
+            r#"cmd /d /c "C:\Program Files\Tool\tool.exe" "C:\work\a b.txt""#,
+        ] {
+            for shell in ["cmd.exe", "pwsh"] {
+                assert!(!denied(command, shell), "{shell}: {command}");
+            }
+            if cfg!(windows) {
+                assert_eq!(reason(command, "Bash", None), None, "Bash: {command}");
             }
         }
         // 未知switch・本文前の未知引数は本文を確定できないためfail-closedにする。
@@ -3520,6 +3797,45 @@ mod tests {
             ("call,echo ok", Some("cmd.exe"), true, true),
             ("for %i in (a;b) do echo %i", Some("cmd.exe"), true, false),
             ("set PATH=C:\\x;%PATH%", Some("cmd.exe"), true, true),
+            // 制御語・callを外した後や接頭辞だけの語の後のリダイレクト、`for /f`のコマンド集合、
+            // 本文が`"`で始まる`cmd /c "…" 引数`も実行名を隠さない。
+            (r#"call >nul del "<FILE>""#, Some("cmd.exe"), false, false),
+            (
+                r#"for %i in ("<FILE>") do >nul del %i"#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (
+                r#"if exist "<FILE>" (echo keep) else >nul del "<FILE>""#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (r#"@>nul del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"@ del "<FILE>""#, Some("cmd.exe"), false, false),
+            (r#"call call del "<FILE>""#, Some("cmd.exe"), false, false),
+            (
+                r#"for /f %i in ('del "<FILE>"') do rem"#,
+                Some("cmd.exe"),
+                false,
+                false,
+            ),
+            (r#"cmd /d /c "del <FILE>" x"#, Some("cmd.exe"), false, false),
+            (r#"cmd //d //c "del <FILE>" x"#, None, false, false),
+            ("@echo off", Some("cmd.exe"), true, true),
+            (
+                "for /f %i in ('dir /b') do echo %i",
+                Some("cmd.exe"),
+                true,
+                false,
+            ),
+            (
+                r#"cmd /d /c "C:\Program Files\Tool\tool.exe" --flag value"#,
+                Some("cmd.exe"),
+                true,
+                true,
+            ),
         ];
         for (command, shell, pass, bash_pass) in cases {
             let command = command.replace("<FILE>", file);
@@ -3773,8 +4089,26 @@ mod tests {
             r"if exist x,del x",
             r"if /i not exist x,del x",
             r"call,cmd/c del x",
+            // 制御語・`call`を外した後や接頭辞だけの語の後にも、リダイレクトと接頭辞の読み飛ばしを繰り返す。
+            r"call >out del x",
+            r"for %i in (a) do >nul del %i",
+            r"if exist x (echo a) else >nul del x",
+            r"@>nul del x",
+            r"@ del x",
+            r", del x",
+            r"call call del x",
+            r"for %i in (a) do,@ del %i",
+            // `for /f`のコマンド集合（`'…'`・usebackqの`` `…` ``）の先頭語は実行名。
+            r"for /f %i in ('del x') do rem",
+            r"for /f %i in ('>nul del x') do rem",
+            r"for /f %i in (' del x') do rem",
+            r#"for /f "usebackq" %i in (`del x`) do rem"#,
         ] {
             assert!(denied(command, "cmd.exe"), "{command}");
+            if cfg!(windows) {
+                let wrapped = format!(r#"cmd /c "{command}""#);
+                assert!(reason(&wrapped, "Bash", None).is_some(), "{wrapped}");
+            }
         }
         for command in [
             r"for %i in (a) do echo del %i",
@@ -3783,9 +4117,22 @@ mod tests {
             "else",
             "do,",
             "call,echo ok",
+            "@echo off",
+            "call x.bat",
+            "call -x",
+            "do echo del",
+            "2>nul echo hi",
+            "@ echo hi",
+            r"for /f %i in ('dir /b') do echo %i",
+            r#"for /f "usebackq" %i in (`dir /b`) do echo %i"#,
         ] {
             assert!(!denied(command, "cmd.exe"), "{command}");
         }
+        // 語が分かれた制御語とリダイレクトの大量の反復も、再帰せず線形時間で終わる。
+        let spaced = format!("{}echo x", "do >a ".repeat(100_000));
+        assert!(!denied(&spaced, "cmd.exe"));
+        let spaced = format!("{}del x", "do >a ".repeat(100_000));
+        assert!(denied(&spaced, "cmd.exe"));
         // 上限以内の直結連鎖は削除命令として報告し、上限を超える連鎖は検査不能として拒否する。
         let within = format!("{}del x", "do,".repeat(CMD_GLUED_PREFIX_LIMIT));
         let found = reason(&within, "exec_command", Some("cmd.exe")).expect("within");
@@ -4142,6 +4489,8 @@ mod tests {
             "cat>f <<'EOF'\nrm -rf /tmp/y\nEOF",
             "cat>f<<'EOF'\nrm -rf /tmp/y\nEOF",
             "cat >| f <<'EOF'\nrm -rf /tmp/y\nEOF",
+            // 引用しない終端語の本文でも、展開が無害なら通す。
+            "cat > f <<EOF\nIt's $(date) and \"ok\" # note\nEOF",
         ] {
             assert!(!posix_denied(allowed), "{allowed:?}");
         }
@@ -4167,6 +4516,17 @@ mod tests {
             // 展開される本文（終端語が引用されていない）は文として検査する。
             "cat > f <<EOF\n$(rm -rf /tmp/y)\nEOF",
             "cat > f <<EOF\nrm -rf /tmp/y\nEOF",
+            // 引用しない終端語の本文では`'`・`"`は引用ではなく、`#`もコメントではない（`$(…)`・逆引用は展開される）。
+            "cat <<EOF\nDon't $(unlink /tmp/y)\nEOF",
+            "cat > f <<EOF\nDon't `unlink /tmp/y`\nEOF",
+            "cat <<EOF\nsay \"$(unlink /tmp/y)\nEOF",
+            "cat <<EOF\n# $(unlink /tmp/y)\nEOF",
+            // `$(…)`の中では引用が有効（`'r''m'`は`rm`）。
+            "cat <<EOF\nDon't $('r''m' -rf /tmp/y)\nEOF",
+            // shellへ渡る本文は内側のshellが引用を解釈するため、従来の読みでも検査を続ける。
+            "bash <<EOF\n'r''m' -rf /tmp/y\nEOF",
+            // 1行に引用あり・なしのヒアドキュメントが並ぶ形。
+            "cat <<'A' <<B\nx\nA\nDon't $(unlink /tmp/y)\nB",
             // `<<`を算術・`[[`・逆引用・コマンド置換の中で書いた形は読み飛ばさない。
             "echo $((1<<'X'))\nrm -rf /tmp/y\nX",
             "[[ a << 'X' ]]\nrm -rf /tmp/y\nX",
@@ -4475,6 +4835,14 @@ mod tests {
             "bash -c 2>/dev/null 'unlink /tmp/y'",
             "env>/tmp/z unlink /tmp/y",
             "sh>python <<'EOF'\nunlink /tmp/y\nEOF",
+            // prefix・代入の後ろのリダイレクトを飛ばした先の実行名も検査する。
+            "exec 3>&- unlink /tmp/y",
+            "exec >log rm -rf /tmp/y",
+            "FOO=1 >out unlink /tmp/y",
+            // リダイレクトを前置しても動的な実行名の拒否は外れない。
+            "exec >log $cmd /tmp/y",
+            "FOO=1 >out $cmd /tmp/y",
+            "for f in a; do >out $cmd $f; done",
         ] {
             assert!(posix_denied(denied), "{denied:?}");
             if cfg!(windows) {
@@ -4504,6 +4872,12 @@ mod tests {
             "ls>&/tmp/log",
             "bash 2>/dev/null -c 'echo hi'",
             "sort<in.txt>out.txt",
+            // prefix・代入の後ろがリダイレクトだけの形はコマンドを実行しない。
+            "exec 3>&-",
+            "exec >log 2>&1",
+            "exec 2>/dev/null",
+            "FOO=1 >out",
+            "for f in a; do echo $f; done; 2>/dev/null ls",
         ] {
             assert!(!posix_denied(allowed), "{allowed:?}");
             if cfg!(windows) {
@@ -4587,6 +4961,15 @@ mod tests {
             "echo \"$(echo \"$(echo '\"')\")\"; unlink /tmp/y",
             // `$(…)`の本文の削除は従来どおり検査する。
             "echo \"$(unlink /tmp/y)\"",
+            // 実行名の位置のブレース展開は、bashが展開してから実行名を決めるため検査不能として拒否する。
+            "r{m,} -rf /tmp/y",
+            "{unlink,/tmp/y}",
+            "un{link,} /tmp/y",
+            "A=1 {rm,-rf,/tmp/y}",
+            "env {rm,-rf,/tmp/y}",
+            "if true; then {unlink,/tmp/y}; fi",
+            "echo ok; r{l..m} -rf /tmp/y",
+            "{\"rm\",-rf,/tmp/y}",
         ] {
             assert!(posix_denied(denied), "{denied:?}");
             if cfg!(windows) {
@@ -4602,6 +4985,14 @@ mod tests {
             "cd \"$(dirname \"$0\")\"",
             "x=\"$(printf '%s' ')')\"; echo \"$x\"",
             "echo \"$((1 + 2))\"",
+            // 引数の位置のブレース展開・空白を伴うグループ・`{}`は従来どおり通す。
+            "echo {a,b}",
+            "mkdir -p x/{a,b}",
+            "cp a.txt{,.bak}",
+            "find . -name '*.rs' -exec ls {} \\;",
+            "{ echo a; echo b; }",
+            "echo {done}",
+            "a={x,y}; echo $a",
         ] {
             assert!(!posix_denied(allowed), "{allowed:?}");
             if cfg!(windows) {
