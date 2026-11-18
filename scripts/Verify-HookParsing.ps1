@@ -483,7 +483,7 @@ $cases += @(
     @{ name='posix-heredoc-delete-after-body'; command="cat > /d/example/a.txt <<'EOF'`nx`nEOF`nrm -f `"<FILE>`""; pass=$false },
     @{ name='posix-heredoc-piped-to-shell'; command="cat <<'EOF' | sh`nrm -f `"<FILE>`"`nEOF"; pass=$false },
     @{ name='posix-loop-assignment-and-test'; command='for f in a b; do n=$(basename $f); if [ -f "$f" ]; then echo $n; fi; done 2>&1'; pass=$true },
-    # 出力先が単純な変数展開のcat・teeも本文をdataとして読み、shell不明でもCMD・PowerShell規則が本文の行を文として拾わない。
+    # 出力先が単純な変数展開のcat・teeはPOSIX規則では本文をdataとして読むが、shell不明ではCMD・PowerShell規則も全文を検査する。
     # shell不明ではCMD・PowerShell規則も本文を文として検査するため、許可ケースの本文には削除命令の綴りを含めない。
     @{ name='posix-heredoc-variable-target-body'; command=('cat > "$TEMP/x/y.ts" <<''EOF''|for (const f of files) {|  if (f) { run(f) }|}|EOF').Replace('|', "`n"); pass=$true },
     @{ name='posix-heredoc-braced-variable-target-body'; command=('cat > ${TEMP}/x/y.ts <<''EOF''|for (const f of files) {|  run(f)|}|EOF').Replace('|', "`n"); pass=$true },

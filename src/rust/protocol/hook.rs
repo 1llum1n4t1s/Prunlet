@@ -1984,6 +1984,8 @@ struct Heredoc {
     statement_start: usize,
     /// `<<`より前の状況が読み飛ばし可能か（括弧の入れ子なし、算術・`[[`・逆引用なし）。
     context_ok: bool,
+    /// `<<`より前に、制御構文の開始語か引用外の`{`・`(`が一度でも現れたか（閉じたかは問わない）。
+    control_seen: bool,
 }
 /// ヒアドキュメント本文を読み飛ばしてよい場合に、本文の次の文字位置を返す。
 ///
@@ -2003,10 +2005,21 @@ fn heredoc_skip(
         return Ok(None);
     }
     for heredoc in heredocs {
+        let statement = &out[heredoc.statement_start.min(out.len())..];
         if !heredoc.quoted
             || !heredoc.context_ok
             || heredoc.delimiter.is_empty()
-            || !heredoc_consumer_is_data_sink(&out[heredoc.statement_start.min(out.len())..])?
+            || !heredoc_consumer_is_data_sink(statement)?
+        {
+            return Ok(None);
+        }
+        // 出力先が変数の`cat`・`tee`は、中身が`/dev/stdout`などでありうる。制御構文の開始語や
+        // `{`・`(`が`<<`より前に一度でも現れていれば、終了語の数え違いで外側と誤認しうるため読み飛ばさない。
+        if heredoc.control_seen
+            && statement
+                .iter()
+                .take_while(|w| !w.boundary)
+                .any(|w| w.dynamic)
         {
             return Ok(None);
         }
@@ -2074,6 +2087,10 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
             if target_text.starts_with('&') {
                 return Ok(false);
             }
+            // 標準出力はfdが空か`1`のとき。それ以外のfd（`3>`等）は別の書き出し先で、`tee`の標準出力を決めない。
+            if !matches!(&text[..digits], "" | "1" | "2") {
+                return Ok(false);
+            }
             if &text[..digits] != "2" {
                 let lower = target_text.to_ascii_lowercase();
                 if lower == "/dev/null" {
@@ -2114,8 +2131,9 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
         _ => false,
     })
 }
-/// `tee [-a] <path>...`が、静的なオプションと1つ以上の書き出し先だけを取る形か。
-/// 書き出し先の条件は`cat >`の出力先と同じ（`data_sink_path`）。
+/// `tee`の引数が、静的なoption（`-a`・`-i`・`-p`・`--append`・`--ignore-interrupts`・`--`）と
+/// 1つ以上の書き出し先だけか。書き出し先の条件は`cat >`の出力先と同じ（`data_sink_path`）。
+/// 標準出力の向き先は呼出し側が確認する。
 fn tee_writes_only_files(args: &[&Token]) -> bool {
     let mut options_done = false;
     let mut paths = 0;
@@ -2255,18 +2273,16 @@ fn at_command_position(words: &[Token]) -> bool {
     while k < words.len() {
         let word = &words[k];
         let text = word.text.as_str();
-        if word.quoted {
-            return false;
-        }
+        // リダイレクトは引用の判定より先に見る（`>"f"`は引用を含むが、語全体が対象つきの演算子）。
         let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-        if text[digits..].starts_with(['<', '>']) {
+        if word.quote_start != Some(0) && text[digits..].starts_with(['<', '>']) {
             // 演算子だけなら対象は次の語。
             k += if text[digits..].trim_start_matches(['<', '>', '&', '|']).is_empty() {
                 2
             } else {
                 1
             };
-        } else if SKIPPED.contains(&text) || is_assignment_text(text) {
+        } else if !word.quoted && (SKIPPED.contains(&text) || is_assignment_text(text)) {
             k += 1;
         } else {
             return false;
@@ -2311,6 +2327,8 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
     let mut heredocs: Vec<Heredoc> = Vec::new();
     let mut statement_start = 0usize;
     let mut group_depth = 0i32;
+    // 引用外の`{`・`(`を一度でも見たか（`echo {done}`のように閉じても残る）。
+    let mut group_seen = false;
     let mut line_start = 0usize;
     let mut heredoc_boundary_after = false;
     while i < s.len() {
@@ -2366,6 +2384,15 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
                 delimiter,
                 quoted: quoted && complete,
                 statement_start,
+                control_seen: group_seen
+                    || out.iter().any(|w: &Token| {
+                        !w.boundary
+                            && !w.quoted
+                            && matches!(
+                                w.text.as_str(),
+                                "if" | "while" | "until" | "for" | "select" | "case"
+                            )
+                    }),
                 context_ok: group_depth == 0
                     && !inside_control_construct(&out)
                     && !before.contains("((")
@@ -2608,7 +2635,10 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
                     heredoc_boundary_after = true;
                 }
                 match c {
-                    '(' | '{' => group_depth += 1,
+                    '(' | '{' => {
+                        group_depth += 1;
+                        group_seen = true;
+                    }
                     ')' | '}' => group_depth -= 1,
                     _ => {}
                 }
@@ -3976,13 +4006,28 @@ mod tests {
             "until false\ndo\npython - <<'EOF'\nrm -rf /tmp/y\nEOF\ndone",
             "if true; then\nif true; then\ncat > f <<'EOF'\nrm -rf /tmp/y\nEOF\nfi\nelse\necho\nfi",
             "case x in\nx)\ncat > f <<'EOF'\nrm -rf /tmp/y\nEOF\n;;\nesac",
+            // 終了語の数え違いで外側と誤認させる形（出力先が変数なら、開始語・`{`・`(`を一度でも見たら読み飛ばさない）。
+            "X=/dev/stdout\necho {done}\nwhile true\ndo\ncat > \"$X\" <<'EOF'\nunlink /tmp/y\nEOF\nbreak\ndone | sh",
+            "X=/dev/stdout\nwhile true\ndo\necho {done}\ncat > \"$X\" <<'EOF'\nunlink /tmp/y\nEOF\nbreak\ndone | sh",
+            "X=/dev/stdout\ncat <<Z\ndone\nZ\nwhile true\ndo\ncat > \"$X\" <<'EOF'\nunlink /tmp/y\nEOF\nbreak\ndone | sh",
+            "X=/dev/stdout\necho (x)\ncat > \"$X\" <<'EOF'\nunlink /tmp/y\nEOF",
+            "X=/dev/stdout\nfor i in 1; do echo; done\ntee \"$X\" >/dev/null <<'EOF'\nunlink /tmp/y\nEOF",
+            // 標準出力ではないfdの出力先は、`tee`・`cat`の標準出力を決めない。
+            "tee /tmp/x 3>/dev/null <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "tee /tmp/x 3>/tmp/z <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "cat 3>/tmp/z <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "cat > /tmp/z 4>/tmp/w <<'EOF'\nrm -rf /tmp/y\nEOF",
+            // リダイレクトは引用を含んでも実行名の位置の判定から外れない。
+            ">\"f\" ${X}unlink /tmp/y",
+            ">\"f\" ${X} unlink /tmp/y",
         ] {
             assert!(posix_denied(command), "{command:?}");
         }
-        // 制御構文を閉じた後は、従来どおり読み飛ばす。
+        // 出力先が静的なら、制御構文を閉じた後は従来どおり読み飛ばす（標準出力が他へ流れない）。
         for command in [
             "for i in 1; do echo; done\ncat > f <<'EOF'\nrm -rf /tmp/y\nEOF",
             "if true; then echo; fi\ntee f >/dev/null <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "echo {x}\ncat > /tmp/f <<'EOF'\nrm -rf /tmp/y\nEOF",
             "A=1 cat > ${OUT} <<'EOF'\nrm -rf /tmp/y\nEOF",
         ] {
             assert!(!posix_denied(command), "{command:?}");
