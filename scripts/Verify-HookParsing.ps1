@@ -592,7 +592,19 @@ $cases += @(
     @{ name='pwsh-block-comment-after-assignment'; command='$x=<# c #> Remove-Item -LiteralPath "<FILE>"'; shell='pwsh'; pass=$false; bashPass=$false },
     @{ name='pwsh-smart-quote-here-string'; command=('$a = @' + [char]0x2018 + "`nit's`n" + [char]0x2019 + '@; Remove-Item -LiteralPath "<FILE>"; Write-Output ''ok'''); shell='pwsh'; pass=$false; bashPass=$false },
     @{ name='pwsh-smart-quote-legacy-reading'; command=('Write-Output ' + [char]0x2018 + '; Remove-Item -LiteralPath "<FILE>"; Write-Output '''); shell='pwsh'; pass=$false; bashPass=$false },
-    @{ name='pwsh-here-string-after-comma-harmless'; command=("Write-Output 1,@'`nit's`n'@"); shell='pwsh'; pass=$true }
+    @{ name='pwsh-here-string-after-comma-harmless'; command=("Write-Output 1,@'`nit's`n'@"); shell='pwsh'; pass=$true },
+    # 実行名の位置の`${…}`の連続を再帰せずに読み飛ばし、`>-`は1語のリダイレクト、退避・引用した`\>`・`2">"x`はoptionの値として読む。
+    # 閉じない`${…$(`の行の連続は線形時間で拒否し、`<<<`・置換の中のコメント・ヒアドキュメント本文のJSON行は誤拒否しない。
+    @{ name='posix-many-parameter-words'; command=(('${a} ' * 3000) + '; unlink "<FILE>"'); pass=$false },
+    @{ name='posix-redirect-dash-file-after-env'; command='env >- unlink "<FILE>"'; pass=$false },
+    @{ name='posix-redirect-dash-file-in-then'; command='if true; then >- unlink "<FILE>"; fi'; pass=$false },
+    @{ name='posix-escaped-redirect-option-value'; command='env -u \> unlink "<FILE>"'; pass=$false },
+    @{ name='posix-quoted-redirect-option-value'; command='exec -a 2">"x unlink "<FILE>"'; pass=$false },
+    @{ name='posix-unclosed-parameter-substitution-lines'; command=(('echo ${x:-$(' + "`n") * 40000 + 'unlink "<FILE>"'); pass=$false },
+    @{ name='posix-here-string-in-quoted-substitution'; command='count="$(wc -l <<< "$lines")"'; pass=$true },
+    @{ name='posix-quoted-substitution-comment'; command=('x="$(' + "`n# don't do this`necho hi`n" + ')"'); pass=$true },
+    @{ name='posix-heredoc-body-json-line'; command=("curl -s -X POST http://localhost/api -d @- <<'EOF'`n" + '{"name":"x","id":1}' + "`nEOF"); pass=$true },
+    @{ name='posix-unquoted-heredoc-body-json-line'; command=("kubectl apply -f - <<EOF`n" + '{"a":"b","c":1}' + "`nEOF"); pass=$true }
 )
 
 $results = [Collections.Generic.List[object]]::new()

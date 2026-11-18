@@ -140,5 +140,19 @@
  {"name":"heredoc-undetermined-delimiter","command":"cat <<$'E\\x4fF'\nit's\nEOF\nunlink <FILE>\necho 'ok'","pass":false,"reason":"POSIX here-document delimiter cannot be determined"},
  {"name":"heredoc-carriage-return-line-is-body","command":"cat <<'EOF'\nEOF\r\nit's\nEOF\nunlink <FILE>\necho 'ok'","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
  {"name":"prefix-option-value-redirect","command":"env -u >/dev/null FOO unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
- {"name":"array-subscript-with-blank","command":"a[1 + 1]=5 unlink <FILE>","pass":false,"reason":"POSIX array subscript with blanks cannot be inspected"}
+ {"name":"array-subscript-with-blank","command":"a[1 + 1]=5 unlink <FILE>","pass":false,"reason":"POSIX array subscript with blanks cannot be inspected"},
+ {"name":"parameter-words-and-redirects-before-command","command":"${a} ${b} >x ${c} unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"redirect-to-dash-file-after-env","command":"env >- unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"redirect-to-dash-file-after-assignment","command":"FOO=1 >- unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"redirect-to-dash-file-in-then","command":"if true; then >- unlink <FILE>; fi","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"escaped-redirect-is-env-option-value","command":"env -u \\> unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"quoted-redirect-is-env-option-value","command":"env -u 2\">\"x unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"escaped-redirect-is-sudo-option-value","command":"sudo -p \\> unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"escaped-redirect-is-exec-option-value","command":"exec -a \\> unlink <FILE>","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"here-string-in-quoted-substitution","command":"count=\"$(wc -l <<< \"$lines\")\"","pass":true},
+ {"name":"heredoc-body-json-line","command":"curl -s -X POST http://localhost/api -d @- <<'EOF'\n{\"name\":\"x\",\"id\":1}\nEOF","pass":true},
+ {"name":"unquoted-heredoc-body-json-line","command":"kubectl apply -f - <<EOF\n{\"a\":\"b\",\"c\":1}\nEOF","pass":true},
+ {"name":"heredoc-body-brace-then-delete","command":"cat <<EOF\n{\"a\":1,\"b\":2} unlink <FILE>\nEOF","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"},
+ {"name":"quoted-substitution-comment-apostrophe","command":"x=\"$(\n# don't do this\necho hi\n)\"","pass":true},
+ {"name":"quoted-substitution-comment-then-delete","command":"x=\"$(\n# don't )\nunlink <FILE>\n)\"","pass":false,"reason":"deletion command; detected token \"unlink\"; interpretation=POSIX"}
 ]

@@ -54,6 +54,9 @@ struct Token {
     /// POSIX規則で、語が引用外のブレース展開（`r{m,}`・`{a,b}`・`{1..3}`）を含むか。
     /// bashは展開後の最初の語を実行名にするため、実行名の位置では検査不能として扱う。
     brace: bool,
+    /// 語が引用外・非退避のリダイレクト演算子（`<`・`>`。fd番号の数字が前に付く形を含む）で始まるか。
+    /// 退避・引用した`\>`・`">"`・`2">"x`はoptionの値などの通常の語で、リダイレクトとして読み飛ばさない。
+    redirect: bool,
 }
 impl Token {
     fn new(text: impl Into<String>) -> Self {
@@ -74,6 +77,7 @@ impl Token {
             escaped: false,
             continued: false,
             brace: false,
+            redirect: false,
         }
     }
     /// 語全体が1つの単一引用だけでできたPowerShellの静的リテラルか（`'...'`、`''`は`'`）。
@@ -107,6 +111,8 @@ fn split_cmd_commas(words: &[Token]) -> Vec<Token> {
                 let inside = |position: usize| position >= start && position < end;
                 piece.quote_start = word.quote_start.filter(|&q| inside(q)).map(|q| q - start);
                 piece.quoted = piece.quote_start.is_some();
+                // リダイレクトの印は語の先頭の片だけが引き継ぐ。
+                piece.redirect = word.redirect && start == 0;
                 if let Some(e) = word.equality.filter(|&e| inside(e)) {
                     piece.equality = Some(e - start);
                     piece.quoted_after_equality = word.quoted_after_equality;
@@ -969,11 +975,24 @@ impl Inspector {
                 && let Some(rest) = posix_parameter_rest(&w[0].text)
             {
                 // 語全体が引用なしの展開だけ（`${X}`）なら、空に展開されて次の語が実行名になりうる。
+                // 同じ形の語とリダイレクトが続く間は読み飛ばし、最初の残りの語から1回だけ検査する。
+                // 語ごとに再帰すると、大量に並んだ入力（`${a} ${a} …`）で再帰の深さと計算量が語数に比例して増える。
                 let found = if rest.is_empty() {
-                    w.len() > 1
-                        && w[0].quote_start.is_none()
-                        && w[0].text.starts_with("${")
-                        && self.command(&w[1..], depth, strict)?
+                    let empty = posix_empty_parameter_word(&w[0])?;
+                    let mut next = 1;
+                    if empty {
+                        while next < w.len() {
+                            let redirects = leading_redirect_words(&w[next..], false);
+                            if redirects > 0 {
+                                next += redirects;
+                            } else if posix_empty_parameter_word(&w[next])? {
+                                next += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    empty && next < w.len() && self.command(&w[next..], depth, strict)?
                 } else {
                     let mut copy = Vec::with_capacity(w.len());
                     let mut head = Token::new(rest);
@@ -2253,34 +2272,70 @@ fn heredoc_skippable(heredocs: &[Heredoc], out: &[Token], boundary_after: bool) 
 /// 戻り値は（本文の終わり＝終端行の先頭, 終端行の次の位置）。行末の`\r`も行の一部として比べる
 /// （CRLFの入力では、見出しの終端語の直後の`\r`を終端語に含めて記録するため、`EOF\r`の行で終わる）。
 /// 終端が見つからない、または終端語を確定できない場合は入力の終わりまでを本文とする（bashも入力の終わりで本文を閉じる）。
-fn heredoc_body_end(s: &[char], start: usize, heredoc: &Heredoc) -> (usize, usize) {
-    let Some(delimiter) = heredoc.delimiter.as_deref() else {
-        return (s.len(), s.len());
-    };
-    let delimiter: Vec<char> = delimiter.chars().collect();
-    let mut position = start;
-    while position < s.len() {
-        let end = s[position..]
-            .iter()
-            .position(|&c| c == '\n')
-            .map_or(s.len(), |offset| position + offset);
-        let mut line = &s[position..end];
-        if heredoc.strip_tabs {
-            while let ['\t', rest @ ..] = line {
-                line = rest;
-            }
+///
+/// 入力の全行を内容ごとに索引し、終端行を二分探索で求める。行ごとに入力の終わりまで走査すると、
+/// 終端のないヒアドキュメントが行ごとに並ぶ入力（本文を区切らない従来の読みで毎行記録する`cat <<EOF`の連続）で二乗になるため。
+struct HeredocLines {
+    /// 行の内容 → その内容の行の（先頭, 改行の位置）の昇順の一覧。
+    exact: std::collections::HashMap<String, Vec<(usize, usize)>>,
+    /// 先頭のタブを除いた行の内容 → 同上（`<<-`の終端行の照合に使う）。
+    stripped: std::collections::HashMap<String, Vec<(usize, usize)>>,
+    len: usize,
+}
+impl HeredocLines {
+    fn new(s: &[char]) -> Self {
+        let mut exact: std::collections::HashMap<String, Vec<(usize, usize)>> =
+            std::collections::HashMap::new();
+        let mut stripped: std::collections::HashMap<String, Vec<(usize, usize)>> =
+            std::collections::HashMap::new();
+        let mut position = 0;
+        while position < s.len() {
+            let end = s[position..]
+                .iter()
+                .position(|&c| c == '\n')
+                .map_or(s.len(), |offset| position + offset);
+            let line = &s[position..end];
+            let tabs = line.iter().take_while(|&&c| c == '\t').count();
+            exact
+                .entry(line.iter().collect())
+                .or_default()
+                .push((position, end));
+            stripped
+                .entry(line[tabs..].iter().collect())
+                .or_default()
+                .push((position, end));
+            position = end + 1;
         }
-        if line == delimiter.as_slice() {
-            return (position, (end + 1).min(s.len()));
+        Self {
+            exact,
+            stripped,
+            len: s.len(),
         }
-        position = end + 1;
     }
-    (s.len(), s.len())
+    fn body_end(&self, start: usize, heredoc: &Heredoc) -> (usize, usize) {
+        let Some(delimiter) = heredoc.delimiter.as_deref() else {
+            return (self.len, self.len);
+        };
+        let index = if heredoc.strip_tabs {
+            &self.stripped
+        } else {
+            &self.exact
+        };
+        let Some(lines) = index.get(delimiter) else {
+            return (self.len, self.len);
+        };
+        let first = lines.partition_point(|&(line, _)| line < start);
+        match lines.get(first) {
+            Some(&(line, end)) => (line, (end + 1).min(self.len)),
+            None => (self.len, self.len),
+        }
+    }
 }
 /// `chars[start]`が`$`、`chars[start + 1]`が`(`のとき、対応する`)`の次の位置を返す。`limit`までに閉じなければ`None`。
 /// 入れ子の括弧・`'`・`"`（二重引用の中の`$(…)`を含む）・`\`の退避を読む。
 /// `posix`はPOSIX規則で、逆引用を閉じる逆引用までの入れ子のコマンド置換（中の`\`は次の1文字を退避）として、
-/// `$'…'`をANSI-C引用（`\`は次の1文字を退避）として、`$$`を2文字の対として読む。
+/// `$'…'`をANSI-C引用（`\`は次の1文字を退避）として、`$$`を2文字の対として、`${…}`をパラメーター展開（中の`)`・`#`は閉じ・コメントでない）として、
+/// 括弧の中の語頭の`#`から行末までをコメントとして、`<<<`をヒアストリングとして読む。
 /// PowerShell規則では逆引用は次の1文字を退避する文字で、`$'`・`$$`は特別に扱わない。
 /// `Inspector::expanded`と字句解析が同じ範囲を使う。入れ子は明示のスタックで追い、深い入れ子でも再帰しない。
 fn subexpression_close(chars: &[char], start: usize, limit: usize, posix: bool) -> Option<usize> {
@@ -2301,6 +2356,8 @@ fn subexpression_close(chars: &[char], start: usize, limit: usize, posix: bool) 
     // POSIX規則で、置換の直下（入れ子の括弧・算術の外）に書いたヒアドキュメントの（終端語, `<<-`か）。
     // 行末で本文を読み飛ばす（`"$(cat <<'EOF'`…`EOF`改行`)"`の本文の`'`を引用として数えない）。
     let mut heredocs: Vec<(Vec<char>, bool)> = Vec::new();
+    // 直前の`\`の退避が終わった位置（退避した空白の直後の`#`をコメントの語頭と取り違えない）。
+    let mut escape_end = usize::MAX;
     let mut i = start + 2;
     while i < limit {
         let c = chars[i];
@@ -2333,6 +2390,17 @@ fn subexpression_close(chars: &[char], start: usize, limit: usize, posix: bool) 
                 }
             }
             i = position;
+            continue;
+        }
+        // `<<<`はヒアストリング（後ろの語がそのまま入力になる）で、ヒアドキュメントの終端語を読まない。
+        // 3文字をまとめて読み飛ばし、2文字目からの`<<`をヒアドキュメントと取り違えない。
+        if posix
+            && c == '<'
+            && chars.get(i + 1) == Some(&'<')
+            && chars.get(i + 2) == Some(&'<')
+            && stack.last() != Some(&'"')
+        {
+            i += 3;
             continue;
         }
         if posix
@@ -2405,8 +2473,21 @@ fn subexpression_close(chars: &[char], start: usize, limit: usize, posix: bool) 
             continue;
         }
         match c {
-            '\\' | '`' => i += 2,
+            '\\' | '`' => {
+                i += 2;
+                escape_end = i;
+            }
             '$' if posix && chars.get(i + 1) == Some(&'$') => i += 2,
+            // POSIX規則の`${…}`（パラメーター展開）の中。`#`はコメントでなく（`${x:- #}`）、`)`は閉じではない。
+            '$' if posix && chars.get(i + 1) == Some(&'{') => {
+                stack.push('{');
+                i += 2;
+            }
+            '}' if stack.last() == Some(&'{') => {
+                stack.pop();
+                i += 1;
+            }
+            ')' if stack.last() == Some(&'{') => i += 1,
             // ANSI-C引用の中は`\`が次の1文字を退避し、非退避の`'`で閉じる。
             '$' if posix && chars.get(i + 1) == Some(&'\'') => {
                 let mut k = i + 2;
@@ -2419,6 +2500,20 @@ fn subexpression_close(chars: &[char], start: usize, limit: usize, posix: bool) 
                     }
                 }
                 i = k + 1;
+            }
+            // POSIX規則で、括弧の中の語頭（直前が退避されていない空白・`;|&()`）の`#`から行末まではコメント。
+            // 中の`'`・`)`を引用・閉じとして数えない（`"$(`改行`# don't`改行`…)"`）。改行は読み進めず、ヒアドキュメント本文の読み飛ばしの判定へ渡す。
+            // `${#x}`・`$#`・`16#ff`・`\ #`の`#`と`${…}`の中の`#`は語頭のコメントではない。
+            // 逆引用の中は`backtick_close`が閉じる逆引用までを読むため、ここへ来ない。
+            '#' if posix
+                && stack.last() == Some(&'(')
+                && escape_end != i
+                && (chars[i - 1].is_whitespace()
+                    || matches!(chars[i - 1], ';' | '|' | '&' | '(' | ')')) =>
+            {
+                while i < limit && chars[i] != '\n' {
+                    i += 1;
+                }
             }
             // 単一引用の中は退避を含めて文字どおり。
             '\'' => match chars[i + 1..limit].iter().position(|&d| d == '\'') {
@@ -2507,7 +2602,8 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
             break;
         }
         // `<<`・`<<-`（終端語が直結していれば同じ語、離れていれば次の語が終端語）。
-        if word.quote_start != Some(0) && text.starts_with("<<") {
+        // リダイレクトは字句解析が演算子の印を付けた語だけ（退避・引用した`\>x`・`">"x`は通常の引数）。
+        if word.redirect && text.starts_with("<<") {
             let rest = text[2..].strip_prefix('-').unwrap_or(&text[2..]);
             k += if rest.is_empty() && !word.quoted { 2 } else { 1 };
             continue;
@@ -2517,7 +2613,7 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
         }
         // 出力リダイレクト（`>`・`>>`・`1>`・`2>`。対象は直結か次の語）。
         let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-        if word.quote_start != Some(0) && text[digits..].starts_with('>') {
+        if word.redirect && text[digits..].starts_with('>') {
             // `>|`（noclobberを無視する出力）の`|`も演算子の一部で、書き出し先ではない。
             let operator = text[digits..].trim_start_matches('>');
             let operator = operator.strip_prefix('|').unwrap_or(operator);
@@ -2658,24 +2754,26 @@ fn powershell_dot_argument(s: &[char], i: usize, out: &[Token]) -> bool {
     }
     true
 }
-/// 文頭に並ぶリダイレクト（演算子と対象）が占める語数。`>f`・`2>&1`は1語、`>`・`<`・`2>`・`<<`は対象の次の語まで2語。
-/// 先頭が引用で始まる語（`">"`）と、PowerShell規則のブロックコメント開始`<#`はリダイレクトではない。
+/// 文頭に並ぶリダイレクト（演算子と対象）が占める語数。`>f`・`2>&1`・`>-`は1語、`>`・`<`・`2>`・`<<`・`<<-`は対象の次の語まで2語。
+/// 字句解析が引用外・非退避の演算子で始まる語に付けた印（`Token::redirect`）の語だけを数える。
+/// 退避・引用した`\>`・`">"`・`2">"x`と、PowerShell規則のブロックコメント開始`<#`はリダイレクトではない。
 fn leading_redirect_words(words: &[Token], powershell: bool) -> usize {
     let mut k = 0;
     while let Some(word) = words.get(k) {
         let text = word.text.as_str();
         let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-        if word.quote_start == Some(0)
+        if !word.redirect
             || !text[digits..].starts_with(['<', '>'])
             || (powershell && text.starts_with("<#"))
         {
             break;
         }
         let operator = &text[digits..];
-        // `>&-`・`<&-`（fdを閉じる）は対象語を取らない完結した1語。`<<-`は終端語を取る演算子のまま。
-        k += if !operator.ends_with("&-")
-            && operator.trim_start_matches(['<', '>', '&', '|', '-']).is_empty()
-        {
+        // 対象語を次の語に取るのは、`<`・`>`の並びの後ろが空か`&`・`|`の1文字だけの演算子（`>`・`>>`・`<>`・`>&`・`>|`・`<<<`）と、
+        // ヒアドキュメントの`<<-`だけ。`-`を演算子の一部として読むのは`<<-`と`>&-`・`<&-`（fdを閉じる完結した1語）に限り、
+        // `>-`・`<-`は`-`という名前のファイルを対象に含めた1語（bashも同じ）。
+        let rest = operator.trim_start_matches(['<', '>']);
+        k += if matches!(rest, "" | "&" | "|") || operator == "<<-" {
             2
         } else {
             1
@@ -2853,6 +2951,14 @@ fn posix_unclosed_subscript(word: &Token) -> bool {
         && word.quote_start.is_none_or(|q| q > name)
         && !text[name..].contains(']')
 }
+/// POSIX規則の実行名の位置の語が、空に展開されて次の語を実行名にしうる引用なしの`${…}`だけの語か
+/// （代入でなく、`${`で始まり、最後の`${…}`の後ろに残りがない）。`Inspector::command`が読み飛ばす語の判定に使う。
+fn posix_empty_parameter_word(word: &Token) -> Result<bool> {
+    Ok(word.quote_start.is_none()
+        && word.text.starts_with("${")
+        && !compiled(&ASSIGNMENT)?.is_match(&word.text)
+        && posix_parameter_rest(&word.text) == Some(""))
+}
 /// POSIX規則の語に含まれる最後の`${…}`（パラメーター展開）の後ろの残りを返す（`${X}rm`は`rm`、`${X}`は空）。
 /// `${`を含まない、または対応する`}`が無い語は`None`。
 fn posix_parameter_rest(text: &str) -> Option<&str> {
@@ -2862,7 +2968,7 @@ fn posix_parameter_rest(text: &str) -> Option<&str> {
     let mut k = 0;
     while k + 1 < plain.len() {
         if plain[k] == '$' && plain[k + 1] == '{' {
-            if let Some(end) = parameter_expansion_end(&plain, k) {
+            if let Some(end) = parameter_expansion_end(&plain, k, plain.len()) {
                 rest = Some(chars.get(end).map_or(text.len(), |&(byte, _)| byte));
                 k = end;
                 continue;
@@ -2876,10 +2982,13 @@ fn posix_parameter_rest(text: &str) -> Option<&str> {
 /// POSIX規則で、`s[start]`の`$`に続く`${…}`（パラメーター展開）の、対応する`}`の次の位置を返す。
 /// 入れ子の`{`・`}`を数え、`\`の退避・`'`・`"`の引用・`$(…)`・逆引用の中の`}`は数えない。
 /// 改行を含む・閉じない形は`None`（呼出し側は従来どおり`{`・`}`で語を割って読む）。
-fn parameter_expansion_end(s: &[char], start: usize) -> Option<usize> {
+/// `limit`より先は走査しない。改行を含む形は`None`なので、字句解析は行末（次の改行の位置）を渡し、
+/// 閉じない`${…$(`が行ごとに並んでも入力の終わりまで走査し直さない（全体を線形に保つ）。
+fn parameter_expansion_end(s: &[char], start: usize, limit: usize) -> Option<usize> {
+    let limit = limit.min(s.len());
     let mut depth = 0usize;
     let mut j = start + 1;
-    while j < s.len() {
+    while j < limit {
         match s[j] {
             '\r' | '\n' => return None,
             '\\' => {
@@ -2907,7 +3016,7 @@ fn parameter_expansion_end(s: &[char], start: usize) -> Option<usize> {
                 }
             }
             '$' if s.get(j + 1) == Some(&'(') => {
-                let end = subexpression_close(s, j, s.len(), true)?;
+                let end = subexpression_close(s, j, limit, true)?;
                 if s[j..end].contains(&'\n') {
                     return None;
                 }
@@ -2960,6 +3069,8 @@ fn tokens_with(
     let mut continuation_previous: Option<char> = None;
     // `${…}`の走査が閉じなかった行の終わり（この位置までは`${`を1語として読まない）。
     let mut parameter_unclosed_until = 0usize;
+    // `${…}`の走査の上限に使う、直近に求めた次の改行の位置（無ければ入力の長さ）。
+    let mut next_newline: Option<usize> = None;
     // POSIX規則のヒアドキュメント追跡（heredoc_skippable参照）。
     let mut heredocs: Vec<Heredoc> = Vec::new();
     let mut statement_start = 0usize;
@@ -2982,6 +3093,11 @@ fn tokens_with(
     // POSIX規則のブレース展開。`brace_scanned`まではブレースの走査済み、`brace_until`までの`{`・`}`は語の一部。
     let mut brace_scanned = 0usize;
     let mut brace_until = 0usize;
+    // 直近に記録したヒアドキュメントの本文・終端行の終わり。読みの系統（新しい読み・従来の読み）を問わず記録し、
+    // この位置までの`{`ではブレース展開の語を作らない（本文の区切り`body_cuts`は従来の読みでは作らないため別に持つ）。
+    let mut heredoc_body_until = 0usize;
+    // ヒアドキュメント本文の終端行の索引（最初のヒアドキュメントで1回だけ作る）。
+    let mut heredoc_lines: Option<HeredocLines> = None;
     while i < s.len() {
         // 本文・終端行の区切りでは、引用状態を持ち越さずに語と文を閉じる。
         while let Some(&(cut, _)) = body_cuts.last()
@@ -3427,12 +3543,19 @@ fn tokens_with(
             && !literal_text
             && i >= parameter_unclosed_until
         {
-            let end = parameter_expansion_end(&s, i);
+            // 行末は行ごとに1回だけ求める（同じ行の`${`ごとに求めると、改行のない長い行で二乗になる）。
+            if next_newline.is_none_or(|n| n < i) {
+                next_newline = Some(
+                    s[i..]
+                        .iter()
+                        .position(|&d| d == '\n')
+                        .map_or(s.len(), |offset| i + offset),
+                );
+            }
+            let line_end = next_newline.unwrap_or(s.len());
+            let end = parameter_expansion_end(&s, i, line_end);
             if end.is_none() {
-                parameter_unclosed_until = s[i..]
-                    .iter()
-                    .position(|&d| d == '\n')
-                    .map_or(s.len(), |offset| i + offset);
+                parameter_unclosed_until = line_end;
             }
             end
         } else {
@@ -3603,7 +3726,14 @@ fn tokens_with(
         // POSIX規則のブレース展開（`r{m,}`・`{unlink,x}`・`{1..3}`）。`$`直後の`{`（`${…}`）と、空白を伴うグループ
         // （`{ …; }`）・`{}`・区切りのない`{x}`は従来どおり文の境界として読む。展開を含む語は`{`・`}`で割らずに
         // 1語のまま印を付け、実行名の位置では`Inspector::command`が検査不能として拒否する。
-        if mode == Mode::Posix && c == '{' && i >= brace_scanned && (i == 0 || s[i - 1] != '$') {
+        // ヒアドキュメント本文（読み飛ばさずに文として読む本文）の中では、ブレース展開の語を作らず`{`・`}`を従来どおり境界として読む
+        // （本文のJSON行`{"a":1,"b":2}`を実行名の位置のブレース展開として拒否しない。main 4ec0b8fと同じ読み）。
+        if mode == Mode::Posix
+            && c == '{'
+            && i >= brace_scanned
+            && i >= heredoc_body_until
+            && (i == 0 || s[i - 1] != '$')
+        {
             let (end, expansion) = brace_word_scan(&s, i);
             brace_scanned = end;
             if expansion {
@@ -3625,7 +3755,9 @@ fn tokens_with(
                     let mut position = i + 1;
                     let mut unquoted_body = false;
                     for heredoc in &heredocs {
-                        let (body_end, next) = heredoc_body_end(&s, position, heredoc);
+                        let (body_end, next) = heredoc_lines
+                            .get_or_insert_with(|| HeredocLines::new(&s))
+                            .body_end(position, heredoc);
                         // 本文の区間には、終端語を引用しない（bashが本文を展開する）かを持たせる。終端行は持たない。
                         cuts.push((body_end, !heredoc.quoted));
                         cuts.push((next, false));
@@ -3634,6 +3766,7 @@ fn tokens_with(
                     }
                     heredocs.clear();
                     heredoc_boundary_after = false;
+                    heredoc_body_until = position;
                     if skip {
                         boundary(&mut out);
                         statement_start = out.len();
@@ -3700,6 +3833,16 @@ fn tokens_with(
             // 引用外・非退避の`,`だけを記録する（引用内は上で、`^,`は退避分岐で処理済み）。
             if mode == Mode::Cmd && c == ',' {
                 t.commas.push(t.text.len());
+            }
+            // 語が空か引用・退避のないfd番号（数字）だけのところへ足す引用外・非退避の`<`・`>`は、リダイレクト演算子の始まり。
+            // 語が空のときの`escaped`は、CMD・PowerShellの行継続（`^`・`` ` ``＋改行）が語の前に立てた印で、演算子自体は退避されていない。
+            if matches!(c, '<' | '>')
+                && t.quote_start.is_none()
+                && (t.text.is_empty() || !t.escaped)
+                && !t.dynamic
+                && t.text.chars().all(|d| d.is_ascii_digit())
+            {
+                t.redirect = true;
             }
             t.bare_chars += 1;
             append(&mut t, c, &mut previous_equal);
@@ -5750,6 +5893,94 @@ mod tests {
         let _ = posix_denied(&many);
         let many = format!("echo \"$(echo {}\"", "${x:-`".repeat(100_000));
         let _ = posix_denied(&many);
+    }
+
+    /// 字句解析の見直しで生じた回帰（main 4ec0b8fでは拒否した削除の見逃し・異常終了・時間超過）と誤拒否を直した形。
+    #[test]
+    fn lexer_rework_regressions_and_false_rejections_are_fixed() {
+        // R-1: 実行名の位置に引用なしの`${…}`語が大量に並んでも再帰せず、後ろの文を検査する。
+        let many = format!("{}; unlink /tmp/y", "${a} ".repeat(100_000));
+        assert!(posix_denied(&many));
+        let many = format!("{}unlink /tmp/y", "${a} >x ".repeat(50_000));
+        assert!(posix_denied(&many));
+        let many = format!("{}rm -rf /tmp/y", "${a}".repeat(100_000));
+        assert!(posix_denied(&many));
+        for denied in [
+            // R-2: `>-`・`<-`は`-`という名前のファイルへのリダイレクトで、次の語を対象に取らない。
+            "env >- unlink /tmp/y",
+            "FOO=1 >- unlink /tmp/y",
+            "if true; then >- unlink /tmp/y; fi",
+            ">- unlink /tmp/y",
+            "env <- unlink /tmp/y",
+            "bash >- -c 'unlink /tmp/y'",
+            // R-3: 退避・引用した`>`で始まる語はoptionの値で、リダイレクトではない。
+            "env -u \\> unlink /tmp/y",
+            "env -u \\>x unlink /tmp/y",
+            "env -u 2\">\"x unlink /tmp/y",
+            "env -u '>' unlink /tmp/y",
+            "sudo -p \\> unlink /tmp/y",
+            "exec -a \\> unlink /tmp/y",
+            "bash -o \\> -c 'unlink /tmp/y'",
+            // F-2: ヒアドキュメント本文の中でも、`{`・`}`の後ろに続く削除は従来どおり検査する。
+            "cat <<EOF\n{\"a\":1,\"b\":2} unlink /tmp/y\nEOF",
+            "bash <<'EOF'\n{\"a\":1,\"b\":2} unlink /tmp/y\nEOF",
+            // F-2: 本文の外の実行名の位置のブレース展開は従来どおり検査不能。
+            "cat <<'EOF'\nx\nEOF\n{unlink,/tmp/y}",
+            // F-3: 置換の中のコメントは行末まで。コメントの後ろの行の削除は検査する。
+            "x=\"$(\n# don't )\nunlink /tmp/y\n)\"",
+            "x=$(\n# it's\nunlink /tmp/y\n)",
+            "x=\"$(echo ${x:- #})\"; unlink /tmp/y",
+        ] {
+            assert!(posix_denied(denied), "{denied:?}");
+            if cfg!(windows) {
+                assert!(reason(denied, "Bash", None).is_some(), "{denied:?}");
+            }
+        }
+        // R-3: CMD・PowerShellの行継続の直後の演算子はリダイレクト（退避された文字ではない）。
+        assert!(denied("call ^\n>nul del x", "cmd.exe"));
+        assert!(denied("pwsh -Command \"Remove-Item y\" `\n> out.txt", "pwsh"));
+        // 処理時間の上限。修正前の二乗の走査はリリースビルドでも数十秒（デバッグビルドではその数倍）かかり、
+        // 線形の走査はデバッグビルドでも数秒で終わる。遅いCIでも誤って失敗しないよう十分な余裕を取る。
+        let linear = |command: &str, expected: bool| {
+            let started = std::time::Instant::now();
+            assert_eq!(posix_denied(command), expected);
+            let elapsed = started.elapsed();
+            eprintln!("linear-time case: {elapsed:?}");
+            assert!(elapsed < std::time::Duration::from_secs(60), "{elapsed:?}");
+        };
+        // R-4: 閉じない`${…$(`が行ごとに並んでも、行ごとに入力の終わりまで走査しない。
+        linear(
+            &format!("{}unlink /tmp/y", "echo ${x:-$(\n".repeat(40_000)),
+            true,
+        );
+        // 終端のないヒアドキュメントが行ごとに並んでも（本文を区切らない従来の読みは毎行記録する）、
+        // 行ごとに入力の終わりまで終端行を探し直さない。
+        for many in [
+            "cat <<EOF\n".repeat(40_000) + "echo ok",
+            "cat <<'EOF'\n".repeat(40_000) + "echo ok",
+            (0..30_000).map(|k| format!("cat <<E{k}\n")).collect::<String>() + "echo ok",
+        ] {
+            linear(&many, false);
+        }
+        for allowed in [
+            // F-1: `<<<`はヒアストリングで、ヒアドキュメントの終端語を読まない。
+            "count=\"$(wc -l <<< \"$lines\")\"",
+            "echo \"$(cat <<<\"$x\")\" done",
+            // F-2: ヒアドキュメント本文のJSON行は、実行名の位置のブレース展開として拒否しない。
+            "curl -s -X POST http://localhost/api -d @- <<'EOF'\n{\"name\":\"x\",\"id\":1}\nEOF",
+            "kubectl apply -f - <<EOF\n{\"a\":\"b\",\"c\":1}\nEOF",
+            // F-3: 置換の中のコメント（`'`・`)`を含む）は行末まで。
+            "x=\"$(\n# don't do this\necho hi\n)\"",
+            "x=$(\n# it's (fine)\necho hi\n)\necho \"$x\"",
+            // F-3: `${…}`の中・退避した空白の後の`#`はコメントではない。
+            "x=\"$(echo ${x:- #})\"; echo ok",
+            "x=\"$(echo a\\ #b)\"",
+        ] {
+            assert!(!posix_denied(allowed), "{allowed:?}");
+            if cfg!(windows) {
+                assert_eq!(reason(allowed, "Bash", None), None, "{allowed:?}");
+            }
+        }
     }
 
     /// EncodedCommand内の`"$(...)"`は参照だけの形、pwshは静的な`.ps1`の`-File`実行だけを許可する。
