@@ -742,27 +742,37 @@ impl Inspector {
             let previous_explicit = self.explicit;
             self.mode = Some(m);
             self.explicit = mode.is_some();
-            let result = (|| {
-                let tokens = tokens(script, m, strict)?;
-                let mut words = Vec::new();
-                let mut control = self.posix_script;
-                for token in tokens {
-                    if token.boundary {
-                        // CMD規則の字句解析だけが`;`の境界に";"を載せる。直前の文の末尾が`;`かを伝える。
-                        self.cmd_semicolon = token.text == ";";
-                        if self.statement(&words, depth, strict, &mut control)? {
-                            return Ok(true);
+            let result = (|| -> Result<bool> {
+                // POSIX規則で`>& 名前`があれば、名前をリダイレクト対象としてつなぐ読みでも検査する（tokens_with参照）。
+                let mut ampersand_name = false;
+                for attach in [false, true] {
+                    if attach && !ampersand_name {
+                        break;
+                    }
+                    let tokens = tokens_with(script, m, strict, attach, &mut ampersand_name)?;
+                    let mut words = Vec::new();
+                    let mut control = self.posix_script;
+                    for token in tokens {
+                        if token.boundary {
+                            // CMD規則の字句解析だけが`;`の境界に";"を載せる。直前の文の末尾が`;`かを伝える。
+                            self.cmd_semicolon = token.text == ";";
+                            if self.statement(&words, depth, strict, &mut control)? {
+                                return Ok(true);
+                            }
+                            words.clear();
+                        } else {
+                            words.push(token);
                         }
-                        words.clear();
-                    } else {
-                        words.push(token);
+                    }
+                    // 最後の文の後ろは、入れ子の本文ならそれを含む外側の文の終端を引き継ぐ。
+                    // cmd.exeは`cmd /c cmd;/c del x`の本文を`;`以降まで含めて渡すため、本文末尾の`cmd`も
+                    // `;`に続く引数を受ける。最上位（previous_semicolon=false）では終端なしになる。
+                    self.cmd_semicolon = previous_semicolon;
+                    if self.statement(&words, depth, strict, &mut control)? {
+                        return Ok(true);
                     }
                 }
-                // 最後の文の後ろは、入れ子の本文ならそれを含む外側の文の終端を引き継ぐ。
-                // cmd.exeは`cmd /c cmd;/c del x`の本文を`;`以降まで含めて渡すため、本文末尾の`cmd`も
-                // `;`に続く引数を受ける。最上位（previous_semicolon=false）では終端なしになる。
-                self.cmd_semicolon = previous_semicolon;
-                self.statement(&words, depth, strict, &mut control)
+                Ok(false)
             })();
             self.mode = previous;
             self.cmd_semicolon = previous_semicolon;
@@ -1524,6 +1534,13 @@ impl Inspector {
         let mut command: Option<&str> = None;
         let mut index = 1;
         while index < words.len() {
+            // リダイレクト（`>/dev/null`・`2>&1`・`> f`・`bash>/dev/null`の分割後）はshellの引数ではない。
+            // 対象語ごと読み飛ばし、後ろの`-c`と本文を見落とさない。
+            let redirect = leading_redirect_words(&words[index..], false);
+            if redirect > 0 {
+                index += redirect;
+                continue;
+            }
             let word = &words[index];
             if word.dynamic {
                 return Ok(Some(match command {
@@ -1673,32 +1690,9 @@ impl Inspector {
                 start += 1;
                 continue;
             }
-            let mut level = 1;
-            let mut end = start + 2;
-            let mut quote = '\0';
-            while end < chars.len() && level > 0 {
-                let c = chars[end];
-                if c == '\\' || c == '`' {
-                    end += 2;
-                    continue;
-                }
-                if quote != '\0' {
-                    if c == quote {
-                        quote = '\0';
-                    }
-                    end += 1;
-                    continue;
-                }
-                if c == '\'' || c == '"' {
-                    quote = c;
-                } else if c == '(' {
-                    level += 1;
-                } else if c == ')' {
-                    level -= 1;
-                }
-                end += 1;
-            }
-            let body_end = if level == 0 { end - 1 } else { chars.len() };
+            // 閉じていない`$(`は入力の終わりまでを本文として検査する。
+            let close = subexpression_close(&chars, start, chars.len());
+            let body_end = close.map_or(chars.len(), |end| end - 1);
             if self.contains(
                 &chars[start + 2..body_end].iter().collect::<String>(),
                 depth + 1,
@@ -1707,7 +1701,7 @@ impl Inspector {
             )? {
                 return Ok(true);
             }
-            start = if level == 0 { end } else { chars.len() };
+            start = close.unwrap_or(chars.len());
         }
         Ok(false)
     }
@@ -1941,7 +1935,14 @@ fn here_string(s: &[char], position: &mut usize, quote: char) -> Result<String> 
             && s[end] == quote
             && s[end + 1] == '@'
         {
-            let body = &s[start..end];
+            // 終端の直前の行終端（`\n`か`\r\n`）は本文に含まれない（言語仕様）。空の本文では何も除かない。
+            let mut body = &s[start..end];
+            if let [rest @ .., '\n'] = body {
+                body = rest;
+            }
+            if let [rest @ .., '\r'] = body {
+                body = rest;
+            }
             if quote == '"' {
                 let mut i = 0;
                 while i + 1 < body.len() {
@@ -1984,62 +1985,137 @@ fn boundary(out: &mut Vec<Token>) {
     t.boundary = true;
     out.push(t);
 }
-/// POSIX規則で見つけたヒアドキュメント1つ分の情報。本文を読み飛ばせるかの判定に使う。
+/// POSIX規則で見つけたヒアドキュメント1つ分の情報。本文の範囲と、本文を読み飛ばせるかの判定に使う。
 struct Heredoc {
-    /// 引用を除いた終端語。
-    delimiter: String,
+    /// 引用除去後の終端語。`None`はbashと同じ終端語を確定できない形（退避を含む`$'…'`・閉じていない引用）で、
+    /// 本文を入力の終わりまでとみなす（遅く終われば終端の後ろも本文として文の検査を続けるだけなので安全側に倒れる）。
+    delimiter: Option<String>,
+    /// `<<-`か（本文の各行と終端行の先頭のタブだけを除いて比べる）。
+    strip_tabs: bool,
     /// 終端語が引用・退避されているか（本文で展開・コマンド置換が起きない）。
     quoted: bool,
+    /// 終端語が単純な文字（英数字・`_`・`-`・`.`）だけで、退避・`$`・逆引用を含まないか。読み飛ばしの条件に使う。
+    simple: bool,
     /// `<<`を含む文がtokens出力のどこから始まるか。
     statement_start: usize,
     /// `<<`より前の状況が読み飛ばし可能か（括弧の入れ子なし、算術・`[[`・逆引用なし）。
     context_ok: bool,
 }
-/// ヒアドキュメント本文を読み飛ばしてよい場合に、本文の次の文字位置を返す。
+/// 同じ行で記録したヒアドキュメントの本文を、すべてdataとして読み飛ばしてよいか。
 ///
-/// 読み飛ばすのは、終端語が引用された本文（展開なしのdata）を、ファイルへ書き出す`cat`か、
+/// 読み飛ばすのは、単純な終端語を引用した本文（展開なしのdata）を、ファイルへ書き出す`cat`か、
 /// 本文をコードとして読むインタプリタ（`python`・`node`。`-c`の本文と同じく検査対象外）が受け取る形だけ。
-/// shellへ渡りうる形（パイプ・入れ子のグループ・同じ行の後続文・`/dev`への出力）は従来どおり本文を文として検査する。
-/// 本文の終わりはbashより早めに判定する（前後の空白を除いて終端語と一致した行）。早く終われば残りを
-/// 文として検査するだけなので安全側に倒れる。
-fn heredoc_skip(
-    s: &[char],
-    body_start: usize,
-    heredocs: &[Heredoc],
-    out: &[Token],
-    boundary_after: bool,
-) -> Result<Option<usize>> {
+/// shellへ渡りうる形（パイプ・入れ子のグループ・同じ行の後続文・`/dev`への出力）は本文を文として検査する。
+fn heredoc_skippable(heredocs: &[Heredoc], out: &[Token], boundary_after: bool) -> Result<bool> {
     if boundary_after || heredocs.is_empty() {
-        return Ok(None);
+        return Ok(false);
     }
     for heredoc in heredocs {
         if !heredoc.quoted
+            || !heredoc.simple
             || !heredoc.context_ok
-            || heredoc.delimiter.is_empty()
             || !heredoc_consumer_is_data_sink(&out[heredoc.statement_start.min(out.len())..])?
         {
-            return Ok(None);
+            return Ok(false);
         }
     }
-    let mut position = body_start;
-    for heredoc in heredocs {
-        loop {
-            if position >= s.len() {
-                // 終端のないヒアドキュメントはbashでも入力の終わりまでが本文になる。
-                return Ok(Some(s.len()));
-            }
-            let end = s[position..]
-                .iter()
-                .position(|&c| c == '\n')
-                .map_or(s.len(), |offset| position + offset);
-            let line: String = s[position..end].iter().collect();
-            position = (end + 1).min(s.len());
-            if line.trim() == heredoc.delimiter {
-                break;
+    Ok(true)
+}
+/// `start`から始まるヒアドキュメント本文の範囲を、bashと同じ規則（終端語と行全体の完全一致。`<<-`は先頭のタブだけを除く）で求める。
+/// 戻り値は（本文の終わり＝終端行の先頭, 終端行の次の位置）。CRLFの入力に合わせ、行末の`\r`を除いた一致も終端とみなす。
+/// 終端が見つからない、または終端語を確定できない場合は入力の終わりまでを本文とする（bashも入力の終わりで本文を閉じる）。
+fn heredoc_body_end(s: &[char], start: usize, heredoc: &Heredoc) -> (usize, usize) {
+    let Some(delimiter) = heredoc.delimiter.as_deref() else {
+        return (s.len(), s.len());
+    };
+    let delimiter: Vec<char> = delimiter.chars().collect();
+    let mut position = start;
+    while position < s.len() {
+        let end = s[position..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(s.len(), |offset| position + offset);
+        let mut line = &s[position..end];
+        if heredoc.strip_tabs {
+            while let ['\t', rest @ ..] = line {
+                line = rest;
             }
         }
+        let without_cr = line.strip_suffix(&['\r'][..]).unwrap_or(line);
+        if line == delimiter.as_slice() || without_cr == delimiter.as_slice() {
+            return (position, (end + 1).min(s.len()));
+        }
+        position = end + 1;
     }
-    Ok(Some(position))
+    (s.len(), s.len())
+}
+/// `chars[start]`が`$`、`chars[start + 1]`が`(`のとき、対応する`)`の次の位置を返す。`limit`までに閉じなければ`None`。
+/// 入れ子の括弧・`'`・`"`（二重引用の中の`$(…)`を含む）・退避（`\`と逆引用の次の1文字）を読む。
+/// `Inspector::expanded`と字句解析が同じ範囲を使う。入れ子は明示のスタックで追い、深い入れ子でも再帰しない。
+fn subexpression_close(chars: &[char], start: usize, limit: usize) -> Option<usize> {
+    // 文脈のスタック。`(`は括弧の中、`"`は二重引用の中。
+    let mut stack = vec!['('];
+    let mut i = start + 2;
+    while i < limit {
+        let c = chars[i];
+        if stack.last() == Some(&'"') {
+            match c {
+                '\\' | '`' => i += 2,
+                '"' => {
+                    stack.pop();
+                    i += 1;
+                }
+                '$' if chars.get(i + 1) == Some(&'(') => {
+                    stack.push('(');
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        match c {
+            '\\' | '`' => i += 2,
+            // 単一引用の中は退避を含めて文字どおり。
+            '\'' => match chars[i + 1..limit].iter().position(|&d| d == '\'') {
+                Some(offset) => i += offset + 2,
+                None => return None,
+            },
+            '"' | '(' => {
+                stack.push(c);
+                i += 1;
+            }
+            ')' => {
+                stack.pop();
+                i += 1;
+                if stack.is_empty() {
+                    return Some(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+/// 書き出し先のPOSIXパスが、通常のファイルと確定できない先（`/dev/`・`/proc/`の配下、`..`区間を含む先）か。
+/// 連続する`/`をまとめ、`.`区間を除いた字句上の正規形で判定する（`//dev/stdout`・`/./dev/stdout`を見逃さない）。
+/// `..`はシンボリックリンクの解決順で行き先が変わりうるため、正規化せずに拒否側へ倒す。
+fn posix_device_path(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let mut parts = Vec::new();
+    for part in lower.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return true,
+            other => parts.push(other),
+        }
+    }
+    lower.starts_with('/') && matches!(parts.first(), Some(&("dev" | "proc")))
+}
+/// 書き出し先のPOSIXパスが、字句上の正規形で`/dev/null`か。
+fn posix_null_path(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let parts: Vec<&str> = lower.split('/').filter(|p| !matches!(*p, "" | ".")).collect();
+    lower.starts_with('/') && parts == ["dev", "null"]
 }
 /// ヒアドキュメントを受け取る文が、本文をshellへ渡さない形（ファイルへの`cat`・インタプリタ）か。
 fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
@@ -2067,7 +2143,9 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
         // 出力リダイレクト（`>`・`>>`・`1>`・`2>`。対象は直結か次の語）。
         let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
         if word.quote_start != Some(0) && text[digits..].starts_with('>') {
+            // `>|`（noclobberを無視する出力）の`|`も演算子の一部で、書き出し先ではない。
             let operator = text[digits..].trim_start_matches('>');
+            let operator = operator.strip_prefix('|').unwrap_or(operator);
             let (target, step) = if operator.is_empty() {
                 match words.get(k + 1) {
                     Some(next) => (next, 2),
@@ -2089,14 +2167,13 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
                 return Ok(false);
             }
             if &text[..digits] != "2" {
-                let lower = target_text.to_ascii_lowercase();
-                if lower == "/dev/null" {
+                if posix_null_path(target_text) {
                     // 出力の破棄だけは、`tee`が本文を標準出力へ流さない形として認める（`cat`は従来どおり拒否）。
                     stdout_to_null = true;
                     k += step;
                     continue;
                 }
-                if lower.starts_with("/dev/") || lower.starts_with("/proc/") {
+                if posix_device_path(target_text) {
                     return Ok(false);
                 }
                 stdout_to_file = true;
@@ -2147,13 +2224,7 @@ fn tee_writes_only_files(args: &[&Token]) -> bool {
             }
             continue;
         }
-        let lower = text.to_ascii_lowercase();
-        if word.boundary
-            || word.dynamic
-            || text.is_empty()
-            || lower.starts_with("/dev/")
-            || lower.starts_with("/proc/")
-        {
+        if word.boundary || word.dynamic || text.is_empty() || posix_device_path(text) {
             return false;
         }
         paths += 1;
@@ -2230,23 +2301,93 @@ fn leading_redirect_words(words: &[Token], powershell: bool) -> usize {
     }
     k.min(words.len())
 }
+/// 語がリダイレクト演算子の途中か（引用・退避・展開がなく、数字だけ、または先頭の数字に`<`・`>`だけが続く）。
+/// POSIX・CMD規則で`<`・`>`の手前で語を切るかの判定に使う（`2>`・`>>`・`<<`・`2>>`は1つの演算子のまま）。
+fn redirect_operator_prefix(t: &Token) -> bool {
+    t.quote_start.is_none()
+        && !t.escaped
+        && !t.dynamic
+        && t.text
+            .trim_start_matches(|d: char| d.is_ascii_digit())
+            .chars()
+            .all(|d| matches!(d, '<' | '>'))
+}
+/// 非strictのPowerShell規則で、引用符の種類（単一は`'`、二重は`"`）を返す。PowerShellはスマート引用符
+/// （U+2018〜U+201Bを単一、U+201C〜U+201Eを二重）をASCIIの引用符と同じ種類として扱う。
+fn powershell_quote_kind(c: char) -> Option<char> {
+    match c {
+        '\'' | '\u{2018}'..='\u{201b}' => Some('\''),
+        '"' | '\u{201c}'..='\u{201e}' => Some('"'),
+        _ => None,
+    }
+}
+/// `s[position]`の`@'`・`@"`の後ろが、空白・タブだけを挟んで行末になるか（PowerShellのヒアストリングの見出し）。
+fn here_string_header(s: &[char], position: usize) -> bool {
+    let mut k = position + 2;
+    while k < s.len() && matches!(s[k], ' ' | '\t') {
+        k += 1;
+    }
+    k < s.len() && matches!(s[k], '\r' | '\n')
+}
+/// POSIX規則のANSI-C引用（`$'…'`）を読んでいる間の`quote`の値。`\`は次の1文字を退避し、非退避の`'`で閉じる。
+const ANSI_C_QUOTE: char = '\u{1}';
 fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
+    let mut ampersand_name = false;
+    tokens_with(script, mode, strict, false, &mut ampersand_name)
+}
+/// 字句解析の本体。
+///
+/// `attach_ampersand_name`は、POSIX規則で`>&`・`<&`の後ろに数字でも`-`でもない語が続く形（`>& /tmp/z unlink y`）の
+/// 読み方を選ぶ。falseは従来どおり`&`で文を割って次の語を実行名として読み、trueは次の語をリダイレクト対象として
+/// 同じ語へつなぐ（bashの`>&word`は`&>word`と同じ出力先の指定）。該当箇所があれば`ampersand_name`をtrueにし、
+/// 呼出し側は両方の読みで検査する。
+fn tokens_with(
+    script: &str,
+    mode: Mode,
+    strict: bool,
+    attach_ampersand_name: bool,
+    ampersand_name: &mut bool,
+) -> Result<Vec<Token>> {
     let s: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
     let mut t = Token::new("");
     let mut quote = '\0';
     let mut previous_equal = false;
     let mut i = 0;
-    // POSIX規則のヒアドキュメント追跡（heredoc_skip参照）。
+    // 非strictのPowerShell規則では、スマート引用符もASCIIと同じ種類の引用符として読む。
+    let smart_quotes = mode == Mode::PowerShell && !strict;
+    // POSIX規則のヒアドキュメント追跡（heredoc_skippable参照）。
     let mut heredocs: Vec<Heredoc> = Vec::new();
     let mut statement_start = 0usize;
     let mut group_depth = 0i32;
     let mut line_start = 0usize;
     let mut heredoc_boundary_after = false;
+    // 単一引用・ANSI-C引用の外で開いたままの逆引用があるか。行をまたいで追う。
+    let mut backtick_open = false;
+    // 読み飛ばさないヒアドキュメントの本文・終端行を検査している間の区切り位置（降順。末尾が次の区切り）。
+    // 本文と終端行はそれぞれ独立に字句解析し、区切りで引用・括弧・逆引用の状態を本文の前へ戻す。
+    let mut body_cuts: Vec<usize> = Vec::new();
+    let mut body_saved = (0i32, false);
     while i < s.len() {
+        // 本文・終端行の区切りでは、引用状態を持ち越さずに語と文を閉じる。
+        while let Some(&cut) = body_cuts.last()
+            && i >= cut
+        {
+            body_cuts.pop();
+            flush(&mut t, &mut out);
+            quote = '\0';
+            previous_equal = false;
+            boundary(&mut out);
+            statement_start = out.len();
+            (group_depth, backtick_open) = body_saved;
+            line_start = i;
+        }
+        let in_body = !body_cuts.is_empty();
         let mut c = s[i];
         // 引用外の`<<`（`<<<`を除く）を見つけたら終端語を読み取って記録する。字句解析は通常どおり続ける。
+        // 本文の中の`<<`は追跡しない（本文はbashにとってdataで、読み飛ばすと展開される`$(…)`を見落とすため）。
         if mode == Mode::Posix
+            && !in_body
             && quote == '\0'
             && c == '<'
             && s.get(i + 1) == Some(&'<')
@@ -2254,7 +2395,8 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             && (i == 0 || s[i - 1] != '<')
         {
             let mut j = i + 2;
-            if s.get(j) == Some(&'-') {
+            let strip_tabs = s.get(j) == Some(&'-');
+            if strip_tabs {
                 j += 1;
             }
             while j < s.len() && matches!(s[j], ' ' | '\t') {
@@ -2263,17 +2405,60 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             let mut delimiter = String::new();
             let mut quoted = false;
             let mut complete = true;
-            while j < s.len() && !s[j].is_whitespace() && !matches!(s[j], ';' | '|' | '&' | '(' | ')' | '<' | '>') {
+            // 引用の中の退避・展開（`$`・逆引用）を含まないか。引用外の`\EOF`は終端語を引用する定型として含めない。
+            let mut plain = true;
+            // `$'…'`の中の退避。bashは退避を処理した語を終端語にするため、ここでは確定させない。
+            let mut ansi_escape = false;
+            while j < s.len()
+                && !s[j].is_whitespace()
+                && !matches!(s[j], ';' | '|' | '&' | '(' | ')' | '<' | '>')
+            {
                 match s[j] {
-                    '\'' | '"' => {
-                        let close = s[j];
+                    '\'' => {
                         quoted = true;
                         j += 1;
-                        while j < s.len() && s[j] != close {
+                        while j < s.len() && s[j] != '\'' {
                             delimiter.push(s[j]);
                             j += 1;
                         }
                         if j == s.len() {
+                            complete = false;
+                        }
+                        j += 1;
+                    }
+                    '"' => {
+                        quoted = true;
+                        j += 1;
+                        while j < s.len() && s[j] != '"' {
+                            if s[j] == '\\' && matches!(s.get(j + 1), Some('"' | '\\' | '$' | '`')) {
+                                plain = false;
+                                j += 1;
+                            } else if matches!(s[j], '$' | '`') {
+                                plain = false;
+                            }
+                            delimiter.push(s[j]);
+                            j += 1;
+                        }
+                        if j == s.len() {
+                            complete = false;
+                        }
+                        j += 1;
+                    }
+                    '$' if s.get(j + 1) == Some(&'\'') => {
+                        quoted = true;
+                        plain = false;
+                        j += 2;
+                        while j < s.len() && s[j] != '\'' {
+                            if s[j] == '\\' {
+                                ansi_escape = true;
+                                j += 1;
+                            }
+                            if j < s.len() {
+                                delimiter.push(s[j]);
+                                j += 1;
+                            }
+                        }
+                        if j >= s.len() {
                             complete = false;
                         }
                         j += 1;
@@ -2286,17 +2471,30 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
                         j += 2;
                     }
                     other => {
+                        if matches!(other, '$' | '`') {
+                            plain = false;
+                        }
                         delimiter.push(other);
                         j += 1;
                     }
                 }
             }
+            let simple = quoted
+                && complete
+                && plain
+                && !delimiter.is_empty()
+                && delimiter
+                    .chars()
+                    .all(|d| d.is_ascii_alphanumeric() || matches!(d, '_' | '-' | '.'));
             let before: String = s[line_start..i].iter().collect();
             heredocs.push(Heredoc {
-                delimiter,
+                delimiter: (complete && !ansi_escape).then_some(delimiter),
+                strip_tabs,
                 quoted: quoted && complete,
+                simple,
                 statement_start,
                 context_ok: group_depth == 0
+                    && !backtick_open
                     && !before.contains("((")
                     && !before.contains("[[")
                     && !before.contains('`')
@@ -2401,8 +2599,10 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
                 bail!("EncodedCommand dot-sourcing cannot be inspected.");
             }
         }
-        if mode == Mode::Posix && c == '`' && quote != '\'' {
+        let literal_quote = matches!(quote, '\'' | ANSI_C_QUOTE);
+        if mode == Mode::Posix && c == '`' && !literal_quote {
             t.backticks += 1;
+            backtick_open = !backtick_open;
         }
         if matches!(mode, Mode::Posix | Mode::PowerShell)
             && quote == '"'
@@ -2412,12 +2612,37 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             t.subexpression = true;
         }
         if mode == Mode::Posix
-            && quote != '\''
+            && !literal_quote
             && (matches!(c, '$' | '`') || quote == '\0' && matches!(c, '*' | '?' | '['))
         {
             t.dynamic = true;
         }
         if quote != '\0' {
+            if quote == ANSI_C_QUOTE {
+                if c == '\\' && i + 1 < s.len() {
+                    t.text.push(s[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if c == '\'' {
+                    quote = '\0';
+                } else {
+                    t.text.push(c);
+                }
+                i += 1;
+                continue;
+            }
+            // 二重引用内の`$(…)`は外側と独立した引用文脈を持つ（`"$(echo '"')"`の内側の`"`で外側を閉じない）。
+            // 対応する`)`まで生のまま語へ取り込み、本文は`Inspector::expanded`が再帰検査する。
+            if mode == Mode::Posix && quote == '"' && c == '$' && s.get(i + 1) == Some(&'(') {
+                let limit = body_cuts.last().copied().unwrap_or(s.len());
+                // 閉じていない`$(`は、expandedと同じく入力の終わりまで（ヒアドキュメント本文の中では
+                // 次の区切りまで）を本文として取り込む。取り込んだ本文はexpandedが再帰検査する。
+                let end = subexpression_close(&s, i, limit).unwrap_or(limit);
+                t.text.extend(&s[i..end]);
+                i = end;
+                continue;
+            }
             if quote == '"'
                 && i + 1 < s.len()
                 && ((mode == Mode::PowerShell && c == '`')
@@ -2430,8 +2655,15 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
                 i += 1;
                 continue;
             }
-            if c == quote {
-                if mode != Mode::Posix && s.get(i + 1) == Some(&quote) {
+            let same_kind = |value: char| {
+                if smart_quotes {
+                    powershell_quote_kind(value) == Some(quote)
+                } else {
+                    value == quote
+                }
+            };
+            if same_kind(c) {
+                if mode != Mode::Posix && s.get(i + 1).is_some_and(|&n| same_kind(n)) {
                     t.text.push(c);
                     i += 1;
                 } else {
@@ -2463,7 +2695,23 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             i += 1;
             continue;
         }
-        if mode == Mode::PowerShell && c == '@' && matches!(s.get(i + 1), Some('\'' | '"')) {
+        // 非strictのPowerShell規則のブロックコメント。語頭の`<#`から最初の`#>`までを空白として読み飛ばす
+        // （閉じがなければ残り全体がコメント）。行コメントと誤認して`#>`以降の行を捨てない。
+        if smart_quotes && c == '<' && s.get(i + 1) == Some(&'#') && t.text.is_empty() && !t.quoted {
+            let close = (i + 2..s.len().saturating_sub(1)).find(|&k| s[k] == '#' && s[k + 1] == '>');
+            i = close.map_or(s.len(), |k| k + 2);
+            previous_equal = false;
+            continue;
+        }
+        // ヒアストリングは語頭か代入の直後（`$x=@'`）で、見出しが行末で終わる場合だけ。非strictでは、語の途中の
+        // `@"`・`@'`（`ssh user@"host"`）や見出しの後ろが行末でない形を、通常の`@`と引用として読む。
+        if mode == Mode::PowerShell
+            && c == '@'
+            && matches!(s.get(i + 1), Some('\'' | '"'))
+            && (strict
+                || (((t.text.is_empty() && !t.quoted) || t.text.ends_with('='))
+                    && here_string_header(&s, i)))
+        {
             if t.quote_start.is_none() {
                 t.quote_start = Some(t.text.len());
             }
@@ -2476,7 +2724,10 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             i += 1;
             continue;
         }
-        if c == '"' || (c == '\'' && mode != Mode::Cmd) {
+        // POSIX規則のANSI-C引用（`$'…'`）。`\'`は引用を閉じない。語は`$`を含むため従来どおり動的として扱う。
+        if mode == Mode::Posix && c == '$' && s.get(i + 1) == Some(&'\'') {
+            t.bare_chars += 1;
+            append(&mut t, c, &mut previous_equal);
             if t.quote_start.is_none() {
                 t.quote_start = Some(t.text.len());
             }
@@ -2484,20 +2735,59 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
                 t.quoted_after_equality = true;
             }
             previous_equal = false;
-            quote = c;
+            quote = ANSI_C_QUOTE;
             t.quoted = true;
             t.quote_segments += 1;
-            if c != '\'' {
+            i += 2;
+            continue;
+        }
+        let opening = if smart_quotes {
+            powershell_quote_kind(c)
+        } else if c == '"' || (c == '\'' && mode != Mode::Cmd) {
+            Some(c)
+        } else {
+            None
+        };
+        if let Some(kind) = opening {
+            if t.quote_start.is_none() {
+                t.quote_start = Some(t.text.len());
+            }
+            if t.equality.is_some() {
+                t.quoted_after_equality = true;
+            }
+            previous_equal = false;
+            quote = kind;
+            t.quoted = true;
+            t.quote_segments += 1;
+            if kind != '\'' {
                 t.non_single_quote = true;
             }
             i += 1;
             continue;
         }
-        if mode != Mode::Cmd && c == '#' && t.text.is_empty() {
+        // 行コメント。POSIX規則では、語の先頭（直前の生の文字が空白・改行・`;|&()`か入力の先頭）で、
+        // 語に引用・退避を含まない`#`だけをコメントにする（`${#x}`・`""#`の`#`は語の一部）。
+        let comment = c == '#'
+            && t.text.is_empty()
+            && match mode {
+                Mode::Cmd => false,
+                Mode::PowerShell => true,
+                Mode::Posix => {
+                    !t.quoted
+                        && !t.escaped
+                        && (i == 0
+                            || s[i - 1].is_whitespace()
+                            || matches!(s[i - 1], ';' | '|' | '&' | '(' | ')'))
+                }
+            };
+        if comment {
             while i < s.len() && !matches!(s[i], '\r' | '\n') {
                 i += 1;
             }
-            c = '\n';
+            if i == s.len() {
+                break;
+            }
+            c = s[i];
         }
         // fdの複製・閉じ（`2>&1`・`>&2`・`<&0`・`>&-`）の`&`は文の区切りではなく、リダイレクト演算子の一部。
         // 語を割ると、後ろの`1 rm x`が別の文になり、リダイレクトの後の実行名を検査できない。
@@ -2530,21 +2820,66 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             }
             continue;
         }
+        // POSIX規則で`>&`・`<&`の後ろに名前が続く形。bashは名前を出力先として読むため（`>& /tmp/z unlink y`は
+        // `unlink y`を実行する）、`&`で割る読みに加えて、名前をリダイレクト対象としてつなぐ読みでも検査させる。
+        if mode == Mode::Posix
+            && c == '&'
+            && (t.text.ends_with('>') || t.text.ends_with('<'))
+            && redirect_operator_prefix(&t)
+        {
+            *ampersand_name = true;
+            if attach_ampersand_name {
+                t.bare_chars += 1;
+                append(&mut t, c, &mut previous_equal);
+                i += 1;
+                while i < s.len() && matches!(s[i], ' ' | '\t') {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        // POSIX規則の`>|`（`N>|`を含む。noclobberを無視する出力）は1つの演算子で、`|`はパイプではない。
+        if mode == Mode::Posix
+            && c == '|'
+            && redirect_operator_prefix(&t)
+            && t.text.trim_start_matches(|d: char| d.is_ascii_digit()) == ">"
+        {
+            t.bare_chars += 1;
+            append(&mut t, c, &mut previous_equal);
+            i += 1;
+            continue;
+        }
         let is_boundary = matches!(c, ';' | '|' | '&' | '\r' | '\n' | '(' | ')' | '{' | '}');
         if c.is_whitespace() || is_boundary {
             flush(&mut t, &mut out);
             previous_equal = false;
-            // 行末で、記録したヒアドキュメントの本文をdataとして読み飛ばせるか判定する。
+            // 行末で、記録したヒアドキュメントの本文の範囲を確定し、dataとして読み飛ばすか、文として別に検査する。
             if mode == Mode::Posix && c == '\n' {
-                let skip = heredoc_skip(&s, i + 1, &heredocs, &out, heredoc_boundary_after)?;
-                heredocs.clear();
-                heredoc_boundary_after = false;
-                if let Some(next) = skip {
-                    boundary(&mut out);
-                    statement_start = out.len();
-                    i = next;
-                    line_start = next;
-                    continue;
+                if !heredocs.is_empty() {
+                    let skip = heredoc_skippable(&heredocs, &out, heredoc_boundary_after)?;
+                    let mut cuts = Vec::new();
+                    let mut position = i + 1;
+                    for heredoc in &heredocs {
+                        let (body_end, next) = heredoc_body_end(&s, position, heredoc);
+                        cuts.push(body_end);
+                        cuts.push(next);
+                        position = next;
+                    }
+                    heredocs.clear();
+                    heredoc_boundary_after = false;
+                    if skip {
+                        boundary(&mut out);
+                        statement_start = out.len();
+                        i = position;
+                        line_start = position;
+                        continue;
+                    }
+                    // 読み飛ばさない本文と終端行は、それぞれ独立に文として検査する。本文の引用状態を
+                    // 終端の後ろへ持ち越さず、終端行の次からは通常の状態で読み直す。
+                    cuts.dedup();
+                    cuts.reverse();
+                    body_cuts = cuts;
+                    body_saved = (group_depth, backtick_open);
                 }
                 line_start = i + 1;
             }
@@ -2554,7 +2889,9 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
                 }
                 match c {
                     '(' | '{' => group_depth += 1,
-                    ')' | '}' => group_depth -= 1,
+                    // 引数の`}`（`echo }`）で負にならないよう0で下限を切る。負のまま`{`で0へ戻ると、
+                    // グループの中のヒアドキュメントを外側と誤認するため。
+                    ')' | '}' => group_depth = (group_depth - 1).max(0),
                     _ => {}
                 }
             }
@@ -2571,6 +2908,15 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
                 }
             }
         } else {
+            // POSIX・CMD規則では、引用外・非退避の`<`・`>`の手前で語を切る（`rm>/dev/null x`の実行名は`rm`）。
+            // 数字だけの語（`2>`のfd番号）と演算子の途中（`>>`・`<<`）は切らない。PowerShellは`<`・`>`で一般の語を切らない。
+            if matches!(mode, Mode::Posix | Mode::Cmd)
+                && matches!(c, '<' | '>')
+                && !redirect_operator_prefix(&t)
+            {
+                flush(&mut t, &mut out);
+                previous_equal = false;
+            }
             // 引用外・非退避の`,`だけを記録する（引用内は上で、`^,`は退避分岐で処理済み）。
             if mode == Mode::Cmd && c == ',' {
                 t.commas.push(t.text.len());
@@ -3789,6 +4135,13 @@ mod tests {
             "cat > f <<'EOF'\r\nrm -rf /tmp/y\r\nEOF\r\necho ok",
             // 終端のない本文はbashでも入力の終わりまでがdata。
             "cat > f <<'EOF'\nrm -rf /tmp/y\n",
+            // 終端は行全体の完全一致（字下げした終端語は本文の一部。`<<-`は先頭のタブだけを除く）。
+            "cat > f <<'EOF'\n  EOF\nrm -rf /tmp/y\nEOF",
+            "cat > f <<-'EOF'\n  EOF\nrm -rf /tmp/y\n\t\tEOF",
+            // 実行名に直結した出力先・`>|`の出力先も静的なファイルなら読み飛ばす。
+            "cat>f <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "cat>f<<'EOF'\nrm -rf /tmp/y\nEOF",
+            "cat >| f <<'EOF'\nrm -rf /tmp/y\nEOF",
         ] {
             assert!(!posix_denied(allowed), "{allowed:?}");
         }
@@ -3821,6 +4174,22 @@ mod tests {
             "echo `cat > f <<'EOF'`\nrm -rf /tmp/y\nEOF",
             // here-string（`<<<`）はヒアドキュメントではない。
             "cat > f <<<'EOF'\nrm -rf /tmp/y\nEOF",
+            // 読み飛ばさない本文の引用状態（孤立した`'`）を終端の後ろへ持ち越さない。
+            "cat <<'EOF'\nDon't\nEOF\nunlink /tmp/y\ncat <<'EOF'\nIt's\nEOF",
+            "bash <<'EOF'\necho \"\nEOF\nunlink /tmp/y\necho \"",
+            // 終端はbashと同じ完全一致。字下げした行で早く終わらず、引用内の空白・退避・`$'…'`の終端語も一致させる。
+            "cat > /tmp/f <<'EOF'\n  EOF\nit's\nEOF\nunlink /tmp/y\necho '",
+            "cat > /tmp/f <<'EOF '\nnote\nEOF \nunlink /tmp/y",
+            "cat > /tmp/f <<\"E\\\"F\"\nx\nE\"F\nunlink /tmp/y",
+            "cat > /tmp/f <<$'EOF'\nx\nEOF\nunlink /tmp/y",
+            "cat > /tmp/f <<\"E$F\"\nx\nE$F\nunlink /tmp/y",
+            // 単純でない終端語の本文は読み飛ばさない。
+            "cat > /tmp/f <<'EOF '\nunlink /tmp/y\nEOF ",
+            "cat > /tmp/f <<$'EOF'\nunlink /tmp/y\nEOF",
+            "cat > /tmp/f <<$'E\\x4fF'\nunlink /tmp/y\nEOF",
+            // 前の行で開いた逆引用の中のヒアドキュメントは読み飛ばさない。
+            "echo `\ncat > f <<'EOF'\nrm -rf /tmp/y\nEOF\n`",
+            "x=`echo a\ncat > f <<'EOF'\nrm -rf /tmp/y\nEOF\n`",
         ] {
             assert!(posix_denied(denied), "{denied:?}");
         }
@@ -3841,6 +4210,10 @@ mod tests {
             "tee -a /tmp/x /tmp/y >/tmp/out <<'EOF'",
             "tee --append -- /tmp/x 1>/dev/null <<'EOF'",
             "tee -- -a >/dev/null <<'EOF'",
+            // 字句上の正規形が`/dev/null`の出力先。
+            "tee /tmp/x >//dev/null <<'EOF'",
+            "tee /tmp/x >/./dev/null <<'EOF'",
+            "cat >| /tmp/x <<'EOF'",
         ] {
             let command = format!("{head}\n{JS_BODY}\nEOF\necho done");
             assert!(!posix_denied(&command), "{command:?}");
@@ -3895,6 +4268,24 @@ mod tests {
             "tee /tmp/x 3>/tmp/z <<'EOF'",
             "cat 3>/tmp/z <<'EOF'",
             "cat > /tmp/z 4>/tmp/w <<'EOF'",
+            // `/dev/`・`/proc/`の判定は字句上の正規形で行い、`..`区間を含む出力先は読み飛ばさない。
+            "cat > //dev/stdout <<'EOF'",
+            "cat > /./dev/stdout <<'EOF'",
+            "cat > /tmp/../dev/stdout <<'EOF'",
+            "cat > ///proc/self/fd/1 <<'EOF'",
+            "cat > ../x <<'EOF'",
+            "tee //dev/stdout >/dev/null <<'EOF'",
+            "tee /./dev/stdout >/dev/null <<'EOF'",
+            "tee /tmp/../dev/stdout >/dev/null <<'EOF'",
+            "tee /tmp/x >//dev/stdout <<'EOF'",
+            "tee /tmp/x >/dev/../dev/null <<'EOF'",
+            // `>|`の`|`を書き出し先の一部と誤認しない。
+            "cat >|/dev/stdout <<'EOF'",
+            "cat >| /dev/stdout <<'EOF'",
+            "tee /tmp/x >|/dev/stdout <<'EOF'",
+            // 実行名に直結したリダイレクトの先がインタプリタ名でも、実行名はshell。
+            "sh>python <<'EOF'",
+            "bash>/tmp/node <<'EOF'",
         ] {
             let command = format!("{head}\nrm -rf /tmp/y\nEOF");
             assert!(posix_denied(&command), "{command:?}");
@@ -3934,6 +4325,9 @@ mod tests {
             "X=/dev/stdout\necho \"$(\ncat > $X <<'EOF'\nunlink /tmp/y\nEOF\n)\" | sh",
             "X=/dev/stdout bash -c 'cat > $X <<\\EOF\nunlink /tmp/y\nEOF' | sh",
             "X=/dev/stdout bash -c \"cat > \\$X <<'EOF'\nunlink /tmp/y\nEOF\" | sh",
+            // 標準出力へ戻る出力先の別表記（`//dev/stdout`）と、`echo }`で括弧の深さが負になる形。
+            "while true\ndo\ntee //dev/stdout >/dev/null <<'EOF'\nunlink /tmp/y\nEOF\nbreak\ndone | sh",
+            "echo }\n{ python - <<'EOF'\nunlink /tmp/y\nEOF\n} | sh",
         ] {
             assert!(posix_denied(command), "{command:?}");
         }
@@ -4060,6 +4454,27 @@ mod tests {
             // `>& del x`は名前が続くので、`&`で文を割って`del x`を検査する。
             ">& rm -rf /tmp/y",
             "echo a >& rm x",
+            // 名前をリダイレクト対象として読む解釈（bashの`>&word`）でも、後ろの実行名を検査する。
+            ">& /tmp/z unlink /tmp/y",
+            "2>& /tmp/z unlink /tmp/y",
+            ">&/tmp/z unlink /tmp/y",
+            ">& /tmp/z >& /tmp/w unlink /tmp/y",
+            // `>|`は1つの演算子で、`|`はパイプではない。
+            ">| /tmp/z unlink /tmp/y",
+            ">|/tmp/z unlink /tmp/y",
+            "2>| /tmp/z unlink /tmp/y",
+            // 実行名に直結したリダイレクト（`<`・`>`は語を切る）。
+            "rm>/dev/null -rf /tmp/y",
+            "unlink>/dev/null /tmp/y",
+            "unlink</dev/null /tmp/y",
+            "unlink 2>/dev/null>/tmp/z /tmp/y",
+            // shell wrapper・prefixの名前に直結した形と、wrapperのoptionの間のリダイレクト。
+            "bash>/dev/null -c 'unlink /tmp/y'",
+            "bash >/dev/null -c 'unlink /tmp/y'",
+            "sh 2>&1 -c 'unlink /tmp/y'",
+            "bash -c 2>/dev/null 'unlink /tmp/y'",
+            "env>/tmp/z unlink /tmp/y",
+            "sh>python <<'EOF'\nunlink /tmp/y\nEOF",
         ] {
             assert!(posix_denied(denied), "{denied:?}");
             if cfg!(windows) {
@@ -4081,6 +4496,14 @@ mod tests {
             "2>&1 echo ok",
             "> /tmp/z",
             ">",
+            // 実行名に直結したリダイレクト・`>|`・`>& 名前`の正常形。
+            "echo hi>out",
+            "echo hi >| /tmp/out",
+            "echo hi>|/tmp/out",
+            "ls >& /tmp/log",
+            "ls>&/tmp/log",
+            "bash 2>/dev/null -c 'echo hi'",
+            "sort<in.txt>out.txt",
         ] {
             assert!(!posix_denied(allowed), "{allowed:?}");
             if cfg!(windows) {
@@ -4095,6 +4518,11 @@ mod tests {
                 "2>&1 del x",
                 "2>& 1 del x",
                 ">& 1 del x",
+                // CMD規則でも、実行名に直結した`<`・`>`は語を切る。
+                "del>nul x",
+                "del<nul x",
+                "rd>nul /s /q x",
+                "cmd>nul /c echo ok",
             ] {
                 assert!(reason(denied, "exec_command", Some("cmd.exe")).is_some(), "{denied:?}");
                 assert!(reason(denied, "Bash", None).is_some(), "{denied:?}");
@@ -4102,6 +4530,9 @@ mod tests {
             assert!(reason("2>$null Remove-Item x", "exec_command", Some("pwsh")).is_some());
             assert!(reason(">out Remove-Item x", "exec_command", Some("pwsh")).is_some());
             assert_eq!(reason("2>nul echo hi", "exec_command", Some("cmd.exe")), None);
+            assert_eq!(reason("echo hi>nul", "exec_command", Some("cmd.exe")), None);
+            // PowerShellは`<`・`>`で一般の語を切らない（`Remove-Item>out.txt`は存在しないコマンド名）。
+            assert_eq!(reason("Remove-Item>out.txt x", "exec_command", Some("pwsh")), None);
             // PowerShellのブロックコメント開始`<#`はリダイレクトではなく、本文は実行されない。
             assert_eq!(
                 reason("<# del old #>\nGet-Date", "exec_command", Some("pwsh")),
@@ -4134,6 +4565,118 @@ mod tests {
             "for f in a; do echo; done > out; rm -rf y",
         ] {
             assert!(posix_denied(denied), "{denied:?}");
+        }
+    }
+
+    /// コメント・ANSI-C引用・二重引用内の`$(…)`で字句解析の引用状態がshellとずれず、後続の削除を隠さない。
+    #[test]
+    fn posix_lexer_tracks_comments_ansi_c_quotes_and_quoted_substitutions() {
+        for denied in [
+            // `${#x}`・`""#`の`#`は語の一部でコメントではない。
+            "if [ ${#x} -gt 0 ]; then unlink /tmp/y; fi",
+            "echo ${#x}; unlink /tmp/y",
+            "echo \"\"#; unlink /tmp/y",
+            "echo ''#; unlink /tmp/y",
+            "echo \\#; unlink /tmp/y",
+            // ANSI-C引用の`\'`は引用を閉じない。
+            "echo $'\\''\nunlink /tmp/y\necho \"'\"",
+            "x=$'a\\'b'; unlink /tmp/y",
+            // 二重引用内の`$(…)`は独立した引用文脈を持つ。
+            "echo \"$(echo '\"')\"; unlink /tmp/y",
+            "echo \"$(printf '%s' \"(\")\"; unlink /tmp/y",
+            "echo \"$(echo \"$(echo '\"')\")\"; unlink /tmp/y",
+            // `$(…)`の本文の削除は従来どおり検査する。
+            "echo \"$(unlink /tmp/y)\"",
+        ] {
+            assert!(posix_denied(denied), "{denied:?}");
+            if cfg!(windows) {
+                assert!(reason(denied, "Bash", None).is_some(), "{denied:?}");
+            }
+        }
+        for allowed in [
+            "echo hi # unlink /tmp/y",
+            "# unlink /tmp/y\necho ok",
+            "echo ok;# unlink /tmp/y",
+            "printf $'a\\n'",
+            "printf $'it\\'s\\n'",
+            "cd \"$(dirname \"$0\")\"",
+            "x=\"$(printf '%s' ')')\"; echo \"$x\"",
+            "echo \"$((1 + 2))\"",
+        ] {
+            assert!(!posix_denied(allowed), "{allowed:?}");
+            if cfg!(windows) {
+                assert_eq!(reason(allowed, "Bash", None), None, "{allowed:?}");
+            }
+        }
+        // 閉じていない`"$(`が大量に並ぶ本文でも、区切りまでを1回で取り込み線形時間で終わる。
+        let many = format!("bash <<'EOF'\n\"{}\nEOF\necho ok", "$( ".repeat(200_000));
+        let _ = posix_denied(&many);
+        let many = format!("echo \"{}", "$( \"".repeat(200_000));
+        let _ = posix_denied(&many);
+    }
+
+    /// 非strictのPowerShell規則のブロックコメント・スマート引用符・ヒアストリングの境界を言語仕様に合わせる。
+    /// strict（EncodedCommand）の拒否は従来どおり。
+    #[test]
+    fn powershell_lexer_handles_block_comments_smart_quotes_and_here_strings() {
+        for command in [
+            // ブロックコメントの`#>`を行コメントと誤認して、後ろの文を捨てない。
+            "<# c #> Remove-Item y",
+            "Get-Date <# c #> ; Remove-Item y",
+            "<# a\nb #> Remove-Item y",
+            // スマート引用符はASCIIと同じ種類の引用符。
+            "& \u{2018}Remove-Item\u{2019} x",
+            "echo 'a\u{2019}; Remove-Item x; \u{2019}b'",
+            "echo \u{201c}a\"; Remove-Item x; \"b\u{201d}",
+            // ヒアストリングの本文は終端直前の改行を含まない。
+            "& @'\nRemove-Item\n'@ x",
+            "& @'\r\nRemove-Item\r\n'@ x",
+        ] {
+            assert!(denied(command, "pwsh"), "{command:?}");
+            if cfg!(windows) {
+                assert!(reason(command, "Bash", None).is_some(), "{command:?}");
+            }
+        }
+        if cfg!(windows) {
+            for command in [
+                "pwsh -Command \"<# c #> Remove-Item y\"",
+                "pwsh -Command \"Get-Date <# c #> ; Remove-Item y\"",
+            ] {
+                assert!(reason(command, "Bash", None).is_some(), "{command:?}");
+            }
+        }
+        for allowed in [
+            "<# Remove-Item y #> Get-Date",
+            "Get-Date <# Remove-Item y #>",
+            "echo \u{2018}Remove-Item x\u{2019}",
+            "$x = @'\n'@",
+            "Write-Output @'\nRemove-Item\n'@",
+        ] {
+            assert!(!denied(allowed, "pwsh"), "{allowed:?}");
+        }
+        // 語の途中の`@"`・`@'`はヒアストリングではない（shell不明の検査で全体を拒否しない）。
+        for allowed in [
+            "ssh user@\"host\" ls",
+            "npm i pkg@\"1.2.3\"",
+            "git clone git@'github.com':o/r.git",
+        ] {
+            assert!(!denied(allowed, "pwsh"), "{allowed:?}");
+            if cfg!(windows) {
+                assert_eq!(reason(allowed, "Bash", None), None, "{allowed:?}");
+            }
+        }
+        if cfg!(windows) {
+            // strictではスマート引用符・ブロックコメント・不正なヒアストリング見出しを従来どおり拒否する。
+            for command in [
+                "<# c #> Get-Date",
+                "echo \u{2018}x\u{2019}",
+                "ssh user@'host' ls",
+            ] {
+                assert!(
+                    reason(&encoded_command(command), "Bash", None).is_some(),
+                    "{command:?}"
+                );
+            }
         }
     }
 

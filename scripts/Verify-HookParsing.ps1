@@ -526,7 +526,36 @@ $cases += @(
     @{ name='cmd-redirect-amp-name-del'; command='echo a >&del "<FILE>"'; pass=$false },
     @{ name='cmd-redirect-amp-quoted-del'; command='>&"del" "<FILE>"'; pass=$false },
     @{ name='cmd-stderr-redirect-amp-name-del'; command='echo a 2>&del "<FILE>"'; pass=$false },
-    @{ name='posix-cmd-wrapper-delete'; command='cmd //c del "<FILE>"'; pass=$false }
+    @{ name='posix-cmd-wrapper-delete'; command='cmd //c del "<FILE>"'; pass=$false },
+    # 実行名に直結した`<`・`>`は語を切る（POSIX・CMD規則）。`>|`・`>& 名前`、shell wrapperのoption間のリダイレクトも実行名を隠さない。
+    @{ name='redirect-glued-rm'; command='rm>/dev/null -f "<FILE>"'; pass=$false },
+    @{ name='redirect-glued-unlink'; command='unlink>/dev/null "<FILE>"'; pass=$false },
+    @{ name='redirect-glued-bash-wrapper'; command='bash>/dev/null -c ''unlink "<FILE>"'''; pass=$false },
+    @{ name='redirect-between-bash-options'; command='bash >/dev/null -c ''unlink "<FILE>"'''; pass=$false },
+    @{ name='redirect-glued-cmd-del'; command='del>nul "<FILE>"'; pass=$false },
+    @{ name='redirect-clobber-unlink'; command='>| /tmp/z unlink "<FILE>"'; pass=$false },
+    @{ name='redirect-amp-target-unlink'; command='>& /tmp/z unlink "<FILE>"'; pass=$false },
+    @{ name='redirect-glued-harmless'; command='echo hi>out.txt'; pass=$true },
+    @{ name='redirect-clobber-harmless'; command='echo hi >| /tmp/out'; pass=$true },
+    @{ name='redirect-amp-target-harmless'; command='ls >& /tmp/log'; pass=$true },
+    # `${#x}`・`""#`の`#`、ANSI-C引用の`\'`、二重引用内の`$(…)`の引用で、後続の削除を隠さない。
+    @{ name='posix-brace-length-not-comment'; command='echo ${#x}; unlink "<FILE>"'; pass=$false },
+    @{ name='posix-empty-quote-hash-not-comment'; command='echo ""#; unlink "<FILE>"'; pass=$false },
+    @{ name='posix-ansi-c-escaped-quote'; command=('echo $''\''''' + "`n" + 'unlink "<FILE>"' + "`n" + 'echo "''"'); pass=$false },
+    @{ name='posix-quoted-substitution-inner-quote'; command='echo "$(echo ''"'')"; unlink "<FILE>"'; pass=$false },
+    @{ name='posix-quoted-substitution-harmless'; command='cd "$(dirname "$0")"'; pass=$true },
+    # ヒアドキュメントの終端はbashと同じ完全一致で判定し、本文の引用を終端の後ろへ持ち越さない。
+    @{ name='posix-heredoc-body-quote-not-carried'; command=("cat <<'EOF'`nDon't`nEOF`nunlink `"<FILE>`"`ncat <<'EOF'`nIt's`nEOF"); pass=$false },
+    @{ name='posix-heredoc-delimiter-with-space'; command=("cat > /tmp/f <<'EOF '`nnote`nEOF `nunlink `"<FILE>`""); pass=$false },
+    @{ name='posix-heredoc-delimiter-escaped-quote'; command=("cat > /tmp/f <<`"E\`"F`"`nx`nE`"F`nunlink `"<FILE>`""); pass=$false },
+    @{ name='posix-heredoc-indented-delimiter-early-end'; command=("cat > /tmp/f <<'EOF'`n  EOF`nit's`nEOF`nunlink `"<FILE>`"`necho '"); pass=$false },
+    @{ name='posix-heredoc-double-slash-dev-stdout'; command=("tee //dev/stdout >/dev/null <<'EOF'`nunlink `"<FILE>`"`nEOF"); pass=$false },
+    # 非strictのPowerShell規則のブロックコメント・スマート引用符・ヒアストリングの境界。語の途中の`@"`は誤拒否しない。
+    @{ name='pwsh-block-comment-before-delete'; command='<# c #> Remove-Item -LiteralPath "<FILE>"'; shell='pwsh'; pass=$false; bashPass=$false },
+    @{ name='pwsh-block-comment-mid-line-delete'; command='Get-Date <# c #> ; Remove-Item -LiteralPath "<FILE>"'; shell='pwsh'; pass=$false; bashPass=$false },
+    @{ name='pwsh-smart-quote-command-name'; command=('& ' + [char]0x2018 + 'Remove-Item' + [char]0x2019 + ' -LiteralPath "<FILE>"'); shell='pwsh'; pass=$false; bashPass=$false },
+    @{ name='pwsh-here-string-command-name'; command=("& @'`nRemove-Item`n'@ -LiteralPath `"<FILE>`""); shell='pwsh'; pass=$false; bashPass=$false },
+    @{ name='pwsh-at-quote-inside-word'; command='ssh user@"host" ls'; pass=$true }
 )
 
 $results = [Collections.Generic.List[object]]::new()
