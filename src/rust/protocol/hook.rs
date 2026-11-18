@@ -736,18 +736,7 @@ impl Inspector {
         } else {
             vec![Mode::Posix]
         };
-        // shell不明のWindowsでは、POSIX規則がdataと確定したヒアドキュメント本文をCMD・PowerShell規則の
-        // 文として検査しない（本文の`rm`・`del`等の行を削除命令と誤判定するため）。
-        let without_data_heredocs = if mode.is_none() && cfg!(windows) {
-            posix_data_heredocs_removed(script)
-        } else {
-            None
-        };
         for m in modes {
-            let script = match (&without_data_heredocs, m) {
-                (Some(stripped), Mode::Cmd | Mode::PowerShell) => stripped.as_str(),
-                _ => script,
-            };
             let previous = self.mode;
             let previous_semicolon = self.cmd_semicolon;
             let previous_explicit = self.explicit;
@@ -2047,6 +2036,7 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
     let assignment = compiled(&ASSIGNMENT)?;
     let mut command: Vec<&Token> = Vec::new();
     let mut stdout_to_file = false;
+    let mut stdout_to_null = false;
     let mut k = 0;
     while k < words.len() {
         let word = &words[k];
@@ -2080,8 +2070,18 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
             if target.boundary || !data_sink_path(target, target_text) {
                 return Ok(false);
             }
+            // `>&2`・`>&-`などのfd複製は書き出し先として扱わない。
+            if target_text.starts_with('&') {
+                return Ok(false);
+            }
             if &text[..digits] != "2" {
                 let lower = target_text.to_ascii_lowercase();
+                if lower == "/dev/null" {
+                    // 出力の破棄だけは、`tee`が本文を標準出力へ流さない形として認める（`cat`は従来どおり拒否）。
+                    stdout_to_null = true;
+                    k += step;
+                    continue;
+                }
                 if lower.starts_with("/dev/") || lower.starts_with("/proc/") {
                     return Ok(false);
                 }
@@ -2108,7 +2108,8 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
     let static_option = |w: &&Token| !w.quoted && !w.dynamic && w.text.starts_with('-');
     Ok(match leaf(&first.text).as_str() {
         "cat" => command.len() == 1 && stdout_to_file,
-        "tee" => tee_writes_only_files(&command[1..]),
+        // `tee`は本文を標準出力へも流すため、標準出力がファイルか`/dev/null`へ向く場合だけdataとして扱う。
+        "tee" => (stdout_to_file || stdout_to_null) && tee_writes_only_files(&command[1..]),
         "python" | "python3" | "py" | "node" => command[1..].iter().all(static_option),
         _ => false,
     })
@@ -2120,7 +2121,11 @@ fn tee_writes_only_files(args: &[&Token]) -> bool {
     let mut paths = 0;
     for word in args {
         let text = word.text.as_str();
-        if !options_done && !word.quoted && !word.dynamic && text.starts_with('-') {
+        if !options_done && text.starts_with('-') {
+            // 引用・展開を含む語は静的なoptionと確定できない（`tee "-a"`）。
+            if word.quoted || word.dynamic {
+                return false;
+            }
             match text {
                 "--" => options_done = true,
                 "-a" | "-i" | "-p" | "--append" | "--ignore-interrupts" => {}
@@ -2175,6 +2180,10 @@ fn data_sink_path(word: &Token, text: &str) -> bool {
             j += 1;
         }
         if j == name_start || (braced && chars.get(j) != Some(&'}')) {
+            return false;
+        }
+        // `$_`は直前のコマンドの最後の引数を指す特殊パラメータ。
+        if j - name_start == 1 && chars[name_start] == '_' {
             return false;
         }
         i = if braced { j + 1 } else { j };
@@ -2236,52 +2245,62 @@ fn braced_name_end(s: &[char], start: usize) -> Option<usize> {
     }
     (j > start && s.get(j) == Some(&'}')).then_some(j)
 }
-/// shell不明のWindows検査で、POSIX規則がデータと確定した引用付きヒアドキュメント本文を取り除いた文字列。
-///
-/// ClaudeのBash toolはGit Bashで実行されるが、Codexのexec_commandも同じ`Bash`名でshellを渡さず、
-/// PowerShell・CMDで実行される。tool名だけではPOSIX実行と確定できないため、CMD・PowerShell規則は
-/// 全文を検査し続け、POSIX規則が`cat >`・`tee`・インタプリタのdataとして読み飛ばした本文だけを除く
-/// （PowerShellは`<`のリダイレクトを構文エラーにし、`cmd /c`は最初の改行以降を実行しないため、
-/// 本文は他のshellでも実行されない）。取り除くのは、そこまでの文章の引用が両規則でそろっている
-/// ことが明らかな範囲だけで、判断できなければ元の文字列を使う。
-fn posix_data_heredocs_removed(script: &str) -> Option<String> {
-    let mut ranges = Vec::new();
-    tokens_collecting(script, Mode::Posix, false, &mut ranges).ok()?;
-    if ranges.is_empty() {
-        return None;
-    }
-    let s: Vec<char> = script.chars().collect();
-    let mut out = String::new();
-    let mut position = 0;
-    for (start, end) in ranges {
-        out.extend(&s[position..start]);
-        // 本文より前に、規則ごとに引用の読み方が分かれうる文字がある場合は、以降を取り除かない。
-        let neutral = out.matches('"').count().is_multiple_of(2)
-            && out.matches('\'').count().is_multiple_of(2)
-            && !out.contains(['`', '^'])
-            && !out.contains("@'")
-            && !out.contains("@\"")
-            && !out.contains("<#");
-        if !neutral {
-            out.extend(&s[start..]);
-            return Some(out);
+/// 文の先頭の語（実行名）の位置か。先頭の代入・リダイレクト・制御語（`then`・`do`等）は実行名ではない。
+/// `words`は現在の文の、ここまでの語。
+fn at_command_position(words: &[Token]) -> bool {
+    const SKIPPED: &[&str] = &[
+        "then", "do", "else", "elif", "if", "while", "until", "!", "time", "coproc",
+    ];
+    let mut k = 0;
+    while k < words.len() {
+        let word = &words[k];
+        let text = word.text.as_str();
+        if word.quoted {
+            return false;
         }
-        position = end;
+        let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if text[digits..].starts_with(['<', '>']) {
+            // 演算子だけなら対象は次の語。
+            k += if text[digits..].trim_start_matches(['<', '>', '&', '|']).is_empty() {
+                2
+            } else {
+                1
+            };
+        } else if SKIPPED.contains(&text) || is_assignment_text(text) {
+            k += 1;
+        } else {
+            return false;
+        }
     }
-    out.extend(&s[position..]);
-    Some(out)
+    true
+}
+/// `NAME=...`・`NAME+=...`の形か（実行名ではない代入語）。
+fn is_assignment_text(text: &str) -> bool {
+    let name_end = text
+        .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
+        .unwrap_or(text.len());
+    name_end > 0
+        && !text.starts_with(|c: char| c.is_ascii_digit())
+        && (text[name_end..].starts_with('=') || text[name_end..].starts_with("+="))
+}
+/// `out`（ここまでの語）が`if`・`while`・`until`・`for`・`select`・`case`の内側か。
+/// 開始語は位置を問わず数え、終了語（`fi`・`done`・`esac`）は文の先頭だけで引くので、数え違いは「内側」へ倒れる。
+fn inside_control_construct(out: &[Token]) -> bool {
+    let mut depth = 0i32;
+    for (index, word) in out.iter().enumerate() {
+        if word.boundary || word.quoted {
+            continue;
+        }
+        let at_start = index == 0 || out[index - 1].boundary;
+        match word.text.as_str() {
+            "if" | "while" | "until" | "for" | "select" | "case" => depth += 1,
+            "fi" | "done" | "esac" if at_start => depth -= 1,
+            _ => {}
+        }
+    }
+    depth > 0
 }
 fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
-    tokens_collecting(script, mode, strict, &mut Vec::new())
-}
-/// `tokens`と同じ字句解析で、POSIX規則が読み飛ばしたヒアドキュメント本文の文字範囲
-/// （`script`の文字位置、本文の先頭と末尾の次）も`skipped`へ追加する。
-fn tokens_collecting(
-    script: &str,
-    mode: Mode,
-    strict: bool,
-    skipped: &mut Vec<(usize, usize)>,
-) -> Result<Vec<Token>> {
     let s: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
     let mut t = Token::new("");
@@ -2348,6 +2367,7 @@ fn tokens_collecting(
                 quoted: quoted && complete,
                 statement_start,
                 context_ok: group_depth == 0
+                    && !inside_control_construct(&out)
                     && !before.contains("((")
                     && !before.contains("[[")
                     && !before.contains('`')
@@ -2551,10 +2571,11 @@ fn tokens_collecting(
             c = '\n';
         }
         // 引用外の`${NAME}`（`NAME`は識別子だけ）は、`{`・`}`で語を割らず1つの動的な語にする。
-        // それ以外の`${`は従来どおり（`{`が境界になる）。
+        // 文の先頭語（実行名）の位置と、それ以外の`${`は従来どおり（`{`が境界になる）。
         if mode == Mode::Posix
             && c == '$'
             && s.get(i + 1) == Some(&'{')
+            && !at_command_position(&out[statement_start.min(out.len())..])
             && let Some(end) = braced_name_end(&s, i + 2)
         {
             for &ch in &s[i..=end] {
@@ -2574,7 +2595,6 @@ fn tokens_collecting(
                 heredocs.clear();
                 heredoc_boundary_after = false;
                 if let Some(next) = skip {
-                    skipped.push((i + 1, next));
                     boundary(&mut out);
                     statement_start = out.len();
                     i = next;
@@ -3873,10 +3893,13 @@ mod tests {
             "cat > ${TEMP}/x/y.ts <<'EOF'",
             "cat >> \"${TEMP}/x_$NAME.ts\" <<'EOF'",
             "cat > \"$A\"\"$B\" <<'EOF'",
-            "tee \"$TEMP/x\" <<'EOF'",
-            "tee -a \"$TEMP/x\" /tmp/y <<'EOF'",
-            "tee -- ${OUT} <<'EOF'",
-            "tee /tmp/x <<'EOF'",
+            "cat > /tmp/x.js <<'EOF'",
+            // `tee`は標準出力がファイルか`/dev/null`のときだけ。
+            "tee \"$TEMP/x\" >/dev/null <<'EOF'",
+            "tee -a f > /dev/null <<'EOF'",
+            "tee -a \"$TEMP/x\" /tmp/y >/tmp/out <<'EOF'",
+            "tee -- ${OUT} >/dev/null <<'EOF'",
+            "tee /tmp/x >\"$TEMP/out\" <<'EOF'",
         ] {
             let command = format!("{head}\n{JS_BODY}\nEOF\necho done");
             assert!(!posix_denied(&command), "{command:?}");
@@ -3902,7 +3925,19 @@ mod tests {
             "tee `echo x` <<'EOF'",
             "tee /dev/stdout <<'EOF'",
             "tee /proc/self/fd/1 <<'EOF'",
-            "tee /tmp/x >/dev/null <<'EOF'",
+            "tee /tmp/x >/dev/stdout <<'EOF'",
+            "tee /tmp/x >&2 <<'EOF'",
+            "tee /tmp/x 2>/dev/null <<'EOF'",
+            "tee \"$TEMP/x\" <<'EOF'",
+            "tee /tmp/x <<'EOF'",
+            "tee -a /tmp/x <<'EOF'",
+            "tee \"-a\" x >/dev/null <<'EOF'",
+            "tee -z x >/dev/null <<'EOF'",
+            "tee x /dev/null >/dev/null <<'EOF'",
+            "tee \"$_\" >/dev/null <<'EOF'",
+            "cat > $_ <<'EOF'",
+            "cat > \"${_}\" <<'EOF'",
+            "cat > \"$_/x\" <<'EOF'",
             "tee <<'EOF'",
             "tee -z x <<'EOF'",
             "tee x | sh <<'EOF'",
@@ -3926,33 +3961,51 @@ mod tests {
             "ssh host <<'EOF'\nrm -rf /tmp/y\nEOF",
             "$X <<'EOF'\nrm -rf /tmp/y\nEOF",
             "${X} <<'EOF'\nrm -rf /tmp/y\nEOF",
+            // 実行名の位置の`${NAME}`は従来どおり割って検査する。
+            "${X}rm -rf /tmp/y",
+            "${X} rm -rf /tmp/y",
+            "A=1 ${X}rm -rf /tmp/y",
+            "x${X}rm -rf /tmp/y",
+            "if true; then ${X}rm -rf /tmp/y; fi",
+            // 制御構文の内側では、cat・tee・インタプリタでも本文を読み飛ばさない。
+            "while true\ndo\ntee /tmp/x >/dev/null <<'EOF'\nrm -rf /tmp/y\nEOF\nbreak\ndone | sh",
+            "while true\ndo\ntee /tmp/x <<'EOF'\nrm -rf /tmp/y\nEOF\nbreak\ndone | sh",
+            "if true\nthen\ntee /tmp/x <<'EOF'\nrm -rf /tmp/y\nEOF\nfi | bash",
+            "X=/dev/stdout\nwhile true\ndo\ncat > \"$X\" <<'EOF'\nrm -rf /tmp/y\nEOF\nbreak\ndone | sh",
+            "for i in 1\ndo\ncat > /tmp/x <<'EOF'\nrm -rf /tmp/y\nEOF\ndone",
+            "until false\ndo\npython - <<'EOF'\nrm -rf /tmp/y\nEOF\ndone",
+            "if true; then\nif true; then\ncat > f <<'EOF'\nrm -rf /tmp/y\nEOF\nfi\nelse\necho\nfi",
+            "case x in\nx)\ncat > f <<'EOF'\nrm -rf /tmp/y\nEOF\n;;\nesac",
         ] {
             assert!(posix_denied(command), "{command:?}");
         }
+        // 制御構文を閉じた後は、従来どおり読み飛ばす。
+        for command in [
+            "for i in 1; do echo; done\ncat > f <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "if true; then echo; fi\ntee f >/dev/null <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "A=1 cat > ${OUT} <<'EOF'\nrm -rf /tmp/y\nEOF",
+        ] {
+            assert!(!posix_denied(command), "{command:?}");
+        }
     }
 
-    /// shell不明（Claude Codeの`Bash`・Codexの`exec_command`）のWindows検査では、POSIX規則がdataと確定した
-    /// ヒアドキュメント本文をCMD・PowerShell規則の文として拾わない。本文の外や、dataと確定しない形の削除は拒否する。
-    /// `Bash`をPOSIXと決めない理由はDESIGN.mdの「hookのshell選択」を参照する。
+    /// shell不明（Claude Codeの`Bash`・Codexの`exec_command`）のWindows検査は、POSIX規則がdataと読む
+    /// ヒアドキュメント本文も、CMD・PowerShell規則で全文を検査し続ける。PowerShellは`python --% <<'EOF'`や
+    /// 引用の読み分けで`<<`を構文エラーにしないため、本文の削除が実行されうる。
+    /// `Bash`をPOSIXと決めない理由はDESIGN.mdの「フックのshell解析境界」を参照する。
     #[test]
-    fn unknown_shell_inspection_skips_posix_confirmed_heredoc_data() {
+    fn unknown_shell_inspection_still_checks_heredoc_bodies_under_other_rules() {
         if !cfg!(windows) {
             return;
         }
-        for head in [
-            "cat > \"$TEMP/x/y.ts\" <<'EOF'",
-            "cat > ${TEMP}/x/y.ts <<'EOF'",
-            "tee -a \"$TEMP/x\" <<'EOF'",
-            "cat > /tmp/x.js <<'EOF'",
-            "python - <<'EOF'",
-        ] {
-            let command = format!("{head}\n{JS_BODY}\nEOF\necho done");
-            assert_eq!(reason(&command, "Bash", None), None, "{command:?}");
-            // 本文を取り除くのはshell不明のときだけで、明示したCMD・PowerShellは全文を検査する。
-            assert!(reason(&command, "exec_command", Some("cmd.exe")).is_some(), "{command:?}");
-            assert!(reason(&command, "exec_command", Some("pwsh")).is_some(), "{command:?}");
-        }
         for command in [
+            "python --% <<'EOF'\nRemove-Item y\nEOF",
+            "echo \\' \" \\' \"\ntee x <<'EOF'\n\" ; Remove-Item y\nEOF",
+            "echo \u{201c}\ntee x <<'EOF'\n\u{201d} ; Remove-Item y\nEOF",
+            // POSIX規則だけならdataの形でも、CMD・PowerShell規則が本文の削除を検知する。
+            "cat > \"$TEMP/x\" <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "cat > \"$TEMP/x\" <<'EOF'\ndel x\nEOF",
+            "cat > \"$TEMP/x\" <<'EOF'\nRemove-Item x\nEOF",
             "cat > \"$TEMP/x\" <<'EOF'\nx\nEOF\nrm -rf /tmp/y",
             "cat > \"$TEMP/x\" <<'EOF'\nx\nEOF\ndel x",
             "cat > \"$TEMP/x\" <<'EOF'\nx\nEOF\nRemove-Item x",
@@ -3966,10 +4019,6 @@ mod tests {
             "ssh host <<'EOF'\nrm -rf /tmp/y\nEOF",
             "rm -rf x",
             "del x",
-            // 本文より前の引用が規則ごとに読み分かれうる形は、本文を取り除かず全文を検査する。
-            "echo 'a\ncat > x <<'EOF'\ndel x\nEOF",
-            "echo @'\ncat > x <<'EOF'\ndel x\nEOF",
-            "echo ^\ncat > x <<'EOF'\ndel x\nEOF",
             // 内側のshellの呼び出し（POSIX規則でも対応する規則で再帰検査する）。
             "cmd //c del x",
             "cmd /c del x",
