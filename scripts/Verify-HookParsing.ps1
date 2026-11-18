@@ -500,6 +500,15 @@ $cases += @(
     @{ name='posix-heredoc-unquoted-delimiter-body'; command=('cat > "$TEMP/x" <<EOF|del "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
     @{ name='posix-heredoc-bash-body'; command=('bash <<''EOF''|rm -f "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
     @{ name='posix-heredoc-delete-after-variable-target-body'; command=('cat > "$TEMP/x" <<''EOF''|x|EOF|rm -f "<FILE>"').Replace('|', "`n"); pass=$false },
+    @{ name='posix-heredoc-variable-target-brace-before-loop'; command=('X=/dev/stdout|echo {done}|while true|do|cat > "$X" <<''EOF''|unlink "<FILE>"|EOF|break|done').Replace('|', "`n") + ' | sh'; pass=$false },
+    @{ name='posix-heredoc-extra-fd-tee'; command=('tee /tmp/x 3>/tmp/z <<''EOF''|rm -f "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
+    # 先頭のリダイレクトは実行名ではない。対象語を飛ばした次の語を実行名として検査する。
+    @{ name='leading-redirect-stderr-rm'; command='2>/dev/null rm -f "<FILE>"'; pass=$false },
+    @{ name='leading-redirect-stdout-rm'; command='>/tmp/z rm -f "<FILE>"'; pass=$false },
+    @{ name='leading-redirect-stdin-rm'; command='</dev/null rm -f "<FILE>"'; pass=$false },
+    @{ name='leading-redirect-dup-rm'; command='2>&1 rm -f "<FILE>"'; pass=$false },
+    @{ name='leading-redirect-harmless'; command='2>/dev/null ls /tmp'; pass=$true },
+    @{ name='leading-redirect-echo'; command='>/tmp/z echo hi'; pass=$true },
     @{ name='posix-cmd-wrapper-delete'; command='cmd //c del "<FILE>"'; pass=$false }
 )
 

@@ -824,6 +824,16 @@ impl Inspector {
         if self.noncanonical(w, depth)? {
             return Ok(true);
         }
+        // 先頭のリダイレクト（`2>/dev/null rm x`・`>out rm x`）は実行名ではない。対象語まで読み飛ばし、
+        // 次の語を実行名として検査する（飛ばさないと、リダイレクトの語が実行名になり削除名が隠れる）。
+        let redirects = leading_redirect_words(w);
+        if redirects > 0 {
+            return if redirects >= w.len() {
+                Ok(false)
+            } else {
+                self.command(&w[redirects..], depth, strict)
+            };
+        }
         if self.mode == Some(Mode::Posix) {
             if let Some(result) = self.posix_prefix(w, depth, strict)? {
                 return Ok(result);
@@ -2263,6 +2273,27 @@ fn braced_name_end(s: &[char], start: usize) -> Option<usize> {
     }
     (j > start && s.get(j) == Some(&'}')).then_some(j)
 }
+/// 文頭に並ぶリダイレクト（演算子と対象）が占める語数。`>f`・`2>&1`は1語、`>`・`<`・`2>`・`<<`は対象の次の語まで2語。
+/// 先頭が引用で始まる語（`">"`）はリダイレクトではない。
+fn leading_redirect_words(words: &[Token]) -> usize {
+    let mut k = 0;
+    while let Some(word) = words.get(k) {
+        let text = word.text.as_str();
+        let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if word.quote_start == Some(0) || !text[digits..].starts_with(['<', '>']) {
+            break;
+        }
+        k += if text[digits..]
+            .trim_start_matches(['<', '>', '&', '|', '-'])
+            .is_empty()
+        {
+            2
+        } else {
+            1
+        };
+    }
+    k.min(words.len())
+}
 /// 文の先頭の語（実行名）の位置か。先頭の代入・リダイレクト・制御語（`then`・`do`等）は実行名ではない。
 /// `words`は現在の文の、ここまでの語。
 fn at_command_position(words: &[Token]) -> bool {
@@ -2610,6 +2641,22 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
                 append(&mut t, ch, &mut previous_equal);
             }
             i = end + 1;
+            continue;
+        }
+        // fdの複製（`2>&1`・`>&2`・`<&0`）の`&`は文の区切りではなく、リダイレクト演算子の一部。
+        // 語を割ると、後ろの`1 rm x`が別の文になり、リダイレクトの後の実行名を検査できない。
+        if matches!(mode, Mode::Posix | Mode::Cmd)
+            && c == '&'
+            && t.quote_start.is_none()
+            && (t.text.ends_with('>') || t.text.ends_with('<'))
+            && t.text
+                .trim_end_matches(['<', '>'])
+                .chars()
+                .all(|d| d.is_ascii_digit())
+        {
+            t.bare_chars += 1;
+            append(&mut t, c, &mut previous_equal);
+            i += 1;
             continue;
         }
         let is_boundary = matches!(c, ';' | '|' | '&' | '\r' | '\n' | '(' | ')' | '{' | '}');
@@ -4088,6 +4135,51 @@ mod tests {
             encoded.as_str(),
         ] {
             assert!(posix_denied(command), "{command:?}");
+        }
+    }
+
+    /// 先頭のリダイレクトは実行名ではない。対象語を飛ばした次の語を実行名として検査し、削除名を隠せない。
+    #[test]
+    fn leading_redirections_do_not_hide_the_command_name() {
+        for denied in [
+            "2>/dev/null rm -rf /tmp/y",
+            ">/tmp/z rm -rf /tmp/y",
+            "</dev/null rm x",
+            "2>&1 rm x",
+            "> /tmp/z rm -rf /tmp/y",
+            ">/tmp/a 2>&1 </dev/null rm x",
+            ">\"f\" rm x",
+            "FOO=1 2>/dev/null rm x",
+        ] {
+            assert!(posix_denied(denied), "{denied:?}");
+            if cfg!(windows) {
+                assert!(reason(denied, "Bash", None).is_some(), "{denied:?}");
+            }
+        }
+        // 実行名が`cmd`の呼び出しはwrapperとして扱われ、未知のswitch（`2>/dev/null`）は元から拒否される（今回の変更ではない）。
+        assert!(posix_denied("cmd 2>/dev/null"));
+        for allowed in [
+            "ls 2>/dev/null",
+            ">out echo hi",
+            "2>/dev/null ls /tmp",
+            "</dev/null cat",
+            "2>&1 echo ok",
+            "> /tmp/z",
+            ">",
+        ] {
+            assert!(!posix_denied(allowed), "{allowed:?}");
+            if cfg!(windows) {
+                assert_eq!(reason(allowed, "Bash", None), None, "{allowed:?}");
+            }
+        }
+        if cfg!(windows) {
+            for denied in ["2>nul del x", ">out del x", "<nul del x", "2>&1 del x"] {
+                assert!(reason(denied, "exec_command", Some("cmd.exe")).is_some(), "{denied:?}");
+                assert!(reason(denied, "Bash", None).is_some(), "{denied:?}");
+            }
+            assert!(reason("2>$null Remove-Item x", "exec_command", Some("pwsh")).is_some());
+            assert!(reason(">out Remove-Item x", "exec_command", Some("pwsh")).is_some());
+            assert_eq!(reason("2>nul echo hi", "exec_command", Some("cmd.exe")), None);
         }
     }
 
