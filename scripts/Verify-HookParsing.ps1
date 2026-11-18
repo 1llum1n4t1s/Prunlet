@@ -507,6 +507,9 @@ $cases += @(
     @{ name='leading-redirect-stdout-rm'; command='>/tmp/z rm -f "<FILE>"'; pass=$false },
     @{ name='leading-redirect-stdin-rm'; command='</dev/null rm -f "<FILE>"'; pass=$false },
     @{ name='leading-redirect-dup-rm'; command='2>&1 rm -f "<FILE>"'; pass=$false },
+    @{ name='leading-redirect-close-fd-rm'; command='2>&- rm -f "<FILE>"'; pass=$false },
+    @{ name='leading-redirect-close-stdin-unlink'; command='<&- unlink "<FILE>"'; pass=$false },
+    @{ name='posix-heredoc-nested-variable-target'; command=('X=/dev/stdout|echo "$(|cat > $X <<''EOF''|unlink "<FILE>"|EOF|)"').Replace('|', "`n") + ' | sh'; pass=$false },
     @{ name='leading-redirect-harmless'; command='2>/dev/null ls /tmp'; pass=$true },
     @{ name='leading-redirect-echo'; command='>/tmp/z echo hi'; pass=$true },
     @{ name='posix-cmd-wrapper-delete'; command='cmd //c del "<FILE>"'; pass=$false }

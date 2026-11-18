@@ -743,7 +743,7 @@ impl Inspector {
             self.mode = Some(m);
             self.explicit = mode.is_some();
             let result = (|| {
-                let tokens = tokens(script, m, strict)?;
+                let tokens = tokens_at(script, m, strict, depth > 0)?;
                 let mut words = Vec::new();
                 let mut control = self.posix_script;
                 for token in tokens {
@@ -2010,6 +2010,7 @@ fn heredoc_skip(
     heredocs: &[Heredoc],
     out: &[Token],
     boundary_after: bool,
+    nested: bool,
 ) -> Result<Option<usize>> {
     if boundary_after || heredocs.is_empty() {
         return Ok(None);
@@ -2025,7 +2026,7 @@ fn heredoc_skip(
         }
         // 出力先が変数の`cat`・`tee`は、中身が`/dev/stdout`などでありうる。制御構文の開始語や
         // `{`・`(`が`<<`より前に一度でも現れていれば、終了語の数え違いで外側と誤認しうるため読み飛ばさない。
-        if heredoc.control_seen
+        if (heredoc.control_seen || nested)
             && statement
                 .iter()
                 .take_while(|w| !w.boundary)
@@ -2283,9 +2284,10 @@ fn leading_redirect_words(words: &[Token]) -> usize {
         if word.quote_start == Some(0) || !text[digits..].starts_with(['<', '>']) {
             break;
         }
-        k += if text[digits..]
-            .trim_start_matches(['<', '>', '&', '|', '-'])
-            .is_empty()
+        let operator = &text[digits..];
+        // `>&-`・`<&-`（fdを閉じる）は対象語を取らない完結した1語。`<<-`は終端語を取る演算子のまま。
+        k += if !operator.ends_with("&-")
+            && operator.trim_start_matches(['<', '>', '&', '|', '-']).is_empty()
         {
             2
         } else {
@@ -2348,6 +2350,11 @@ fn inside_control_construct(out: &[Token]) -> bool {
     depth > 0
 }
 fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
+    tokens_at(script, mode, strict, false)
+}
+/// `nested`は、入れ子の本文（`$(…)`・`bash -c`の本文）の再検査か。外側のパイプや制御構文が見えないため、
+/// 出力先が変数の`cat`・`tee`の本文は読み飛ばさない。
+fn tokens_at(script: &str, mode: Mode, strict: bool, nested: bool) -> Result<Vec<Token>> {
     let s: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
     let mut t = Token::new("");
@@ -2665,7 +2672,8 @@ fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
             previous_equal = false;
             // 行末で、記録したヒアドキュメントの本文をdataとして読み飛ばせるか判定する。
             if mode == Mode::Posix && c == '\n' {
-                let skip = heredoc_skip(&s, i + 1, &heredocs, &out, heredoc_boundary_after)?;
+                let skip =
+                    heredoc_skip(&s, i + 1, &heredocs, &out, heredoc_boundary_after, nested)?;
                 heredocs.clear();
                 heredoc_boundary_after = false;
                 if let Some(next) = skip {
@@ -4150,6 +4158,16 @@ mod tests {
             ">/tmp/a 2>&1 </dev/null rm x",
             ">\"f\" rm x",
             "FOO=1 2>/dev/null rm x",
+            // fdを閉じる`&-`は対象語を取らないので、次の語が実行名。
+            "2>&- rm -rf /tmp/y",
+            ">&- rm -rf /tmp/y",
+            "<&- unlink /tmp/y",
+            // `<<-`は終端語を取る。
+            "<<- EOF rm x\nEOF",
+            // 入れ子の再検査では、出力先が変数の`cat`・`tee`の本文を読み飛ばさない。
+            "X=/dev/stdout\necho \"$(\ncat > $X <<'EOF'\nunlink /tmp/y\nEOF\n)\" | sh",
+            "X=/dev/stdout bash -c 'cat > $X <<\\EOF\nunlink /tmp/y\nEOF' | sh",
+            "X=/dev/stdout bash -c \"cat > \\$X <<'EOF'\nunlink /tmp/y\nEOF\" | sh",
         ] {
             assert!(posix_denied(denied), "{denied:?}");
             if cfg!(windows) {
@@ -4160,6 +4178,9 @@ mod tests {
         assert!(posix_denied("cmd 2>/dev/null"));
         for allowed in [
             "ls 2>/dev/null",
+            "<<- EOF cat\nEOF",
+            "x=\"$(python - <<'EOF'\nfor i in range(3):\n    print(i)\nEOF\n)\"",
+            "x=\"$(cat > /tmp/f <<'EOF'\nfor (const f of files) {\n}\nEOF\n)\"",
             ">out echo hi",
             "2>/dev/null ls /tmp",
             "</dev/null cat",
