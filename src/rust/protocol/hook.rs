@@ -743,7 +743,7 @@ impl Inspector {
             self.mode = Some(m);
             self.explicit = mode.is_some();
             let result = (|| {
-                let tokens = tokens_at(script, m, strict, depth > 0)?;
+                let tokens = tokens(script, m, strict)?;
                 let mut words = Vec::new();
                 let mut control = self.posix_script;
                 for token in tokens {
@@ -1994,8 +1994,6 @@ struct Heredoc {
     statement_start: usize,
     /// `<<`より前の状況が読み飛ばし可能か（括弧の入れ子なし、算術・`[[`・逆引用なし）。
     context_ok: bool,
-    /// `<<`より前に、制御構文の開始語か引用外の`{`・`(`が一度でも現れたか（閉じたかは問わない）。
-    control_seen: bool,
 }
 /// ヒアドキュメント本文を読み飛ばしてよい場合に、本文の次の文字位置を返す。
 ///
@@ -2010,27 +2008,15 @@ fn heredoc_skip(
     heredocs: &[Heredoc],
     out: &[Token],
     boundary_after: bool,
-    nested: bool,
 ) -> Result<Option<usize>> {
     if boundary_after || heredocs.is_empty() {
         return Ok(None);
     }
     for heredoc in heredocs {
-        let statement = &out[heredoc.statement_start.min(out.len())..];
         if !heredoc.quoted
             || !heredoc.context_ok
             || heredoc.delimiter.is_empty()
-            || !heredoc_consumer_is_data_sink(statement)?
-        {
-            return Ok(None);
-        }
-        // 出力先が変数の`cat`・`tee`は、中身が`/dev/stdout`などでありうる。制御構文の開始語や
-        // `{`・`(`が`<<`より前に一度でも現れていれば、終了語の数え違いで外側と誤認しうるため読み飛ばさない。
-        if (heredoc.control_seen || nested)
-            && statement
-                .iter()
-                .take_while(|w| !w.boundary)
-                .any(|w| w.dynamic)
+            || !heredoc_consumer_is_data_sink(&out[heredoc.statement_start.min(out.len())..])?
         {
             return Ok(None);
         }
@@ -2091,7 +2077,7 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
                 (word, 1)
             };
             let target_text = if operator.is_empty() { target.text.as_str() } else { operator };
-            if target.boundary || !data_sink_path(target, target_text) {
+            if target.dynamic || target.boundary || target_text.is_empty() {
                 return Ok(false);
             }
             // `>&2`・`>&-`などのfd複製は書き出し先として扱わない。
@@ -2143,8 +2129,7 @@ fn heredoc_consumer_is_data_sink(words: &[Token]) -> Result<bool> {
     })
 }
 /// `tee`の引数が、静的なoption（`-a`・`-i`・`-p`・`--append`・`--ignore-interrupts`・`--`）と
-/// 1つ以上の書き出し先だけか。書き出し先の条件は`cat >`の出力先と同じ（`data_sink_path`）。
-/// 標準出力の向き先は呼出し側が確認する。
+/// 1つ以上の静的な書き出し先（`/dev/`・`/proc/`以外）だけか。標準出力の向き先は呼出し側が確認する。
 fn tee_writes_only_files(args: &[&Token]) -> bool {
     let mut options_done = false;
     let mut paths = 0;
@@ -2164,60 +2149,16 @@ fn tee_writes_only_files(args: &[&Token]) -> bool {
         }
         let lower = text.to_ascii_lowercase();
         if word.boundary
+            || word.dynamic
             || text.is_empty()
             || lower.starts_with("/dev/")
             || lower.starts_with("/proc/")
-            || !data_sink_path(word, text)
         {
             return false;
         }
         paths += 1;
     }
     paths > 0
-}
-/// データの書き出し先として扱える語か。静的な語はそのまま、動的な語は単純な変数展開
-/// （`$NAME`・`${NAME}`）と静的な文字の連結だけを認める。コマンド置換・逆引用符・算術展開・
-/// 位置/特殊パラメータ・修飾付き展開・グロブを含む語は、実行や対象が静的に確定しないため認めない。
-fn data_sink_path(word: &Token, text: &str) -> bool {
-    if text.is_empty() {
-        return false;
-    }
-    if word.backticks > 0 || word.subexpression {
-        return false;
-    }
-    if !word.dynamic {
-        return true;
-    }
-    if text.contains(['*', '?', '[', '`']) {
-        return false;
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] != '$' {
-            i += 1;
-            continue;
-        }
-        let braced = chars.get(i + 1) == Some(&'{');
-        let mut j = i + if braced { 2 } else { 1 };
-        let name_start = j;
-        while j < chars.len()
-            && (chars[j] == '_'
-                || chars[j].is_ascii_alphabetic()
-                || (j > name_start && chars[j].is_ascii_digit()))
-        {
-            j += 1;
-        }
-        if j == name_start || (braced && chars.get(j) != Some(&'}')) {
-            return false;
-        }
-        // `$_`は直前のコマンドの最後の引数を指す特殊パラメータ。
-        if j - name_start == 1 && chars[name_start] == '_' {
-            return false;
-        }
-        i = if braced { j + 1 } else { j };
-    }
-    true
 }
 /// PowerShell strict検査で、`s[i]`の単独の`.`がdot-sourcingではなく、前のコマンドへ渡す
 /// 引数（カレントディレクトリ）かを判定する。`rg -n x .`・`Get-ChildItem -Path .`・
@@ -2264,16 +2205,6 @@ fn powershell_dot_argument(s: &[char], i: usize, out: &[Token]) -> bool {
     }
     true
 }
-/// `s[start..]`が`NAME}`（識別子だけ）で始まるとき、`}`の位置を返す。
-fn braced_name_end(s: &[char], start: usize) -> Option<usize> {
-    let mut j = start;
-    while j < s.len()
-        && (s[j] == '_' || s[j].is_ascii_alphabetic() || (j > start && s[j].is_ascii_digit()))
-    {
-        j += 1;
-    }
-    (j > start && s.get(j) == Some(&'}')).then_some(j)
-}
 /// 文頭に並ぶリダイレクト（演算子と対象）が占める語数。`>f`・`2>&1`は1語、`>`・`<`・`2>`・`<<`は対象の次の語まで2語。
 /// 先頭が引用で始まる語（`">"`）はリダイレクトではない。
 fn leading_redirect_words(words: &[Token]) -> usize {
@@ -2296,65 +2227,7 @@ fn leading_redirect_words(words: &[Token]) -> usize {
     }
     k.min(words.len())
 }
-/// 文の先頭の語（実行名）の位置か。先頭の代入・リダイレクト・制御語（`then`・`do`等）は実行名ではない。
-/// `words`は現在の文の、ここまでの語。
-fn at_command_position(words: &[Token]) -> bool {
-    const SKIPPED: &[&str] = &[
-        "then", "do", "else", "elif", "if", "while", "until", "!", "time", "coproc",
-    ];
-    let mut k = 0;
-    while k < words.len() {
-        let word = &words[k];
-        let text = word.text.as_str();
-        // リダイレクトは引用の判定より先に見る（`>"f"`は引用を含むが、語全体が対象つきの演算子）。
-        let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-        if word.quote_start != Some(0) && text[digits..].starts_with(['<', '>']) {
-            // 演算子だけなら対象は次の語。
-            k += if text[digits..].trim_start_matches(['<', '>', '&', '|']).is_empty() {
-                2
-            } else {
-                1
-            };
-        } else if !word.quoted && (SKIPPED.contains(&text) || is_assignment_text(text)) {
-            k += 1;
-        } else {
-            return false;
-        }
-    }
-    true
-}
-/// `NAME=...`・`NAME+=...`の形か（実行名ではない代入語）。
-fn is_assignment_text(text: &str) -> bool {
-    let name_end = text
-        .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
-        .unwrap_or(text.len());
-    name_end > 0
-        && !text.starts_with(|c: char| c.is_ascii_digit())
-        && (text[name_end..].starts_with('=') || text[name_end..].starts_with("+="))
-}
-/// `out`（ここまでの語）が`if`・`while`・`until`・`for`・`select`・`case`の内側か。
-/// 開始語は位置を問わず数え、終了語（`fi`・`done`・`esac`）は文の先頭だけで引くので、数え違いは「内側」へ倒れる。
-fn inside_control_construct(out: &[Token]) -> bool {
-    let mut depth = 0i32;
-    for (index, word) in out.iter().enumerate() {
-        if word.boundary || word.quoted {
-            continue;
-        }
-        let at_start = index == 0 || out[index - 1].boundary;
-        match word.text.as_str() {
-            "if" | "while" | "until" | "for" | "select" | "case" => depth += 1,
-            "fi" | "done" | "esac" if at_start => depth -= 1,
-            _ => {}
-        }
-    }
-    depth > 0
-}
 fn tokens(script: &str, mode: Mode, strict: bool) -> Result<Vec<Token>> {
-    tokens_at(script, mode, strict, false)
-}
-/// `nested`は、入れ子の本文（`$(…)`・`bash -c`の本文）の再検査か。外側のパイプや制御構文が見えないため、
-/// 出力先が変数の`cat`・`tee`の本文は読み飛ばさない。
-fn tokens_at(script: &str, mode: Mode, strict: bool, nested: bool) -> Result<Vec<Token>> {
     let s: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
     let mut t = Token::new("");
@@ -2365,8 +2238,6 @@ fn tokens_at(script: &str, mode: Mode, strict: bool, nested: bool) -> Result<Vec
     let mut heredocs: Vec<Heredoc> = Vec::new();
     let mut statement_start = 0usize;
     let mut group_depth = 0i32;
-    // 引用外の`{`・`(`を一度でも見たか（`echo {done}`のように閉じても残る）。
-    let mut group_seen = false;
     let mut line_start = 0usize;
     let mut heredoc_boundary_after = false;
     while i < s.len() {
@@ -2422,17 +2293,7 @@ fn tokens_at(script: &str, mode: Mode, strict: bool, nested: bool) -> Result<Vec
                 delimiter,
                 quoted: quoted && complete,
                 statement_start,
-                control_seen: group_seen
-                    || out.iter().any(|w: &Token| {
-                        !w.boundary
-                            && !w.quoted
-                            && matches!(
-                                w.text.as_str(),
-                                "if" | "while" | "until" | "for" | "select" | "case"
-                            )
-                    }),
                 context_ok: group_depth == 0
-                    && !inside_control_construct(&out)
                     && !before.contains("((")
                     && !before.contains("[[")
                     && !before.contains('`')
@@ -2635,25 +2496,12 @@ fn tokens_at(script: &str, mode: Mode, strict: bool, nested: bool) -> Result<Vec
             }
             c = '\n';
         }
-        // 引用外の`${NAME}`（`NAME`は識別子だけ）は、`{`・`}`で語を割らず1つの動的な語にする。
-        // 文の先頭語（実行名）の位置と、それ以外の`${`は従来どおり（`{`が境界になる）。
-        if mode == Mode::Posix
-            && c == '$'
-            && s.get(i + 1) == Some(&'{')
-            && !at_command_position(&out[statement_start.min(out.len())..])
-            && let Some(end) = braced_name_end(&s, i + 2)
-        {
-            for &ch in &s[i..=end] {
-                t.bare_chars += 1;
-                append(&mut t, ch, &mut previous_equal);
-            }
-            i = end + 1;
-            continue;
-        }
-        // fdの複製（`2>&1`・`>&2`・`<&0`）の`&`は文の区切りではなく、リダイレクト演算子の一部。
+        // fdの複製・閉じ（`2>&1`・`>&2`・`<&0`・`>&-`）の`&`は文の区切りではなく、リダイレクト演算子の一部。
         // 語を割ると、後ろの`1 rm x`が別の文になり、リダイレクトの後の実行名を検査できない。
+        // 直後が数字か`-`のときだけ結合する。`>&del x`・`>&"del" x`は従来どおり`&`で文を割り、`del x`を検査する。
         if matches!(mode, Mode::Posix | Mode::Cmd)
             && c == '&'
+            && s.get(i + 1).is_some_and(|d| d.is_ascii_digit() || *d == '-')
             && t.quote_start.is_none()
             && (t.text.ends_with('>') || t.text.ends_with('<'))
             && t.text
@@ -2672,8 +2520,7 @@ fn tokens_at(script: &str, mode: Mode, strict: bool, nested: bool) -> Result<Vec
             previous_equal = false;
             // 行末で、記録したヒアドキュメントの本文をdataとして読み飛ばせるか判定する。
             if mode == Mode::Posix && c == '\n' {
-                let skip =
-                    heredoc_skip(&s, i + 1, &heredocs, &out, heredoc_boundary_after, nested)?;
+                let skip = heredoc_skip(&s, i + 1, &heredocs, &out, heredoc_boundary_after)?;
                 heredocs.clear();
                 heredoc_boundary_after = false;
                 if let Some(next) = skip {
@@ -2690,10 +2537,7 @@ fn tokens_at(script: &str, mode: Mode, strict: bool, nested: bool) -> Result<Vec
                     heredoc_boundary_after = true;
                 }
                 match c {
-                    '(' | '{' => {
-                        group_depth += 1;
-                        group_seen = true;
-                    }
+                    '(' | '{' => group_depth += 1,
                     ')' | '}' => group_depth -= 1,
                     _ => {}
                 }
@@ -3968,124 +3812,140 @@ mod tests {
 
     const JS_BODY: &str = "for (const f of files) {\n  if (f) { rm(f) }\n}\nrm -rf /tmp/y\ndel x\nri y";
 
-    /// 出力先が単純な変数展開（`$VAR`・`${VAR}`と静的な文字の連結）の`cat >`・`tee`は、本文をdataとして読む。
-    /// 出力先がコード実行や不定な対象を含む形、パイプ・同じ行の後続文がある形は従来どおり本文を文として検査する。
+    /// `tee`は、静的なパスだけを取り、標準出力（fdが空か`1`）がファイルか`/dev/null`へ向く場合に限り、
+    /// 本文をdataとして読む。出力先が変数・コマンド置換などの動的な語の`cat >`・`tee`は読み飛ばさない。
     #[test]
-    fn heredoc_data_sinks_accept_simple_variable_targets_and_tee() {
+    fn heredoc_data_sinks_accept_static_cat_and_tee_only() {
         for head in [
-            "cat > \"$TEMP/x/y.ts\" <<'EOF'",
-            "cat > $TEMP/x/y.ts <<'EOF'",
-            "cat > ${TEMP}/x/y.ts <<'EOF'",
-            "cat >> \"${TEMP}/x_$NAME.ts\" <<'EOF'",
-            "cat > \"$A\"\"$B\" <<'EOF'",
             "cat > /tmp/x.js <<'EOF'",
+            "cat >> /d/x/y.ts <<'EOF'",
             // `tee`は標準出力がファイルか`/dev/null`のときだけ。
-            "tee \"$TEMP/x\" >/dev/null <<'EOF'",
+            "tee /d/x >/dev/null <<'EOF'",
             "tee -a f > /dev/null <<'EOF'",
-            "tee -a \"$TEMP/x\" /tmp/y >/tmp/out <<'EOF'",
-            "tee -- ${OUT} >/dev/null <<'EOF'",
-            "tee /tmp/x >\"$TEMP/out\" <<'EOF'",
+            "tee -a /tmp/x /tmp/y >/tmp/out <<'EOF'",
+            "tee --append -- /tmp/x 1>/dev/null <<'EOF'",
+            "tee -- -a >/dev/null <<'EOF'",
         ] {
             let command = format!("{head}\n{JS_BODY}\nEOF\necho done");
             assert!(!posix_denied(&command), "{command:?}");
         }
         for head in [
+            // 出力先が動的（変数・コマンド置換・逆引用符・算術展開・プロセス置換・グロブ）。
+            "cat > \"$out\" <<'EOF'",
+            "cat > \"$TEMP/x/y.ts\" <<'EOF'",
+            "cat > $TEMP/x/y.ts <<'EOF'",
+            "cat > ${TEMP}/x/y.ts <<'EOF'",
+            "cat >> \"${TEMP}/x_$NAME.ts\" <<'EOF'",
             "cat > \"$(echo x)\" <<'EOF'",
             "cat > $(echo x) <<'EOF'",
             "cat > `echo x` <<'EOF'",
             "cat > \"`echo x`\" <<'EOF'",
             "cat > \"$((1+1))\" <<'EOF'",
             "cat > \"${x:-/tmp/y}\" <<'EOF'",
-            "cat > \"${!x}\" <<'EOF'",
             "cat > \"$1\" <<'EOF'",
             "cat > \"$@\" <<'EOF'",
             "cat > /tmp/*.x <<'EOF'",
-            "cat > \"$TEMP\"/*.x <<'EOF'",
             "cat > >(sh) <<'EOF'",
             "cat > /dev/$x <<'EOF'",
             "cat > /dev/stdout <<'EOF'",
             "cat > $'\\x2fdev/x' <<'EOF'",
+            "cat > $_ <<'EOF'",
+            "tee \"$TEMP/x\" >/dev/null <<'EOF'",
+            "tee -- ${OUT} >/dev/null <<'EOF'",
+            "tee /tmp/x >\"$TEMP/out\" <<'EOF'",
             "tee >(sh) <<'EOF'",
             "tee \"$(echo x)\" <<'EOF'",
             "tee `echo x` <<'EOF'",
+            "tee \"$_\" >/dev/null <<'EOF'",
+            // `tee`の標準出力が`/dev/null`・ファイルに向かない、静的でないoption・書き出し先。
             "tee /dev/stdout <<'EOF'",
             "tee /proc/self/fd/1 <<'EOF'",
             "tee /tmp/x >/dev/stdout <<'EOF'",
             "tee /tmp/x >&2 <<'EOF'",
             "tee /tmp/x 2>/dev/null <<'EOF'",
-            "tee \"$TEMP/x\" <<'EOF'",
             "tee /tmp/x <<'EOF'",
             "tee -a /tmp/x <<'EOF'",
             "tee \"-a\" x >/dev/null <<'EOF'",
             "tee -z x >/dev/null <<'EOF'",
             "tee x /dev/null >/dev/null <<'EOF'",
-            "tee \"$_\" >/dev/null <<'EOF'",
-            "cat > $_ <<'EOF'",
-            "cat > \"${_}\" <<'EOF'",
-            "cat > \"$_/x\" <<'EOF'",
             "tee <<'EOF'",
             "tee -z x <<'EOF'",
             "tee x | sh <<'EOF'",
             "tee x && sh x <<'EOF'",
             "tee x y z; sh <<'EOF'",
             "tee x | cat | sh <<'EOF'",
+            // 標準出力ではないfdの出力先は、`tee`・`cat`の標準出力を決めない。
+            "tee /tmp/x 3>/dev/null <<'EOF'",
+            "tee /tmp/x 3>/tmp/z <<'EOF'",
+            "cat 3>/tmp/z <<'EOF'",
+            "cat > /tmp/z 4>/tmp/w <<'EOF'",
         ] {
             let command = format!("{head}\nrm -rf /tmp/y\nEOF");
             assert!(posix_denied(&command), "{command:?}");
         }
-        // 本文の外の削除、引用なしの終端語、shellが読む形は拒否する。
+        // 本文の外の削除、引用なしの終端語、shellが読む形、動的な出力先と制御構文・入れ子の組み合わせは拒否する。
         for command in [
+            "tee /d/x >/dev/null <<'EOF'\nx\nEOF\nrm -rf /tmp/y",
+            "tee /d/x >/dev/null <<EOF\nrm -rf /tmp/y\nEOF",
+            "tee /d/x >/dev/null <<'EOF' | sh\nrm -rf /tmp/y\nEOF",
+            "tee /d/x >/dev/null <<'EOF'; sh x\nrm -rf /tmp/y\nEOF",
             "cat > \"$TEMP/x\" <<'EOF'\nx\nEOF\nrm -rf /tmp/y",
-            "tee \"$TEMP/x\" <<'EOF'\nx\nEOF\nrm -rf /tmp/y",
             "cat > \"$TEMP/x\" <<EOF\nrm -rf /tmp/y\nEOF",
-            "tee \"$TEMP/x\" <<EOF\nrm -rf /tmp/y\nEOF",
-            "tee \"$TEMP/x\" <<'EOF' | sh\nrm -rf /tmp/y\nEOF",
-            "tee \"$TEMP/x\" <<'EOF'; sh x\nrm -rf /tmp/y\nEOF",
             "bash <<'EOF'\nrm -rf /tmp/y\nEOF",
             "sh -s <<'EOF'\nrm -rf /tmp/y\nEOF",
             "ssh host <<'EOF'\nrm -rf /tmp/y\nEOF",
             "$X <<'EOF'\nrm -rf /tmp/y\nEOF",
             "${X} <<'EOF'\nrm -rf /tmp/y\nEOF",
-            // 実行名の位置の`${NAME}`は従来どおり割って検査する。
+            // `${NAME}`は従来どおり`{`・`}`で割って検査する。
             "${X}rm -rf /tmp/y",
             "${X} rm -rf /tmp/y",
             "A=1 ${X}rm -rf /tmp/y",
             "x${X}rm -rf /tmp/y",
             "if true; then ${X}rm -rf /tmp/y; fi",
-            // 制御構文の内側では、cat・tee・インタプリタでも本文を読み飛ばさない。
-            "while true\ndo\ntee /tmp/x >/dev/null <<'EOF'\nrm -rf /tmp/y\nEOF\nbreak\ndone | sh",
+            ">\"f\" ${X}unlink /tmp/y",
+            ">\"f\" ${X} unlink /tmp/y",
+            // 動的な出力先は制御構文の内側でも、閉じ数えを誤らせる形でも、入れ子の本文でも読み飛ばさない。
             "while true\ndo\ntee /tmp/x <<'EOF'\nrm -rf /tmp/y\nEOF\nbreak\ndone | sh",
             "if true\nthen\ntee /tmp/x <<'EOF'\nrm -rf /tmp/y\nEOF\nfi | bash",
             "X=/dev/stdout\nwhile true\ndo\ncat > \"$X\" <<'EOF'\nrm -rf /tmp/y\nEOF\nbreak\ndone | sh",
-            "for i in 1\ndo\ncat > /tmp/x <<'EOF'\nrm -rf /tmp/y\nEOF\ndone",
-            "until false\ndo\npython - <<'EOF'\nrm -rf /tmp/y\nEOF\ndone",
-            "if true; then\nif true; then\ncat > f <<'EOF'\nrm -rf /tmp/y\nEOF\nfi\nelse\necho\nfi",
-            "case x in\nx)\ncat > f <<'EOF'\nrm -rf /tmp/y\nEOF\n;;\nesac",
-            // 終了語の数え違いで外側と誤認させる形（出力先が変数なら、開始語・`{`・`(`を一度でも見たら読み飛ばさない）。
             "X=/dev/stdout\necho {done}\nwhile true\ndo\ncat > \"$X\" <<'EOF'\nunlink /tmp/y\nEOF\nbreak\ndone | sh",
             "X=/dev/stdout\nwhile true\ndo\necho {done}\ncat > \"$X\" <<'EOF'\nunlink /tmp/y\nEOF\nbreak\ndone | sh",
             "X=/dev/stdout\ncat <<Z\ndone\nZ\nwhile true\ndo\ncat > \"$X\" <<'EOF'\nunlink /tmp/y\nEOF\nbreak\ndone | sh",
             "X=/dev/stdout\necho (x)\ncat > \"$X\" <<'EOF'\nunlink /tmp/y\nEOF",
             "X=/dev/stdout\nfor i in 1; do echo; done\ntee \"$X\" >/dev/null <<'EOF'\nunlink /tmp/y\nEOF",
-            // 標準出力ではないfdの出力先は、`tee`・`cat`の標準出力を決めない。
-            "tee /tmp/x 3>/dev/null <<'EOF'\nrm -rf /tmp/y\nEOF",
-            "tee /tmp/x 3>/tmp/z <<'EOF'\nrm -rf /tmp/y\nEOF",
-            "cat 3>/tmp/z <<'EOF'\nrm -rf /tmp/y\nEOF",
-            "cat > /tmp/z 4>/tmp/w <<'EOF'\nrm -rf /tmp/y\nEOF",
-            // リダイレクトは引用を含んでも実行名の位置の判定から外れない。
-            ">\"f\" ${X}unlink /tmp/y",
-            ">\"f\" ${X} unlink /tmp/y",
+            "X=/dev/stdout\necho \"$(\ncat > $X <<'EOF'\nunlink /tmp/y\nEOF\n)\" | sh",
+            "X=/dev/stdout bash -c 'cat > $X <<\\EOF\nunlink /tmp/y\nEOF' | sh",
+            "X=/dev/stdout bash -c \"cat > \\$X <<'EOF'\nunlink /tmp/y\nEOF\" | sh",
         ] {
             assert!(posix_denied(command), "{command:?}");
         }
-        // 出力先が静的なら、制御構文を閉じた後は従来どおり読み飛ばす（標準出力が他へ流れない）。
+        // 静的な出力先は、制御構文の内側・閉じた後でも従来どおり読み飛ばす（標準出力が他へ流れない）。
         for command in [
             "for i in 1; do echo; done\ncat > f <<'EOF'\nrm -rf /tmp/y\nEOF",
             "if true; then echo; fi\ntee f >/dev/null <<'EOF'\nrm -rf /tmp/y\nEOF",
             "echo {x}\ncat > /tmp/f <<'EOF'\nrm -rf /tmp/y\nEOF",
-            "A=1 cat > ${OUT} <<'EOF'\nrm -rf /tmp/y\nEOF",
+            "while true\ndo\ntee /tmp/x >/dev/null <<'EOF'\nrm -rf /tmp/y\nEOF\nbreak\ndone | sh",
         ] {
             assert!(!posix_denied(command), "{command:?}");
+        }
+    }
+
+    /// CMD規則では、`>&`の後に数字でも`-`でもない語が続く形（`>&del x`）は、従来どおり`&`で文を割って`del x`を検査する。
+    #[test]
+    fn cmd_redirect_ampersand_followed_by_a_name_is_still_inspected() {
+        if !cfg!(windows) {
+            return;
+        }
+        for command in [
+            "echo a >&del x",
+            ">&del x",
+            "echo a 2>&del x",
+            "echo a >&\"del\" x",
+            ">&\"del\" x",
+            "echo a 2>&\"del\" x",
+        ] {
+            assert!(reason(command, "exec_command", Some("cmd.exe")).is_some(), "{command:?}");
+            assert!(reason(command, "Bash", None).is_some(), "{command:?}");
         }
     }
 
@@ -4103,6 +3963,9 @@ mod tests {
             "echo \\' \" \\' \"\ntee x <<'EOF'\n\" ; Remove-Item y\nEOF",
             "echo \u{201c}\ntee x <<'EOF'\n\u{201d} ; Remove-Item y\nEOF",
             // POSIX規則だけならdataの形でも、CMD・PowerShell規則が本文の削除を検知する。
+            "cat > /tmp/x <<'EOF'\ndel x\nEOF",
+            "cat > /tmp/x <<'EOF'\nRemove-Item x\nEOF",
+            "tee /tmp/x >/dev/null <<'EOF'\ndel x\nEOF",
             "cat > \"$TEMP/x\" <<'EOF'\nrm -rf /tmp/y\nEOF",
             "cat > \"$TEMP/x\" <<'EOF'\ndel x\nEOF",
             "cat > \"$TEMP/x\" <<'EOF'\nRemove-Item x\nEOF",

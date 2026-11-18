@@ -483,24 +483,24 @@ $cases += @(
     @{ name='posix-heredoc-delete-after-body'; command="cat > /d/example/a.txt <<'EOF'`nx`nEOF`nrm -f `"<FILE>`""; pass=$false },
     @{ name='posix-heredoc-piped-to-shell'; command="cat <<'EOF' | sh`nrm -f `"<FILE>`"`nEOF"; pass=$false },
     @{ name='posix-loop-assignment-and-test'; command='for f in a b; do n=$(basename $f); if [ -f "$f" ]; then echo $n; fi; done 2>&1'; pass=$true },
-    # 出力先が単純な変数展開のcat・teeはPOSIX規則では本文をdataとして読むが、shell不明ではCMD・PowerShell規則も全文を検査する。
-    # shell不明ではCMD・PowerShell規則も本文を文として検査するため、許可ケースの本文には削除命令の綴りを含めない。
-    @{ name='posix-heredoc-variable-target-body'; command=('cat > "$TEMP/x/y.ts" <<''EOF''|for (const f of files) {|  if (f) { run(f) }|}|EOF').Replace('|', "`n"); pass=$true },
-    @{ name='posix-heredoc-braced-variable-target-body'; command=('cat > ${TEMP}/x/y.ts <<''EOF''|for (const f of files) {|  run(f)|}|EOF').Replace('|', "`n"); pass=$true },
-    @{ name='posix-heredoc-tee-null-body'; command=('tee -a "$TEMP/x/y.ts" >/dev/null <<''EOF''|for (const f of files) {|  run(f)|}|EOF').Replace('|', "`n"); pass=$true },
-    @{ name='posix-heredoc-tee-no-redirect-body'; command=('tee "$TEMP/x" <<''EOF''|rm -f "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
+    # tee（静的なパス・標準出力がファイルか/dev/null）はPOSIX規則でdataだが、shell不明ではCMD・PowerShell規則も全文を検査する。
+    @{ name='posix-heredoc-tee-null-body'; command=('tee -a /d/example/y.ts >/dev/null <<''EOF''|for (const f of files) {|  run(f)|}|EOF').Replace('|', "`n"); pass=$true },
+    @{ name='posix-heredoc-tee-no-redirect-body'; command=('tee /d/example/x <<''EOF''|rm -f "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
+    @{ name='posix-heredoc-variable-target-body'; command=('cat > "$TEMP/x" <<''EOF''|for (const f of files) {|  run(f)|}|EOF').Replace('|', "`n"); pass=$false },
     @{ name='posix-heredoc-variable-target-del-body'; command=('cat > "$TEMP/x" <<''EOF''|del "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
+    @{ name='posix-heredoc-tee-variable-target-body'; command=('tee "$TEMP/x" >/dev/null <<''EOF''|for (const f of files) {|  run(f)|}|EOF').Replace('|', "`n"); pass=$false },
     @{ name='posix-heredoc-python-percent-powershell-body'; command=('python --% <<''EOF''|Remove-Item "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
     @{ name='posix-heredoc-powershell-quote-mismatch-body'; command=('echo \'' " \'' "|tee x <<''EOF''|" ; Remove-Item "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
     @{ name='posix-heredoc-smart-quote-body'; command=('echo ' + [char]0x201c + '|tee x <<''EOF''|' + [char]0x201d + ' ; Remove-Item "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
-    @{ name='posix-heredoc-inside-loop-piped-to-shell'; command=('while true|do|tee /tmp/x >/dev/null <<''EOF''|rm -f "<FILE>"|EOF|break|done').Replace('|', "`n") + ' | sh'; pass=$false },
+    @{ name='posix-heredoc-inside-loop-piped-to-shell'; command=('while true|do|tee /tmp/x <<''EOF''|rm -f "<FILE>"|EOF|break|done').Replace('|', "`n") + ' | sh'; pass=$false },
     @{ name='posix-heredoc-command-substitution-target'; command=('cat > "$(echo x)" <<''EOF''|rm -f "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
     @{ name='posix-heredoc-process-substitution-tee'; command=('tee >(sh) <<''EOF''|rm -f "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
-    @{ name='posix-heredoc-tee-piped-to-shell'; command=('tee "$TEMP/x" <<''EOF'' | sh' + "`n" + 'rm -f "<FILE>"' + "`n" + 'EOF'); pass=$false },
-    @{ name='posix-heredoc-unquoted-delimiter-body'; command=('cat > "$TEMP/x" <<EOF|del "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
+    @{ name='posix-heredoc-tee-piped-to-shell'; command=('tee /d/example/x >/dev/null <<''EOF'' | sh' + "`n" + 'rm -f "<FILE>"' + "`n" + 'EOF'); pass=$false },
+    @{ name='posix-heredoc-unquoted-delimiter-body'; command=('cat > /d/example/x <<EOF|del "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
     @{ name='posix-heredoc-bash-body'; command=('bash <<''EOF''|rm -f "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
-    @{ name='posix-heredoc-delete-after-variable-target-body'; command=('cat > "$TEMP/x" <<''EOF''|x|EOF|rm -f "<FILE>"').Replace('|', "`n"); pass=$false },
+    @{ name='posix-heredoc-delete-after-tee-body'; command=('tee /d/example/x >/dev/null <<''EOF''|x|EOF|rm -f "<FILE>"').Replace('|', "`n"); pass=$false },
     @{ name='posix-heredoc-variable-target-brace-before-loop'; command=('X=/dev/stdout|echo {done}|while true|do|cat > "$X" <<''EOF''|unlink "<FILE>"|EOF|break|done').Replace('|', "`n") + ' | sh'; pass=$false },
+    @{ name='posix-heredoc-nested-variable-target'; command=('X=/dev/stdout|echo "$(|cat > $X <<''EOF''|unlink "<FILE>"|EOF|)"').Replace('|', "`n") + ' | sh'; pass=$false },
     @{ name='posix-heredoc-extra-fd-tee'; command=('tee /tmp/x 3>/tmp/z <<''EOF''|rm -f "<FILE>"|EOF').Replace('|', "`n"); pass=$false },
     # 先頭のリダイレクトは実行名ではない。対象語を飛ばした次の語を実行名として検査する。
     @{ name='leading-redirect-stderr-rm'; command='2>/dev/null rm -f "<FILE>"'; pass=$false },
@@ -509,9 +509,12 @@ $cases += @(
     @{ name='leading-redirect-dup-rm'; command='2>&1 rm -f "<FILE>"'; pass=$false },
     @{ name='leading-redirect-close-fd-rm'; command='2>&- rm -f "<FILE>"'; pass=$false },
     @{ name='leading-redirect-close-stdin-unlink'; command='<&- unlink "<FILE>"'; pass=$false },
-    @{ name='posix-heredoc-nested-variable-target'; command=('X=/dev/stdout|echo "$(|cat > $X <<''EOF''|unlink "<FILE>"|EOF|)"').Replace('|', "`n") + ' | sh'; pass=$false },
     @{ name='leading-redirect-harmless'; command='2>/dev/null ls /tmp'; pass=$true },
     @{ name='leading-redirect-echo'; command='>/tmp/z echo hi'; pass=$true },
+    # CMD規則で`>&`の後に名前が続く形は、`&`で文を割って`del`を検査する。
+    @{ name='cmd-redirect-amp-name-del'; command='echo a >&del "<FILE>"'; pass=$false },
+    @{ name='cmd-redirect-amp-quoted-del'; command='>&"del" "<FILE>"'; pass=$false },
+    @{ name='cmd-stderr-redirect-amp-name-del'; command='echo a 2>&del "<FILE>"'; pass=$false },
     @{ name='posix-cmd-wrapper-delete'; command='cmd //c del "<FILE>"'; pass=$false }
 )
 
