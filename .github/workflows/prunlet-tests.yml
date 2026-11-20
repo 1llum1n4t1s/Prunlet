@@ -1,6 +1,8 @@
 name: Prunlet tests
 
-# main への push とすべての PR で、Windows の Rust テストを動かす（配信 workflow にも同じ cargo test を入れてある）。
+# main への push とすべての PR で、Windows と Linux の Rust テストを動かす（配信 workflow にも同じ cargo test を入れてある）。
+# - linux: ubuntu-24.04（x64）の cargo test --locked --lib と --test localization。配信 workflow
+#   （prunlet-linux-release.yml）と同じ範囲を、タグを打つ前に確かめる。macOS は隔離 root と Mach の条件が要るため含めない。
 # - unit: 通常の cargo test --locked（lib・bin・結合テスト）。
 # - update-cfg: 起動時更新の検証用 cfg（prunlet_windows_update_tests）付きの debug ビルドの cargo test --lib。
 #   この cfg でだけ有効になる fixture 入口・テスト鍵のテスト（src/rust/update/fixture.rs ほか）は、通常の
@@ -91,3 +93,38 @@ jobs:
           TMP: ${{ runner.temp }}
           RUST_BACKTRACE: '1'
         run: ./scripts/Invoke-PrunletTests.ps1 -Mode UpdateCfg -CargoTargetDirectory (Join-Path (Split-Path $env:GITHUB_WORKSPACE) 'prunlet-cargo-target')
+
+  linux:
+    name: cargo test (linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare Rust
+        run: |
+          set -euo pipefail
+          # rust-toolchain.toml が指定する版・component を導入する。
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+      - name: Cache Rust build
+        # 保存は main だけ（PR は復元のみ）。配信 workflow には入れない。
+        # target はリポジトリ外の固定ディレクトリ（下の CARGO_TARGET_DIR）へ置いてキャッシュする。
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: '. -> ../prunlet-cargo-target'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run the Rust tests
+        # 配信 workflow（prunlet-linux-release.yml）と同じテスト。共有されるホームの Trash へ触れないよう、
+        # テストごとの一時領域を RUNNER_TEMP へ向ける。
+        env:
+          RUST_BACKTRACE: '1'
+        run: |
+          set -euo pipefail
+          export TMPDIR="$RUNNER_TEMP/cargo-test-tmp"
+          mkdir "$TMPDIR"
+          export CARGO_TARGET_DIR="$(dirname "$GITHUB_WORKSPACE")/prunlet-cargo-target"
+          cargo test --locked --lib
+          cargo test --locked --test localization
