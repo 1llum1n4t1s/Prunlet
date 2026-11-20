@@ -136,7 +136,7 @@ fn cli_quote(s: &str) -> String {
         s.into()
     }
 }
-fn deny(reason: &str) -> Value {
+pub(crate) fn deny(reason: &str) -> Value {
     json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":reason}})
 }
 pub fn run(config_path: &Path, cli_path: &Path) -> i32 {

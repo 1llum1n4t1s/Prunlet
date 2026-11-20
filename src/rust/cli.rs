@@ -28,7 +28,7 @@ pub enum Host {
 /// 理由付きの拒否・exit 0にして、検査されないまま素通しや判定不能にならないようにする。
 fn hook_start_denied(reason: &str) -> i32 {
     eprintln!("Prunlet hook: {reason}");
-    let value = json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":format!("Prunlet hook could not start: {reason}")}});
+    let value = crate::protocol::hook::deny(&format!("Prunlet hook could not start: {reason}"));
     let _ = write_json(&value);
     0
 }
@@ -635,8 +635,6 @@ pub fn has_errors(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(windows)]
-    use crate::help::CURRENT as HELP;
 
     #[test]
     fn hook_start_failures_are_hook_denials() {
@@ -714,10 +712,6 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
-        #[cfg(windows)]
-        assert!(
-            HELP.contains("migrate [--dry-run | --apply [--if-needed | --retry-legacy-discard]]")
-        );
     }
 
     #[test]

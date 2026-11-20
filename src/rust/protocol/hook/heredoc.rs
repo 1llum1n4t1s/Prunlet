@@ -172,3 +172,163 @@ pub(super) fn here_string_header(s: &[char], position: usize) -> bool {
     }
     k < s.len() && matches!(s[k], '\r' | '\n')
 }
+/// POSIXのヒアドキュメントの見出し（`<<`・`<<-`の後ろの終端語）を`i`の`<<`から読み取った結果。
+pub(super) struct HeredocHeader {
+    /// 終端語を読み終えた位置。
+    pub(super) end: usize,
+    pub(super) strip_tabs: bool,
+    /// 引用除去後の終端語（CRLFの入力では末尾の`\r`を含む）。
+    pub(super) delimiter: String,
+    pub(super) quoted: bool,
+    pub(super) complete: bool,
+    pub(super) simple: bool,
+    pub(super) ansi_escape: bool,
+}
+/// `s[i..]`の`<<`の直後から、ヒアドキュメントの終端語を読み取る（入力だけに依存する純関数）。
+pub(super) fn heredoc_header(s: &[char], i: usize) -> HeredocHeader {
+    let mut j = i + 2;
+    let strip_tabs = s.get(j) == Some(&'-');
+    if strip_tabs {
+        j += 1;
+    }
+    while j < s.len() && matches!(s[j], ' ' | '\t') {
+        j += 1;
+    }
+    let mut delimiter = String::new();
+    let mut quoted = false;
+    let mut complete = true;
+    // 引用の中の退避・展開（`$`・逆引用）を含まないか。引用外の`\EOF`は終端語を引用する定型として含めない。
+    let mut plain = true;
+    // `$'…'`の中の退避。bashは退避を処理した語を終端語にするため、ここでは確定させない。
+    let mut ansi_escape = false;
+    while j < s.len()
+        && !s[j].is_whitespace()
+        && !matches!(s[j], ';' | '|' | '&' | '(' | ')' | '<' | '>')
+    {
+        match s[j] {
+            '\'' => {
+                quoted = true;
+                j += 1;
+                while j < s.len() && s[j] != '\'' {
+                    delimiter.push(s[j]);
+                    j += 1;
+                }
+                if j == s.len() {
+                    complete = false;
+                }
+                j += 1;
+            }
+            '"' => {
+                quoted = true;
+                j += 1;
+                while j < s.len() && s[j] != '"' {
+                    if s[j] == '\\' && matches!(s.get(j + 1), Some('"' | '\\' | '$' | '`')) {
+                        plain = false;
+                        j += 1;
+                    } else if matches!(s[j], '$' | '`') {
+                        plain = false;
+                    }
+                    delimiter.push(s[j]);
+                    j += 1;
+                }
+                if j == s.len() {
+                    complete = false;
+                }
+                j += 1;
+            }
+            '$' if s.get(j + 1) == Some(&'\'') => {
+                quoted = true;
+                plain = false;
+                j += 2;
+                while j < s.len() && s[j] != '\'' {
+                    if s[j] == '\\' {
+                        ansi_escape = true;
+                        j += 1;
+                    }
+                    if j < s.len() {
+                        delimiter.push(s[j]);
+                        j += 1;
+                    }
+                }
+                if j >= s.len() {
+                    complete = false;
+                }
+                j += 1;
+            }
+            '\\' => {
+                quoted = true;
+                if let Some(&next) = s.get(j + 1) {
+                    delimiter.push(next);
+                }
+                j += 2;
+            }
+            other => {
+                if matches!(other, '$' | '`') {
+                    plain = false;
+                }
+                delimiter.push(other);
+                j += 1;
+            }
+        }
+    }
+    let simple = quoted
+        && complete
+        && plain
+        && !delimiter.is_empty()
+        && delimiter
+            .chars()
+            .all(|d| d.is_ascii_alphanumeric() || matches!(d, '_' | '-' | '.'));
+    // bashは`\r`を語の文字として読む。終端語の直後が`\r\n`（CRLFの入力）なら、`\r`も終端語の一部になり、
+    // 終端行は`EOF\r`と完全一致する行に限る（`\r`を除いて比べると、`EOF\r`でない行で早く終わりうる）。
+    if s.get(j) == Some(&'\r') && s.get(j + 1) == Some(&'\n') {
+        delimiter.push('\r');
+    }
+    HeredocHeader {
+        end: j,
+        strip_tabs,
+        delimiter,
+        quoted,
+        complete,
+        simple,
+        ansi_escape,
+    }
+}
+/// strictのPowerShellで`&`の後ろの`'…'`（位置`next`の引用符）を呼出し先として読み取り、(呼出し先, 閉じ引用符の位置)を返す。
+pub(super) fn strict_call_target(s: &[char], next: usize) -> Result<(String, usize)> {
+    let mut target = String::new();
+    let mut end = next + 1;
+    while end < s.len() {
+        let value = s[end];
+        if matches!(value, '\r' | '\n') || ('\u{2018}'..='\u{201e}').contains(&value) {
+            bail!("EncodedCommand invocation target cannot be inspected.");
+        }
+        if value != '\'' {
+            target.push(value);
+            end += 1;
+            continue;
+        }
+        if s.get(end + 1) == Some(&'\'') {
+            target.push('\'');
+            end += 2;
+            continue;
+        }
+        break;
+    }
+    if end == s.len()
+        || target.is_empty()
+        || s.get(end + 1)
+            .is_some_and(|c| !c.is_whitespace() && !matches!(c, ';' | '|' | '&'))
+    {
+        bail!("EncodedCommand invocation target must be a complete static literal.");
+    }
+    if target.starts_with(char::is_whitespace)
+        || target.ends_with(char::is_whitespace)
+        || target.ends_with('.')
+    {
+        bail!("EncodedCommand invocation target has an ambiguous name.");
+    }
+    if leaf(&target) == "reg" {
+        bail!("EncodedCommand quoted reg invocation cannot be inspected.");
+    }
+    Ok((target, end))
+}

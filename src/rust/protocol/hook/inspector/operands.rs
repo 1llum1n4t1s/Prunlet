@@ -40,13 +40,7 @@ impl Inspector {
             let dashed = text.starts_with(['-', '/', '\u{2013}', '\u{2014}', '\u{2015}']);
             if !dashed {
                 // 位置引数。以降すべてが本文（後ろのリダイレクトはwrapper_bodyが除く）。
-                return Some(self.wrapper_body(
-                    &w[j..],
-                    depth,
-                    Some(Mode::PowerShell),
-                    strict,
-                    false,
-                ));
+                return Some(self.wrapper_body(&w[j..], depth, Some(Mode::PowerShell), strict));
             }
             if encoded(text) || file_option(text) || command_option(text) {
                 return None;

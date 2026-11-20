@@ -1,5 +1,13 @@
 use super::*;
 
+/// 深さ0で全体がEncodedCommand呼び出しだけの本文を判定する（一度だけコンパイルする）。
+static STANDALONE_ENCODED: LazyLock<std::result::Result<Regex, regex::Error>> =
+    LazyLock::new(|| {
+        Regex::new(
+            r"(?i)\A[ \t]*(?:pwsh|powershell)(?:\.exe)?[ \t]+-NoProfile[ \t]+-EncodedCommand[ \t]+([A-Za-z0-9+/]+={0,2})[ \t]*\z",
+        )
+    });
+
 mod command;
 mod operands;
 mod posix;
@@ -59,9 +67,7 @@ impl Inspector {
             return Ok(self.detected("inspection depth limit exceeded", &depth.to_string()));
         }
         if depth == 0 {
-            let re = Regex::new(
-                r"(?i)\A[ \t]*(?:pwsh|powershell)(?:\.exe)?[ \t]+-NoProfile[ \t]+-EncodedCommand[ \t]+([A-Za-z0-9+/]+={0,2})[ \t]*\z",
-            )?;
+            let re = compiled(&STANDALONE_ENCODED)?;
             if let Some(m) = re.captures(script) {
                 let data = &m[1];
                 if data.starts_with('/') {

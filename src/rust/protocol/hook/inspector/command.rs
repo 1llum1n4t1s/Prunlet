@@ -1,4 +1,5 @@
 use super::*;
+use std::ops::ControlFlow;
 
 impl Inspector {
     pub(super) fn command(&mut self, w: &[Token], depth: usize, strict: bool) -> Result<bool> {
@@ -86,75 +87,13 @@ impl Inspector {
         let mut i = 0;
         // CMD規則では先頭の`, ; =`も落とし、`cmd`直結の`/c`等を分離する（exec_name参照）。
         let mut current = exec_name_in(&w[0].text, self.mode, self.explicit);
-        // CMDの実行名の位置を、変化がなくなるまで1つのループで整理する。
-        // - リダイレクトと対象語（`call >out del x`・`do >nul del %i`）は実行名ではないので読み飛ばす。
-        // - 接頭辞の記号だけの語（`@ del x`・`, del x`・`@>nul del x`の`@`）は実行名ではないので読み飛ばす。
-        // - `for ... do <cmd>`・`... else <cmd>`の`do`/`else`と`call`を剥がし、後続を実行名として読む
-        //   （字句解析で括弧は文の境界になるため、先頭に残った制御語を剥がす）。
-        // `do,del %i`・`else=del x`・`call,del x`のように区切りで直結した残りも、cmd.exeは
-        // 次の実行名として実行するため、同じ語の位置のまま残りを評価し直す（残りは`w`を借用するだけで複製しない）。
-        // 再帰でなくループで剥がし、大量に並んだ入力でも深さや計算量を増やさない。語を進める処理は語数で、
-        // 同じ語の中で直結した残りを評価し直す処理は`CMD_GLUED_PREFIX_LIMIT`で回数が抑えられる。
-        // POSIXの制御語はposix_prefixが別に扱うため、ここではCMD規則に限定する。
         if self.mode == Some(Mode::Cmd) {
-            // いま実行名として評価している文字列（語全体か、制御語に直結した残り）。
-            let mut text = w[0].text.as_str();
-            // `text`が語全体か（制御語に直結した残りでないか）。リダイレクトは語単位でだけ読み飛ばす。
-            let mut whole = true;
-            // 同じ語の中で直結した残りを評価し直した回数。各評価は残りの長さに比例するため、
-            // `do,do,do,…`のような1語の連鎖で計算量が二乗にならないよう上限を設け、超えたら拒否する。
-            let mut glued_steps = 0usize;
-            loop {
-                // 次の語へ進む語数（0なら今の位置で制御語を判定する）。
-                let skip = if whole && leading_redirect_words(&w[i..i + 1], false) > 0 {
-                    leading_redirect_words(&w[i..], false)
-                } else if (!whole || !w[i].quoted)
-                    && text.trim_start_matches(CMD_NAME_PREFIX).is_empty()
-                {
-                    1
-                } else {
-                    let control = match current.glued {
-                        // 区切りで切れた名前（cmd_prefix_word）。語の引用の有無は問わない（`call,"del" x`）。
-                        Some(_) => cmd_prefix_word(&current.name),
-                        // 引用されていない語全体が`do`/`else`/`call`（先頭の`@ , ; =`は落として比べる）。
-                        // 経路形式（`x/do`）や引用された`"do"`は従来どおり制御語とみなさない。
-                        None => {
-                            let bare = text.trim_start_matches(CMD_NAME_PREFIX);
-                            !w[i].quoted
-                                && (bare.eq_ignore_ascii_case("do")
-                                    || bare.eq_ignore_ascii_case("else")
-                                    || bare.eq_ignore_ascii_case("call"))
-                        }
-                    };
-                    if !control {
-                        break;
-                    }
-                    let rest = current
-                        .glued
-                        .map(|tail| tail.trim_start_matches([',', ';', '=']))
-                        .filter(|tail| !tail.is_empty());
-                    if let Some(rest) = rest {
-                        glued_steps += 1;
-                        if glued_steps > CMD_GLUED_PREFIX_LIMIT {
-                            return Ok(self.detected(
-                                "too many CMD control words joined by delimiters cannot be inspected",
-                                &current.name,
-                            ));
-                        }
-                        text = rest;
-                        whole = false;
-                        current = exec_name_in(text, self.mode, self.explicit);
-                        continue;
-                    }
-                    1
-                };
-                i += skip;
-                if i >= w.len() {
-                    return Ok(false);
+            match self.cmd_exec_position(w, i, current)? {
+                ControlFlow::Break(result) => return Ok(result),
+                ControlFlow::Continue((next, name)) => {
+                    i = next;
+                    current = name;
                 }
-                text = &w[i].text;
-                whole = true;
-                current = exec_name_in(text, self.mode, self.explicit);
             }
         }
         let ExecName {
@@ -293,79 +232,7 @@ impl Inspector {
         }
         // cmd.exeはPowerShell・POSIX shellと異なるswitch規則を持つため専用に解析する。
         if name == "cmd" {
-            // 実行名に直結した`/c`・`,/c`・`=/c`は、直結部分を先頭の語として差し替えた複製で解析する。
-            // 先頭の`, ; =`を落として何も残らない（`cmd,`など）場合は、その語を読み飛ばして続きを解析する。
-            let replaced;
-            let (words, start): (&[Token], usize) = match glued {
-                Some(tail) => {
-                    let head = tail.trim_start_matches([',', ';', '=']);
-                    let mut copy = w.to_vec();
-                    copy[i].text = head.to_owned();
-                    replaced = copy;
-                    (&replaced, if head.is_empty() { i + 1 } else { i })
-                }
-                None => (w, i + 1),
-            };
-            let w = words;
-            return match cmd_switches(w, start) {
-                CmdSwitches::NoBody => {
-                    // cmd.exeでは`;`は引数の区切りなので、本文switchを持たない`cmd`の直後の`;`は
-                    // 後続を引数として受ける（`cmd /d;/c del x`）。字句解析で割れた後続を見落とさない。
-                    if self.cmd_semicolon && self.mode == Some(Mode::Cmd) {
-                        Ok(
-                            self.detected(
-                                "unsupported CMD wrapper switch cannot be inspected",
-                                ";",
-                            ),
-                        )
-                    } else {
-                        Ok(false)
-                    }
-                }
-                CmdSwitches::Unknown(token) => {
-                    Ok(self.detected("unsupported CMD wrapper switch cannot be inspected", &token))
-                }
-                CmdSwitches::Body { token, attached } => {
-                    let rest = &w[token + 1..];
-                    let body = if attached.is_empty() {
-                        if rest.is_empty() {
-                            return Ok(false);
-                        }
-                        if rest.len() == 1 && rest[0].quoted {
-                            rest[0].text.clone()
-                        } else {
-                            rest.iter()
-                                .map(|t| quote_token(t, true))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        }
-                    } else {
-                        // 直結本文は引用し直さず生のまま使う。`/c"rd /s /q x"`を再引用すると
-                        // 1つの実行名になり、本文中の削除を見逃すため。
-                        std::iter::once(attached)
-                            .chain(rest.iter().map(|t| quote_token(t, true)))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    };
-                    if self.contains(&body, depth + 1, Some(Mode::Cmd), strict)? {
-                        return Ok(true);
-                    }
-                    // cmd.exeは本文が`"`で始まると、`/s`なし・引用符がちょうど2つ・間に特殊文字なし・空白あり・
-                    // 引用内が実行ファイル名の全てを満たす場合を除き、最初の`"`と最後の`"`を外して実行する
-                    // （`cmd /c "del x" y`は`del x y`）。実行ファイルの有無は判定できないため、外した形も同じ深さで
-                    // 追加検査し、どちらかで検知すれば拒否する（空白入りパスの実行ファイルを引用する形は両方で通る）。
-                    match body.strip_prefix('"') {
-                        Some(inner) => {
-                            let unquoted = match inner.rfind('"') {
-                                Some(last) => format!("{}{}", &inner[..last], &inner[last + 1..]),
-                                None => inner.to_owned(),
-                            };
-                            self.contains(&unquoted, depth + 1, Some(Mode::Cmd), strict)
-                        }
-                        None => Ok(false),
-                    }
-                }
-            };
+            return self.cmd_wrapper(w, i, glued, depth, strict);
         }
         // 外側の規則（PowerShell・CMD）が何であれ、`sh`・`bash`・`zsh`はPOSIXのoption規則で起動される。
         // 結合flag（`-ec`・`-xc`）や`-c`後の`--`・option（`-c -- "<本文>"`）を、完全一致だけの下の走査が
@@ -404,8 +271,7 @@ impl Inspector {
             if j + 1 >= w.len() {
                 return Ok(false);
             }
-            let cmd = name == "cmd";
-            return self.wrapper_body(&w[j + 1..], depth, shell(&name), strict, cmd);
+            return self.wrapper_body(&w[j + 1..], depth, shell(&name), strict);
         }
         Ok(false)
     }
@@ -420,7 +286,6 @@ impl Inspector {
         depth: usize,
         body_mode: Option<Mode>,
         strict: bool,
-        cmd: bool,
     ) -> Result<bool> {
         let build = |words: &[Token]| {
             if words.len() == 1 && words[0].quoted {
@@ -428,7 +293,7 @@ impl Inspector {
             } else {
                 words
                     .iter()
-                    .map(|t| quote_token(t, cmd))
+                    .map(|t| quote_token(t, false))
                     .collect::<Vec<_>>()
                     .join(" ")
             }
@@ -441,5 +306,164 @@ impl Inspector {
             return self.contains(&build(rest), depth + 1, body_mode, strict);
         }
         Ok(false)
+    }
+    /// CMD規則の実行名の位置を、変化がなくなるまで1つのループで整理する。
+    /// 戻り値の`Break`は検査の結果が確定した場合、`Continue`は整理後の語の位置と実行名。
+    /// 整理の規則は以下のとおり。
+    // CMDの実行名の位置を、変化がなくなるまで1つのループで整理する。
+    // - リダイレクトと対象語（`call >out del x`・`do >nul del %i`）は実行名ではないので読み飛ばす。
+    // - 接頭辞の記号だけの語（`@ del x`・`, del x`・`@>nul del x`の`@`）は実行名ではないので読み飛ばす。
+    // - `for ... do <cmd>`・`... else <cmd>`の`do`/`else`と`call`を剥がし、後続を実行名として読む
+    //   （字句解析で括弧は文の境界になるため、先頭に残った制御語を剥がす）。
+    // `do,del %i`・`else=del x`・`call,del x`のように区切りで直結した残りも、cmd.exeは
+    // 次の実行名として実行するため、同じ語の位置のまま残りを評価し直す（残りは`w`を借用するだけで複製しない）。
+    // 再帰でなくループで剥がし、大量に並んだ入力でも深さや計算量を増やさない。語を進める処理は語数で、
+    // 同じ語の中で直結した残りを評価し直す処理は`CMD_GLUED_PREFIX_LIMIT`で回数が抑えられる。
+    // POSIXの制御語はposix_prefixが別に扱うため、ここではCMD規則に限定する。
+    fn cmd_exec_position<'a>(
+        &mut self,
+        w: &'a [Token],
+        mut i: usize,
+        mut current: ExecName<'a>,
+    ) -> Result<ControlFlow<bool, (usize, ExecName<'a>)>> {
+        // いま実行名として評価している文字列（語全体か、制御語に直結した残り）。
+        let mut text = w[0].text.as_str();
+        // `text`が語全体か（制御語に直結した残りでないか）。リダイレクトは語単位でだけ読み飛ばす。
+        let mut whole = true;
+        // 同じ語の中で直結した残りを評価し直した回数。各評価は残りの長さに比例するため、
+        // `do,do,do,…`のような1語の連鎖で計算量が二乗にならないよう上限を設け、超えたら拒否する。
+        let mut glued_steps = 0usize;
+        loop {
+            // 次の語へ進む語数（0なら今の位置で制御語を判定する）。
+            let skip = if whole && leading_redirect_words(&w[i..i + 1], false) > 0 {
+                leading_redirect_words(&w[i..], false)
+            } else if (!whole || !w[i].quoted)
+                && text.trim_start_matches(CMD_NAME_PREFIX).is_empty()
+            {
+                1
+            } else {
+                let control = match current.glued {
+                    // 区切りで切れた名前（cmd_prefix_word）。語の引用の有無は問わない（`call,"del" x`）。
+                    Some(_) => cmd_prefix_word(&current.name),
+                    // 引用されていない語全体が`do`/`else`/`call`（先頭の`@ , ; =`は落として比べる）。
+                    // 経路形式（`x/do`）や引用された`"do"`は従来どおり制御語とみなさない。
+                    None => {
+                        let bare = text.trim_start_matches(CMD_NAME_PREFIX);
+                        !w[i].quoted
+                            && (bare.eq_ignore_ascii_case("do")
+                                || bare.eq_ignore_ascii_case("else")
+                                || bare.eq_ignore_ascii_case("call"))
+                    }
+                };
+                if !control {
+                    break;
+                }
+                let rest = current
+                    .glued
+                    .map(|tail| tail.trim_start_matches([',', ';', '=']))
+                    .filter(|tail| !tail.is_empty());
+                if let Some(rest) = rest {
+                    glued_steps += 1;
+                    if glued_steps > CMD_GLUED_PREFIX_LIMIT {
+                        return Ok(ControlFlow::Break(self.detected(
+                            "too many CMD control words joined by delimiters cannot be inspected",
+                            &current.name,
+                        )));
+                    }
+                    text = rest;
+                    whole = false;
+                    current = exec_name_in(text, self.mode, self.explicit);
+                    continue;
+                }
+                1
+            };
+            i += skip;
+            if i >= w.len() {
+                return Ok(ControlFlow::Break(false));
+            }
+            text = &w[i].text;
+            whole = true;
+            current = exec_name_in(text, self.mode, self.explicit);
+        }
+        Ok(ControlFlow::Continue((i, current)))
+    }
+    /// cmd.exeはPowerShell・POSIX shellと異なるswitch規則を持つため、専用に解析して本文を再検査する。
+    /// `glued`は実行名に直結していた残り、`i`は実行名の語の位置。
+    fn cmd_wrapper(
+        &mut self,
+        w: &[Token],
+        i: usize,
+        glued: Option<&str>,
+        depth: usize,
+        strict: bool,
+    ) -> Result<bool> {
+        // 実行名に直結した`/c`・`,/c`・`=/c`は、直結部分を先頭の語として差し替えた複製で解析する。
+        // 先頭の`, ; =`を落として何も残らない（`cmd,`など）場合は、その語を読み飛ばして続きを解析する。
+        let replaced;
+        let (words, start): (&[Token], usize) = match glued {
+            Some(tail) => {
+                let head = tail.trim_start_matches([',', ';', '=']);
+                let mut copy = w.to_vec();
+                copy[i].text = head.to_owned();
+                replaced = copy;
+                (&replaced, if head.is_empty() { i + 1 } else { i })
+            }
+            None => (w, i + 1),
+        };
+        let w = words;
+        match cmd_switches(w, start) {
+            CmdSwitches::NoBody => {
+                // cmd.exeでは`;`は引数の区切りなので、本文switchを持たない`cmd`の直後の`;`は
+                // 後続を引数として受ける（`cmd /d;/c del x`）。字句解析で割れた後続を見落とさない。
+                if self.cmd_semicolon && self.mode == Some(Mode::Cmd) {
+                    Ok(self.detected("unsupported CMD wrapper switch cannot be inspected", ";"))
+                } else {
+                    Ok(false)
+                }
+            }
+            CmdSwitches::Unknown(token) => {
+                Ok(self.detected("unsupported CMD wrapper switch cannot be inspected", &token))
+            }
+            CmdSwitches::Body { token, attached } => {
+                let rest = &w[token + 1..];
+                let body = if attached.is_empty() {
+                    if rest.is_empty() {
+                        return Ok(false);
+                    }
+                    if rest.len() == 1 && rest[0].quoted {
+                        rest[0].text.clone()
+                    } else {
+                        rest.iter()
+                            .map(|t| quote_token(t, true))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }
+                } else {
+                    // 直結本文は引用し直さず生のまま使う。`/c"rd /s /q x"`を再引用すると
+                    // 1つの実行名になり、本文中の削除を見逃すため。
+                    std::iter::once(attached)
+                        .chain(rest.iter().map(|t| quote_token(t, true)))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                if self.contains(&body, depth + 1, Some(Mode::Cmd), strict)? {
+                    return Ok(true);
+                }
+                // cmd.exeは本文が`"`で始まると、`/s`なし・引用符がちょうど2つ・間に特殊文字なし・空白あり・
+                // 引用内が実行ファイル名の全てを満たす場合を除き、最初の`"`と最後の`"`を外して実行する
+                // （`cmd /c "del x" y`は`del x y`）。実行ファイルの有無は判定できないため、外した形も同じ深さで
+                // 追加検査し、どちらかで検知すれば拒否する（空白入りパスの実行ファイルを引用する形は両方で通る）。
+                match body.strip_prefix('"') {
+                    Some(inner) => {
+                        let unquoted = match inner.rfind('"') {
+                            Some(last) => format!("{}{}", &inner[..last], &inner[last + 1..]),
+                            None => inner.to_owned(),
+                        };
+                        self.contains(&unquoted, depth + 1, Some(Mode::Cmd), strict)
+                    }
+                    None => Ok(false),
+                }
+            }
+        }
     }
 }

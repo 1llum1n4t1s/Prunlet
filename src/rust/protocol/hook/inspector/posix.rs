@@ -1,5 +1,9 @@
 use super::*;
 
+/// for/selectの変数名（一度だけコンパイルする）。
+static LOOP_VARIABLE: LazyLock<std::result::Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"\A[A-Za-z_][A-Za-z0-9_]*\z"));
+
 impl Inspector {
     pub(super) fn posix_prefix(
         &mut self,
@@ -38,7 +42,7 @@ impl Inspector {
             // loopの変数名とin以降はdata。展開されるsubexpressionは上の字句検査で調べる。
             if words.len() >= 2
                 && !words[1].dynamic
-                && Regex::new(r"\A[A-Za-z_][A-Za-z0-9_]*\z")?.is_match(&words[1].text)
+                && compiled(&LOOP_VARIABLE)?.is_match(&words[1].text)
                 && (words.len() == 2 || words[2].text == "in")
             {
                 return Ok(Some(false));
