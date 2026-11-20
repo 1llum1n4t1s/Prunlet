@@ -50,6 +50,7 @@ runtimeは`win-x64`・`win-arm64`・`linux-x64`・`linux-arm64`・`osx-arm64`・
 
 - 署名用のSecrets `SIGILUNE_EMAIL`・`SIGILUNE_TOTP_URI` は、Environment `release`（承認者なし。タグ`v<x.y.z>`だけ許可）にだけ置く。workflowは署名stepだけへ渡し、Rustのビルド（依存crateのbuild scriptを含む）には渡さない。同じEnvironmentに`PRUNLET_RELEASE_SIGNING_KEY`と`CLOUDFLARE_API_TOKEN`も置き、それぞれ関門・R2の各stepだけへ渡す。
 - 別マシンの並列jobが同じTOTP時間枠を使うとCertumが後者を拒否するため、win-x64・win-arm64を1つのjobで扱い、同じSigiluneセッションで署名してログインを1回にする。v1.0.0公開前のSigiluneで1回の呼出しに複数ファイルを渡すと、signtoolの異常終了やdlibのpanicが観測されたため、1ファイルずつ呼び出す。失敗時に自動再試行しない。
+- Sigiluneは自作の移動タグ`@v1`で使う（v1はその版のR2配信が成功したcommitへだけ動かす）。導入する版はactionが指すcommitのCargo.tomlの版から決まり、`version`入力で別の版を指定しない（R2に無い古い版を指定すると導入に失敗するため）。
 - 署名・検証の処理は`scripts/Signing.Common.ps1`と`scripts/Sign-PrunletBuild.ps1`に集約する。署名後はSigiluneの検証に加えて、Windowsの判定が`Valid`であること、署名者の共通名、タイムスタンプの存在を独立に確認する。タイムスタンプがないと証明書の期限切れ後に`Valid`でなくなり、公開済みクライアント（NotSigned・Valid以外を拒否する）が更新を受け付けなくなる。
 
 ## 公開の順序
@@ -61,7 +62,7 @@ runtimeは`win-x64`・`win-arm64`・`linux-x64`・`linux-arm64`・`osx-arm64`・
 1. `Assert-PrunletReleaseRef.ps1`がタグ名と`Cargo.toml`の版、軽量タグがイベントのcommitを指すこと、HEADとイベントのcommit、既定ブランチの祖先であることを確認し、鍵整合の関門を通す。続けて`scripts/Invoke-PrunletTests.ps1 -Mode Standard`（`cargo test --locked`）を実行し、失敗したら署名・R2配置へ進まない。起動時更新の検証用cfg（`prunlet_windows_update_tests`）のテストは、`main`のpushとPRで動く`.github/workflows/prunlet-tests.yml`の`update-cfg` jobが担う（配信jobでは動かさない）。
 2. win-x64・win-arm64を`Publish-Prunlet.ps1`でビルドし、製品の版を照合する。
 3. Sigiluneを導入し、`Sign-PrunletBuild.ps1`で両runtimeの実行ファイルを署名する。署名後のhashと署名者・署名前hashを`build-manifest.json`へ記録する。
-4. `Package-PrunletUpdate.ps1`で梱包し、`Verify-ReleasePackage.ps1 -RequireSignature`が同梱物・版・machine・metadata・hashと署名を検証する。
+4. `Package-PrunletUpdate.ps1`で梱包し、`Verify-ReleasePackage.ps1 -RequireSignature`が、entryの過不足・重複、metadataの取得元・commit・runtime・版、machine、全同梱ファイルの長さ・SHA-256を今回のpublish出力・sourceと照合し、各実行ファイルの署名・署名者・タイムスタンプを確認する。
 5. `Publish-PrunletR2.ps1 -CheckOnly`が全runtimeの既存マニフェストと最新ポインタを読取りだけで検査し、続けて`Publish-PrunletR2.ps1`が署名を含めて再検証したZIPを、上の順序でR2へ置いて署名付きマニフェストを発行する。R2 SDK連携は`R2Distribution.Common.ps1`に置く。
 
 再実行は、原因を確認してから同じタグ`v<版>`のrefで`workflow_dispatch`する（`gh workflow run prunlet-release-package.yml --ref v<版>`）。署名の失敗を自動で再実行しない。同じ版を再ビルドするとZIPのhashが変わるため、配信済みの版の再配信はpayloadの不一致で失敗する（patchを上げて新しいタグ`v<版>`を切る）。
