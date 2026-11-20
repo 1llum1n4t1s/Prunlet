@@ -44,6 +44,13 @@ jobs:
         run: |
           rustup target add x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Cache Rust build
+        # 保存は main だけ（PR は復元のみ）。配信 workflow には入れない。
+        # target はリポジトリ外の固定ディレクトリ（Invoke-PrunletTests.ps1 の -CargoTargetDirectory）へ置いてキャッシュする。
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: '. -> ../prunlet-cargo-target'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run the Rust tests
         # GitHub ランナーの既定 TEMP は 8.3 短縮名（例: RUNNER~1 を含むパス）を含み、Prunlet は祖先パスの短縮名を
         # 「固定名が変わる」として拒否するため、テストの fixture が作れない。長い名前の runner.temp を TEMP/TMP にする。
@@ -51,7 +58,7 @@ jobs:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
           RUST_BACKTRACE: '1'
-        run: ./scripts/Invoke-PrunletTests.ps1 -Mode Standard
+        run: ./scripts/Invoke-PrunletTests.ps1 -Mode Standard -CargoTargetDirectory (Join-Path (Split-Path $env:GITHUB_WORKSPACE) 'prunlet-cargo-target')
 
   update-cfg:
     name: cargo test (windows, update cfg)
@@ -69,6 +76,13 @@ jobs:
         run: |
           rustup target add x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Cache Rust build
+        # 保存は main だけ（PR は復元のみ）。配信 workflow には入れない。
+        # target はリポジトリ外の固定ディレクトリ（Invoke-PrunletTests.ps1 の -CargoTargetDirectory）へ置いてキャッシュする。
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: '. -> ../prunlet-cargo-target'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run the update-path tests with the verification cfg
         # GitHub ランナーの既定 TEMP は 8.3 短縮名（例: RUNNER~1 を含むパス）を含み、Prunlet は祖先パスの短縮名を
         # 「固定名が変わる」として拒否するため、テストの fixture が作れない。長い名前の runner.temp を TEMP/TMP にする。
@@ -76,4 +90,4 @@ jobs:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
           RUST_BACKTRACE: '1'
-        run: ./scripts/Invoke-PrunletTests.ps1 -Mode UpdateCfg
+        run: ./scripts/Invoke-PrunletTests.ps1 -Mode UpdateCfg -CargoTargetDirectory (Join-Path (Split-Path $env:GITHUB_WORKSPACE) 'prunlet-cargo-target')

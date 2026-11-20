@@ -6,7 +6,10 @@ param(
     #            製品ビルド・公開には使わない（AGENTS.md の起動時更新の項）。
     [ValidateSet('Standard', 'UpdateCfg')][string]$Mode = 'Standard',
     # Cargo の target と native_* テストの fixture を置く外部の作業領域。未指定なら RUNNER_TEMP、無ければ既定の一時フォルダー。
-    [string]$WorkDirectory
+    [string]$WorkDirectory,
+    # Cargo の target を置く固定の外部ディレクトリ（CI のビルドキャッシュ用）。絶対パスかつリポジトリ外だけ受け付ける。
+    # 未指定なら従来どおり、作業領域の下に実行ごとの一意の target を作る。
+    [string]$CargoTargetDirectory
 )
 # Windows の Rust テストをリポジトリ外の出力先で実行する（AGENTS.md「ビルドと検証」の Windows 手順）。
 # - Cargo の出力先はリポジトリの外へ隔離する。TEMP/TMP は上書きしない（ランナー・開発機の既定の一時フォルダーを使う）。
@@ -20,15 +23,23 @@ $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $base = if ($WorkDirectory) { $WorkDirectory } elseif ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
 if (-not [IO.Path]::IsPathFullyQualified($base)) { throw 'WorkDirectory must be absolute.' }
 $base = [IO.Path]::GetFullPath($base)
-if ($base.Equals($repoRoot, [StringComparison]::OrdinalIgnoreCase) -or $base.StartsWith($repoRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+function Test-InsideRepository([string]$Path) {
+    $Path.Equals($repoRoot, [StringComparison]::OrdinalIgnoreCase) -or $Path.StartsWith($repoRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+if (Test-InsideRepository $base) {
     throw 'WorkDirectory must be outside the repository.'
 }
 $work = Join-Path $base ('prunlet-tests-' + $Mode.ToLowerInvariant() + '-' + [guid]::NewGuid().ToString('N'))
 $targetRoot = Join-Path $work 'cargo-target'
+if ($CargoTargetDirectory) {
+    if (-not [IO.Path]::IsPathFullyQualified($CargoTargetDirectory)) { throw 'CargoTargetDirectory must be absolute.' }
+    $targetRoot = [IO.Path]::GetFullPath($CargoTargetDirectory)
+    if (Test-InsideRepository $targetRoot) { throw 'CargoTargetDirectory must be outside the repository.' }
+}
 # native_* テストはゴミ箱が有効なボリューム上の fixture を要求する。TEMP が即時削除設定のボリュームだと
 # 明示的に失敗するため、呼び出し側が指定していなければ作業領域の下を使う（テストはその下に一意の fixture を作る）。
 $recycleRoot = Join-Path $work 'native-recycle'
-New-Item -ItemType Directory -Path $targetRoot, $recycleRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $targetRoot, $recycleRoot | Out-Null
 
 $cargo = Get-Command cargo.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
 if (!$cargo) { $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe' }
