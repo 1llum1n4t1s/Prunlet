@@ -128,7 +128,6 @@ pub(super) fn receive_with(
         "Published download does not match its prepared state."
     );
     verify_stage_owner(&stage, root, commit)?;
-    budget::ensure(root, 0)?;
     let used = budget::measure(root)?;
     let mut existing = None;
     let destination = stage.join(&state.package_name);

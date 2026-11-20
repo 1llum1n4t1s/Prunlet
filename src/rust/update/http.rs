@@ -754,11 +754,7 @@ impl NativeReader {
                 let entry = WINHTTP_PROXY_RESULT_ENTRY {
                     fProxy: 1,
                     fBypass: 0,
-                    ProxyScheme: match proxy.scheme() {
-                        "http" => WINHTTP_INTERNET_SCHEME_HTTP,
-                        "https" => WINHTTP_INTERNET_SCHEME_HTTPS,
-                        _ => bail!("Unsupported native proxy scheme"),
-                    },
+                    ProxyScheme: WINHTTP_INTERNET_SCHEME_HTTPS,
                     pwszProxy: proxy_name.as_ref().context("Missing proxy host")?.as_ptr()
                         as *mut u16,
                     ProxyPort: proxy

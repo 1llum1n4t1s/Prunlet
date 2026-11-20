@@ -29,11 +29,24 @@ pub fn now() -> DateTime<FixedOffset> {
         .unwrap()
         .fixed_offset()
 }
+type FixedRegex = std::sync::LazyLock<std::result::Result<regex::Regex, regex::Error>>;
+// serializeが使う固定パターン。一度だけコンパイルし、失敗は呼出し側へErrで返す。
+static DATE_FIELDS: FixedRegex = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#""(createdUtc|closedUtc)": "((?:\\.|[^"\\])*)""#)
+});
+static BASE64_FIELDS: FixedRegex = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#""(security|data|contextSecurity|directorySecurity)": "((?:\\.|[^"\\])*)""#)
+});
+fn compiled(pattern: &'static FixedRegex) -> Result<&'static regex::Regex> {
+    pattern
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
 // 所有予約のhashは.NET由来の途中公開にも一致させる。日時専用writerは文字列encoderを通らない。
 pub fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let bytes = super::session::dotnet_serialize(value)?;
     let source = std::str::from_utf8(&bytes)?;
-    let pattern = regex::Regex::new(r#""(createdUtc|closedUtc)": "((?:\\.|[^"\\])*)""#)?;
+    let pattern = compiled(&DATE_FIELDS)?;
     let mut output = String::with_capacity(source.len());
     let mut previous = 0;
     for captures in pattern.captures_iter(source) {
@@ -53,9 +66,7 @@ pub fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     }
     output.push_str(&source[previous..]);
     let source = output;
-    let pattern = regex::Regex::new(
-        r#""(security|data|contextSecurity|directorySecurity)": "((?:\\.|[^"\\])*)""#,
-    )?;
+    let pattern = compiled(&BASE64_FIELDS)?;
     let mut output = String::with_capacity(source.len());
     let mut previous = 0;
     for captures in pattern.captures_iter(&source) {

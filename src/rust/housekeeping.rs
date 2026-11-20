@@ -52,7 +52,7 @@ pub const LEGACY_QUIET_HOURS: u64 = 24;
 /// 1回の保守で削除する件数の上限（保守が長引かないようにする。残りは次回に回る）。
 pub const MAX_REMOVALS_PER_RUN: usize = 64;
 
-const STATE_NAME: &str = ".prunlet-update-state.json";
+use crate::update::state::STATE_NAME;
 /// 状態ファイルとして読む上限（`update::coordinator::read_state` と同じ64 KiB）。
 const STATE_READ_LIMIT: u64 = 65536;
 /// 最終更新の探索で辿る深さ・件数の上限（巨大な木で保守を止めないため）。
@@ -170,14 +170,9 @@ fn is_plain_dir(meta: &fs::Metadata) -> bool {
 fn is_plain_file(meta: &fs::Metadata) -> bool {
     meta.is_file() && !is_reparse(meta)
 }
-#[cfg(windows)]
 fn is_reparse(meta: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     meta.file_type().is_symlink() || meta.file_attributes() & 0x400 != 0
-}
-#[cfg(not(windows))]
-fn is_reparse(meta: &fs::Metadata) -> bool {
-    meta.file_type().is_symlink()
 }
 
 /// 大文字小文字を区別しない（Windows）成分比較用の正規化。

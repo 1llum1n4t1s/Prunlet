@@ -433,7 +433,12 @@ const INSTRUCTIONS: &str = r#"Use delete_files for authorized absolute Windows f
 const INSTRUCTIONS: &str = "Use delete_files for authorized absolute macOS paths. Set recursive=true for directory contents. Files move to the macOS Trash without operation records. Links are handled without following their targets. Inspect the source and Trash after ambiguous results. The queue waits for cooperative flock locks.";
 #[cfg(target_os = "linux")]
 const INSTRUCTIONS: &str = "Use delete_files for authorized absolute Linux paths. Set recursive=true for directory contents. Items move to the freedesktop home Trash on the same mount. Links are handled without following their targets. Inspect the source and Trash after ambiguous results.";
+/// OS別の絞り込み後のtool一覧。初回だけ解析し、以降は不変値を複製して返す。
 fn tools() -> Value {
+    static TOOLS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    TOOLS.get_or_init(build_tools).clone()
+}
+fn build_tools() -> Value {
     let tools: Vec<Value> =
         serde_json::from_str(include_str!("tools.json")).expect("embedded MCP schemas");
     #[cfg(windows)]

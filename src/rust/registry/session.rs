@@ -4,7 +4,11 @@ use crate::{config::Config, service::Progress};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{cell::RefCell, sync::Arc};
+use std::{cell::RefCell, sync::Arc, sync::LazyLock};
+
+// native sessionのpipe名（一度だけコンパイルする）。
+static PIPE_NAME: LazyLock<std::result::Result<regex::Regex, regex::Error>> =
+    LazyLock::new(|| regex::Regex::new(r"\Aprunlet-registry-[0-9a-f]{32}\z"));
 
 thread_local! { static CONTEXT:RefCell<Option<Scope>>=const {RefCell::new(None)}; }
 pub fn current_scope() -> Option<Scope> {
@@ -1201,7 +1205,9 @@ mod windows {
                 && descriptor.executable_sha256 == me.hash
                 && descriptor.server_process_id > 0
                 && descriptor.server_creation_time > 0
-                && regex::Regex::new(r"\Aprunlet-registry-[0-9a-f]{32}\z")?
+                && PIPE_NAME
+                    .as_ref()
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?
                     .is_match(&descriptor.pipe_name)
                 && expiry > Utc::now()
                 && expiry <= Utc::now() + Duration::minutes(61),
