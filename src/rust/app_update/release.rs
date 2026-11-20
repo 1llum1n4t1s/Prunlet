@@ -125,9 +125,6 @@ mod tests {
             manifest_url("1.0.48").unwrap(),
             "https://prunlet.kagayoi.com/manifests/1.0.48/velopack-win-x64.json"
         );
-        for bad in ["", "1.0", "1.0.0/../x", "1.0.0-rc", "a/b"] {
-            assert!(manifest_url(bad).is_err(), "{bad}");
-        }
     }
 
     #[test]

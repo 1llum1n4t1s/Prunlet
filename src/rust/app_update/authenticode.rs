@@ -423,13 +423,14 @@ mod tests {
     }
 
     /// 署名済みの prunlet.exe がある環境でだけ、実物の署名・版・タイムスタンプの読み取りを確かめる。
-    /// `PRUNLET_TEST_SIGNED_FILE`（読み取り専用の複製を指す）を指定したときだけ走る。
+    /// `PRUNLET_TEST_SIGNED_FILE`（読み取り専用の複製を指す）を指定して `--include-ignored` で実行する。
     #[test]
+    #[ignore = "PRUNLET_TEST_SIGNED_FILE に署名済みファイルを指定して --include-ignored で実行"]
     fn signed_file_probe() {
-        let Some(file) = std::env::var_os("PRUNLET_TEST_SIGNED_FILE") else {
-            return;
-        };
-        let file = std::path::PathBuf::from(file);
+        let file = std::path::PathBuf::from(
+            std::env::var_os("PRUNLET_TEST_SIGNED_FILE")
+                .expect("PRUNLET_TEST_SIGNED_FILE に署名済みファイルを指定してください"),
+        );
         let signature = signature_facts(&file);
         assert!(signature.valid, "{signature:?}");
         assert!(signature.timestamped, "{signature:?}");

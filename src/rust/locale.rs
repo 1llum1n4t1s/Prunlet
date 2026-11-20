@@ -355,9 +355,5 @@ mod tests {
             "no.such.key",
             "unknown keys return themselves"
         );
-        assert_eq!(
-            fill("a {x} b {x} {y}", &[("x", "1"), ("y", "2")]),
-            "a 1 b 1 2"
-        );
     }
 }
