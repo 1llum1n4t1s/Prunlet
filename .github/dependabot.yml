@@ -38,3 +38,13 @@ updates:
       - patch
   commit-message:
     prefix: deps
+- package-ecosystem: rust-toolchain
+  directory: /
+  schedule:
+    interval: weekly
+    day: monday
+    time: '09:00'
+    timezone: Asia/Tokyo
+  open-pull-requests-limit: 5
+  commit-message:
+    prefix: deps
