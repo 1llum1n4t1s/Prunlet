@@ -163,7 +163,7 @@ function Run-CaseQ([string]$Name, [scriptblock]$Body) {
     catch { $case.error = $_.Exception.Message }
 }
 
-function Invoke-McpQ($Session, [int]$Id, [string]$Method, [hashtable]$Parameters) {
+function Invoke-McpQ($Session, [int]$Id, [string]$Method, [hashtable]$Parameters, [switch]$AllowError) {
     $request = @{ jsonrpc = '2.0'; id = $Id; method = $Method; params = $Parameters }
     $Session.process.StandardInput.WriteLine(($request | ConvertTo-Json -Depth 30 -Compress))
     $Session.process.StandardInput.Flush()
@@ -176,6 +176,7 @@ function Invoke-McpQ($Session, [int]$Id, [string]$Method, [hashtable]$Parameters
         $message = $line | ConvertFrom-Json -AsHashtable -Depth 50
         $invocations.Add(@{ transport = 'stdio-mcp'; request = $request; response = $message })
         if ($message.ContainsKey('id') -and $message.id -eq $Id) {
+            if ($AllowError) { return $message }
             Assert-Q (!$message.error) 'MCP returned a protocol error.'
             return $message.result
         }
@@ -280,6 +281,30 @@ try {
             }
         }
         $case.observed.unchangedFiles = $expected.Count
+    }
+    Run-CaseQ 'cli-257-paths-refused-without-worker' {
+        param($case)
+        $fixture = New-FixtureQ 'queue-over-limit'
+        $paths = @($fixture.root) + @(1..256 | ForEach-Object { Join-Path $fixture.root ('absent-' + $_) })
+        $pathsFile = Join-Path $OutputDirectory 'queue-over-limit-paths.json'
+        [IO.File]::WriteAllText($pathsFile, (ConvertTo-Json -InputObject $paths), $utf8)
+        $expected = [ordered]@{
+            file = 'Paths file must contain between 1 and 256 path strings; no targets were changed. This is an input limit, not a policy refusal: split larger lists into paths files of at most 256 entries and run the same command once per file. Pass a parent folder once with --recursive only when the whole folder is authorized for deletion.'
+            list = 'Specify between 1 and 256 paths for a queued deletion; no targets were changed. This is an input limit, not a policy refusal: split larger lists into queued jobs of at most 256 paths.'
+        }
+        $byFile = Invoke-Q @('delete-queue', '--recursive', '--paths-file', $pathsFile) $AcceptanceTimeoutSeconds
+        # 引数列はCMDの長さ上限（約8191文字）に収めるため、件数の検査が先に働く短い絶対パスを使う。
+        $shortPaths = @($fixture.root) + @(1..256 | ForEach-Object { 'C:\q\' + $_ })
+        $byList = Invoke-Q (@('delete-queue', '--recursive', '--') + $shortPaths) $AcceptanceTimeoutSeconds
+        $case.observed.byFile = $byFile
+        $case.observed.byList = $byList
+        foreach ($response in @($byFile, $byList)) {
+            if ($response.json.jobId -and $response.json.workerProcessId -gt 0) { $ownedJobs.Add($response.json) }
+            Assert-Q ($response.exitCode -ne 0 -and !$response.json.jobId) 'An over-limit queue request started a job.'
+        }
+        Assert-Q ($byFile.json.error -ceq $expected.file) 'Over-limit paths file was not refused with the split guidance.'
+        Assert-Q ($byList.json.error -ceq $expected.list) 'Over-limit argument list was not refused with the split guidance.'
+        Assert-Q ([IO.File]::ReadAllText($fixture.child) -ceq $fixture.content) 'Refused queue request changed the target.'
     }
     Run-CaseQ 'locked-child-completes-after-release' {
         param($case)
@@ -598,6 +623,12 @@ try {
             $null = Invoke-McpQ $session 1 'initialize' @{ protocolVersion = '2024-11-05'; capabilities = @{}; clientInfo = @{ name = 'deferred-delete-e2e'; version = '1' } }
             $process.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
             $process.StandardInput.Flush()
+            # 上限（256）を1件超えた受付は、workerを起動せず-32602で拒否する。
+            $overPaths = @($fixture.root) + @(1..256 | ForEach-Object { Join-Path $fixture.root ('absent-' + $_) })
+            $refused = Invoke-McpQ $session 6 'tools/call' @{ name = 'delete_files'; arguments = @{ action = 'enqueue'; paths = $overPaths; recursive = $true } } -AllowError
+            $case.observed.overLimitResponse = $refused
+            Assert-Q ($refused.error.code -eq -32602 -and $refused.error.message -ceq 'Paths must contain 1 to 256 strings; no targets were changed. This is an input limit, not a policy refusal: call delete_files again with batches of at most 256 paths. Pass a parent folder once with recursive=true only when the whole folder is authorized for deletion.') 'MCP did not refuse 257 queued paths with the split guidance.'
+            Assert-Q ([IO.File]::ReadAllText($fixture.child) -ceq $fixture.content) 'Refused MCP enqueue changed the target.'
             $accepted = Invoke-McpQ $session 2 'tools/call' @{ name = 'delete_files'; arguments = @{ action = 'enqueue'; paths = @($fixture.root); recursive = $true } }
             Assert-Q (!$accepted.isError -and $accepted.structuredContent.status -ceq 'pending') 'MCP failed to accept the locked fixture.'
             $job = $accepted.structuredContent

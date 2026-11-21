@@ -1,5 +1,8 @@
 //! キューの実体snapshotと結果はworkerのメモリーにだけ保持する。
-use super::recordless::{self, Snapshot};
+use super::{
+    PathLimit,
+    recordless::{self, Snapshot},
+};
 use crate::{
     config::Config,
     json::parse_unique,
@@ -96,7 +99,7 @@ pub fn enqueue(config: &Config, args: &Value) -> Result<Value> {
             return Err(std::io::Error::from_raw_os_error(error as i32).into());
         }
     }
-    recordless::normalize_paths(config, args)?;
+    recordless::normalize_paths(config, args, PathLimit::Queue)?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     let request = json!({"jobId":id,"paths":args["paths"],"recursive":args["recursive"].as_bool().unwrap_or(false)});
     let executable = std::env::current_exe()?;
@@ -479,7 +482,7 @@ pub fn worker(config: &Config) -> Result<Value> {
         return Ok(Value::Null);
     };
     let accepted = (|| -> Result<_> {
-        let paths = recordless::normalize_paths(config, &request)?;
+        let paths = recordless::normalize_paths(config, &request, PathLimit::Queue)?;
         recordless::validate_queued_paths(config, &paths)?;
         let mut snapshots = vec![];
         let mut count = 0;

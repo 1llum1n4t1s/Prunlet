@@ -178,8 +178,8 @@ fn serve(config: &Config, base: &str) -> Result<Value> {
         return Ok(json!({"status":"stopped"}));
     };
     let paths = request["paths"].as_array().context("paths missing")?;
-    if paths.is_empty() || paths.len() > 256 {
-        bail!("Queue permits 1..256 paths");
+    if paths.is_empty() || paths.len() > crate::files::QUEUE_PATH_LIMIT {
+        bail!(crate::files::queue_count_error());
     }
     let reservation = prepare_queue(config, &request)?;
     #[cfg(all(debug_assertions, prunlet_macos_race_tests))]
@@ -538,6 +538,12 @@ pub(super) fn execute(
     }
     if command != "delete-queue" {
         bail!("Unsupported macOS queue command");
+    }
+    // worker起動前（クライアント側）にも件数を検査し、上限超過をworkerなしで拒否する。
+    if args["paths"].as_array().is_none_or(|paths| {
+        paths.is_empty() || paths.len() > crate::files::QUEUE_PATH_LIMIT
+    }) {
+        bail!(crate::files::queue_count_error());
     }
     if serde_json::to_vec(args)?.len() >= LIMIT {
         bail!("Queue input exceeds 1 MiB");

@@ -154,7 +154,7 @@ C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet
 C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete --paths-file C:\work\delete-paths.json
 ```
 
-请把可执行文件和配置替换为已安装的绝对路径。在 Codex 中请指定 `cmd.exe` 和 `login: false`。含空格、Unicode、数量多或路径长的目标，不要在 shell 中展开，请以 UTF-8 JSON 数组中的绝对路径传递。`--paths-file` 接受 1 到 256 项，最大 1 MiB。
+请把可执行文件和配置替换为已安装的绝对路径。在 Codex 中请指定 `cmd.exe` 和 `login: false`。含空格、Unicode、数量多或路径长的目标，不要在 shell 中展开，请以 UTF-8 JSON 数组中的绝对路径传递。`--paths-file` 在 Windows 上接受 1 到 1024 项、最大 4 MiB（macOS 和 Linux 为 256 项、1 MiB）；MCP 的 `delete_files` 和 `delete-queue` 每次请求最多 256 项。超出上限的请求会整体被拒绝且不做任何更改，请拆分后再传递。
 
 ```json
 ["C:\\work\\project\\unused.txt", "C:\\work\\project\\other.txt"]

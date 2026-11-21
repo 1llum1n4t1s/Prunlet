@@ -154,7 +154,7 @@ C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet
 C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete --paths-file C:\work\delete-paths.json
 ```
 
-실행 파일과 구성은 설치된 절대 경로로 바꾸십시오. Codex에서는 `cmd.exe`와 `login: false`를 지정합니다. 공백, Unicode, 많은 수, 긴 대상 경로는 shell에서 확장하지 말고 UTF-8 JSON 배열의 절대 경로로 전달합니다. `--paths-file`은 1~256개, 최대 1 MiB입니다.
+실행 파일과 구성은 설치된 절대 경로로 바꾸십시오. Codex에서는 `cmd.exe`와 `login: false`를 지정합니다. 공백, Unicode, 많은 수, 긴 대상 경로는 shell에서 확장하지 말고 UTF-8 JSON 배열의 절대 경로로 전달합니다. `--paths-file`은 Windows에서 1~1024개, 최대 4 MiB(macOS·Linux는 256개, 1 MiB)이며, MCP `delete_files`와 `delete-queue`는 요청당 256개까지입니다. 한도를 넘는 요청은 아무것도 변경하지 않고 전체가 거부되므로 나누어 전달하십시오.
 
 ```json
 ["C:\\work\\project\\unused.txt", "C:\\work\\project\\other.txt"]

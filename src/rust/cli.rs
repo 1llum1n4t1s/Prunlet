@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::{
     config::{Config, ConfigData},
+    files::{PathLimit, paths_file_bytes_error, paths_file_count_error},
     platform,
     service::{Backend, Runtime},
 };
@@ -331,20 +332,50 @@ fn initialize(path: &Path, args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
-fn read_paths(path: &str) -> Result<Vec<String>> {
-    let bytes = platform::read_plain_file(Path::new(path), 1024 * 1024, true)?;
+/// `read_plain_file`の失敗が`--paths-file`のバイト上限超過によるものかを返す。
+/// リンク（reparse point・複数リンク・シンボリックリンク）や通常ファイルでない対象の拒否は、
+/// 元の文言を保つため偽にする。
+fn exceeded_byte_limit(path: &str, limit: PathLimit, error: &anyhow::Error) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() <= limit.file_bytes() as u64 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        // Windowsの読み取りは、上限超過だけ固有の文言で失敗する（リンクは別の文言）。
+        error.to_string().contains("exceeds its byte limit")
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = error;
+        meta.nlink() == 1
+    }
+}
+
+fn read_paths(path: &str, limit: PathLimit) -> Result<Vec<String>> {
+    let bytes = match platform::read_plain_file(Path::new(path), limit.file_bytes(), true) {
+        Ok(bytes) => bytes,
+        // 読み取り失敗の原因がバイト上限超過だったときだけ、分割の案内つきの文言へ置き換える。
+        Err(error) if exceeded_byte_limit(path, limit, &error) => {
+            bail!(paths_file_bytes_error(limit))
+        }
+        Err(error) => return Err(error),
+    };
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
     let paths: Vec<String> = serde_json::from_slice(bytes)?;
     ensure!(
-        (1..=256).contains(&paths.len()),
-        "Paths file must contain between 1 and 256 path strings."
+        (1..=limit.count()).contains(&paths.len()),
+        paths_file_count_error(limit)
     );
     Ok(paths)
 }
 
-fn targets(args: &[String], offset: usize) -> Result<Vec<String>> {
+fn targets(args: &[String], offset: usize, limit: PathLimit) -> Result<Vec<String>> {
     if args.len() == offset + 2 && args[offset] == "--paths-file" {
-        read_paths(&args[offset + 1])
+        read_paths(&args[offset + 1], limit)
     } else if args.len() > offset + 1 && args[offset] == "--" {
         Ok(args[offset + 1..].to_vec())
     } else {
@@ -368,12 +399,12 @@ fn parse_command(command: &str, args: &[String]) -> Result<Value> {
                 };
                 offset += 1;
             }
-            Ok(json!({"paths":targets(args,offset)?,"dryRun":dry_run,"recursive":recursive}))
+            Ok(json!({"paths":targets(args,offset,PathLimit::Sync)?,"dryRun":dry_run,"recursive":recursive}))
         }
         "delete-queue" => {
             let recursive = args.first().is_some_and(|a| a == "--recursive");
             Ok(
-                json!({"paths":targets(args,usize::from(recursive))?,"recursive":recursive,"action":"enqueue"}),
+                json!({"paths":targets(args,usize::from(recursive),PathLimit::Queue)?,"recursive":recursive,"action":"enqueue"}),
             )
         }
         "delete-queue-status" | "delete-queue-cancel" => {

@@ -92,6 +92,27 @@ pub fn within(path: &Path, root: &Path) -> bool {
     );
     path == root || path.starts_with(&(root + "\\"))
 }
+/// `within`と同じ正規化（大文字小文字・区切り・root末尾の`\`）を1回だけ行った比較用の鍵。
+/// 多数のパスの総当たり比較で、比較ごとの大文字化の確保を避けるために使う。判定は`within`と一致させる。
+pub struct OverlapKey {
+    path: String,
+    root: String,
+}
+impl OverlapKey {
+    pub fn new(path: &Path) -> Self {
+        let path = super::upper(&path.to_string_lossy().replace('/', "\\"));
+        let root = path.trim_end_matches('\\').to_string();
+        Self { path, root }
+    }
+    /// `within(self, other)`と同じ判定（等しい、または`other`の配下）。
+    pub fn within(&self, other: &OverlapKey) -> bool {
+        self.path == other.root
+            || self
+                .path
+                .strip_prefix(other.root.as_str())
+                .is_some_and(|rest| rest.starts_with('\\'))
+    }
+}
 /// テスト・検証の出力先（TEMPやfixture root）が「外部」かを確認し、正規化したパスを返す。
 ///
 /// 開発者固有のドライブ文字には依存させず、利用者・他の開発者の環境でも同じテストを回せるようにする。

@@ -105,7 +105,15 @@ fn command(params: &Value) -> std::result::Result<(&'static str, Value), (i32, S
                     .get("paths")
                     .and_then(Value::as_array)
                     .ok_or_else(|| invalid("Paths must contain 1 to 256 strings."))?;
-                if paths.is_empty() || paths.len() > 256 || paths.iter().any(|v| !v.is_string()) {
+                if paths.len() > crate::files::MCP_PATH_LIMIT
+                    && paths.iter().all(|v| v.is_string())
+                {
+                    return Err(invalid(crate::files::mcp_count_error()));
+                }
+                if paths.is_empty()
+                    || paths.len() > crate::files::MCP_PATH_LIMIT
+                    || paths.iter().any(|v| !v.is_string())
+                {
                     return Err(invalid("Paths must contain 1 to 256 strings."));
                 }
                 booleans(&args, &["dryRun", "recursive"])?;
@@ -227,6 +235,50 @@ mod worker_tests {
 mod result_tests {
     use super::*;
 
+    fn delete_params(count: usize, extra: Value) -> Value {
+        let paths: Vec<Value> = (0..count).map(|i| json!(format!("C:\\a\\{i}"))).collect();
+        let mut arguments = json!({"paths":paths});
+        if let Some(object) = extra.as_object() {
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .extend(object.clone());
+        }
+        json!({"name":"delete_files","arguments":arguments})
+    }
+
+    #[test]
+    fn path_count_limit_is_256_for_sync_and_enqueue() {
+        assert!(command(&delete_params(256, json!({}))).is_ok());
+        let error = command(&delete_params(257, json!({}))).unwrap_err();
+        assert_eq!(error.0, -32602);
+        assert_eq!(error.1, crate::files::mcp_count_error());
+        assert!(error.1.contains("batches of at most 256 paths"));
+        // Linuxはenqueue（action）を受け付けない。それ以外のOSは同期と同じ上限を適用する。
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(command(&delete_params(256, json!({"action":"enqueue"}))).is_ok());
+            let error = command(&delete_params(257, json!({"action":"enqueue"}))).unwrap_err();
+            assert_eq!(error.0, -32602);
+            assert_eq!(error.1, crate::files::mcp_count_error());
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            command(&delete_params(1, json!({"action":"enqueue"})))
+                .unwrap_err()
+                .1,
+            "Unexpected argument property."
+        );
+        let mut params = delete_params(257, json!({}));
+        params["arguments"]["paths"][0] = json!(1);
+        assert_eq!(
+            command(&params).unwrap_err().1,
+            "Paths must contain 1 to 256 strings."
+        );
+        let empty = command(&delete_params(0, json!({}))).unwrap_err();
+        assert_eq!(empty.1, "Paths must contain 1 to 256 strings.");
+    }
+
     #[test]
     fn mcp_keeps_its_own_result_and_items_recursion() {
         assert!(has_errors(
@@ -328,7 +380,7 @@ pub fn run(backend: Arc<dyn Backend>) -> Result<()> {
             let mut id = Value::Null;
             let response = (|| -> RpcResult {
                 if line.exceeds_limit {
-                    return Err((-32600, "Request exceeds 1 MiB.".into()));
+                    return Err((-32600, "Request exceeds 1 MiB and was not executed. Split large path lists into smaller requests.".into()));
                 }
                 let request: Value =
                     serde_json::from_str(&line.text).map_err(|e| (-32700, e.to_string()))?;
@@ -428,11 +480,11 @@ pub fn run(backend: Arc<dyn Backend>) -> Result<()> {
     result.and(deferred.map_or(Ok(()), Err))
 }
 #[cfg(windows)]
-const INSTRUCTIONS: &str = r#"Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true for directory contents. Files and directories normally go to the Windows Recycle Bin without Prunlet operation records. An ordinary file with a Windows reserved final name is permanently deleted after identity checks without using the bin; dry-run reports would_permanently_delete. Reserved-name directories and links are rejected. If Windows reports that an item is too large for the bin and its original identity is confirmed, Prunlet attempts to permanently delete its original name. Only confirmed removal returns permanently_deleted; an uncertain attempt returns ambiguous. A permanently deleted name cannot be restored from the bin. On a volume whose confirmed immediate-delete setting means the bin is unavailable, an item may also be permanently deleted after the same identity checks; its status is permanently_deleted, never recycled. Other recycling failures do not trigger permanent deletion. Dry-run cannot predict an ordinary item's bin-size outcome. File results have no operationId. For ambiguous results, do not resend deletion; inspect the source and Windows Recycle Bin. Windows controls bin retention and users may empty it. Metadata and legacy volume recovery directories and their ancestors remain protected. Links are handled without following their targets. Hard links share content with surviving aliases. Prunlet retention and capacity settings default to 7 days and 1 GiB for registry snapshots only, never for the Windows bin. list_operations lists registry recovery only. Use delete_registry for explicitly authorized local keys/values with required view 32 or 64, and restore_registry for their operationId. Empty valueName selects the default value; omitted valueName selects the key. Full key ACL snapshots require SeSecurityPrivilege; no automatic elevation or nontransactional fallback. Existing host approvals and policies still apply."#;
+const INSTRUCTIONS: &str = r#"Use delete_files for authorized absolute Windows files and empty directories without a target directory allowlist. Set recursive=true for directory contents. Files and directories normally go to the Windows Recycle Bin without Prunlet operation records. An ordinary file with a Windows reserved final name is permanently deleted after identity checks without using the bin; dry-run reports would_permanently_delete. Reserved-name directories and links are rejected. If Windows reports that an item is too large for the bin and its original identity is confirmed, Prunlet attempts to permanently delete its original name. Only confirmed removal returns permanently_deleted; an uncertain attempt returns ambiguous. A permanently deleted name cannot be restored from the bin. On a volume whose confirmed immediate-delete setting means the bin is unavailable, an item may also be permanently deleted after the same identity checks; its status is permanently_deleted, never recycled. Other recycling failures do not trigger permanent deletion. Dry-run cannot predict an ordinary item's bin-size outcome. File results have no operationId. For ambiguous results, do not resend deletion; inspect the source and Windows Recycle Bin. Windows controls bin retention and users may empty it. Metadata and legacy volume recovery directories and their ancestors remain protected. Links are handled without following their targets. Hard links share content with surviving aliases. Prunlet retention and capacity settings default to 7 days and 1 GiB for registry snapshots only, never for the Windows bin. list_operations lists registry recovery only. Use delete_registry for explicitly authorized local keys/values with required view 32 or 64, and restore_registry for their operationId. Empty valueName selects the default value; omitted valueName selects the key. Full key ACL snapshots require SeSecurityPrivilege; no automatic elevation or nontransactional fallback. Existing host approvals and policies still apply. Each call accepts 1 to 256 paths; a call with more is rejected before any change, so split larger lists into calls of at most 256 paths. Splitting applies only to calls rejected by this limit; do not automatically resend failed or ambiguous items."#;
 #[cfg(target_os = "macos")]
-const INSTRUCTIONS: &str = "Use delete_files for authorized absolute macOS paths. Set recursive=true for directory contents. Files move to the macOS Trash without operation records. Links are handled without following their targets. Inspect the source and Trash after ambiguous results. The queue waits for cooperative flock locks.";
+const INSTRUCTIONS: &str = "Use delete_files for authorized absolute macOS paths. Set recursive=true for directory contents. Files move to the macOS Trash without operation records. Links are handled without following their targets. Inspect the source and Trash after ambiguous results. The queue waits for cooperative flock locks. Each call accepts 1 to 256 paths; a call with more is rejected before any change, so split larger lists into calls of at most 256 paths. Splitting applies only to calls rejected by this limit; do not automatically resend failed or ambiguous items.";
 #[cfg(target_os = "linux")]
-const INSTRUCTIONS: &str = "Use delete_files for authorized absolute Linux paths. Set recursive=true for directory contents. Items move to the freedesktop home Trash on the same mount. Links are handled without following their targets. Inspect the source and Trash after ambiguous results.";
+const INSTRUCTIONS: &str = "Use delete_files for authorized absolute Linux paths. Set recursive=true for directory contents. Items move to the freedesktop home Trash on the same mount. Links are handled without following their targets. Inspect the source and Trash after ambiguous results. Each call accepts 1 to 256 paths; a call with more is rejected before any change, so split larger lists into calls of at most 256 paths. Splitting applies only to calls rejected by this limit; do not automatically resend failed or ambiguous items.";
 /// OS別の絞り込み後のtool一覧。初回だけ解析し、以降は不変値を複製して返す。
 fn tools() -> Value {
     static TOOLS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();

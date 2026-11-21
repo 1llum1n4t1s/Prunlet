@@ -183,6 +183,10 @@ $cases += @(
     @{ name='canonical-cli-msys'; command=('cmd.exe //d //c "' + $ExecutablePath + ' --config ' + $ConfigPath + ' delete --paths-file ' + $pathsJson + '"'); pass=$true },
     @{ name='canonical-cli-call'; command=('cmd.exe /d /c call "' + $ExecutablePath + '" --config "' + $ConfigPath + '" delete --paths-file "' + $pathsJson + '"'); shell='cmd.exe'; pass=$true },
     @{ name='canonical-cli-call-msys'; command=('cmd.exe //d //c call "' + $ExecutablePath + '" --config "' + $ConfigPath + '" delete --paths-file "' + $pathsJson + '"'); pass=$true },
+    # PRUNLET.mdが勧める、正規のCLI呼出しの末尾に出力リダイレクトを付けた形。
+    @{ name='canonical-cli-msys-redirect'; command=('cmd.exe //d //c "' + $ExecutablePath + ' --config ' + $ConfigPath + ' delete --paths-file ' + $pathsJson + ' > ' + $pathsJson + '.out.json"'); pass=$true },
+    @{ name='canonical-cli-cmd-redirect-stderr'; command=('cmd.exe /d /c "' + $ExecutablePath + ' --config ' + $ConfigPath + ' delete --paths-file ' + $pathsJson + ' > ' + $pathsJson + '.out.json 2>&1"'); shell='cmd.exe'; pass=$true },
+    @{ name='canonical-cli-direct-cmd-shell-redirect'; command=('"' + $ExecutablePath + '" --config "' + $ConfigPath + '" delete --paths-file "' + $pathsJson + '" > "' + $pathsJson + '.out.json" 2>&1'); shell='cmd.exe'; pass=$true },
     @{ name='cmd-wrapper-depth-four'; command='cmd /c cmd /c cmd /c cmd /c echo ok'; shell='cmd.exe'; pass=$true },
     @{ name='cmd-wrapper-depth-limit'; command='cmd /c cmd /c cmd /c cmd /c cmd /c echo ok'; shell='cmd.exe'; pass=$false; reason='inspection depth limit exceeded' },
     @{ name='pwsh-wrapper-depth-limit'; command='pwsh -c pwsh -c pwsh -c pwsh -c pwsh -c Write-Output ok'; shell='pwsh'; pass=$false; reason='inspection depth limit exceeded' }

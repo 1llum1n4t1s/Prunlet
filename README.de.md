@@ -154,7 +154,7 @@ C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet
 C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete --paths-file C:\work\delete-paths.json
 ```
 
-Ersetzen Sie Programmdatei und Konfiguration durch die absoluten Pfade Ihrer Installation. Geben Sie in Codex `cmd.exe` und `login: false` an. Erweitern Sie Zielpfade mit Leerzeichen, Unicode, vielen Elementen oder langen Pfaden nicht in der Shell, sondern übergeben Sie sie als absolute Pfade in einem UTF-8-JSON-Array. `--paths-file` akzeptiert 1 bis 256 Einträge und bis zu 1 MiB.
+Ersetzen Sie Programmdatei und Konfiguration durch die absoluten Pfade Ihrer Installation. Geben Sie in Codex `cmd.exe` und `login: false` an. Erweitern Sie Zielpfade mit Leerzeichen, Unicode, vielen Elementen oder langen Pfaden nicht in der Shell, sondern übergeben Sie sie als absolute Pfade in einem UTF-8-JSON-Array. `--paths-file` akzeptiert unter Windows 1 bis 1024 Einträge und bis zu 4 MiB (macOS und Linux: 256 Einträge und 1 MiB); MCP `delete_files` und `delete-queue` akzeptieren bis zu 256 Pfade pro Anfrage. Anfragen über dem Limit werden als Ganzes abgelehnt, ohne etwas zu ändern; teilen Sie die Liste auf.
 
 ```json
 ["C:\\work\\project\\unused.txt", "C:\\work\\project\\other.txt"]

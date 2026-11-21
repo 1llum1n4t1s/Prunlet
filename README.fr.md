@@ -154,7 +154,7 @@ C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet
 C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete --paths-file C:\work\delete-paths.json
 ```
 
-Remplacez l'exécutable et la configuration par les chemins absolus de votre installation. Dans Codex, indiquez `cmd.exe` et `login: false`. N'étendez pas dans le shell les chemins cibles contenant des espaces, de l'Unicode, de nombreux éléments ou des chemins longs ; transmettez-les comme chemins absolus dans un tableau JSON en UTF-8. `--paths-file` accepte de 1 à 256 entrées et jusqu'à 1 Mio.
+Remplacez l'exécutable et la configuration par les chemins absolus de votre installation. Dans Codex, indiquez `cmd.exe` et `login: false`. N'étendez pas dans le shell les chemins cibles contenant des espaces, de l'Unicode, de nombreux éléments ou des chemins longs ; transmettez-les comme chemins absolus dans un tableau JSON en UTF-8. `--paths-file` accepte sous Windows de 1 à 1024 entrées et jusqu'à 4 Mio (macOS et Linux : 256 entrées et 1 Mio) ; MCP `delete_files` et `delete-queue` acceptent jusqu'à 256 chemins par requête. Une requête au-dessus de la limite est refusée en bloc sans rien modifier ; divisez la liste.
 
 ```json
 ["C:\\work\\project\\unused.txt", "C:\\work\\project\\other.txt"]

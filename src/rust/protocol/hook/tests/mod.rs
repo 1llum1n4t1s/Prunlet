@@ -39,7 +39,7 @@ fn reason(command: &str, tool: &str, shell: Option<&str>) -> Option<String> {
                 .unwrap_or_default()
                 .to_owned(),
         ),
-        Err(error) => Some(format!("Prunlet could not inspect the hook input: {error}")),
+        Err(error) => Some(super::uninspectable_reason(&error)),
     }
 }
 fn denied(command: &str, shell: &str) -> bool {

@@ -154,7 +154,7 @@ C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet
 C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete --paths-file C:\work\delete-paths.json
 ```
 
-請將執行檔與設定替換為已安裝的絕對路徑。在 Codex 中請指定 `cmd.exe` 與 `login: false`。含空格、Unicode、數量多或路徑長的目標，不要在 shell 中展開，請以 UTF-8 JSON 陣列中的絕對路徑傳遞。`--paths-file` 接受 1 到 256 項，最大 1 MiB。
+請將執行檔與設定替換為已安裝的絕對路徑。在 Codex 中請指定 `cmd.exe` 與 `login: false`。含空格、Unicode、數量多或路徑長的目標，不要在 shell 中展開，請以 UTF-8 JSON 陣列中的絕對路徑傳遞。`--paths-file` 在 Windows 上接受 1 到 1024 項、最大 4 MiB（macOS 與 Linux 為 256 項、1 MiB）；MCP 的 `delete_files` 與 `delete-queue` 每次請求最多 256 項。超出上限的請求會整體被拒絕且不做任何變更，請拆分後再傳遞。
 
 ```json
 ["C:\\work\\project\\unused.txt", "C:\\work\\project\\other.txt"]

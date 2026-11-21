@@ -72,7 +72,10 @@ fn inspect(input: &Value, config: &Path, cli: &Path) -> Result<Value> {
             admin_config: config.to_string_lossy().into_owned(),
             ..Inspector::default()
         };
-        if inspection.contains(command, 0, mode, false)? {
+        if inspection
+            .contains(command, 0, mode, false)
+            .map_err(|e| anyhow::Error::new(CommandSyntax(e.to_string())))?
+        {
             detected = Some(inspection);
             break;
         }
@@ -139,6 +142,39 @@ fn cli_quote(s: &str) -> String {
 pub(crate) fn deny(reason: &str) -> Value {
     json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":reason}})
 }
+/// 検査段階（コマンドの構文を静的に分類できない場合）のエラー。書き直しの案内を付ける対象を区別する印。
+#[derive(Debug)]
+struct CommandSyntax(String);
+impl std::fmt::Display for CommandSyntax {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for CommandSyntax {}
+/// 句点で終わっていなければ`.`を補う。
+fn sentence(text: &str) -> String {
+    let text = text.trim_end();
+    if text.ends_with(['.', '!', '?']) {
+        text.to_owned()
+    } else {
+        format!("{text}.")
+    }
+}
+/// 検査できない入力の拒否理由。コマンドの構文が原因のときだけ、同じコマンドの再送や手探りの書き直しを
+/// 繰り返さないよう直し方を添える。stdinの読み取り・JSON・入力の型の誤りには案内を付けない。
+pub(crate) fn uninspectable_reason(error: &anyhow::Error) -> String {
+    let base = format!(
+        "Prunlet could not inspect the hook input: {}",
+        sentence(&error.to_string())
+    );
+    if error.downcast_ref::<CommandSyntax>().is_some() {
+        format!(
+            "{base} Rewrite the command without that construct instead of resending it; for multi-step logic, write a script file and run it by its path, keeping file, folder and registry deletion on the Prunlet CLI."
+        )
+    } else {
+        base
+    }
+}
 pub fn run(config_path: &Path, cli_path: &Path) -> i32 {
     let result = (|| -> Result<Value> {
         let text = read_to_end(io::stdin().lock())?;
@@ -149,7 +185,7 @@ pub fn run(config_path: &Path, cli_path: &Path) -> i32 {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Prunlet hook: {e}");
-            deny(&format!("Prunlet could not inspect the hook input: {e}"))
+            deny(&uninspectable_reason(&e))
         }
     };
     println!("{output}");

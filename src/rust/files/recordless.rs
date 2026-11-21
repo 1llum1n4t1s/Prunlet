@@ -1,4 +1,7 @@
-use super::coordination::{self, WorkerSlot};
+use super::{
+    PathLimit,
+    coordination::{self, WorkerSlot},
+};
 use crate::{
     config::Config,
     platform::windows::{
@@ -67,13 +70,16 @@ pub fn inspect(path: &Path) -> Result<Option<PinnedFile>> {
         Err(error) => Err(error),
     }
 }
-pub fn normalize_paths(config: &Config, args: &Value) -> Result<Vec<PathBuf>> {
+pub fn normalize_paths(config: &Config, args: &Value, limit: PathLimit) -> Result<Vec<PathBuf>> {
     let input = args
         .get("paths")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("paths must be an array"))?;
-    if input.is_empty() || input.len() > 256 {
-        bail!("Specify between 1 and 256 paths");
+    if input.is_empty() || input.len() > limit.count() {
+        bail!(match limit {
+            PathLimit::Sync => super::sync_count_error(limit.count()),
+            PathLimit::Queue => super::queue_count_error(),
+        });
     }
     let metadata = path::resolve(Path::new(&config.data.backup_directory), false, false)?;
     let mut result = vec![];
@@ -110,14 +116,74 @@ pub fn normalize_paths(config: &Config, args: &Value) -> Result<Vec<PathBuf>> {
         }
         result.push(final_path);
     }
-    for (i, a) in result.iter().enumerate() {
-        for b in &result[i + 1..] {
-            if path::within(a, b) || path::within(b, a) {
+    reject_overlapping(&result)?;
+    Ok(result)
+}
+/// 重複・親子関係にある対象を拒否する。判定は`path::within`と同じで、正規化は対象ごとに1回だけ行う。
+fn reject_overlapping(paths: &[PathBuf]) -> Result<()> {
+    let keys: Vec<path::OverlapKey> = paths.iter().map(|p| path::OverlapKey::new(p)).collect();
+    for (i, a) in keys.iter().enumerate() {
+        for b in &keys[i + 1..] {
+            if a.within(b) || b.within(a) {
                 bail!("Duplicate or overlapping target paths are not allowed");
             }
         }
     }
-    Ok(result)
+    Ok(())
+}
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    fn overlaps(items: &[&str]) -> bool {
+        let paths: Vec<PathBuf> = items.iter().map(PathBuf::from).collect();
+        reject_overlapping(&paths).is_err()
+    }
+    #[test]
+    fn rejects_duplicates_and_nesting_like_within() {
+        assert!(overlaps(&[r"C:\x\a", r"c:/X/A"]));
+        assert!(overlaps(&[r"C:\x", r"C:\x\a\b"]));
+        assert!(overlaps(&[r"C:\x\a\b", r"C:\X"]));
+        assert!(overlaps(&[r"\\srv\share", r"\\srv\share\d"]));
+        assert!(!overlaps(&[r"C:\x\a", r"C:\x\a b"]));
+        assert!(!overlaps(&[r"C:\x\a", r"C:\x\b", r"D:\x\a"]));
+        assert!(!overlaps(&[r"C:\x\a"]));
+    }
+    /// 高速化した比較が、従来の`path::within`による双方向の判定と全組で一致することを確かめる。
+    #[test]
+    fn agrees_with_within_for_every_pair() {
+        let samples = [
+            r"C:\x\a",
+            r"c:/X/A",
+            r"C:\x\a b",
+            r"C:\x\a\b",
+            r"C:\x\a\",
+            r"C:\x",
+            r"C:\",
+            r"C:",
+            r"\\srv\share",
+            r"\\srv\share\d",
+            r"\\?\C:\x\a",
+            r"C:\ÄÖ\a",
+            r"c:\äö",
+            r"D:\x\a",
+        ];
+        for a in samples {
+            for b in samples {
+                let (pa, pb) = (Path::new(a), Path::new(b));
+                assert_eq!(
+                    overlaps(&[a, b]),
+                    path::within(pa, pb) || path::within(pb, pa),
+                    "{a} vs {b}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn handles_a_large_disjoint_list() {
+        let items: Vec<String> = (0..4096).map(|i| format!(r"C:\fixture\f{i}.txt")).collect();
+        let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+        assert!(!overlaps(&refs));
+    }
 }
 /// 互換設定`volumeRecoveryDirectories`の値が、現在存在しないドライブ上かを返す。
 /// 取り外したドライブの設定が残っていても、無関係なボリューム上の削除まで止めないための判定で、
@@ -331,7 +397,7 @@ fn prepare(
     }))
 }
 pub fn execute(config: &Config, args: &Value, progress: Option<Progress>) -> Result<Value> {
-    let paths = normalize_paths(config, args)?;
+    let paths = normalize_paths(config, args, PathLimit::Sync)?;
     let result = delete(
         config,
         &paths,

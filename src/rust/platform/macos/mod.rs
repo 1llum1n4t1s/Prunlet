@@ -715,7 +715,7 @@ pub(super) fn execute_delete_inner(
         .and_then(Value::as_array)
         .context("paths must be an array")?;
     if raw.is_empty() || raw.len() > 4096 {
-        bail!("paths must contain 1..4096 entries");
+        bail!(crate::files::sync_count_error(4096));
     }
     let _lock = lock(config, progress.as_ref())?;
     let metadata = path::resolve(Path::new(&config.data.backup_directory), true, false)?;

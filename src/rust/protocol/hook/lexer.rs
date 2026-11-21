@@ -189,13 +189,15 @@ pub(super) fn tokens_with(
                 bail!("EncodedCommand contains unsupported smart quotation marks.");
             }
             if quote == '\0' && c == '<' && s.get(i + 1) == Some(&'#') {
-                bail!("EncodedCommand block comments cannot be inspected.");
+                bail!("EncodedCommand block comments cannot be inspected. Use # line comments instead.");
             }
             if quote == '\0' && c == '@' && s.get(i + 1) == Some(&'{') {
-                bail!("EncodedCommand hashtables cannot be inspected.");
+                bail!(
+                    "EncodedCommand hashtables cannot be inspected. Select plain property names instead of calculated properties, pass parameters directly instead of splatting, or move the logic into a script file."
+                );
             }
             if quote == '\0' && c == '$' && s.get(i + 1) == Some(&'{') {
-                bail!("EncodedCommand braced variables cannot be inspected.");
+                bail!("EncodedCommand braced variables cannot be inspected. Write $name or $env:NAME without braces.");
             }
             if quote != '\''
                 && c == '`'
@@ -212,7 +214,9 @@ pub(super) fn tokens_with(
                 && s.get(i + 1) == Some(&'(')
                 && !powershell_property_subexpression(&s[i + 2..])
             {
-                bail!("EncodedCommand expandable string subexpressions cannot be inspected.");
+                bail!(
+                    "EncodedCommand expandable string subexpressions cannot be inspected. Inside double quotes, $(...) may hold only a variable with property or numeric index references, such as \"$($x.Name)\" or \"$($r.items[0].Name)\"; assign method calls, operators or commands to a variable first ($v = $x.Method(); \"$v\"), or use -f formatting or + concatenation."
+                );
             }
             if quote == '\0' && c == '&' {
                 let mut next = i + 1;
@@ -232,7 +236,7 @@ pub(super) fn tokens_with(
                     continue;
                 }
                 if next < s.len() && matches!(s[next], '(' | '$' | '@' | '{' | '\'' | '"' | '`') {
-                    bail!("EncodedCommand dynamic invocation cannot be inspected.");
+                    bail!("EncodedCommand dynamic invocation cannot be inspected. Call the command by its literal name, or a literal path such as & 'C:\\path\\tool.exe'.");
                 }
             }
             if quote == '\0'
@@ -241,7 +245,7 @@ pub(super) fn tokens_with(
                 && s.get(i + 1).is_some_and(|c| c.is_whitespace() || *c == '(')
                 && !powershell_dot_argument(&s, i, &out)
             {
-                bail!("EncodedCommand dot-sourcing cannot be inspected.");
+                bail!("EncodedCommand dot-sourcing cannot be inspected. Run the script with a literal path such as & 'C:\\path\\script.ps1' instead.");
             }
         }
         let literal_quote = matches!(quote, '\'' | ANSI_C_QUOTE);

@@ -154,7 +154,7 @@ C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet
 C:\Users\you\.local\Prunlet\bin\prunlet.exe --config C:\Users\you\.local\Prunlet\config.json delete --paths-file C:\work\delete-paths.json
 ```
 
-exe・設定は配置済みの絶対パスへ置き換えてください。Codexでは`cmd.exe`・`login: false`を指定します。空白・Unicode・多数・長い対象パスはshellへ展開せず、UTF-8 JSON配列の絶対パスで渡します。`--paths-file`は1〜256件、最大1 MiBです。
+exe・設定は配置済みの絶対パスへ置き換えてください。Codexでは`cmd.exe`・`login: false`を指定します。空白・Unicode・多数・長い対象パスはshellへ展開せず、UTF-8 JSON配列の絶対パスで渡します。`--paths-file`はWindowsで1〜1024件・最大4 MiB（macOS・Linuxは256件・1 MiB）、MCPの`delete_files`と`delete-queue`は1要求256件までです。上限を超えた要求は何も変更せず全体が拒否されるため、分割してください。
 
 ```json
 ["C:\\work\\project\\unused.txt", "C:\\work\\project\\other.txt"]

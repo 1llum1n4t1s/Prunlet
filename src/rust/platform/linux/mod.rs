@@ -450,7 +450,7 @@ pub fn execute(
     let paths = args["paths"].as_array().context("paths must be an array")?;
     ensure!(
         !paths.is_empty() && paths.len() <= 4096,
-        "paths must contain 1..4096 entries"
+        crate::files::sync_count_error(4096)
     );
     let root = home_trash()?;
     let mount = Dir::nearest(&root)?.identity.mount;

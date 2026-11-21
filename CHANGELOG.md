@@ -2,6 +2,11 @@
 
 ## 未リリース
 
+- Windowsの同期`delete`・`delete --dry-run`（`--paths-file`と`-- <paths>`）が1回に受け付ける対象を256件から1024件、`--paths-file`の上限を1 MiBから4 MiBへ引き上げた。macOS・Linuxの同期は`--paths-file`が256件・1 MiBのまま（`-- <paths>`は従来どおりCoreの4096件まで）、MCPの`delete_files`（同期・enqueue）、待機キュー`delete-queue`は256件・1 MiBのまま。4096件はdry-runが72.7秒かかり合格条件（dry-run 30秒・実削除120秒）を満たさないため採用していない。重複・親子の検査も高速化した（判定は変えていない）。
+- 上限を超えた要求のエラー文を、「何も変更していない」「入力上限でありポリシー拒否ではない」ことと、上限以下に分けて呼び直す方法、フォルダー全体の削除が許可されている場合だけ親を`--recursive`で1件渡す方法を示す内容にした。MCPの説明とINSTRUCTIONSにも同じ案内を追加した。エージェントが上限超過を拒否と取り違えて諦める問題への対策である。
+- フックが検査できない構文（PowerShellの二重引用内の`$(...)`・hashtable・`${...}`・動的な呼び出し・dot-sourcing・ブロックコメント）を拒否するときの理由に、書き直し方（再送せずスクリプトファイルにする、削除はPrunlet CLIで行う）を追加した。拒否の判定は変えていない。
+- 共通指示`PRUNLET.md`に上限と分割の手順を追記した。Codexで`-RegisterAgentInstructions`により共通指示を登録済みの環境では、共通指示が変わる候補として起動時更新が「The candidate changes agent instructions and requires review」で保留になり、インストール済みの製品はそのまま保たれる。同じオプション（`-RegisterCodex -RegisterAgentInstructions`）でインストーラーを再実行して登録を更新すること。
+
 ## 1.0.54 - 2026-11-21
 
 - 動作の変更はない。内部の整理と依存更新のみ。依存crate（zip・regex・bytes ほか）を更新し、更新キャッシュの二重の走査と、固定パターンの正規表現・MCPのツール一覧の繰り返しの構築をなくした。フックの解析の一部を、挙動を変えずに関数へ切り出した。重複していたテストと文書の記述を整理し、`main`への push と PR で Linux のテストも走らせるようにした。
